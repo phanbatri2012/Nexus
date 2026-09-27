@@ -4039,6 +4039,38 @@ def retry_system_job(job_id: str) -> dict | None:
     )
 
 
+def resume_system_job_from_checkpoint(
+    job_id: str,
+    resume_from_step: str,
+) -> dict | None:
+    job = get_system_job(job_id)
+    if not job:
+        return None
+    if job["job_type"] != "video_generation":
+        raise ValueError("Chỉ job tạo video mới có thể tiếp tục từ checkpoint.")
+    if job["status"] not in {"error", "failed", "canceled"}:
+        raise ValueError("Chỉ có thể tiếp tục job lỗi hoặc đã hủy.")
+    if job.get("video_id") is None:
+        raise ValueError("Job chưa gắn với video nên không thể tiếp tục checkpoint.")
+    video = get_video(int(job["video_id"]))
+    if video and video.get("video_status") == VIDEO_STATUS_ERROR:
+        raise ValueError(
+            "Video đang ở trạng thái Lỗi. Hãy khôi phục trạng thái trước."
+        )
+    normalized_step = str(resume_from_step or "checkpoint").strip() or "checkpoint"
+    return update_system_job(
+        job_id,
+        status="queued",
+        progress=f"Đang chờ tiếp tục từ checkpoint: {normalized_step}",
+        error="",
+        recovery_count=0,
+        resume_from_step=normalized_step,
+        next_retry_at="",
+        cancel_requested=0,
+        finished_at="",
+    )
+
+
 def get_system_job_queue_position(job_id: str) -> int | None:
     job = get_system_job(job_id)
     if not job or job["status"] != "queued":

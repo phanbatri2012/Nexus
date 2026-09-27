@@ -49,8 +49,17 @@ test('wires the persistent Job Center and keeps video submission queueable', asy
   assert.match(videoQueueSource, /'queued', 'running', 'retry_wait', 'paused'/)
   assert.match(videoQueueSource, /const hasPollableJobs = useMemo/)
   assert.match(videoQueueSource, /if \(!hasPollableJobs\) return undefined/)
-  assert.match(videoQueueSource, /method: ['"]PATCH['"]/)
-  assert.match(videoQueueSource, /method: ['"]DELETE['"]/)
+  assert.match(
+    videoQueueSource,
+    /method: ['"]PATCH['"]/
+  )
+  assert.match(
+    videoQueueSource,
+    /method: ['"]DELETE['"]/
+  )
+  assert.match(videoQueueSource, /runJobAction\(job\.raw_id, ['"]resume-checkpoint['"]\)/)
+  assert.match(videoQueueSource, /Tiếp tục từ checkpoint/)
+  assert.match(jobCenterSource, /runAction\(job, ['"]resume-checkpoint['"]\)/)
   assert.match(videoQueueSource, />Sửa</)
   assert.match(videoQueueSource, />Xóa</)
 })

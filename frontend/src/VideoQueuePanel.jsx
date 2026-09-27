@@ -205,8 +205,27 @@ function VideoQueuePanel({ refreshKey, onOpenJobCenter, onOpenVideo }) {
               {job.can_edit && (
                 <button className="btn-secondary" disabled={Boolean(actionId)} style={{ padding: '5px 9px' }} onClick={() => beginEdit(job)}>Sửa</button>
               )}
+              {job.can_resume_checkpoint && (
+                <button
+                  className="btn-secondary"
+                  disabled={Boolean(actionId)}
+                  style={{ padding: '5px 9px', color: '#7ee787' }}
+                  title={`Giữ nguyên phần đã hoàn tất và tiếp tục từ ${job.checkpoint_resume_step || 'checkpoint'}`}
+                  onClick={() => runJobAction(job.raw_id, 'resume-checkpoint')}
+                >
+                  Tiếp tục từ checkpoint
+                </button>
+              )}
               {job.can_retry && (
-                <button className="btn-secondary" disabled={Boolean(actionId)} style={{ padding: '5px 9px', color: '#4dd0e1' }} onClick={() => runJobAction(job.raw_id, 'retry')}>Chạy lại</button>
+                <button
+                  className="btn-secondary"
+                  disabled={Boolean(actionId)}
+                  style={{ padding: '5px 9px', color: '#4dd0e1' }}
+                  title="Xóa checkpoint và chạy lại từ đầu"
+                  onClick={() => runJobAction(job.raw_id, 'retry')}
+                >
+                  Chạy lại
+                </button>
               )}
               {ACTIVE_STATUSES.includes(job.status) && (
                 <button className="btn-secondary" disabled={Boolean(actionId)} style={{ padding: '5px 9px', color: '#ffb347' }} onClick={() => cancelJob(job.raw_id)}>Dừng</button>

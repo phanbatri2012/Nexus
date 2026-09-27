@@ -129,12 +129,21 @@ THUMBNAIL_REGENERATE_PROMPT = (
     "Tạo ảnh theo prompt vừa được sửa ở ngay trên. Lưu ý: chỉ cần xuất ảnh của prompt mới sửa"
 )
 CHATGPT_COMPOSER_SELECTOR = (
-    "#prompt-textarea, "
-    "div.ProseMirror, "
-    "div[role='textbox'][contenteditable='true'], "
-    "div[data-composer-markdown], "
-    "textarea[placeholder*='Ask']"
+    '#prompt-textarea:not([data-testid="chatgpt-writing-block"] #prompt-textarea)'
+    ':not(.writing-block-editor #prompt-textarea), '
+    ":is(form, [data-composer-root], [data-testid='composer'], [data-composer-body]) "
+    "div.ProseMirror[contenteditable='true']"
+    ":not([data-testid='chatgpt-writing-block'] *):not(.writing-block-editor *), "
+    ":is(form, [data-composer-root], [data-testid='composer'], [data-composer-body]) "
+    "div[role='textbox'][contenteditable='true']"
+    ":not([data-testid='chatgpt-writing-block'] *):not(.writing-block-editor *), "
+    ":is(form, [data-composer-root], [data-testid='composer'], [data-composer-body]) "
+    "div[data-composer-markdown][contenteditable='true']"
+    ":not([data-testid='chatgpt-writing-block'] *):not(.writing-block-editor *), "
+    ":is(form, [data-composer-root], [data-testid='composer'], [data-composer-body]) "
+    "textarea:not([data-testid='chatgpt-writing-block'] *):not(.writing-block-editor *)"
 )
+CHATGPT_VISIBLE_COMPOSER_SELECTOR = f":is({CHATGPT_COMPOSER_SELECTOR}):visible"
 CHATGPT_SEND_BUTTON_SELECTOR = (
     'button[data-testid="send-button"], '
     'button[aria-label="Send"], '
@@ -143,6 +152,7 @@ CHATGPT_SEND_BUTTON_SELECTOR = (
     'button[aria-label="Send message"], '
     'button.bg-composer-primary'
 )
+CHATGPT_VISIBLE_SEND_BUTTON_SELECTOR = f":is({CHATGPT_SEND_BUTTON_SELECTOR}):visible"
 CHATGPT_STOP_BUTTON_SELECTOR = (
     'button[data-testid="stop-button"], '
     'button[aria-label*="Stop generating"], '
@@ -150,6 +160,41 @@ CHATGPT_STOP_BUTTON_SELECTOR = (
     'button[aria-label*="Dừng tạo"], '
     'button[aria-label*="Dừng phản hồi"]'
 )
+CHATGPT_DOM_HELPERS_JS = f"""
+const isElementVisible = (element) => {{
+    if (!element) return false;
+    const style = window.getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== 'none'
+        && style.visibility !== 'hidden'
+        && rect.width > 0
+        && rect.height > 0;
+}};
+const findComposer = () => [...document.querySelectorAll(
+    {json.dumps(CHATGPT_COMPOSER_SELECTOR)}
+)].find(isElementVisible) || null;
+const findSendButton = (editor) => {{
+    if (!editor) return null;
+    const root = editor.closest('form')
+        || editor.closest('[data-composer-root], [data-testid="composer"]')
+        || editor.closest('[data-composer-body]');
+    if (!root) return null;
+    return [...root.querySelectorAll(
+        {json.dumps(CHATGPT_SEND_BUTTON_SELECTOR)}
+    )].find(isElementVisible) || null;
+}};
+"""
+
+
+def _chatgpt_dom_script(body: str, argument_name: str = "") -> str:
+    return (
+        f"({argument_name}) => {{\n"
+        f"{CHATGPT_DOM_HELPERS_JS}\n"
+        f"{body}\n"
+        "}"
+    )
+
+
 URL_LIKE_TOKEN_PATTERN = re.compile(
     r"(?:https?://|www\.)[^\s<>{}\[\]\"']+"
     r"|\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+"
@@ -361,16 +406,14 @@ def get_visible_conversation_turns(page: Page) -> list[tuple[int, str]]:
     try:
         raw_turns = page.evaluate("""() => {
             const units = [...document.querySelectorAll(
-                '[data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"], [data-content-search-unit-key*="user"], [data-content-search-unit-key*="assistant"]'
+                '[data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"]'
             )];
             const results = [];
             let currentTurn = 0;
             for (const unit of units) {
                 const isUser = unit.getAttribute('data-user-message-bubble') === 'true'
-                    || (unit.getAttribute('data-content-search-unit-key') || '').includes('user')
                     || (unit.getAttribute('data-conversation-role') || '') === 'user';
                 const isAssistant = unit.getAttribute('data-markdown-text-style') === 'assistant-message'
-                    || (unit.getAttribute('data-content-search-unit-key') || '').includes('assistant')
                     || (unit.getAttribute('data-conversation-role') || '') === 'assistant';
                 if (isUser) {
                     results.push([currentTurn++, 'user']);
@@ -401,7 +444,7 @@ def get_assistant_message_count(page: Page) -> int:
             return legacy_count
         return page.evaluate("""() => {
             return document.querySelectorAll(
-                '[data-markdown-text-style="assistant-message"], [data-content-search-unit-key*="assistant"]'
+                '[data-markdown-text-style="assistant-message"]'
             ).length;
         }""")
     except Exception:
@@ -415,7 +458,7 @@ def get_user_message_count(page: Page) -> int:
             return legacy_count
         return page.evaluate("""() => {
             return document.querySelectorAll(
-                '[data-user-message-bubble="true"], [data-content-search-unit-key*="user"]'
+                '[data-user-message-bubble="true"]'
             ).length;
         }""")
     except Exception:
@@ -424,12 +467,7 @@ def get_user_message_count(page: Page) -> int:
 
 def accept_external_app_permission_dialog(page: Page) -> bool:
     """Accept action/plugin consent dialogs (like vidIQ)."""
-    # Look for both modal dialogs and inline action cards
-    # Inline cards don't have role="dialog", so we search globally for consent-like buttons
-    
-    # We look for visible buttons that match our target labels
     target_labels = ["always allow", "luôn cho phép", "allow", "cho phép", "đồng ý", "confirm", "xác nhận"]
-    
     buttons = page.locator("button")
     try:
         count = buttons.count()
@@ -446,25 +484,49 @@ def accept_external_app_permission_dialog(page: Page) -> bool:
             button_text = button.get_attribute("aria-label") or ""
             
         normalized_label = " ".join(button_text.casefold().split())
-        
-        # If it's a split button, the text might be something like "Allow Dropdown" or similar, 
-        # but inner_text() usually just gives "Allow" if the SVG is ignored.
-        # Let's do a loose match: if the normalized label EXACTLY matches one of our targets.
-        if normalized_label in target_labels:
-            # To be safe and avoid clicking random "Confirm" buttons elsewhere, 
-            # we check if there's context of an action consent.
-            # But in the generation wait loop, any "Allow" or "Confirm" button is highly likely to be the popup!
-            try:
-                button.click(timeout=EXTERNAL_APP_PERMISSION_CLICK_TIMEOUT_MS)
-                print(
-                    f">>> Accepted ChatGPT action dialog with button '{normalized_label}'; continuing to wait for the current response.",
-                    file=sys.stderr,
-                )
-                return True
-            except Exception as e:
-                print(f"Failed to click button '{normalized_label}': {e}", file=sys.stderr)
-                
+        for target in target_labels:
+            if target in normalized_label:
+                try:
+                    button.click(timeout=EXTERNAL_APP_PERMISSION_CLICK_TIMEOUT_MS)
+                    print(
+                        f">>> Accepted ChatGPT action dialog with button '{normalized_label}'; continuing to wait for the current response.",
+                        file=sys.stderr,
+                    )
+                    return True
+                except Exception as e:
+                    print(f"Failed to click button '{normalized_label}': {e}", file=sys.stderr)
+                    
     return False
+
+
+def _extract_base_g_identifier(identifier: str) -> str:
+    ident = str(identifier or "").strip()
+    m_proj = re.match(r"^(g-p-[0-9a-f]{32})(?:-.*)?$", ident, re.IGNORECASE)
+    if m_proj:
+        return m_proj.group(1).lower()
+    m_gpt = re.match(r"^(g-[a-z0-9]{8,})(?:-.*)?$", ident, re.IGNORECASE)
+    if m_gpt:
+        return m_gpt.group(1).lower()
+    return ident.lower()
+
+
+def _normalize_chatgpt_path(path: str) -> str:
+    cleaned = str(path or "").strip().rstrip("/")
+    if not cleaned:
+        return "/"
+    parts = cleaned.strip("/").split("/")
+    # 1. Non-project conversation: /c/<conv_id>
+    if len(parts) == 2 and parts[0] == "c":
+        return f"/c/{parts[1]}"
+    # 2. Project or Custom GPT conversation: /g/<identifier_or_slug>/c/<conv_id>
+    if len(parts) == 4 and parts[0] == "g" and parts[2] == "c":
+        base_id = _extract_base_g_identifier(parts[1])
+        return f"/g/{base_id}/c/{parts[3]}"
+    # 3. Project landing page: /g/<identifier_or_slug>/project
+    if len(parts) == 3 and parts[0] == "g" and parts[2] == "project":
+        base_id = _extract_base_g_identifier(parts[1])
+        return f"/g/{base_id}/project"
+    return "/" + "/".join(parts).lower()
 
 
 def get_response_turn_baseline(
@@ -477,7 +539,7 @@ def get_response_turn_baseline(
     if (
         before.scheme != after.scheme
         or before.netloc != after.netloc
-        or before.path.rstrip("/") != after.path.rstrip("/")
+        or _normalize_chatgpt_path(before.path) != _normalize_chatgpt_path(after.path)
     ):
         return -1
     return previous_assistant_turn
@@ -735,7 +797,7 @@ def ensure_expected_project_page(actual_url: str, project_url: str) -> None:
     if (
         actual.scheme != expected.scheme
         or actual.netloc != expected.netloc
-        or actual.path.rstrip("/") != expected.path.rstrip("/")
+        or _normalize_chatgpt_path(actual.path) != _normalize_chatgpt_path(expected.path)
     ):
         raise RuntimeError(
             "ChatGPT did not stay on the configured Project page. "
@@ -781,7 +843,7 @@ def ensure_expected_conversation_page(
     if (
         actual.scheme != expected.scheme
         or actual.netloc != expected.netloc
-        or actual.path.rstrip("/") != expected.path.rstrip("/")
+        or _normalize_chatgpt_path(actual.path) != _normalize_chatgpt_path(expected.path)
     ):
         raise RuntimeError(
             "ChatGPT did not stay on the video's conversation page. "
@@ -797,7 +859,7 @@ def is_expected_project_conversation_url(
     project = urlparse(str(project_url or "").strip())
     actual_parts = actual.path.strip("/").split("/")
     project_parts = project.path.strip("/").split("/")
-    return (
+    if not (
         actual.scheme == project.scheme == "https"
         and actual.netloc == project.netloc == "chatgpt.com"
         and len(project_parts) == 3
@@ -805,10 +867,13 @@ def is_expected_project_conversation_url(
         and project_parts[2] == "project"
         and len(actual_parts) == 4
         and actual_parts[0] == "g"
-        and actual_parts[1] == project_parts[1]
         and actual_parts[2] == "c"
         and bool(actual_parts[3])
-    )
+    ):
+        return False
+    actual_base = _extract_base_g_identifier(actual_parts[1])
+    project_base = _extract_base_g_identifier(project_parts[1])
+    return actual_base == project_base
 
 
 def ensure_expected_project_conversation_page(
@@ -978,6 +1043,7 @@ def navigate_to_chatgpt_project(
     The exact Project route is validated before the caller can send a prompt.
     """
     expected_path = urlparse(project_url).path.rstrip("/")
+    normalized_expected = _normalize_chatgpt_path(expected_path)
     last_error: Exception | None = None
 
     for attempt in range(CHATGPT_PROJECT_NAVIGATION_ATTEMPTS):
@@ -991,7 +1057,7 @@ def navigate_to_chatgpt_project(
                 )
                 check_chatgpt_page_attention(page)
                 actual_path = urlparse(page.url).path.rstrip("/")
-                if actual_path == expected_path:
+                if _normalize_chatgpt_path(actual_path) == normalized_expected:
                     wait_for_chatgpt_composer(page)
                     return
             except ChatGPTAttentionRequiredError:
@@ -1015,9 +1081,15 @@ def navigate_to_chatgpt_project(
                     timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
                 )
 
+            project_identifier = urlparse(project_url).path.strip("/").split("/")[1]
+            base_project_id = _extract_base_g_identifier(project_identifier)
+
             page.wait_for_function(
-                """(path) => location.pathname.replace(/\/+$/, '') === path""",
-                arg=expected_path,
+                """(baseProjId) => {
+                    const path = location.pathname.replace(/\/+$/, '').toLowerCase();
+                    return path.startsWith('/g/' + baseProjId) && path.endsWith('/project');
+                }""",
+                arg=base_project_id,
                 timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
             )
 
@@ -1048,7 +1120,7 @@ def get_chatgpt_load_state(page: Page) -> dict:
     """Return enough DOM state to distinguish a transient full-page failure."""
     try:
         return page.evaluate(
-            """() => {
+            _chatgpt_dom_script("""
                 const isVisible = (element) => {
                     if (!element) return false;
                     const style = window.getComputedStyle(element);
@@ -1069,9 +1141,7 @@ def get_chatgpt_load_state(page: Page) -> dict:
                     'security check', 'cloudflare', 'captcha', 'just a moment',
                     'xác minh bạn là con người', 'đang kiểm tra trình duyệt'
                 ];
-                const editor = document.querySelector(
-                    '#prompt-textarea, div.ProseMirror, div[role="textbox"][contenteditable="true"], div[data-composer-markdown], textarea'
-                );
+                const editor = findComposer();
                 const turns = document.querySelectorAll(
                     '[data-testid^="conversation-turn-"], '
                     + '[data-message-author-role], '
@@ -1116,7 +1186,7 @@ def get_chatgpt_load_state(page: Page) -> dict:
                     ),
                     body_preview: normalize(document.body?.innerText).slice(0, 240),
                 };
-            }"""
+            """)
         )
     except Exception as exc:
         return {
@@ -1156,7 +1226,7 @@ def click_chatgpt_full_page_retry(page: Page) -> bool:
     try:
         return bool(
             page.evaluate(
-                """() => {
+                _chatgpt_dom_script("""
                     const isVisible = (element) => {
                         if (!element) return false;
                         const style = window.getComputedStyle(element);
@@ -1171,9 +1241,7 @@ def click_chatgpt_full_page_retry(page: Page) -> bool:
                         .trim()
                         .toLowerCase();
                     const retryLabels = ['try again', 'retry', 'thử lại'];
-                    const editor = document.querySelector(
-                        '#prompt-textarea, div.ProseMirror, div[role="textbox"][contenteditable="true"], div[data-composer-markdown], textarea'
-                    );
+                    const editor = findComposer();
                     const turns = document.querySelectorAll(
                         '[data-testid^="conversation-turn-"], '
                         + '[data-message-author-role], '
@@ -1195,7 +1263,7 @@ def click_chatgpt_full_page_retry(page: Page) -> bool:
                     if (!retryButton) return false;
                     retryButton.click();
                     return true;
-                }"""
+                """)
             )
         )
     except Exception:
@@ -1212,7 +1280,7 @@ def wait_for_chatgpt_composer(
     duplicate a prompt, and reload always stays in the current project or
     conversation instead of opening a new chat.
     """
-    prompt_textarea = page.locator(CHATGPT_COMPOSER_SELECTOR).first
+    prompt_textarea = page.locator(CHATGPT_VISIBLE_COMPOSER_SELECTOR).first
     retry_clicked = False
     last_state: dict = {}
     last_error: Exception | None = None
@@ -1265,6 +1333,34 @@ def wait_for_chatgpt_composer(
         "No prompt was sent. Check the ChatGPT login or service status."
         f"{detail} Last error: {last_error}"
     ) from last_error
+
+
+def get_chatgpt_send_button(prompt_textarea):
+    composer_root = prompt_textarea.locator(
+        "xpath=ancestor::form[1] | "
+        "ancestor::*[@data-composer-root or @data-testid='composer' "
+        "or @data-composer-body][1]"
+    ).first
+    return composer_root.locator(CHATGPT_VISIBLE_SEND_BUTTON_SELECTOR).first
+
+
+def get_chatgpt_composer_diagnostics(page: Page) -> dict:
+    return page.evaluate(
+        _chatgpt_dom_script("""
+            const editor = findComposer();
+            const button = findSendButton(editor);
+            return {
+                editorTextLength: (editor?.innerText || editor?.value || '').length,
+                editorInsideForm: Boolean(editor?.closest('form')),
+                editorInsideWritingBlock: Boolean(
+                    editor?.closest('[data-testid="chatgpt-writing-block"], .writing-block-editor')
+                ),
+                sendButtonFound: Boolean(button),
+                sendButtonDisabled: button?.disabled ?? null,
+                sendButtonAriaDisabled: button?.getAttribute('aria-disabled') ?? null,
+            };
+        """)
+    )
 
 
 class SharedBrowserContextLease:
@@ -1702,10 +1798,18 @@ def history_prompt_text_matches(expected_text: str, rendered_text: str) -> bool:
     expected = normalize(expected_text)
     actual = normalize(rendered_text)
 
+    if not expected or not actual:
+        return False
+
     if expected == actual:
         return True
 
-    if len(actual) >= 100 and expected.startswith(actual):
+    # Substring / prefix matching for prompts of any length
+    if (len(actual) >= 20 and expected.startswith(actual)) or (len(expected) >= 20 and actual.startswith(expected)):
+        return True
+
+    check_len = min(len(expected), len(actual), 50)
+    if check_len >= 20 and expected[:check_len] == actual[:check_len]:
         return True
 
     if len(actual) >= 100 and len(expected) >= 100:
@@ -1716,33 +1820,34 @@ def history_prompt_text_matches(expected_text: str, rendered_text: str) -> bool:
 
 
 
-def replace_prompt_text_with_javascript(page: Page, prompt_text: str) -> None:
-    page.evaluate("""(text) => {
-        const el = document.querySelector(
-            '#prompt-textarea, div.ProseMirror, div[role="textbox"][contenteditable="true"], div[data-composer-markdown], textarea'
-        );
-        if (!el) return;
+def replace_prompt_text_with_javascript(prompt_textarea, prompt_text: str) -> None:
+    prompt_textarea.evaluate("""(el, text) => {
         el.focus();
         const selection = window.getSelection();
         const range = document.createRange();
         range.selectNodeContents(el);
         selection.removeAllRanges();
         selection.addRange(range);
+        document.execCommand('delete', false, null);
         document.execCommand('insertText', false, text);
-        el.dispatchEvent(new InputEvent('input', {
+        el.dispatchEvent(new InputEvent('beforeinput', {
             bubbles: true,
+            cancelable: true,
             inputType: 'insertText',
             data: text
         }));
+        el.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            cancelable: true,
+            inputType: 'insertText',
+            data: text
+        }));
+        el.dispatchEvent(new Event('input', { bubbles: true }));
         el.dispatchEvent(new Event('change', { bubbles: true }));
     }""", prompt_text)
 
 
-def ensure_prompt_editor_integrity(
-    page: Page,
-    prompt_textarea,
-    prompt_text: str,
-) -> None:
+def ensure_prompt_editor_integrity(prompt_textarea, prompt_text: str) -> None:
     editor_text = prompt_textarea.inner_text()
     if not isinstance(editor_text, str) or prompt_text_matches(
         prompt_text,
@@ -1750,7 +1855,7 @@ def ensure_prompt_editor_integrity(
     ):
         return
 
-    replace_prompt_text_with_javascript(page, prompt_text)
+    replace_prompt_text_with_javascript(prompt_textarea, prompt_text)
     time.sleep(0.2)
     editor_text = prompt_textarea.inner_text()
     if not isinstance(editor_text, str) or not prompt_text_matches(
@@ -1897,7 +2002,7 @@ def get_assistant_response_after_latest_user(
 
         if msg_count > 0:
             latest_user_index = -1
-            for index in range(msg_count):
+            for index in range(msg_count - 1, -1, -1):
                 node = messages.nth(index)
                 role = (
                     node.get_attribute("data-message-author-role")
@@ -1905,28 +2010,30 @@ def get_assistant_response_after_latest_user(
                     or ("user" if node.get_attribute("data-user-message-bubble") == "true" else "")
                 )
                 if role == "user":
-                    latest_user_index = index
+                    if not expected_user_text or history_prompt_text_matches(
+                        expected_user_text,
+                        clean_text(node.inner_text()),
+                    ):
+                        latest_user_index = index
+                        break
             if latest_user_index >= 0:
-                latest_user = messages.nth(latest_user_index)
-                if not expected_user_text or history_prompt_text_matches(
-                    expected_user_text,
-                    clean_text(latest_user.inner_text()),
-                ):
-                    response_text = ""
-                    for index in range(latest_user_index + 1, msg_count):
-                        message = messages.nth(index)
-                        role = (
-                            message.get_attribute("data-message-author-role")
-                            or message.get_attribute("data-conversation-role")
-                            or ("assistant" if message.get_attribute("data-markdown-text-style") == "assistant-message" else "")
-                        )
-                        if role != "assistant":
-                            continue
-                        candidate = _read_assistant_message(message)
-                        if candidate:
-                            response_text = candidate
-                    if response_text:
-                        return response_text
+                response_text = ""
+                for index in range(latest_user_index + 1, msg_count):
+                    message = messages.nth(index)
+                    role = (
+                        message.get_attribute("data-message-author-role")
+                        or message.get_attribute("data-conversation-role")
+                        or ("assistant" if message.get_attribute("data-markdown-text-style") == "assistant-message" else "")
+                    )
+                    if role == "user":
+                        break
+                    if role != "assistant":
+                        continue
+                    candidate = _read_assistant_message(message)
+                    if candidate:
+                        response_text = candidate
+                if response_text:
+                    return response_text
 
         # Modern JS fallback
         data = page.evaluate("""() => {
@@ -1937,44 +2044,42 @@ def get_assistant_response_after_latest_user(
                 return (clone.innerText || clone.textContent || '').trim();
             };
 
-            const legacy = [...document.querySelectorAll('[data-message-author-role]')];
-            if (legacy.length > 0) {
-                return legacy.map(el => ({
-                    role: el.getAttribute('data-message-author-role') || '',
-                    text: cleanNode(el)
-                }));
-            }
-
-            const units = [...document.querySelectorAll(
-                '[data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"]'
+            const allNodes = [...document.querySelectorAll(
+                '[data-user-message-bubble="true"], [data-message-author-role="user"], [data-markdown-text-style="assistant-message"], [data-message-author-role="assistant"]'
             )];
-            return units.map(u => ({
-                role: u.getAttribute('data-user-message-bubble') === 'true' ? 'user' : 'assistant',
-                text: cleanNode(u)
-            }));
+            const topLevel = allNodes.filter((el, idx) => !allNodes.some((other, otherIdx) => otherIdx !== idx && other.contains(el)));
+
+            return topLevel.map(u => {
+                const isUser = u.getAttribute('data-user-message-bubble') === 'true' || u.getAttribute('data-message-author-role') === 'user';
+                return {
+                    role: isUser ? 'user' : 'assistant',
+                    text: cleanNode(u)
+                };
+            }).filter(item => item.text.length > 0);
         }""")
 
         if not data:
             return ""
 
         latest_user_index = -1
-        for index, item in enumerate(data):
+        for index in range(len(data) - 1, -1, -1):
+            item = data[index]
             if item.get("role") == "user":
-                latest_user_index = index
+                if not expected_user_text or history_prompt_text_matches(
+                    expected_user_text,
+                    clean_text(item.get("text", "")),
+                ):
+                    latest_user_index = index
+                    break
 
         if latest_user_index < 0:
-            return ""
-
-        latest_user = data[latest_user_index]
-        if expected_user_text and not history_prompt_text_matches(
-            expected_user_text,
-            clean_text(latest_user.get("text", "")),
-        ):
             return ""
 
         response_text = ""
         for index in range(latest_user_index + 1, len(data)):
             item = data[index]
+            if item.get("role") == "user":
+                break
             if item.get("role") != "assistant":
                 continue
             candidate = clean_text(item.get("text", ""))
@@ -2001,17 +2106,25 @@ def get_new_assistant_response(
             turn = page.locator(
                 f'[data-testid="conversation-turn-{max(new_assistant_turns)}"]'
             )
-            assistant_nodes = turn.locator(
-                '[data-message-author-role="assistant"], [data-markdown-text-style="assistant-message"], .markdown'
-            )
             try:
-                assistant_count = assistant_nodes.count()
+                turn_cnt = turn.count()
+                turn_exists = (turn_cnt > 0) if isinstance(turn_cnt, int) else True
             except Exception:
-                assistant_count = 0
-            if assistant_count > 0:
-                response_text = _read_assistant_message(assistant_nodes.last)
-                if response_text:
-                    return response_text
+                turn_exists = True
+
+            if turn_exists:
+                assistant_nodes = turn.locator(
+                    '[data-message-author-role="assistant"], [data-markdown-text-style="assistant-message"], .markdown'
+                )
+                try:
+                    assistant_count = assistant_nodes.count()
+                    has_nodes = (assistant_count > 0) if isinstance(assistant_count, int) else True
+                except Exception:
+                    has_nodes = True
+                if has_nodes:
+                    response_text = _read_assistant_message(assistant_nodes.last)
+                    if response_text:
+                        return response_text
 
         # Compatibility fallback for ChatGPT DOM variants without numbered
         # turns. The count baseline survives React DOM re-renders, unlike a
@@ -2221,7 +2334,7 @@ def recover_assistant_response_after_reload(
         )
         check_chatgpt_page_attention(page)
         ensure_expected_conversation_page(page.url, expected_url)
-        page.locator(CHATGPT_COMPOSER_SELECTOR).first.wait_for(
+        page.locator(CHATGPT_VISIBLE_COMPOSER_SELECTOR).first.wait_for(
             state="visible",
             timeout=CHATGPT_COMPOSER_WAIT_PER_ATTEMPT_MS,
         )
@@ -2414,18 +2527,25 @@ def send_prompt(
     try:
         prompt_textarea.click()
         page.keyboard.press("Control+A")
+        page.keyboard.press("Backspace")
+    except Exception:
+        pass
+
+    try:
+        prompt_textarea.click()
+        page.keyboard.press("Control+A")
         page.keyboard.insert_text(prompt_text)
     except Exception:
         # Fallback for unusually large prompts or transient keyboard failures.
-        replace_prompt_text_with_javascript(page, prompt_text)
-    time.sleep(0.5)
-    ensure_prompt_editor_integrity(page, prompt_textarea, prompt_text)
+        replace_prompt_text_with_javascript(prompt_textarea, prompt_text)
+    time.sleep(0.3)
+    ensure_prompt_editor_integrity(prompt_textarea, prompt_text)
 
 
     # Attach images if provided
     if reference_image_base64:
         js = """
-        (dataStr) => {
+        (textarea, dataStr) => {
             let base64Array = [];
             if (dataStr.trim().startsWith('[')) {
                 try {
@@ -2450,56 +2570,56 @@ def send_prompt(
                 dt.items.add(file);
             });
 
-            const textarea = document.querySelector(
-                '#prompt-textarea, div.ProseMirror, div[role="textbox"][contenteditable="true"], div[data-composer-markdown], textarea'
-            );
-            if (textarea) {
-                textarea.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
-            }
+            textarea.dispatchEvent(new ClipboardEvent('paste', {
+                clipboardData: dt,
+                bubbles: true,
+                cancelable: true
+            }));
         }
         """
-        page.evaluate(js, reference_image_base64)
+        prompt_textarea.evaluate(js, reference_image_base64)
         page.wait_for_timeout(2000)
 
     # Now wait for the send button to appear and be enabled
-    send_btn = page.locator(CHATGPT_SEND_BUTTON_SELECTOR).first
-    send_button_ready_script = """() => {
-        const btn = document.querySelector(
-            'button[data-testid="send-button"], button[aria-label="Send"], button[aria-label="Gửi"], button[aria-label="Send prompt"], button[aria-label="Send message"], button.bg-composer-primary'
+    send_btn = get_chatgpt_send_button(prompt_textarea)
+    send_button_ready_script = _chatgpt_dom_script("""
+        const btn = findSendButton(findComposer());
+        return Boolean(
+            btn
+            && !btn.disabled
+            && btn.getAttribute('aria-disabled') !== 'true'
         );
-        return btn && !btn.disabled;
-    }"""
+    """)
     try:
-        page.wait_for_function(send_button_ready_script, timeout=30000)
+        page.wait_for_function(send_button_ready_script, timeout=15000)
     except Exception as e:
-        page.evaluate("""() => {
-            const el = document.querySelector(
-                '#prompt-textarea, div.ProseMirror, div[role="textbox"][contenteditable="true"], div[data-composer-markdown], textarea'
-            );
-            if (!el) return;
+        # Nudge React state: focus and dispatch input events
+        try:
+            prompt_textarea.click()
+            page.keyboard.press("Space")
+            page.keyboard.press("Backspace")
+        except Exception:
+            pass
+        prompt_textarea.evaluate("""(el, text) => {
+            el.dispatchEvent(new InputEvent('beforeinput', {
+                bubbles: true,
+                cancelable: true,
+                inputType: 'insertText',
+                data: text
+            }));
             el.dispatchEvent(new InputEvent('input', {
                 bubbles: true,
+                cancelable: true,
                 inputType: 'insertText',
-                data: null
+                data: text
             }));
+            el.dispatchEvent(new Event('input', { bubbles: true }));
             el.dispatchEvent(new Event('change', { bubbles: true }));
-        }""")
+        }""", prompt_text)
         try:
             page.wait_for_function(send_button_ready_script, timeout=10000)
         except Exception:
-            diagnostics = page.evaluate("""() => {
-                const editor = document.querySelector(
-                    '#prompt-textarea, div.ProseMirror, div[role="textbox"][contenteditable="true"], div[data-composer-markdown], textarea'
-                );
-                const button = document.querySelector(
-                    'button[data-testid="send-button"], button[aria-label="Send"], button[aria-label="Gửi"], button[aria-label="Send prompt"], button[aria-label="Send message"], button.bg-composer-primary'
-                );
-                return {
-                    editorTextLength: editor?.innerText?.length ?? 0,
-                    sendButtonFound: Boolean(button),
-                    sendButtonDisabled: button?.disabled ?? null
-                };
-            }""")
+            diagnostics = get_chatgpt_composer_diagnostics(page)
             try:
                 if diagnostics["editorTextLength"] <= 0:
                     raise Exception("The prompt draft was empty before recovery.")
@@ -2507,7 +2627,7 @@ def send_prompt(
                 # ChatGPT occasionally leaves the composer unmounted after a long
                 # insert. Reloading the same conversation restores its saved draft.
                 page.reload(wait_until="domcontentloaded", timeout=60000)
-                prompt_textarea = page.locator(CHATGPT_COMPOSER_SELECTOR).first
+                prompt_textarea = page.locator(CHATGPT_VISIBLE_COMPOSER_SELECTOR).first
                 prompt_textarea.wait_for(state="visible", timeout=60000)
 
                 restored_draft = prompt_textarea.inner_text().strip()
@@ -2515,44 +2635,44 @@ def send_prompt(
                     prompt_textarea.click()
                     page.keyboard.press("Control+A")
                     page.keyboard.insert_text(prompt_text)
+                ensure_prompt_editor_integrity(prompt_textarea, prompt_text)
 
                 # Reload removes the marker classes, so mark the existing replies
                 # again before sending to avoid returning an earlier response.
                 page.evaluate("document.querySelectorAll('[data-message-author-role=\"assistant\"], [data-markdown-text-style=\"assistant-message\"]').forEach(el => el.classList.add('my-old-msg'))")
                 page.wait_for_function(send_button_ready_script, timeout=30000)
-                send_btn = page.locator(CHATGPT_SEND_BUTTON_SELECTOR).first
+                send_btn = get_chatgpt_send_button(prompt_textarea)
             except Exception as recovery_error:
-                recovery_diagnostics = page.evaluate("""() => {
-                    const editor = document.querySelector(
-                        '#prompt-textarea, div.ProseMirror, div[role="textbox"][contenteditable="true"], div[data-composer-markdown], textarea'
-                    );
-                    const button = document.querySelector(
-                        'button[data-testid="send-button"], button[aria-label="Send"], button[aria-label="Gửi"], button[aria-label="Send prompt"], button[aria-label="Send message"], button.bg-composer-primary'
-                    );
-                    return {
-                        editorTextLength: editor?.innerText?.length ?? 0,
-                        sendButtonFound: Boolean(button),
-                        sendButtonDisabled: button?.disabled ?? null
-                    };
-                }""")
-                raise Exception(
-                    "Send button did not appear/enable after typing or one same-chat reload. "
-                    f"Initial diagnostics: {diagnostics}. "
-                    f"Recovery diagnostics: {recovery_diagnostics}. "
-                    f"Initial error: {e}. Recovery error: {recovery_error}"
-                ) from recovery_error
+                recovery_diagnostics = get_chatgpt_composer_diagnostics(page)
+                sent_via_fallback = False
+                try:
+                    if recovery_diagnostics.get("editorTextLength", 0) > 0:
+                        prompt_textarea.focus()
+                        page.keyboard.press("Enter")
+                        sent_via_fallback = True
+                except Exception:
+                    pass
+                if not sent_via_fallback:
+                    raise Exception(
+                        "Send button did not appear/enable after typing or one same-chat reload. "
+                        f"Initial diagnostics: {diagnostics}. "
+                        f"Recovery diagnostics: {recovery_diagnostics}. "
+                        f"Initial error: {e}. Recovery error: {recovery_error}"
+                    ) from recovery_error
 
-    send_btn.click()
+    try:
+        send_btn.click()
+    except Exception:
+        prompt_textarea.focus()
+        page.keyboard.press("Enter")
 
     # Confirm the single send attempt through multiple independent UI signals.
     # Never press Enter or click again after an ambiguous delivery because the
     # first request may already have reached ChatGPT.
     try:
         page.wait_for_function(
-            """(baseline) => {
-                const editor = document.querySelector(
-                    '#prompt-textarea, div.ProseMirror, div[role="textbox"][contenteditable="true"], div[data-composer-markdown], textarea'
-                );
+            _chatgpt_dom_script("""
+                const editor = findComposer();
                 const userTurns = document.querySelectorAll(
                     '[data-message-author-role="user"], [data-user-message-bubble="true"], [data-content-search-unit-key*="user"]'
                 ).length;
@@ -2566,7 +2686,7 @@ def send_prompt(
                     || generationStarted
                     || userTurns > baseline.previousUserCount
                     || location.href !== baseline.previousUrl;
-            }""",
+            """, "baseline"),
             arg={
                 "previousUrl": page_url_before_send,
                 "previousUserCount": previous_user_count,
@@ -2623,19 +2743,16 @@ def is_prompt_in_conversation(page: Page, expected_user_text: str) -> bool:
                 return (clone.innerText || clone.textContent || '').trim();
             };
 
-            const legacy = [...document.querySelectorAll('[data-message-author-role="user"]')];
-            if (legacy.length > 0) return legacy.map(cleanNode);
-
-            const modern = [...document.querySelectorAll('[data-user-message-bubble="true"]')];
-            return modern.map(cleanNode);
+            const nodes = [...document.querySelectorAll('[data-user-message-bubble="true"], [data-message-author-role="user"]')];
+            const unique = nodes.filter((el, idx) => !nodes.some((other, otherIdx) => otherIdx !== idx && other.contains(el)));
+            return unique.map(cleanNode).filter(t => t.length > 0);
         }""")
         if not user_texts:
             return False
 
-        latest_user_text = user_texts[-1]
-        return history_prompt_text_matches(
-            expected_user_text,
-            clean_text(latest_user_text),
+        return any(
+            history_prompt_text_matches(expected_user_text, clean_text(text))
+            for text in user_texts
         )
     except Exception:
         return False

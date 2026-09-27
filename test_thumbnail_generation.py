@@ -80,7 +80,6 @@ class ThumbnailGenerationTests(unittest.TestCase):
         page.locator.assert_not_called()
 
     def test_corrupted_editor_text_is_reinserted_before_send(self):
-        page = MagicMock()
         prompt_textarea = MagicMock()
         prompt_textarea.inner_text.side_effect = (
             "H?y vi?t l?i ph?n BODY.",
@@ -94,18 +93,16 @@ class ThumbnailGenerationTests(unittest.TestCase):
             patch("auto_yt.services.chatgpt_worker.time.sleep"),
         ):
             ensure_prompt_editor_integrity(
-                page,
                 prompt_textarea,
                 "Hãy viết lại phần BODY.",
             )
 
         replace_prompt.assert_called_once_with(
-            page,
+            prompt_textarea,
             "Hãy viết lại phần BODY.",
         )
 
     def test_prompt_is_not_sent_if_editor_remains_corrupted(self):
-        page = MagicMock()
         prompt_textarea = MagicMock()
         prompt_textarea.inner_text.return_value = "H?y vi?t l?i ph?n BODY."
 
@@ -117,7 +114,6 @@ class ThumbnailGenerationTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "No prompt was sent"),
         ):
             ensure_prompt_editor_integrity(
-                page,
                 prompt_textarea,
                 "Hãy viết lại phần BODY.",
             )

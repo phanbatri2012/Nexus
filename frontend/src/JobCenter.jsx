@@ -797,8 +797,25 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                         Dừng
                       </button>
                     )}
+                    {job.can_resume_checkpoint && (
+                      <button
+                        className="btn-run"
+                        disabled={Boolean(actionId)}
+                        style={{ padding: '8px 12px', width: 'auto', color: '#7ee787' }}
+                        title={`Giữ nguyên phần đã hoàn tất và tiếp tục từ ${job.checkpoint_resume_step || 'checkpoint'}`}
+                        onClick={() => runAction(job, 'resume-checkpoint')}
+                      >
+                        Tiếp tục từ checkpoint
+                      </button>
+                    )}
                     {job.can_retry && (
-                      <button className="btn-run" disabled={Boolean(actionId)} style={{ padding: '8px 12px', width: 'auto' }} onClick={() => runAction(job, 'retry')}>
+                      <button
+                        className="btn-run"
+                        disabled={Boolean(actionId)}
+                        style={{ padding: '8px 12px', width: 'auto' }}
+                        title="Xóa checkpoint và chạy lại từ đầu"
+                        onClick={() => runAction(job, 'retry')}
+                      >
                         Chạy lại
                       </button>
                     )}

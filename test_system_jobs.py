@@ -166,6 +166,71 @@ class SystemJobTests(unittest.TestCase):
             "pausable",
         )
 
+    def test_error_video_job_resumes_from_checkpoint_without_clearing_it(self):
+        video_id = database.save_video(
+            "https://youtube.com/watch?v=resume-checkpoint",
+            "Resume checkpoint",
+            "Transcript",
+            "Saved partial script",
+        )
+        self.create_job("resume-checkpoint")
+        database.update_system_job(
+            "resume-checkpoint",
+            video_id=video_id,
+            status="error",
+            error="slug failed",
+            result_json={"preserved": True},
+            recovery_count=3,
+            finished_at=database.utc_now(),
+        )
+        checkpoint = {
+            "chat_url": "https://chatgpt.com/c/saved-chat",
+            "current_step": "slug",
+            "pending_prompt": {"step": "slug", "fingerprint": "saved"},
+        }
+
+        with (
+            patch.object(main, "load_checkpoint", return_value=checkpoint),
+            patch.object(main, "clear_checkpoint") as clear_checkpoint,
+            patch.object(main, "_kick_video_queue") as kick_video_queue,
+        ):
+            response = main.resume_job_from_checkpoint("resume-checkpoint")
+
+        resumed = database.get_system_job("resume-checkpoint")
+        self.assertTrue(response["success"])
+        self.assertEqual(response["job"]["id"], "resume-checkpoint")
+        self.assertEqual(resumed["status"], "queued")
+        self.assertEqual(resumed["resume_from_step"], "slug")
+        self.assertEqual(resumed["recovery_count"], 0)
+        self.assertEqual(resumed["result"], {"preserved": True})
+        clear_checkpoint.assert_not_called()
+        kick_video_queue.assert_called_once_with()
+
+    def test_checkpoint_resume_is_not_available_without_a_saved_chat(self):
+        video_id = database.save_video(
+            "https://youtube.com/watch?v=no-checkpoint",
+            "No checkpoint",
+            "Transcript",
+            "Saved partial script",
+        )
+        self.create_job("no-checkpoint")
+        database.update_system_job(
+            "no-checkpoint",
+            video_id=video_id,
+            status="error",
+        )
+
+        with patch.object(main, "load_checkpoint", return_value={}):
+            item = main._system_job_center_item(
+                database.get_system_job("no-checkpoint"),
+                None,
+            )
+            with self.assertRaisesRegex(main.HTTPException, "checkpoint hợp lệ"):
+                main.resume_job_from_checkpoint("no-checkpoint")
+
+        self.assertFalse(item["can_resume_checkpoint"])
+        self.assertEqual(database.get_system_job("no-checkpoint")["status"], "error")
+
     def test_verification_resume_clears_stale_attention_marker(self):
         self.create_job("verification")
         database.update_system_job(

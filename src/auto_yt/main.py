@@ -5533,6 +5533,23 @@ def continue_video_generation(video_id: int):
     return {"job_id": job_id}
 
 
+def _get_checkpoint_resume_step(video_id: int | None) -> str:
+    if video_id is None:
+        return ""
+    video = db.get_video(int(video_id))
+    if not video or video.get("video_status") == db.VIDEO_STATUS_ERROR:
+        return ""
+    checkpoint = load_checkpoint(int(video_id))
+    if not checkpoint or not str(checkpoint.get("chat_url") or "").strip():
+        return ""
+    pending_prompt = checkpoint.get("pending_prompt")
+    if isinstance(pending_prompt, dict):
+        pending_step = str(pending_prompt.get("step") or "").strip()
+        if pending_step:
+            return pending_step
+    return str(checkpoint.get("current_step") or "checkpoint").strip() or "checkpoint"
+
+
 def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: bool = False) -> dict:
     payload = job.get("payload") or {}
     result = job.get("result") or {}
@@ -5550,6 +5567,11 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
         or payload.get("url", "")
     )
     job_type = str(job.get("job_type") or "")
+    checkpoint_resume_step = (
+        _get_checkpoint_resume_step(video_id)
+        if job_type == "video_generation" and status in {"error", "canceled"}
+        else ""
+    )
     type_label = ALL_JOB_LABELS.get(job_type, job_type)
     publish_workflow = (
         db.get_youtube_publish_workflow_by_job(job["id"])
@@ -5647,6 +5669,8 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
             status in {"error", "canceled"}
             and job_type != "comment_publish"
         ),
+        "can_resume_checkpoint": bool(checkpoint_resume_step),
+        "checkpoint_resume_step": checkpoint_resume_step,
         "can_pause": status in {"queued", "retry_wait"},
         "can_resume": status == "paused",
         "can_edit": job_type == "video_generation" and (
@@ -6440,6 +6464,52 @@ def retry_job(job_id: str):
     return {
         "success": True,
         "job": updated_job,
+    }
+
+
+@app.post("/api/jobs/{job_id}/resume-checkpoint")
+def resume_job_from_checkpoint(job_id: str):
+    job = db.get_system_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Không tìm thấy job.")
+    if str(job.get("job_type") or "") != "video_generation":
+        raise HTTPException(
+            status_code=409,
+            detail="Chỉ job tạo video mới có thể tiếp tục từ checkpoint.",
+        )
+    if str(job.get("status") or "") not in {"error", "failed", "canceled"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Chỉ có thể tiếp tục job lỗi hoặc đã hủy.",
+        )
+
+    resume_from_step = _get_checkpoint_resume_step(job.get("video_id"))
+    if not resume_from_step:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Job không còn checkpoint hợp lệ để tiếp tục. "
+                "Hãy dùng Chạy lại nếu muốn tạo từ đầu."
+            ),
+        )
+    try:
+        updated_job = db.resume_system_job_from_checkpoint(
+            job_id,
+            resume_from_step,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not updated_job:
+        raise HTTPException(status_code=404, detail="Không tìm thấy job.")
+    _sync_legacy_job(updated_job)
+    _kick_video_queue()
+    return {
+        "success": True,
+        "job": _system_job_center_item(
+            updated_job,
+            db.get_system_job_queue_position(job_id),
+            hydrate=True,
+        ),
     }
 
 

@@ -3,7 +3,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from urllib.parse import quote
 from unittest.mock import Mock, patch
+
+from playwright.sync_api import sync_playwright
 
 from auto_yt.services import chatgpt_service, chatgpt_worker
 from auto_yt.services.chatgpt_runtime import ChatGPTAttentionRequiredError
@@ -402,7 +405,10 @@ class ChatGptServiceTests(unittest.TestCase):
         page = Mock()
         page.url = "https://chatgpt.com/g/g-p-test/project"
         prompt_textarea = Mock()
+        composer_root = Mock()
         send_button = Mock()
+        prompt_textarea.locator.return_value.first = composer_root
+        composer_root.locator.return_value.first = send_button
         page.locator.side_effect = lambda selector: Mock(
             first=(
                 send_button
@@ -433,6 +439,102 @@ class ChatGptServiceTests(unittest.TestCase):
 
         send_button.click.assert_called_once_with()
         prompt_textarea.press.assert_not_called()
+
+    def test_send_prompt_ignores_writing_block_before_real_composer(self):
+        html = """
+        <html>
+          <body>
+            <div data-testid="chatgpt-writing-block">
+              <div class="writing-block-editor">
+                <div class="ProseMirror" contenteditable="true" role="textbox"
+                     style="min-height: 20px">Writing block must stay unchanged</div>
+              </div>
+            </div>
+            <form id="composer-form">
+              <div data-composer-body>
+                <div class="ProseMirror" contenteditable="true" role="textbox"
+                     data-composer-markdown style="min-height: 20px"></div>
+              </div>
+              <button type="submit" aria-label="Send" aria-disabled="true" disabled>
+                Send
+              </button>
+            </form>
+            <script>
+              window.sendCount = 0;
+              const form = document.querySelector('#composer-form');
+              const editor = form.querySelector('[contenteditable="true"]');
+              const button = form.querySelector('button');
+              editor.addEventListener('input', () => {
+                const disabled = editor.innerText.trim().length === 0;
+                button.disabled = disabled;
+                button.setAttribute('aria-disabled', String(disabled));
+              });
+              form.addEventListener('submit', (event) => {
+                event.preventDefault();
+                window.sendCount += 1;
+                editor.innerHTML = '';
+                editor.dispatchEvent(new InputEvent('input', { bubbles: true }));
+              });
+            </script>
+          </body>
+        </html>
+        """
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_content(html)
+            with (
+                patch.object(chatgpt_worker.time, "sleep"),
+                patch.object(
+                    chatgpt_worker,
+                    "wait_for_assistant_response",
+                    return_value="Generated response",
+                ),
+            ):
+                response = chatgpt_worker.send_prompt(page, "Prompt test")
+
+            self.assertEqual(response, "Generated response")
+            self.assertEqual(
+                page.locator('[data-testid="chatgpt-writing-block"] .ProseMirror')
+                .inner_text(),
+                "Writing block must stay unchanged",
+            )
+            self.assertEqual(page.evaluate("window.sendCount"), 1)
+            self.assertEqual(
+                page.locator('#composer-form [contenteditable="true"]').inner_text(),
+                "",
+            )
+            browser.close()
+
+    def test_legacy_prompt_textarea_remains_supported_after_reload(self):
+        html = """
+        <html><body>
+          <div id="prompt-textarea" contenteditable="true" role="textbox"
+               style="min-height: 20px"></div>
+        </body></html>
+        """
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(f"data:text/html,{quote(html)}")
+            first_composer = chatgpt_worker.wait_for_chatgpt_composer(
+                page,
+                attempts=1,
+            )
+            self.assertEqual(first_composer.get_attribute("id"), "prompt-textarea")
+
+            page.reload(wait_until="domcontentloaded")
+            reloaded_composer = chatgpt_worker.wait_for_chatgpt_composer(
+                page,
+                attempts=1,
+            )
+            self.assertEqual(
+                reloaded_composer.get_attribute("id"),
+                "prompt-textarea",
+            )
+            browser.close()
 
     def test_composer_wait_recovers_full_page_try_again_without_new_navigation(self):
         page = Mock()
@@ -869,7 +971,7 @@ class ChatGptServiceTests(unittest.TestCase):
         self.assertEqual(result["pipeline"], state["pipeline"])
         self.assertTrue(result["complete_for_audio"])
 
-    def test_video_pipeline_recovers_pending_metadata_without_resending(self):
+    def test_video_pipeline_recovers_pending_title_without_resending(self):
         page = Mock(url="https://chatgpt.com/c/saved-chat")
         context = Mock(pages=[page])
         state = {
@@ -937,14 +1039,17 @@ class ChatGptServiceTests(unittest.TestCase):
             patch.object(
                 chatgpt_worker,
                 "recover_pending_prompt_response",
-                return_value="Metadata recovered",
+                return_value=(
+                    "THƯỢNG TƯỚNG NGUYỄN HỮU AN: "
+                    "VỊ TƯỚNG KHIẾN ĐỐI PHƯƠNG KHIẾP SỢ"
+                ),
             ) as recover_response,
             patch.object(chatgpt_worker, "send_prompt") as send_prompt,
             patch.object(chatgpt_worker, "persist_generation_state"),
         ):
             result = chatgpt_worker._run_complete("Transcript", state)
 
-        self.assertIn("Metadata recovered", result["script"])
+        self.assertIn("THƯỢNG TƯỚNG NGUYỄN HỮU AN", result["script"])
         self.assertNotIn("pending_prompt", state)
         recover_response.assert_called_once()
         send_prompt.assert_not_called()

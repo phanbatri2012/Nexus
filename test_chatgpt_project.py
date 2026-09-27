@@ -200,6 +200,40 @@ class ChatGPTProjectTests(unittest.TestCase):
             chatgpt_worker.is_chatgpt_conversation_url(PROJECT_URL)
         )
 
+    def test_conversation_url_matches_with_or_without_project_slug(self):
+        url_with_slug = (
+            "https://chatgpt.com/g/"
+            "g-p-6846af64f98c8191bec1a743a6f0c45b-gkvs/"
+            "c/6ab85b4f-7174-83ec-891b-71c9e12eabce"
+        )
+        url_without_slug = (
+            "https://chatgpt.com/g/"
+            "g-p-6846af64f98c8191bec1a743a6f0c45b/"
+            "c/6ab85b4f-7174-83ec-891b-71c9e12eabce"
+        )
+        # Should not raise exception
+        chatgpt_worker.ensure_expected_conversation_page(url_without_slug, url_with_slug)
+        chatgpt_worker.ensure_expected_conversation_page(url_with_slug, url_without_slug)
+
+        # Baseline should be preserved across equivalent URLs
+        self.assertEqual(
+            chatgpt_worker.get_response_turn_baseline(url_with_slug, url_without_slug, 5),
+            5,
+        )
+
+    def test_project_page_matches_with_or_without_project_slug(self):
+        proj_with_slug = (
+            "https://chatgpt.com/g/"
+            "g-p-6846af64f98c8191bec1a743a6f0c45b-gkvs/project"
+        )
+        proj_without_slug = (
+            "https://chatgpt.com/g/"
+            "g-p-6846af64f98c8191bec1a743a6f0c45b/project"
+        )
+        # Should not raise exception
+        chatgpt_worker.ensure_expected_project_page(proj_without_slug, proj_with_slug)
+        chatgpt_worker.ensure_expected_project_page(proj_with_slug, proj_without_slug)
+
 
 if __name__ == "__main__":
     unittest.main()
