@@ -84,5 +84,46 @@ class PromptAssetsTests(unittest.TestCase):
                 self.assertFalse(legacy_dir.exists())
 
 
+    def test_scene_0_character_reference_priority(self):
+        from auto_yt.services import video_production
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_assets_dir = Path(temp_dir)
+            with patch.object(prompt_assets, "PROMPT_ASSETS_DIR", fake_assets_dir):
+                thvn_dir = prompt_assets.get_prompt_asset_dir("THVN")
+                img_path = thvn_dir / "le_trong_tan.jpg"
+                img_path.write_bytes(b"sample-character-image")
+
+                # 1. Scene 0 with character mentioned: should prioritize matched character asset
+                windows_with_character = [
+                    {"index": 0, "start": 0.0, "end": 5.0, "duration": 5.0, "transcript": "Tướng Lê Trọng Tấn chỉ huy trận đánh"},
+                    {"index": 1, "start": 5.0, "end": 10.0, "duration": 5.0, "transcript": "Khói lửa mịt mù trên chiến trường"},
+                ]
+                plan1 = video_production.build_default_visual_scene_plan(
+                    windows=windows_with_character,
+                    title="Trận Cánh Đồng Chum",
+                    style_prompt="Cinematic documentary",
+                    prompt_version="THVN",
+                )
+                scene0_char = plan1["scenes"][0]
+                self.assertEqual(scene0_char["primary_reference_id"], "le_trong_tan")
+                self.assertEqual(scene0_char["reference_path"], str(img_path))
+                self.assertIn("Depicting Le Trong Tan", scene0_char["prompt"])
+
+                # 2. Scene 0 without character mentioned: should not assign character reference
+                windows_without_character = [
+                    {"index": 0, "start": 0.0, "end": 5.0, "duration": 5.0, "transcript": "Tiếng bom đạn vang dội khắp thung lũng"},
+                ]
+                plan2 = video_production.build_default_visual_scene_plan(
+                    windows=windows_without_character,
+                    title="Trận Cánh Đồng Chum",
+                    style_prompt="Cinematic documentary",
+                    prompt_version="THVN",
+                )
+                scene0_no_char = plan2["scenes"][0]
+                self.assertEqual(scene0_no_char["primary_reference_id"], "")
+                self.assertEqual(scene0_no_char["reference_path"], "")
+                self.assertNotIn("Depicting", scene0_no_char["prompt"])
+
+
 if __name__ == "__main__":
     unittest.main()

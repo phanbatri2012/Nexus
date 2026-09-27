@@ -2270,14 +2270,14 @@ def build_default_visual_scene_plan(
         is_video = bool(w.get("is_video") or w.get("media_type") == "video")
 
         if w["index"] == 0:
-            # Scene 0: Attach thumbnail reference image if available
-            if thumb_ref_path:
+            # Scene 0: Prioritize matched character/asset reference; fallback to thumbnail reference if no character matched
+            if not matched and thumb_ref_path:
                 ref_id = thumb_ref_id
                 ref_path = thumb_ref_path
                 ref_note = "Visual anchor from story thumbnail. "
 
-            # Scene 0: Use Clean Thumbnail concept text if available, otherwise story hook
-            if clean_thumb_concept and len(clean_thumb_concept) >= 20:
+            # Scene 0: Use Clean Thumbnail concept text if available and not focusing on a specific character, otherwise story hook
+            if not matched and clean_thumb_concept and len(clean_thumb_concept) >= 20:
                 prompt = (
                     f"A cinematic movie still: {style}, opening scene hook. "
                     f"{ref_note}"
