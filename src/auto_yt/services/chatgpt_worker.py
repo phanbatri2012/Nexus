@@ -222,7 +222,7 @@ CORRUPTED_UNICODE_PATTERN = re.compile(
 )
 MIN_CORRUPTED_UNICODE_MARKERS = 3
 THINKING_INDICATOR_PATTERN = re.compile(
-    r"^(?:stopped\s+thinking|thought\s+for\s+\d+.*|thinking\.{0,3}|đã\s+dừng\s+suy\s+nghĩ|đang\s+suy\s+nghĩ\.{0,3})$",
+    r"^(?:stopped\s+thinking|thought\s+for\s+\d+.*|worked\s+for\s+\d+.*|thinking\.{0,3}|đã\s+dừng\s+suy\s+nghĩ|đang\s+suy\s+nghĩ\.{0,3}|đã\s+suy\s+nghĩ\s+trong\s+\d+.*)$",
     re.IGNORECASE,
 )
 
@@ -2070,7 +2070,7 @@ def _extract_clean_markdown_text(node) -> str:
             // 1. Remove all buttons (assistant responses are pure markdown/prose; all <button> elements are UI artifacts: Copy, Collapse, Suggestions, Search, Citations, Add to library, Open editor, etc.)
             clone.querySelectorAll('button').forEach((b) => b.remove());
 
-            // 2. Remove specific citation, search, attribution, and Canvas/Writing Block UI selectors
+            // 2. Remove specific citation, search, attribution, thought, reasoning, and Canvas/Writing Block UI selectors
             const junkSelectors = [
                 '[data-testid*="citation"]',
                 '[data-testid*="source"]',
@@ -2097,13 +2097,31 @@ def _extract_clean_markdown_text(node) -> str:
                 '[data-testid*="action-pill"]',
                 '[data-testid*="canvas-action"]',
                 '[data-testid*="canvas-title"]',
+                '[data-testid*="thought"]',
+                '[data-testid*="reasoning"]',
+                '[data-testid*="thinking"]',
+                '[class*="thought"]',
+                '[class*="reasoning"]',
+                '[class*="thinking"]',
+                '.result-thinking',
+                '[data-testid*="search"]',
+                '[data-testid*="web-search"]',
+                '[class*="web-search"]',
+                '[class*="search-result"]',
+                '[class*="search_result"]',
+                'details',
+                'summary',
+                '[aria-label*="Thinking" i]',
+                '[aria-label*="Thought" i]',
+                '[aria-label*="Suy nghĩ" i]',
+                '[aria-label*="Reasoning" i]',
             ];
             junkSelectors.forEach((sel) => {
                 clone.querySelectorAll(sel).forEach((badEl) => badEl.remove());
             });
 
-            // 3. Remove standalone Canvas title headers, buttons & action pill controls
-            clone.querySelectorAll('div, span, p, header, a').forEach((elem) => {
+            // 3. Remove standalone Canvas title headers, buttons, thought summaries & action pill controls
+            clone.querySelectorAll('div, span, p, header, a, section, aside').forEach((elem) => {
                 const txt = (elem.textContent || '').trim().toLowerCase();
                 if (
                     txt === 'nội dung chính' ||
@@ -2122,9 +2140,24 @@ def _extract_clean_markdown_text(node) -> str:
                     txt.startsWith('rút gọn chi tiết') ||
                     txt.startsWith('rút gọn outro') ||
                     txt.startsWith('làm lời kết') ||
-                    txt.startsWith('sắp xếp lời kêu gọi')
+                    txt.startsWith('sắp xếp lời kêu gọi') ||
+                    txt.startsWith('worked for ') ||
+                    txt.startsWith('thought for ') ||
+                    txt.startsWith('thinking...') ||
+                    txt.startsWith('đang suy nghĩ') ||
+                    txt.startsWith('đã suy nghĩ trong ') ||
+                    txt.startsWith('đã dừng suy nghĩ') ||
+                    txt.startsWith('stopped thinking')
                 ) {
-                    if (elem.children.length === 0 || elem.tagName === 'HEADER') {
+                    if (
+                        elem.children.length === 0 ||
+                        elem.tagName === 'HEADER' ||
+                        elem.tagName === 'SECTION' ||
+                        elem.tagName === 'ASIDE' ||
+                        txt.startsWith('worked for ') ||
+                        txt.startsWith('thought for ') ||
+                        txt.startsWith('đã suy nghĩ trong ')
+                    ) {
                         elem.remove();
                     }
                 }
@@ -2252,7 +2285,13 @@ def get_assistant_response_after_latest_user(
             const cleanNode = (el) => {
                 if (!el) return '';
                 const clone = el.cloneNode(true);
-                clone.querySelectorAll('button, .sr-only, [data-testid*="citation"], sup.citation, header, [class*="header-"], [class*="editorControls"], [class*="suggestion"], [class*="pill"]').forEach(b => b.remove());
+                clone.querySelectorAll('button, .sr-only, [data-testid*="citation"], sup.citation, header, [class*="header-"], [class*="editorControls"], [class*="suggestion"], [class*="pill"], [data-testid*="thought"], [data-testid*="reasoning"], [data-testid*="thinking"], [class*="thought"], [class*="reasoning"], [class*="thinking"], .result-thinking, [data-testid*="search"], [data-testid*="web-search"], [class*="web-search"], details, summary').forEach(b => b.remove());
+                clone.querySelectorAll('div, span, p, header, a, section, aside').forEach((elem) => {
+                    const txt = (elem.textContent || '').trim().toLowerCase();
+                    if (txt.startsWith('worked for ') || txt.startsWith('thought for ') || txt.startsWith('đã suy nghĩ trong ') || txt.startsWith('thinking...') || txt.startsWith('đang suy nghĩ')) {
+                        elem.remove();
+                    }
+                });
                 return (clone.innerText || clone.textContent || '').trim();
             };
 
@@ -2367,10 +2406,11 @@ def is_chatgpt_generation_active(page: Page) -> bool:
     try:
         return bool(page.evaluate(
             """() => {
+                // 1. Explicit stop button
                 if (document.querySelector('[data-testid="stop-button"]')) {
                     return true;
                 }
-                return [...document.querySelectorAll('button')].some((button) => {
+                const hasStopButton = [...document.querySelectorAll('button')].some((button) => {
                     const label = [
                         button.getAttribute('aria-label') || '',
                         button.getAttribute('title') || ''
@@ -2380,6 +2420,25 @@ def is_chatgpt_generation_active(page: Page) -> bool:
                         || label.includes('dừng tạo')
                         || label.includes('dừng phản hồi');
                 });
+                if (hasStopButton) return true;
+
+                // 2. Active thinking / searching state indicators
+                const isThinkingOrSearching = [...document.querySelectorAll(
+                    '[data-testid*="thinking"], [data-testid*="searching"], [class*="thinking"], [class*="thought-process"], [class*="reasoning-state"], .result-thinking, [data-testid*="search-status"]'
+                )].some(el => {
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                });
+                if (isThinkingOrSearching) return true;
+
+                // 3. Check for in-progress animation/spinner or reasoning indicators
+                const hasSpinners = [...document.querySelectorAll('svg.animate-spin, [class*="animate-spin"], [class*="loading-spinner"]')].some(el => {
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                });
+                if (hasSpinners) return true;
+
+                return false;
             }"""
         ))
     except Exception:
@@ -2606,7 +2665,13 @@ def get_reusable_chapter_response(page: Page) -> str:
             const cleanNode = (el) => {
                 if (!el) return '';
                 const clone = el.cloneNode(true);
-                clone.querySelectorAll('button, .sr-only, [data-testid*="citation"]').forEach(b => b.remove());
+                clone.querySelectorAll('button, .sr-only, [data-testid*="citation"], sup.citation, header, [class*="header-"], [class*="editorControls"], [class*="suggestion"], [class*="pill"], [data-testid*="thought"], [data-testid*="reasoning"], [data-testid*="thinking"], [class*="thought"], [class*="reasoning"], [class*="thinking"], .result-thinking, [data-testid*="search"], [data-testid*="web-search"], [class*="web-search"], details, summary').forEach(b => b.remove());
+                clone.querySelectorAll('div, span, p, header, a, section, aside').forEach((elem) => {
+                    const txt = (elem.textContent || '').trim().toLowerCase();
+                    if (txt.startsWith('worked for ') || txt.startsWith('thought for ') || txt.startsWith('đã suy nghĩ trong ') || txt.startsWith('thinking...') || txt.startsWith('đang suy nghĩ')) {
+                        elem.remove();
+                    }
+                });
                 return (clone.innerText || clone.textContent || '').trim();
             };
             const nodes = [...document.querySelectorAll(
@@ -2637,7 +2702,13 @@ def get_reusable_outline_response(page: Page) -> str:
             const cleanNode = (el) => {
                 if (!el) return '';
                 const clone = el.cloneNode(true);
-                clone.querySelectorAll('button, .sr-only, [data-testid*="citation"]').forEach(b => b.remove());
+                clone.querySelectorAll('button, .sr-only, [data-testid*="citation"], sup.citation, header, [class*="header-"], [class*="editorControls"], [class*="suggestion"], [class*="pill"], [data-testid*="thought"], [data-testid*="reasoning"], [data-testid*="thinking"], [class*="thought"], [class*="reasoning"], [class*="thinking"], .result-thinking, [data-testid*="search"], [data-testid*="web-search"], [class*="web-search"], details, summary').forEach(b => b.remove());
+                clone.querySelectorAll('div, span, p, header, a, section, aside').forEach((elem) => {
+                    const txt = (elem.textContent || '').trim().toLowerCase();
+                    if (txt.startsWith('worked for ') || txt.startsWith('thought for ') || txt.startsWith('đã suy nghĩ trong ') || txt.startsWith('thinking...') || txt.startsWith('đang suy nghĩ')) {
+                        elem.remove();
+                    }
+                });
                 return (clone.innerText || clone.textContent || '').trim();
             };
             const nodes = [...document.querySelectorAll(
