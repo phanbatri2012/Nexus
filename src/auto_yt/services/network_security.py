@@ -114,8 +114,17 @@ def validate_image_bytes(data: bytes) -> None:
 
 
 def validate_chatgpt_image_url(url: str) -> str:
+    cleaned = str(url or "").strip()
+    if cleaned.casefold().startswith("blob:https://"):
+        inner_url = cleaned[5:]
+        validate_https_url(
+            inner_url,
+            allowed_hosts=CHATGPT_IMAGE_HOSTS,
+            allow_subdomains=True,
+        )
+        return cleaned
     return validate_https_url(
-        url,
+        cleaned,
         allowed_hosts=CHATGPT_IMAGE_HOSTS,
         allow_subdomains=True,
     )

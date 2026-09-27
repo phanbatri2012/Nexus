@@ -120,7 +120,9 @@ THUMBNAIL_IMAGE_SELECTOR = (
     'img[src*="backend-api/estuary"], '
     'img[alt*="Generated image"], '
     'img[alt*="DALL"], '
-    'img[src*="files/"]'
+    'img[src*="files/"], '
+    'img[src^="blob:https://chatgpt.com/"], '
+    'img[src^="blob:https://"]'
 )
 THUMBNAIL_REPAIR_PROMPT = (
     "hãy chỉ ra điểm vi phạm prompt của tôi. sau đó sửa prompt  sao cho không vi phạm nữa."
@@ -651,7 +653,10 @@ def wait_for_new_user_turn(page: Page, previous_user_turn: int) -> int:
         if request_turn > previous_user_turn:
             return request_turn
         time.sleep(0.25)
-    raise RuntimeError("ChatGPT did not create a new thumbnail request turn.")
+    latest_turn = get_latest_conversation_turn(page, "user")
+    if latest_turn >= 0:
+        return latest_turn
+    return max(0, previous_user_turn + 1)
 
 
 def get_thumbnail_image_identity(image_url: str) -> str:
@@ -681,17 +686,36 @@ def wait_for_thumbnail_images(
                 get_visible_conversation_turns(page),
                 request_turn,
             )
-        if response_turn is None:
-            time.sleep(1)
-            continue
 
-        turn = page.locator(f'[data-testid="conversation-turn-{response_turn}"]')
-        if turn.count() == 0:
-            turn = page.locator('[data-markdown-text-style="assistant-message"], [data-turn-key]').last
+        turn = None
+        if response_turn is not None:
+            turn = page.locator(f'[data-testid="conversation-turn-{response_turn}"]')
+            if turn.count() == 0:
+                turn = None
+
+        if turn is None:
+            turn = page.locator(
+                '[data-markdown-text-style="assistant-message"], '
+                '[data-message-author-role="assistant"], '
+                '[data-turn-key]'
+            ).last
+
         if turn.count() >= 1:
             images = turn.locator(THUMBNAIL_IMAGE_SELECTOR)
-            try:
-                image_snapshots = images.evaluate_all(
+        else:
+            images = page.locator(THUMBNAIL_IMAGE_SELECTOR)
+
+        try:
+            image_snapshots = images.evaluate_all(
+                """
+                elements => elements.map(image => ({
+                    src: image.getAttribute('src') || image.currentSrc || '',
+                    ready: image.complete && image.naturalWidth > 0,
+                }))
+                """
+            )
+            if not image_snapshots:
+                image_snapshots = page.locator(THUMBNAIL_IMAGE_SELECTOR).evaluate_all(
                     """
                     elements => elements.map(image => ({
                         src: image.getAttribute('src') || image.currentSrc || '',
@@ -699,43 +723,70 @@ def wait_for_thumbnail_images(
                     }))
                     """
                 )
-                generation_active = (
-                    page.locator(CHATGPT_STOP_BUTTON_SELECTOR).count() > 0
+            generation_active = (
+                page.locator(CHATGPT_STOP_BUTTON_SELECTOR).count() > 0
+            )
+            snapshot_error_logged = False
+        except Exception as exc:
+            if not snapshot_error_logged:
+                print(
+                    "Thumbnail DOM changed while reading images; retrying: "
+                    f"{exc}",
+                    file=sys.stderr,
                 )
-                snapshot_error_logged = False
-            except PlaywrightError as exc:
-                if not snapshot_error_logged:
-                    print(
-                        "Thumbnail DOM changed while reading images; retrying: "
-                        f"{exc}",
-                        file=sys.stderr,
-                    )
-                    snapshot_error_logged = True
-                time.sleep(1)
-                continue
+                snapshot_error_logged = True
+            time.sleep(1)
+            continue
 
-            image_urls = []
-            image_identities = set()
-            for image_snapshot in image_snapshots:
-                image_url = image_snapshot.get("src", "")
-                image_identity = get_thumbnail_image_identity(image_url)
-                if (
-                    image_url
-                    and image_snapshot.get("ready")
-                    and image_identity not in image_identities
-                ):
-                    image_urls.append(image_url)
-                    image_identities.add(image_identity)
+        image_urls = []
+        image_identities = set()
+        for image_snapshot in image_snapshots:
+            image_url = image_snapshot.get("src", "")
+            image_identity = get_thumbnail_image_identity(image_url)
+            if (
+                image_url
+                and image_snapshot.get("ready")
+                and image_identity not in image_identities
+            ):
+                image_urls.append(image_url)
+                image_identities.add(image_identity)
 
-            if image_urls and not generation_active:
-                downloaded_urls = []
-                for image_url in image_urls[:MAX_THUMBNAIL_IMAGES_PER_RESPONSE]:
-                    downloaded_url = download_image(image_url) or image_url
-                    if downloaded_url and downloaded_url not in downloaded_urls:
-                        downloaded_urls.append(downloaded_url)
+        if image_urls and not generation_active:
+            downloaded_urls = []
+            for image_url in image_urls[:MAX_THUMBNAIL_IMAGES_PER_RESPONSE]:
+                downloaded_url = download_image(image_url) or image_url
+                if downloaded_url and downloaded_url not in downloaded_urls:
+                    downloaded_urls.append(downloaded_url)
+            if downloaded_urls:
                 return downloaded_urls
         time.sleep(1)
     return []
+
+
+def get_reusable_thumbnail_images(page: Page, download_image) -> list[str]:
+    """Extract and download existing thumbnail images from the page if available."""
+    try:
+        images = page.locator(THUMBNAIL_IMAGE_SELECTOR)
+        if images.count() == 0:
+            return []
+        image_snapshots = images.evaluate_all(
+            """
+            elements => elements.map(image => ({
+                src: image.getAttribute('src') || image.currentSrc || '',
+                ready: image.complete && image.naturalWidth > 0,
+            }))
+            """
+        )
+        downloaded = []
+        for snap in image_snapshots:
+            src = snap.get("src", "")
+            if src and snap.get("ready"):
+                local_url = download_image(src) or src
+                if local_url and local_url not in downloaded:
+                    downloaded.append(local_url)
+        return downloaded
+    except Exception:
+        return []
 
 
 def wait_for_thumbnail_image(page: Page, request_turn: int, download_image) -> str:
@@ -3293,18 +3344,25 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 "with_text",
             )
             state["current_step"] = "thumbnail with text"
-            thumb1, image1_urls = send_thumbnail_prompt(
-                page,
-                prompt8,
-                _download_image_local,
-                prompts.get("thumb_text_image_base64")
-            )
+            image1_urls = []
+            thumb1 = ""
+            if is_prompt_in_conversation(page, prompt8):
+                image1_urls = get_reusable_thumbnail_images(page, _download_image_local)
+                if image1_urls:
+                    thumb1 = get_assistant_response_after_latest_user(page, expected_user_text=prompt8)
             if not image1_urls:
-                print(">>> THUMBNAIL CÓ CHỮ LỖI, THỬ LẠI MỘT LẦN...", file=sys.stderr)
-                thumb1, image1_urls = retry_thumbnail_generation(
+                thumb1, image1_urls = send_thumbnail_prompt(
                     page,
+                    prompt8,
                     _download_image_local,
+                    prompts.get("thumb_text_image_base64")
                 )
+                if not image1_urls:
+                    print(">>> THUMBNAIL CÓ CHỮ LỖI, THỬ LẠI MỘT LẦN...", file=sys.stderr)
+                    thumb1, image1_urls = retry_thumbnail_generation(
+                        page,
+                        _download_image_local,
+                    )
 
             thumb1 = append_thumbnail_image_markers(thumb1, image1_urls)
             state["thumb_text"] = thumb1
@@ -3318,18 +3376,25 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 "without_text",
             )
             state["current_step"] = "thumbnail without text"
-            thumb2, image2_urls = send_thumbnail_prompt(
-                page,
-                prompt9,
-                _download_image_local,
-                prompts.get("thumb_notext_image_base64")
-            )
+            image2_urls = []
+            thumb2 = ""
+            if is_prompt_in_conversation(page, prompt9):
+                image2_urls = get_reusable_thumbnail_images(page, _download_image_local)
+                if image2_urls:
+                    thumb2 = get_assistant_response_after_latest_user(page, expected_user_text=prompt9)
             if not image2_urls:
-                print(">>> THUMBNAIL KHÔNG CHỮ LỖI, THỬ LẠI MỘT LẦN...", file=sys.stderr)
-                thumb2, image2_urls = retry_thumbnail_generation(
+                thumb2, image2_urls = send_thumbnail_prompt(
                     page,
+                    prompt9,
                     _download_image_local,
+                    prompts.get("thumb_notext_image_base64")
                 )
+                if not image2_urls:
+                    print(">>> THUMBNAIL KHÔNG CHỮ LỖI, THỬ LẠI MỘT LẦN...", file=sys.stderr)
+                    thumb2, image2_urls = retry_thumbnail_generation(
+                        page,
+                        _download_image_local,
+                    )
 
             thumb2 = append_thumbnail_image_markers(thumb2, image2_urls)
             state["thumb_notext"] = thumb2
