@@ -1,3 +1,4 @@
+import asyncio
 import datetime as dt
 import io
 import json
@@ -6,9 +7,10 @@ import tempfile
 import unittest
 import urllib.error
 import urllib.request
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from auto_yt import main
 from auto_yt.services import database
@@ -862,6 +864,208 @@ class VideoProductionServiceTests(unittest.TestCase):
         self.assertNotIn("Story theme:", scene0["prompt"])
         self.assertNotIn("dramatic opening scene hook for", scene0["prompt"])
         self.assertIn("clean visual without text", scene0["prompt"])
+
+    def test_scene_media_reuses_one_flow_worker_session_for_images_and_video(self):
+        shared_worker = MagicMock()
+        session_entries = []
+        image_paths = [
+            Path(self.temporary_directory.name) / "scene-0.png",
+            Path(self.temporary_directory.name) / "scene-1.png",
+        ]
+        video_path = Path(self.temporary_directory.name) / "scene-0.mp4"
+
+        @asynccontextmanager
+        async def fake_session(video_id, *, force_new_project=False):
+            session_entries.append((video_id, force_new_project))
+            yield shared_worker
+
+        scenes = [
+            {"index": 0, "prompt": "scene zero", "is_video": True},
+            {"index": 1, "prompt": "scene one", "is_video": False},
+        ]
+        with (
+            patch.object(video_production, "_flow_worker_session", fake_session),
+            patch.object(
+                video_production,
+                "_generate_scene_images_with_worker",
+                AsyncMock(return_value=image_paths),
+            ) as generate_images,
+            patch.object(
+                video_production,
+                "_generate_scene_video_async",
+                AsyncMock(return_value=video_path),
+            ) as generate_video,
+            patch.object(video_production, "cleanup_duplicate_scene_artifacts"),
+        ):
+            result = video_production.generate_scene_media(
+                video_id=42,
+                scenes=scenes,
+                settings={"enable_intro_video": True},
+                progress=lambda message, stage: None,
+                cancel_check=lambda: None,
+            )
+
+        self.assertEqual(session_entries, [(42, False)])
+        self.assertIs(generate_images.await_args.kwargs["worker"], shared_worker)
+        self.assertIs(generate_video.await_args.kwargs["worker"], shared_worker)
+        self.assertEqual(result, [video_path, image_paths[1]])
+
+    def test_scene_media_falls_back_immediately_when_veo_fails(self):
+        from auto_yt.services.google_flow_worker import FlowModeError
+
+        shared_worker = MagicMock()
+        image_paths = [Path(self.temporary_directory.name) / "scene-0.png"]
+
+        @asynccontextmanager
+        async def fake_session(video_id, *, force_new_project=False):
+            yield shared_worker
+
+        with (
+            patch.object(video_production, "_flow_worker_session", fake_session),
+            patch.object(
+                video_production,
+                "_generate_scene_images_with_worker",
+                AsyncMock(return_value=image_paths),
+            ),
+            patch.object(
+                video_production,
+                "_generate_scene_video_async",
+                AsyncMock(side_effect=FlowModeError("video mode unavailable")),
+            ) as generate_video,
+            patch.object(video_production, "cleanup_duplicate_scene_artifacts"),
+        ):
+            result = video_production.generate_scene_media(
+                video_id=42,
+                scenes=[{"index": 0, "prompt": "scene", "is_video": True}],
+                settings={"enable_intro_video": True},
+                progress=lambda message, stage: None,
+                cancel_check=lambda: None,
+            )
+
+        self.assertEqual(result, image_paths)
+        generate_video.assert_awaited_once()
+
+    def test_scene_image_retries_once_only_for_explicit_flow_error(self):
+        from PIL import Image
+        from auto_yt.services.google_flow_worker import FlowGenerationError
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-explicit-retry",
+            "Explicit retry",
+            "Transcript",
+            "Script",
+        )
+        worker = MagicMock()
+        worker.generate_scene = AsyncMock(
+            side_effect=[FlowGenerationError("rejected"), "https://flow/image/new"]
+        )
+
+        async def write_image(asset_url, save_path):
+            Image.new("RGB", (1376, 768), color=(10, 20, 30)).save(save_path)
+
+        worker.download_image = AsyncMock(side_effect=write_image)
+        scene = {"index": 0, "prompt": "scene", "action": "action"}
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            result = asyncio.run(
+                video_production._generate_scene_image_async(
+                    video_id=video_id,
+                    scene=scene,
+                    scene_count=1,
+                    profile={},
+                    settings={},
+                    reference_path=None,
+                    reference_id="",
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                    worker=worker,
+                    existing_hashes=set(),
+                )
+            )
+
+        self.assertTrue(result.is_file())
+        self.assertEqual(worker.generate_scene.await_count, 2)
+
+    def test_scene_image_timeout_is_not_retried(self):
+        from auto_yt.services.google_flow_worker import FlowGenerationTimeout
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-no-timeout-retry",
+            "No timeout retry",
+            "Transcript",
+            "Script",
+        )
+        worker = MagicMock()
+        worker.generate_scene = AsyncMock(side_effect=FlowGenerationTimeout("timeout"))
+        worker.download_image = AsyncMock()
+        scene = {"index": 0, "prompt": "scene", "action": "action"}
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            with self.assertRaises(FlowGenerationTimeout):
+                asyncio.run(
+                    video_production._generate_scene_image_async(
+                        video_id=video_id,
+                        scene=scene,
+                        scene_count=1,
+                        profile={},
+                        settings={},
+                        reference_path=None,
+                        reference_id="",
+                        progress=lambda message, stage: None,
+                        cancel_check=lambda: None,
+                        worker=worker,
+                        existing_hashes=set(),
+                    )
+                )
+
+        self.assertEqual(worker.generate_scene.await_count, 1)
+        artifact = database.get_latest_video_artifact(video_id, "scene:0")
+        self.assertEqual(artifact["status"], "failed")
+
+    def test_failed_veo_attempt_marks_artifact_failed(self):
+        from PIL import Image
+        from auto_yt.services.google_flow_worker import FlowModeError
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-veo-failed",
+            "Veo failed",
+            "Transcript",
+            "Script",
+        )
+        start_frame = Path(self.temporary_directory.name) / "start-frame.png"
+        Image.new("RGB", (1376, 768), color=(30, 40, 50)).save(start_frame)
+        worker = MagicMock()
+        worker.generate_scene_video = AsyncMock(
+            side_effect=FlowModeError("video mode unavailable")
+        )
+        worker.download_video = AsyncMock()
+        scene = {"index": 0, "prompt": "scene", "is_video": True}
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            with self.assertRaises(FlowModeError):
+                asyncio.run(
+                    video_production._generate_scene_video_async(
+                        video_id=video_id,
+                        scene=scene,
+                        scene_count=1,
+                        start_frame_path=start_frame,
+                        profile={},
+                        settings={},
+                        progress=lambda message, stage: None,
+                        cancel_check=lambda: None,
+                        worker=worker,
+                    )
+                )
+
+        artifact = database.get_latest_video_artifact(video_id, "scene_video:0")
+        self.assertEqual(artifact["status"], "failed")
+        self.assertIn("video mode unavailable", artifact["metadata"]["fallback_reason"])
 
 if __name__ == "__main__":
     unittest.main()

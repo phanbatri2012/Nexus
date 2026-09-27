@@ -1191,19 +1191,11 @@ export default function Settings({
 
   return (
     <div className="settings-container">
-      <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
+      <div className="settings-header">
         <div>
           <h1 className="hero-title">Prompt Management</h1>
           <p className="hero-subtitle">Quản lý và chỉnh sửa các lệnh AI hệ thống sử dụng.</p>
         </div>
-        <button
-          className="btn-save btn-large"
-          onClick={handleSave}
-          disabled={Boolean(savingSection)}
-          style={{padding: '15px 30px', fontSize: '1.1em'}}
-        >
-          💾 Lưu Tất Cả
-        </button>
       </div>
 
       {lockedPromptVersion && (
@@ -1239,7 +1231,15 @@ export default function Settings({
           </button>
         </div>
         
-        <div style={{display: 'flex', gap: '10px'}}>
+        <div className="version-actions">
+          <button
+            className="btn-save btn-save-all"
+            onClick={handleSave}
+            disabled={Boolean(savingSection)}
+            title="Lưu tất cả thay đổi trên toàn bộ trang"
+          >
+            💾 {savingSection === 'all' ? 'Đang lưu...' : 'Lưu Tất Cả'}
+          </button>
           <button className="btn-secondary" onClick={handleDuplicateVersion}>➕ Tạo Bản Sao</button>
           <button
             className="btn-danger"

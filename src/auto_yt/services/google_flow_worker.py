@@ -2,6 +2,7 @@ import asyncio
 import datetime as dt
 import logging
 import re
+import time
 from pathlib import Path
 
 from PIL import Image
@@ -18,10 +19,41 @@ REFERENCE_RESULT_ATTACHED = "attached"
 REFERENCE_RESULT_NOT_FOUND = "not_found"
 REFERENCE_RESULT_UI_ERROR = "ui_error"
 REFERENCE_ASSET_SCAN_LIMIT = 100
+IMAGE_GENERATION_TIMEOUT_SECONDS = 240.0
+VIDEO_GENERATION_TIMEOUT_SECONDS = 180.0
+GENERATION_START_TIMEOUT_SECONDS = 20.0
+GENERATION_IDLE_GRACE_SECONDS = 10.0
+VIDEO_MODE_TIMEOUT_SECONDS = 10.0
+GENERATION_POLL_SECONDS = 1.0
+MAX_CONSECUTIVE_UI_ERRORS = 3
 
 
 class ReferenceAttachmentError(RuntimeError):
     """Raised when a required Flow reference cannot be attached safely."""
+
+
+class FlowGenerationError(RuntimeError):
+    """Raised when Flow explicitly rejects or fails a generation request."""
+
+
+class FlowGenerationStartError(RuntimeError):
+    """Raised when Flow never shows progress or a new result after submission."""
+
+
+class FlowUiStateError(RuntimeError):
+    """Raised when the Flow UI cannot be inspected reliably."""
+
+
+class FlowResultMissingError(RuntimeError):
+    """Raised when Flow becomes idle without exposing a new result."""
+
+
+class FlowGenerationTimeout(RuntimeError):
+    """Raised when Flow remains active beyond the hard generation deadline."""
+
+
+class FlowModeError(RuntimeError):
+    """Raised when the requested Flow generation mode cannot be confirmed."""
 
 # ---------------------------------------------------------------------------
 # SynthID / Google Flow watermark removal
@@ -518,33 +550,221 @@ class GoogleFlowWorker:
         except Exception as exc:
             logger.warning("Could not upload reference '%s': %s", label or filename, exc)
 
-    async def _get_existing_images(self) -> set[str]:
-        """Collect all flow-content image URLs currently rendered on the page, strictly excluding Google account avatars, reference chips, and menus."""
+    @staticmethod
+    def _media_key(url: str) -> str:
+        return str(url or "").split("?", 1)[0].strip().casefold()
+
+    async def _collect_image_candidates(self) -> list[dict]:
+        """Collect generated image candidates from the gallery and result panel."""
+        result = await self.page.evaluate(r'''() => {
+            const candidates = [];
+            const seen = new Set();
+            const nodes = document.querySelectorAll(
+                "img[src], [data-image-url], [data-media-url], a[href], [style*='background-image']"
+            );
+            for (const node of nodes) {
+                if (node.closest(
+                    "flow-ingredient-chip, .ingredient-chip, .mat-mdc-chip, flow-prompt-box, " +
+                    "[role='menu'], flow-upload-card, [data-testid*='upload' i], .upload-card, " +
+                    "[data-testid*='asset-picker' i], .asset-picker, .uploads-picker"
+                )) continue;
+
+                let src = node.currentSrc || node.src ||
+                    node.getAttribute('data-image-url') || node.getAttribute('data-media-url') ||
+                    node.href || '';
+                if (!src) {
+                    const background = getComputedStyle(node).backgroundImage || '';
+                    const match = background.match(/url\(["']?(.*?)["']?\)/);
+                    src = match ? match[1] : '';
+                }
+                if (!src || src.startsWith('data:')) continue;
+
+                const lowerSrc = src.toLowerCase();
+                const looksLikeImage = lowerSrc.startsWith('blob:') ||
+                    lowerSrc.includes('flow-content.google/image') ||
+                    lowerSrc.includes('googleusercontent.com') ||
+                    /\.(?:png|jpe?g|webp)(?:\?|$)/i.test(src);
+                if (!looksLikeImage || /\.(?:mp4|webm)(?:\?|$)/i.test(src)) continue;
+
+                const alt = (node.alt || '').toLowerCase();
+                const className = String(node.className || '').toLowerCase();
+                const aria = (node.getAttribute('aria-label') || '').toLowerCase();
+                const parentAria = ((node.parentElement && node.parentElement.getAttribute('aria-label')) || '').toLowerCase();
+                if (lowerSrc.includes('s32-c-mo') || lowerSrc.includes('s96-c') ||
+                    lowerSrc.includes('pr_32px') || lowerSrc.includes('/a/acg8oc') ||
+                    alt.includes('google account') || alt.includes('tài khoản google') ||
+                    parentAria.includes('google account') || parentAria.includes('tài khoản google') ||
+                    className.includes('avatar') || className.includes('profile') ||
+                    aria.includes('profile')) continue;
+
+                const card = node.closest(
+                    "flow-media-tile, [data-media-id], [data-asset-id], [data-testid*='media' i], .media-card"
+                );
+                const assetId = card ? (
+                    card.getAttribute('data-media-id') || card.getAttribute('data-asset-id') ||
+                    card.getAttribute('data-id') || ''
+                ) : '';
+                const key = assetId ? `asset:${assetId}` : src;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                candidates.push({
+                    src,
+                    assetId,
+                    className,
+                    width: Number(node.naturalWidth || node.videoWidth || node.width || 0) || 0,
+                    height: Number(node.naturalHeight || node.videoHeight || node.height || 0) || 0,
+                    source: node.closest('.sidebar, .mat-drawer, flow-prompt-history, [data-testid*="result" i]')
+                        ? 'result_panel' : 'gallery'
+                });
+            }
+            return candidates;
+        }''')
+        if not isinstance(result, list):
+            raise FlowUiStateError("Flow image candidate scan returned an invalid result.")
+        return [item for item in result if isinstance(item, dict)]
+
+    async def _collect_video_candidates(self) -> list[dict]:
+        """Collect video URLs from players, media cards, and the result panel."""
+        result = await self.page.evaluate(r'''() => {
+            const candidates = [];
+            const seen = new Set();
+            const nodes = document.querySelectorAll(
+                "video, flow-video-player video, a[href], [data-video-url], [data-media-url]"
+            );
+            for (const node of nodes) {
+                if (node.closest(
+                    "flow-ingredient-chip, flow-prompt-box, [role='menu'], flow-upload-card, " +
+                    "[data-testid*='asset-picker' i], .asset-picker, .uploads-picker"
+                )) continue;
+                const src = node.currentSrc || node.src || node.href ||
+                    node.getAttribute('data-video-url') || node.getAttribute('data-media-url') || '';
+                if (!src || src.startsWith('data:')) continue;
+                const lowerSrc = src.toLowerCase();
+                const looksLikeVideo = node.tagName === 'VIDEO' || lowerSrc.startsWith('blob:') ||
+                    /\.(?:mp4|webm)(?:\?|$)/i.test(src) || node.hasAttribute('data-video-url');
+                if (!looksLikeVideo) continue;
+                const card = node.closest(
+                    "flow-media-tile, [data-media-id], [data-asset-id], [data-testid*='media' i], .media-card"
+                );
+                const assetId = card ? (
+                    card.getAttribute('data-media-id') || card.getAttribute('data-asset-id') ||
+                    card.getAttribute('data-id') || ''
+                ) : '';
+                const key = assetId ? `asset:${assetId}` : src;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                candidates.push({src, assetId});
+            }
+            return candidates;
+        }''')
+        if not isinstance(result, list):
+            raise FlowUiStateError("Flow video candidate scan returned an invalid result.")
+        return [item for item in result if isinstance(item, dict)]
+
+    def _find_new_media_source(
+        self,
+        candidates: list[dict],
+        baseline_keys: set[str],
+        *,
+        exclude_uploaded_images: bool = False,
+    ) -> str:
+        uploaded_keys = {
+            self._media_key(url) for url in self._uploaded_image_urls if str(url).strip()
+        }
+        ranked: list[tuple[int, str]] = []
+        for candidate in candidates:
+            source = str(candidate.get("src") or candidate.get("url") or "").strip()
+            if not source:
+                continue
+            asset_id = str(candidate.get("assetId") or "").strip().casefold()
+            keys = {self._media_key(source)}
+            if asset_id:
+                keys.add(f"asset:{asset_id}")
+            if keys & baseline_keys:
+                continue
+            if exclude_uploaded_images and self._media_key(source) in uploaded_keys:
+                continue
+            try:
+                width = int(candidate.get("width") or 0)
+                height = int(candidate.get("height") or 0)
+            except (TypeError, ValueError):
+                width = 0
+                height = 0
+            ranked.append((width * height, source))
+        if not ranked:
+            return ""
+        ranked.sort(key=lambda item: item[0])
+        return ranked[-1][1]
+
+    async def _read_generation_activity(self) -> bool:
+        result = await self.page.evaluate(r'''() => {
+            const visible = (element) => {
+                if (!element) return false;
+                const style = getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' &&
+                    rect.width > 0 && rect.height > 0;
+            };
+            const controls = Array.from(document.querySelectorAll(
+                "button, [role='button'], [role='progressbar'], [role='status'], " +
+                "[aria-busy='true'], [data-state='generating'], [data-state='processing'], " +
+                ".progress, .generating, .loading, .spinner, flow-media-tile"
+            ));
+            return controls.some((element) => {
+                if (!visible(element)) return false;
+                const text = (element.textContent || '').trim().toLowerCase();
+                const aria = (element.getAttribute('aria-label') || '').trim().toLowerCase();
+                const state = (element.getAttribute('data-state') || '').trim().toLowerCase();
+                return text === 'stop' || text === 'dừng' || aria.includes('stop') ||
+                    aria.includes('dừng') || element.getAttribute('role') === 'progressbar' ||
+                    element.getAttribute('aria-busy') === 'true' || state === 'generating' ||
+                    state === 'processing' || element.classList.contains('generating') ||
+                    element.classList.contains('progress') || element.classList.contains('loading') ||
+                    element.classList.contains('spinner') || /(^|\s)\d{1,3}%($|\s)/.test(text) ||
+                    text.includes('đang tạo') || text.includes('generating') ||
+                    text.includes('creating') || text.includes('hiện tiến trình tư duy');
+            });
+        }''')
+        return result is True
+
+    async def _get_snackbar_error(self) -> str:
+        error_loc = self.page.locator(
+            ".mat-mdc-snack-bar-container [role='alert'], "
+            ".mat-mdc-snack-bar-container, flow-toast-notification"
+        ).first
+        if not await error_loc.is_visible(timeout=200):
+            return ""
+        text = (await error_loc.inner_text() or "").strip()
+        return text if _is_valid_flow_error_text(text) else ""
+
+    def _log_generation_event(
+        self,
+        media_type: str,
+        state: str,
+        started_at: float,
+        *,
+        detail: str = "",
+    ) -> None:
+        logger.info(
+            "flow_generation media=%s state=%s project=%s elapsed=%.2f detail=%s",
+            media_type,
+            state,
+            self._project_id(),
+            max(0.0, time.monotonic() - started_at),
+            detail,
+        )
+
+    async def _get_existing_images(self, *, strict: bool = False) -> set[str]:
+        """Return image URLs currently visible outside upload/reference controls."""
         try:
-            imgs = await self.page.evaluate('''() => {
-                return Array.from(
-                    document.querySelectorAll("img[src*='flow-content.google/image'], img.image, img[src*='googleusercontent.com']")
-                ).filter(i => {
-                    if (!i.src || i.src.startsWith('data:')) return false;
-                    // Exclude images inside reference chips, prompt box, dialogs, menus, and sidebars
-                    if (i.closest('flow-ingredient-chip, .ingredient-chip, .mat-mdc-chip, flow-prompt-box, .cdk-overlay-container, [role="menu"], [role="dialog"], .sidebar, .mat-drawer, flow-upload-card, .mat-mdc-dialog-container')) {
-                        return false;
-                    }
-                    const s = i.src.toLowerCase();
-                    const alt = (i.alt || '').toLowerCase();
-                    const className = (i.className || '').toLowerCase();
-                    const parentRole = ((i.parentElement && i.parentElement.getAttribute('role')) || '').toLowerCase();
-                    const parentAria = ((i.parentElement && i.parentElement.getAttribute('aria-label')) || '').toLowerCase();
-                    // Blacklist all Google Account avatars and profile icons
-                    if (s.includes('s32-c-mo') || s.includes('s96-c') || s.includes('pr_32px') || s.includes('/a/acg8oc') || s.includes('/a/')) return false;
-                    if (alt.includes('google account') || alt.includes('tài khoản google') || alt.includes('profile')) return false;
-                    if (parentAria.includes('google account') || parentAria.includes('tài khoản google') || parentAria.includes('profile')) return false;
-                    if (className.includes('avatar') || className.includes('profile')) return false;
-                    return true;
-                }).map(i => i.src);
-            }''')
-            return set(imgs) if isinstance(imgs, list) else set()
-        except Exception:
+            return {
+                str(item.get("src") or "").strip()
+                for item in await self._collect_image_candidates()
+                if str(item.get("src") or "").strip()
+            }
+        except Exception as exc:
+            if strict:
+                raise FlowUiStateError("Không thể chụp baseline ảnh của Google Flow.") from exc
             return set()
 
     async def _get_existing_error_texts(self) -> set[str]:
@@ -1003,6 +1223,270 @@ class GoogleFlowWorker:
         finally:
             await self.dismiss_blocking_dialogs()
 
+    async def _open_latest_new_media_card(
+        self,
+        media_type: str,
+        baseline_keys: set[str],
+    ) -> bool:
+        return bool(
+            await self.page.evaluate(
+                '''({kind, baseline}) => {
+                    const known = new Set(baseline);
+                    const cards = Array.from(document.querySelectorAll(
+                        "flow-media-tile, [data-media-id], [data-asset-id], " +
+                        "[data-testid*='media' i], .media-card"
+                    ));
+                    for (let index = cards.length - 1; index >= 0; index -= 1) {
+                        const card = cards[index];
+                        if (card.closest(
+                            "flow-upload-card, [data-testid*='upload' i], " +
+                            "[data-testid*='asset-picker' i], .asset-picker, .uploads-picker"
+                        )) continue;
+                        const video = card.querySelector(
+                            "video, [data-video-url], a[href*='.mp4'], a[href*='.webm']"
+                        );
+                        const image = card.querySelector(
+                            "img[src], [data-image-url], [style*='background-image']"
+                        );
+                        if (kind === 'video' && !video) continue;
+                        if (kind === 'image' && video && !image) continue;
+                        const media = kind === 'video' ? video : image;
+                        let src = media ? (
+                            media.currentSrc || media.src || media.href ||
+                            media.getAttribute('data-video-url') ||
+                            media.getAttribute('data-image-url') || ''
+                        ) : '';
+                        const assetId = card.getAttribute('data-media-id') ||
+                            card.getAttribute('data-asset-id') || card.getAttribute('data-id') || '';
+                        const urlKey = src ? src.split('?', 1)[0].trim().toLowerCase() : '';
+                        if ((urlKey && known.has(urlKey)) || (assetId && known.has(`asset:${assetId.toLowerCase()}`))) {
+                            continue;
+                        }
+                        card.click();
+                        return true;
+                    }
+                    return false;
+                }''',
+                {"kind": media_type, "baseline": list(baseline_keys)},
+            )
+        )
+
+    async def _resolve_new_media_source(
+        self,
+        media_type: str,
+        baseline_keys: set[str],
+        *,
+        recover: bool = False,
+    ) -> str:
+        if media_type == "image":
+            candidates = await self._collect_image_candidates()
+            source = self._find_new_media_source(
+                candidates,
+                baseline_keys,
+                exclude_uploaded_images=True,
+            )
+            if not source:
+                if not recover or not await self._open_latest_new_media_card(
+                    media_type,
+                    baseline_keys,
+                ):
+                    return ""
+                await asyncio.sleep(0.5)
+                candidates = await self._collect_image_candidates()
+                source = self._find_new_media_source(
+                    candidates,
+                    baseline_keys,
+                    exclude_uploaded_images=True,
+                )
+                if not source:
+                    return ""
+
+            selected = next(
+                (
+                    item for item in candidates
+                    if str(item.get("src") or item.get("url") or "").strip() == source
+                ),
+                {},
+            )
+            try:
+                width = int(selected.get("width") or 0)
+                height = int(selected.get("height") or 0)
+            except (TypeError, ValueError):
+                width = 0
+                height = 0
+            if width >= 800 and height >= 400:
+                return source
+
+            clicked = await self.page.evaluate(
+                r'''(targetUrl) => {
+                    const nodes = Array.from(document.querySelectorAll(
+                        "img[src], [data-image-url], [data-media-url], a[href], [style*='background-image']"
+                    ));
+                    for (const node of nodes) {
+                        let src = node.currentSrc || node.src ||
+                            node.getAttribute('data-image-url') || node.getAttribute('data-media-url') ||
+                            node.href || '';
+                        if (!src) {
+                            const background = getComputedStyle(node).backgroundImage || '';
+                            const match = background.match(/url\(["']?(.*?)["']?\)/);
+                            src = match ? match[1] : '';
+                        }
+                        if (src !== targetUrl) continue;
+                        const card = node.closest(
+                            "flow-media-tile, [data-media-id], [data-asset-id], " +
+                            "[data-testid*='media' i], .media-card"
+                        );
+                        (card || node).click();
+                        return true;
+                    }
+                    return false;
+                }''',
+                source,
+            )
+            if clicked:
+                await asyncio.sleep(0.5)
+                refreshed = await self._collect_image_candidates()
+                return self._find_new_media_source(
+                    refreshed,
+                    baseline_keys,
+                    exclude_uploaded_images=True,
+                ) or source
+            return source
+
+        candidates = await self._collect_video_candidates()
+        source = self._find_new_media_source(candidates, baseline_keys)
+        if source or not recover:
+            return source
+        if not await self._open_latest_new_media_card(media_type, baseline_keys):
+            return ""
+        await asyncio.sleep(0.5)
+        candidates = await self._collect_video_candidates()
+        return self._find_new_media_source(candidates, baseline_keys)
+
+    async def _wait_for_new_media(
+        self,
+        *,
+        media_type: str,
+        baseline_keys: set[str],
+        initial_error_texts: set[str],
+        submitted_at: float,
+        timeout_seconds: float,
+    ) -> str:
+        hard_deadline = submitted_at + timeout_seconds
+        start_deadline = submitted_at + GENERATION_START_TIMEOUT_SECONDS
+        generation_started = False
+        idle_since: float | None = None
+        consecutive_ui_errors = 0
+        start_logged = False
+
+        while True:
+            await asyncio.sleep(GENERATION_POLL_SECONDS)
+            await self.handle_confirmation_prompts()
+            now = time.monotonic()
+
+            try:
+                source = await self._resolve_new_media_source(media_type, baseline_keys)
+                is_generating = await self._read_generation_activity()
+                consecutive_ui_errors = 0
+            except Exception as exc:
+                consecutive_ui_errors += 1
+                logger.warning(
+                    "flow_generation media=%s state=ui_poll_error project=%s count=%d detail=%s",
+                    media_type,
+                    self._project_id(),
+                    consecutive_ui_errors,
+                    exc,
+                )
+                if consecutive_ui_errors >= MAX_CONSECUTIVE_UI_ERRORS:
+                    await self._save_debug_screenshot(f"{media_type}_ui_failed")
+                    self._log_generation_event(media_type, "ui_error", submitted_at, detail=str(exc))
+                    raise FlowUiStateError(
+                        f"Không thể đọc trạng thái giao diện Google Flow cho {media_type}."
+                    ) from exc
+                continue
+
+            if source:
+                self._log_generation_event(media_type, "completed", submitted_at)
+                return source
+
+            current_errors = await self._get_existing_error_texts()
+            new_errors = [
+                text for text in current_errors
+                if text not in initial_error_texts and _is_valid_flow_error_text(text)
+            ]
+            snackbar_error = ""
+            try:
+                snackbar_error = await self._get_snackbar_error()
+            except Exception:
+                snackbar_error = ""
+            explicit_error = new_errors[0] if new_errors else snackbar_error
+            if explicit_error and explicit_error not in initial_error_texts:
+                await self._save_debug_screenshot(f"{media_type}_explicit_error")
+                self._log_generation_event(
+                    media_type,
+                    "explicit_error",
+                    submitted_at,
+                    detail=explicit_error,
+                )
+                raise FlowGenerationError(
+                    f"Google Flow báo lỗi khi tạo {media_type}: {explicit_error}"
+                )
+
+            if is_generating:
+                generation_started = True
+                idle_since = None
+                if not start_logged:
+                    self._log_generation_event(media_type, "started", submitted_at)
+                    start_logged = True
+            elif not generation_started:
+                if now >= start_deadline:
+                    source = await self._resolve_new_media_source(
+                        media_type,
+                        baseline_keys,
+                        recover=True,
+                    )
+                    if source:
+                        self._log_generation_event(media_type, "completed", submitted_at)
+                        return source
+                    await self._save_debug_screenshot(f"{media_type}_start_failed")
+                    self._log_generation_event(media_type, "start_failed", submitted_at)
+                    raise FlowGenerationStartError(
+                        f"Google Flow không bắt đầu tạo {media_type} sau "
+                        f"{GENERATION_START_TIMEOUT_SECONDS:.0f} giây."
+                    )
+            else:
+                if idle_since is None:
+                    idle_since = now
+                elif now - idle_since >= GENERATION_IDLE_GRACE_SECONDS:
+                    source = await self._resolve_new_media_source(
+                        media_type,
+                        baseline_keys,
+                        recover=True,
+                    )
+                    if source:
+                        self._log_generation_event(media_type, "completed", submitted_at)
+                        return source
+                    await self._save_debug_screenshot(f"{media_type}_result_missing")
+                    self._log_generation_event(media_type, "result_missing", submitted_at)
+                    raise FlowResultMissingError(
+                        f"Google Flow đã dừng nhưng không tìm thấy {media_type} mới."
+                    )
+
+            if now >= hard_deadline:
+                source = await self._resolve_new_media_source(
+                    media_type,
+                    baseline_keys,
+                    recover=True,
+                )
+                if source:
+                    self._log_generation_event(media_type, "completed", submitted_at)
+                    return source
+                await self._save_debug_screenshot(f"{media_type}_hard_timeout")
+                self._log_generation_event(media_type, "hard_timeout", submitted_at)
+                raise FlowGenerationTimeout(
+                    f"Google Flow không trả về {media_type} mới sau {timeout_seconds:.0f} giây."
+                )
+
     async def generate_scene(
         self,
         prompt: str,
@@ -1015,8 +1499,11 @@ class GoogleFlowWorker:
         clean_prompt = re.sub(r"https?://\S+", "", clean_prompt)
         clean_prompt = re.sub(r"/api/thumbnails/\S+", "", clean_prompt).strip()
 
-        # Snapshot existing generated images and error tiles on the page before submitting prompt
-        existing_imgs = await self._get_existing_images()
+        # Snapshot generated assets before attaching references or submitting the prompt.
+        baseline_keys = {
+            self._media_key(source)
+            for source in await self._get_existing_images(strict=True)
+        }
         initial_error_texts = await self._get_existing_error_texts()
 
         # Synchronize reference image ingredients with the prompt bar
@@ -1078,7 +1565,9 @@ class GoogleFlowWorker:
 
         await asyncio.sleep(0.5)
 
-        # Trigger generation: Press Enter in editor first (most reliable for Google Flow / ProseMirror)
+        # Trigger generation with Enter first, then use the visible generate button as fallback.
+        submitted_at = time.monotonic()
+        self._log_generation_event("image", "submitted", submitted_at)
         try:
             focus_res = editor.focus()
             if asyncio.iscoroutine(focus_res):
@@ -1095,264 +1584,34 @@ class GoogleFlowWorker:
             "button:has-text('Generate')",
             "button:has-text('arrow_forward')",
         ]
-        stop_btn_selectors = [
-            "button:has-text('Stop')",
-            "button[aria-label*='Stop' i]",
-            "button.stop-icon-button",
-        ]
 
-        # Check if generation already started from Enter
-        generation_started = False
-        for s_sel in stop_btn_selectors:
-            try:
-                if await self.page.locator(s_sel).first.is_visible(timeout=500):
-                    generation_started = True
-                    break
-            except Exception:
-                continue
+        generation_visible = False
+        try:
+            generation_visible = bool(
+                await self._resolve_new_media_source("image", baseline_keys)
+                or await self._read_generation_activity()
+            )
+        except Exception:
+            generation_visible = True
 
-        if not generation_started:
-            # Try clicking generate button if visible
+        if not generation_visible:
             for sel in gen_btn_selectors:
                 try:
                     candidate = self.page.locator(sel).first
                     if await candidate.is_visible(timeout=1000):
                         await self.dismiss_blocking_dialogs()
                         await candidate.click(timeout=3000, force=True)
-                        generation_started = True
                         break
                 except Exception:
                     continue
 
-        if not generation_started:
-            # Fallback: focus editor and press Enter again
-            try:
-                focus_res = editor.focus()
-                if asyncio.iscoroutine(focus_res):
-                    await focus_res
-            except Exception:
-                pass
-            await self.page.keyboard.press("Enter")
-
-        # Wait for generation to start (Stop button or progress indicator)
-        for _ in range(15):
-            await asyncio.sleep(1)
-            await self.handle_confirmation_prompts()
-            for s_sel in stop_btn_selectors:
-                try:
-                    if await self.page.locator(s_sel).first.is_visible(timeout=500):
-                        generation_started = True
-                        break
-                except Exception:
-                    continue
-            if generation_started:
-                logger.info("Google Flow generation started (Stop button appeared).")
-                break
-
-        # Specific canvas / workspace error tile selectors (excluding sidebar prompt cards and history)
-        canvas_err_selectors = [
-            "flow-error-tile",
-            ".canvas flow-error-tile",
-            "flow-media-tile.error",
-            "flow-media-tile[data-error='true']",
-            "[data-tile-state='error']",
-            ".error-tile",
-        ]
-
-        # Wait for generation to complete (Stop button disappears and new image is available)
-        deadline = asyncio.get_event_loop().time() + 240.0
-        new_src = None
-        existing_bases = {u.split("?")[0] for u in existing_imgs}
-        uploaded_bases = {u.split("?")[0] for u in self._uploaded_image_urls}
-
-        while asyncio.get_event_loop().time() < deadline:
-            await asyncio.sleep(2)
-            await self.handle_confirmation_prompts()
-
-            is_generating = False
-            for s_sel in stop_btn_selectors:
-                try:
-                    if await self.page.locator(s_sel).first.is_visible(timeout=300):
-                        is_generating = True
-                        generation_started = True
-                        break
-                except Exception:
-                    continue
-
-            # Check if generation is actively running via stop buttons or progress indicators
-            for s_sel in stop_btn_selectors:
-                try:
-                    if await self.page.locator(s_sel).first.is_visible(timeout=300):
-                        is_generating = True
-                        generation_started = True
-                        break
-                except Exception:
-                    continue
-
-            if not is_generating:
-                # Also check for active progress indicators on canvas (e.g. text containing "%", spinner, or progress tiles)
-                try:
-                    progress_loc = self.page.locator(".canvas [role='progressbar'], .canvas .progress, flow-media-tile:has-text('%'), .generating").first
-                    if await progress_loc.is_visible(timeout=200):
-                        is_generating = True
-                        generation_started = True
-                except Exception:
-                    pass
-
-            # If generation is actively running, NEVER capture early — continue waiting
-            if is_generating:
-                continue
-
-            # 1. ALWAYS check for brand-new images FIRST before any error tile evaluation
-            try:
-                current_imgs_info = await self.page.evaluate('''() => {
-                    return Array.from(
-                        document.querySelectorAll("img[src*='flow-content.google/image'], img.image, img[src*='googleusercontent.com']")
-                    ).filter(i => {
-                        if (!i.src || i.src.startsWith('data:')) return false;
-                        if (i.closest('flow-ingredient-chip, .ingredient-chip, .mat-mdc-chip, flow-prompt-box, .cdk-overlay-container, [role="menu"], [role="dialog"], .sidebar, .mat-drawer, flow-upload-card, .mat-mdc-dialog-container')) {
-                            return false;
-                        }
-                        const s = i.src.toLowerCase();
-                        const alt = (i.alt || '').toLowerCase();
-                        const className = (i.className || '').toLowerCase();
-                        const parentAria = ((i.parentElement && i.parentElement.getAttribute('aria-label')) || '').toLowerCase();
-                        if (s.includes('s32-c-mo') || s.includes('s96-c') || s.includes('pr_32px') || s.includes('/a/acg8oc') || s.includes('/a/')) return false;
-                        if (alt.includes('google account') || alt.includes('tài khoản google') || alt.includes('profile')) return false;
-                        if (parentAria.includes('google account') || parentAria.includes('tài khoản google') || parentAria.includes('profile')) return false;
-                        if (className.includes('avatar') || className.includes('profile')) return false;
-                        return true;
-                    }).map(i => ({
-                        src: i.src,
-                        className: i.className || '',
-                        width: i.naturalWidth || i.width || 0,
-                        height: i.naturalHeight || i.height || 0
-                    }));
-                }''')
-            except Exception:
-                current_imgs_info = []
-
-            if not isinstance(current_imgs_info, list):
-                current_imgs_info = []
-
-            # Find brand new widescreen images excluding existing and uploaded reference portraits
-            brand_new = [
-                img for img in current_imgs_info
-                if isinstance(img, dict) and img.get("src")
-                and img.get("src") not in existing_imgs
-                and img.get("src").split("?")[0] not in existing_bases
-                and img.get("src") not in self._uploaded_image_urls
-                and img.get("src").split("?")[0] not in uploaded_bases
-                and (img.get("width", 0) >= 800 and img.get("height", 0) >= 400 and (img.get("width", 0) / max(1, img.get("height", 0))) >= 1.2)
-            ]
-
-            # Priority 1: High-resolution widescreen images (width >= 1024, height >= 400)
-            for item in brand_new:
-                w = item.get("width", 0)
-                h = item.get("height", 0)
-                if "thumbnail" not in item.get("className", "") and w >= 1024 and h >= 400:
-                    new_src = item["src"]
-                    break
-
-            # Priority 2: Standard widescreen image (width >= 800, height >= 400, aspect ratio >= 1.2)
-            if not new_src:
-                for item in brand_new:
-                    if "thumbnail" not in item.get("className", ""):
-                        new_src = item["src"]
-                        break
-
-            if new_src:
-                logger.info("Found newly generated Google Flow image: %s", new_src)
-                break
-
-            # 2. Check for NEW canvas error tiles ONLY when generation stopped and NO new image was found
-            current_error_texts = await self._get_existing_error_texts()
-            new_errors = [
-                e for e in current_error_texts
-                if e not in initial_error_texts and _is_valid_flow_error_text(e)
-            ]
-            if new_errors and generation_started:
-                logger.error("Google Flow new error tile detected: %s", new_errors[0])
-                await self._save_debug_screenshot("flow_error_tile")
-                raise RuntimeError(f"Google Flow báo lỗi khi tạo ảnh: {new_errors[0]}")
-
-            # 3. Check for active snackbar error
-            try:
-                error_loc = self.page.locator(".mat-mdc-snack-bar-container [role='alert'], .mat-mdc-snack-bar-container, flow-toast-notification").first
-                if await error_loc.is_visible(timeout=200):
-                    txt = (await error_loc.inner_text() or "").strip()
-                    if _is_valid_flow_error_text(txt) and txt not in initial_error_texts:
-                        logger.error("Google Flow snackbar alert detected: %s", txt)
-                        await self._save_debug_screenshot("flow_snackbar_error")
-                        raise RuntimeError(f"Google Flow báo lỗi khi tạo ảnh: {txt}")
-            except RuntimeError:
-                raise
-            except Exception:
-                pass
-
-            # 4. If generation started and stop button disappeared, check again with diff
-            if generation_started and not is_generating:
-                await asyncio.sleep(2)
-                # Re-query with strict widescreen filter
-                try:
-                    updated_imgs_info = await self.page.evaluate('''() => {
-                        return Array.from(
-                            document.querySelectorAll("img[src*='flow-content.google/image'], img.image, img[src*='googleusercontent.com']")
-                        ).filter(i => {
-                            if (!i.src || i.src.startsWith('data:')) return false;
-                            if (i.closest('flow-ingredient-chip, .ingredient-chip, .mat-mdc-chip, flow-prompt-box, .cdk-overlay-container, [role="menu"], [role="dialog"], .sidebar, .mat-drawer, flow-upload-card, .mat-mdc-dialog-container')) {
-                                return false;
-                            }
-                            const s = i.src.toLowerCase();
-                            const alt = (i.alt || '').toLowerCase();
-                            const className = (i.className || '').toLowerCase();
-                            const parentAria = ((i.parentElement && i.parentElement.getAttribute('aria-label')) || '').toLowerCase();
-                            if (s.includes('s32-c-mo') || s.includes('s96-c') || s.includes('pr_32px') || s.includes('/a/acg8oc') || s.includes('/a/')) return false;
-                            if (alt.includes('google account') || alt.includes('tài khoản google') || alt.includes('profile')) return false;
-                            if (parentAria.includes('google account') || parentAria.includes('tài khoản google') || parentAria.includes('profile')) return false;
-                            if (className.includes('avatar') || className.includes('profile')) return false;
-                            return true;
-                        }).map(i => ({
-                            src: i.src,
-                            className: i.className || '',
-                            width: i.naturalWidth || i.width || 0,
-                            height: i.naturalHeight || i.height || 0
-                        }));
-                    }''')
-                except Exception:
-                    updated_imgs_info = []
-
-                diff = [
-                    item for item in (updated_imgs_info or [])
-                    if isinstance(item, dict) and item.get("src")
-                    and item.get("src") not in existing_imgs
-                    and item.get("src").split("?")[0] not in existing_bases
-                    and item.get("src") not in self._uploaded_image_urls
-                    and item.get("src").split("?")[0] not in uploaded_bases
-                    and (item.get("width", 0) >= 800 and item.get("height", 0) >= 400 and (item.get("width", 0) / max(1, item.get("height", 0))) >= 1.2)
-                ]
-                if diff:
-                    new_src = diff[-1]["src"]
-                    break
-
-        if not new_src:
-            # Check for error alert/snackbars on page (excluding prompt sidebar)
-            error_text = ""
-            try:
-                error_loc = self.page.locator(".mat-mdc-snack-bar-container [role='alert'], .mat-mdc-snack-bar-container, flow-toast-notification").first
-                if await error_loc.is_visible(timeout=1000):
-                    txt = (await error_loc.inner_text() or "").strip()
-                    if _is_valid_flow_error_text(txt):
-                        error_text = txt
-            except Exception:
-                pass
-
-            await self._save_debug_screenshot("generation_timeout")
-            if error_text:
-                raise RuntimeError(f"Google Flow báo lỗi khi tạo ảnh: {error_text}")
-            raise RuntimeError("Google Flow không trả về ảnh mới sau 240 giây.")
-
-        return new_src
+        return await self._wait_for_new_media(
+            media_type="image",
+            baseline_keys=baseline_keys,
+            initial_error_texts=initial_error_texts,
+            submitted_at=submitted_at,
+            timeout_seconds=IMAGE_GENERATION_TIMEOUT_SECONDS,
+        )
 
     async def download_image(self, asset_url: str, save_path: str):
         target = Path(save_path)
@@ -1380,22 +1639,194 @@ class GoogleFlowWorker:
 
         raise RuntimeError(f"Không thể tải ảnh sau 3 lần thử: {last_error}")
 
-    async def _get_existing_videos(self) -> set[str]:
-        """Snapshot all existing video elements and URLs on the page."""
+    async def _get_existing_videos(self, *, strict: bool = False) -> set[str]:
+        """Return video URLs currently visible outside upload/reference controls."""
         try:
-            vids = await self.page.evaluate('''() => {
-                const results = [];
-                document.querySelectorAll("video, flow-video-player video, a[href*='.mp4'], [data-video-url]").forEach(el => {
-                    const src = el.currentSrc || el.src || el.href || el.getAttribute('data-video-url') || '';
-                    if (src && !src.startsWith('data:')) {
-                        results.push(src);
-                    }
-                });
-                return results;
-            }''')
-            return set(vids) if isinstance(vids, list) else set()
-        except Exception:
+            return {
+                str(item.get("src") or "").strip()
+                for item in await self._collect_video_candidates()
+                if str(item.get("src") or "").strip()
+            }
+        except Exception as exc:
+            if strict:
+                raise FlowUiStateError("Không thể chụp baseline video của Google Flow.") from exc
             return set()
+
+    async def _is_video_mode_active(self) -> bool:
+        result = await self.page.evaluate('''() => {
+            const visible = (element) => {
+                if (!element) return false;
+                const style = getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' &&
+                    rect.width > 0 && rect.height > 0;
+            };
+            const videoControls = Array.from(document.querySelectorAll(
+                "[data-frame-position], [data-testid*='start-frame' i], " +
+                "[data-testid*='end-frame' i], [aria-label*='start frame' i], " +
+                "[aria-label*='end frame' i], [aria-label*='khung hình bắt đầu' i], " +
+                "[aria-label*='khung hình kết thúc' i]"
+            ));
+            if (videoControls.some(visible)) return true;
+
+            const toggles = Array.from(document.querySelectorAll(
+                "mat-button-toggle, button, [role='tab'], [role='radio'], [role='option']"
+            ));
+            return toggles.some((element) => {
+                if (!visible(element)) return false;
+                const text = (element.textContent || '').trim().toLowerCase();
+                const aria = (element.getAttribute('aria-label') || '').trim().toLowerCase();
+                const isVideo = text === 'video' || aria === 'video' || aria.includes('video mode');
+                if (!isVideo) return false;
+                const className = String(element.className || '').toLowerCase();
+                return element.getAttribute('aria-pressed') === 'true' ||
+                    element.getAttribute('aria-selected') === 'true' ||
+                    element.getAttribute('aria-checked') === 'true' ||
+                    element.getAttribute('data-state') === 'active' ||
+                    className.includes('selected') || className.includes('checked') ||
+                    className.includes('active');
+            });
+        }''')
+        return result is True
+
+    async def _activate_video_mode(self) -> None:
+        deadline = time.monotonic() + VIDEO_MODE_TIMEOUT_SECONDS
+        last_error: Exception | None = None
+        selectors = [
+            "mat-button-toggle:has-text('Video')",
+            "button:has-text('Video')",
+            "[role='tab']:has-text('Video')",
+            "[role='radio']:has-text('Video')",
+            "[aria-label*='video mode' i]",
+            "button.mode-toggle-video",
+        ]
+        while time.monotonic() < deadline:
+            try:
+                if await self._is_video_mode_active():
+                    return
+            except Exception as exc:
+                last_error = exc
+            for selector in selectors:
+                try:
+                    button = self.page.locator(selector).first
+                    if await button.is_visible(timeout=300):
+                        await button.click(timeout=1500)
+                        await asyncio.sleep(0.5)
+                        if await self._is_video_mode_active():
+                            return
+                except Exception:
+                    continue
+            await asyncio.sleep(0.5)
+
+        await self._save_debug_screenshot("video_mode_failed")
+        raise FlowModeError(
+            f"Không thể xác nhận chế độ Video của Google Flow sau "
+            f"{VIDEO_MODE_TIMEOUT_SECONDS:.0f} giây."
+            + (f" Chi tiết: {last_error}" if last_error else "")
+        )
+
+    async def _wait_for_video_frame_attachment(
+        self,
+        position: str,
+        *,
+        timeout_seconds: float = 5.0,
+    ) -> bool:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            result = await self.page.evaluate(
+                '''(framePosition) => {
+                    const patterns = framePosition === 'start'
+                        ? ['start-frame', 'start frame', 'khung hình bắt đầu', 'ảnh bắt đầu']
+                        : ['end-frame', 'end frame', 'khung hình kết thúc', 'ảnh kết thúc'];
+                    const candidates = Array.from(document.querySelectorAll(
+                        "[data-frame-position], [data-testid], [aria-label], input[type='file']"
+                    ));
+                    return candidates.some((element) => {
+                        const haystack = [
+                            element.getAttribute('data-frame-position') || '',
+                            element.getAttribute('data-testid') || '',
+                            element.getAttribute('aria-label') || '',
+                        ].join(' ').toLowerCase();
+                        if (!patterns.some((pattern) => haystack.includes(pattern))) return false;
+                        const slot = element.closest(
+                            "[data-frame-position], [data-testid], [aria-label], .frame-slot"
+                        ) || element;
+                        const className = String(slot.className || '').toLowerCase();
+                        const state = (slot.getAttribute('data-state') || '').toLowerCase();
+                        const input = slot.matches("input[type='file']")
+                            ? slot : slot.querySelector("input[type='file']");
+                        return Boolean(
+                            (input && input.files && input.files.length) ||
+                            slot.querySelector('img, video, .preview, [data-media-id]') ||
+                            state === 'filled' || state === 'ready' ||
+                            className.includes('filled') || className.includes('has-media')
+                        );
+                    });
+                }''',
+                position,
+            )
+            if result is True:
+                return True
+            await asyncio.sleep(0.5)
+        return False
+
+    async def _attach_video_frame(self, frame_path: Path, position: str) -> bool:
+        if position not in {"start", "end"}:
+            raise ValueError(f"Unsupported video frame position: {position}")
+        if not frame_path.is_file():
+            raise FlowModeError(f"Video {position} frame does not exist: {frame_path}")
+
+        if position == "start":
+            input_selectors = [
+                "input[type='file'][data-frame-position='start']",
+                "[data-testid*='start-frame' i] input[type='file']",
+                "[aria-label*='start frame' i] input[type='file']",
+                "[aria-label*='khung hình bắt đầu' i] input[type='file']",
+                "[aria-label*='ảnh bắt đầu' i] input[type='file']",
+            ]
+            button_selectors = [
+                "button[aria-label*='start frame' i]",
+                "button[aria-label*='khung hình bắt đầu' i]",
+                "button[aria-label*='ảnh bắt đầu' i]",
+                "[data-testid*='start-frame' i] button",
+            ]
+        else:
+            input_selectors = [
+                "input[type='file'][data-frame-position='end']",
+                "[data-testid*='end-frame' i] input[type='file']",
+                "[aria-label*='end frame' i] input[type='file']",
+                "[aria-label*='khung hình kết thúc' i] input[type='file']",
+                "[aria-label*='ảnh kết thúc' i] input[type='file']",
+            ]
+            button_selectors = [
+                "button[aria-label*='end frame' i]",
+                "button[aria-label*='khung hình kết thúc' i]",
+                "button[aria-label*='ảnh kết thúc' i]",
+                "[data-testid*='end-frame' i] button",
+            ]
+
+        for selector in input_selectors:
+            try:
+                file_input = self.page.locator(selector).first
+                if await file_input.count():
+                    await file_input.set_input_files(str(frame_path))
+                    return await self._wait_for_video_frame_attachment(position)
+            except Exception:
+                continue
+
+        for selector in button_selectors:
+            try:
+                button = self.page.locator(selector).first
+                if not await button.is_visible(timeout=300):
+                    continue
+                async with self.page.expect_file_chooser(timeout=3000) as chooser_info:
+                    await button.click(timeout=1500)
+                chooser = await chooser_info.value
+                await chooser.set_files(str(frame_path))
+                return await self._wait_for_video_frame_attachment(position)
+            except Exception:
+                continue
+        return False
 
     async def generate_scene_video(
         self,
@@ -1406,23 +1837,28 @@ class GoogleFlowWorker:
         reference_ids: list[str] | None = None,
     ) -> str:
         """Generate a video clip from start (and optional end) frame using Veo on Google Flow."""
-        existing_vids = await self._get_existing_videos()
+        baseline_keys = {
+            self._media_key(source)
+            for source in await self._get_existing_videos(strict=True)
+        }
+        initial_error_texts = await self._get_existing_error_texts()
 
-        # 1. Upload start frame and end frame if provided
-        upload_refs = []
+        # Character/style references remain ingredients. Start/end images use
+        # dedicated image-to-video frame slots and must not be mixed into this list.
+        await self.sync_reference_ingredients(reference_ids or [])
+        await self._activate_video_mode()
+
         if start_frame_path and Path(start_frame_path).is_file():
-            start_ref = f"start_{Path(start_frame_path).stem}"
-            await self.upload_reference(str(start_frame_path), start_ref)
-            upload_refs.append(start_ref)
-
+            if not await self._attach_video_frame(Path(start_frame_path), "start"):
+                raise FlowModeError("Không thể gắn start frame vào chế độ Video của Google Flow.")
         if end_frame_path and Path(end_frame_path).is_file():
-            end_ref = f"end_{Path(end_frame_path).stem}"
-            await self.upload_reference(str(end_frame_path), end_ref)
-            upload_refs.append(end_ref)
-
-        # Merge with other references if any
-        all_refs = upload_refs + [r for r in (reference_ids or []) if r not in upload_refs]
-        await self.sync_reference_ingredients(all_refs)
+            attached = await self._attach_video_frame(Path(end_frame_path), "end")
+            if not attached:
+                logger.info(
+                    "flow_generation media=video state=end_frame_unsupported project=%s path=%s",
+                    self._project_id(),
+                    end_frame_path,
+                )
 
         # 2. Add strict negative prompt for text/watermarks and static still frames
         strict_avoid = "still frame, static image, cartoon, text, letters, words, typography, watermark, logo, headline, caption, subtitle, poster text"
@@ -1461,24 +1897,8 @@ class GoogleFlowWorker:
 
         await asyncio.sleep(0.5)
 
-        # Try to switch mode to Video if video mode toggle exists
-        video_mode_selectors = [
-            "mat-button-toggle:has-text('Video')",
-            "button:has-text('Video')",
-            "[aria-label*='video' i]:not(video)",
-            "button.mode-toggle-video",
-        ]
-        for v_sel in video_mode_selectors:
-            try:
-                v_btn = self.page.locator(v_sel).first
-                if await v_btn.is_visible(timeout=500):
-                    await v_btn.click(timeout=1000)
-                    await asyncio.sleep(0.3)
-                    break
-            except Exception:
-                continue
-
-        # Trigger generation: Press Enter
+        submitted_at = time.monotonic()
+        self._log_generation_event("video", "submitted", submitted_at)
         try:
             focus_res = editor.focus()
             if asyncio.iscoroutine(focus_res):
@@ -1495,103 +1915,34 @@ class GoogleFlowWorker:
             "button:has-text('Generate')",
             "button:has-text('arrow_forward')",
         ]
-        stop_btn_selectors = [
-            "button:has-text('Stop')",
-            "button[aria-label*='Stop' i]",
-            "button.stop-icon-button",
-        ]
 
-        generation_started = False
-        for s_sel in stop_btn_selectors:
-            try:
-                if await self.page.locator(s_sel).first.is_visible(timeout=500):
-                    generation_started = True
-                    break
-            except Exception:
-                continue
+        generation_visible = False
+        try:
+            generation_visible = bool(
+                await self._resolve_new_media_source("video", baseline_keys)
+                or await self._read_generation_activity()
+            )
+        except Exception:
+            generation_visible = True
 
-        if not generation_started:
+        if not generation_visible:
             for sel in gen_btn_selectors:
                 try:
                     candidate = self.page.locator(sel).first
                     if await candidate.is_visible(timeout=1000):
                         await self.dismiss_blocking_dialogs()
                         await candidate.click(timeout=3000, force=True)
-                        generation_started = True
                         break
                 except Exception:
                     continue
 
-        if not generation_started:
-            try:
-                focus_res = editor.focus()
-                if asyncio.iscoroutine(focus_res):
-                    await focus_res
-            except Exception:
-                pass
-            await self.page.keyboard.press("Enter")
-
-        # Wait for video generation (up to 180s for Veo video)
-        deadline = asyncio.get_event_loop().time() + 180.0
-        new_video_src = None
-
-        while asyncio.get_event_loop().time() < deadline:
-            await asyncio.sleep(2)
-            await self.handle_confirmation_prompts()
-
-            is_generating = False
-            for s_sel in stop_btn_selectors:
-                try:
-                    if await self.page.locator(s_sel).first.is_visible(timeout=300):
-                        is_generating = True
-                        break
-                except Exception:
-                    continue
-
-            if is_generating:
-                continue
-
-            # Query video elements
-            try:
-                current_videos = await self.page.evaluate('''() => {
-                    const results = [];
-                    document.querySelectorAll("video, flow-video-player video, a[href*='.mp4'], [data-video-url]").forEach(el => {
-                        const src = el.currentSrc || el.src || el.href || el.getAttribute('data-video-url') || '';
-                        if (src && !src.startsWith('data:')) {
-                            results.push(src);
-                        }
-                    });
-                    return results;
-                }''')
-            except Exception:
-                current_videos = []
-
-            if isinstance(current_videos, list):
-                for v_src in current_videos:
-                    if v_src and v_src not in existing_vids:
-                        new_video_src = v_src
-                        break
-
-            if new_video_src:
-                break
-
-        if not new_video_src:
-            error_text = ""
-            try:
-                error_loc = self.page.locator(".mat-mdc-snack-bar-container [role='alert'], .mat-mdc-snack-bar-container, flow-toast-notification").first
-                if await error_loc.is_visible(timeout=1000):
-                    txt = (await error_loc.inner_text() or "").strip()
-                    if _is_valid_flow_error_text(txt):
-                        error_text = txt
-            except Exception:
-                pass
-
-            await self._save_debug_screenshot("video_generation_timeout")
-            if error_text:
-                raise RuntimeError(f"Google Flow Veo báo lỗi khi tạo video: {error_text}")
-            raise RuntimeError("Google Flow Veo không trả về video mới sau 180 giây.")
-
-        return new_video_src
+        return await self._wait_for_new_media(
+            media_type="video",
+            baseline_keys=baseline_keys,
+            initial_error_texts=initial_error_texts,
+            submitted_at=submitted_at,
+            timeout_seconds=VIDEO_GENERATION_TIMEOUT_SECONDS,
+        )
 
     async def download_video(self, asset_url: str, save_path: str) -> None:
         """Download generated video file from URL/Blob to local path."""

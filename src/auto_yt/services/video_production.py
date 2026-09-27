@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import hashlib
 import json
 import logging
+import os
 import re
 import secrets
 import shutil
 import subprocess
 import threading
+import time
 import urllib.parse
 import urllib.request
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import imageio_ffmpeg
@@ -594,7 +598,79 @@ def _format_scene_video_prompt(
     return full_video_prompt
 
 
-def _generate_scene_image(
+def _flow_mock_enabled() -> bool:
+    return (
+        os.environ.get("YOUTUBE_UPLOAD", "true") == "false"
+        or os.environ.get("FLOW_MOCK_GENERATION", "false") == "true"
+    )
+
+
+@asynccontextmanager
+async def _flow_worker_session(video_id: int, *, force_new_project: bool = False):
+    """Open one Playwright/CDP connection for a complete scene generation batch."""
+    if _flow_mock_enabled():
+        yield None
+        return
+
+    from playwright.async_api import async_playwright
+    from auto_yt.services import google_flow_browser_service
+    from auto_yt.services.google_flow_worker import GoogleFlowWorker
+
+    endpoint = google_flow_browser_service.get_browser_service_endpoint()
+    if not endpoint:
+        google_flow_browser_service.start_browser_service()
+        await asyncio.sleep(5)
+        endpoint = google_flow_browser_service.get_browser_service_endpoint()
+    if not endpoint:
+        raise VideoProductionError("Browser Google Flow chưa khởi động được.")
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.connect_over_cdp(endpoint)
+        if not browser.contexts:
+            raise VideoProductionError("Google Flow browser không có context đang hoạt động.")
+        context = browser.contexts[0]
+        page = next(
+            (
+                candidate for candidate in context.pages
+                if "flow.google.com" in str(candidate.url or "").lower()
+                or "labs.google" in str(candidate.url or "").lower()
+            ),
+            None,
+        )
+        if page is None:
+            page = context.pages[0] if context.pages else await context.new_page()
+
+        worker = GoogleFlowWorker(page)
+        await worker.ensure_project(
+            f"auto_yt_{video_id}",
+            force_new=force_new_project,
+        )
+        yield worker
+
+
+def _log_scene_generation(
+    *,
+    video_id: int,
+    scene_index: int,
+    media_type: str,
+    state: str,
+    attempt: int,
+    started_at: float,
+    detail: str = "",
+) -> None:
+    logger.info(
+        "flow_scene video_id=%s scene=%s media=%s state=%s attempt=%s elapsed=%.2f detail=%s",
+        video_id,
+        scene_index,
+        media_type,
+        state,
+        attempt,
+        max(0.0, time.monotonic() - started_at),
+        detail,
+    )
+
+
+async def _generate_scene_image_async(
     *,
     video_id: int,
     scene: dict,
@@ -605,6 +681,7 @@ def _generate_scene_image(
     reference_id: str,
     progress,
     cancel_check,
+    worker,
     existing_hashes: set[str] | None = None,
     force_new_project: bool = False,
 ) -> Path:
@@ -642,18 +719,12 @@ def _generate_scene_image(
     target.parent.mkdir(parents=True, exist_ok=True)
     generation_attempt = existing.get("metadata", {}).get("generation_attempt", 0) + 1 if existing else 1
     
+    started_at = time.monotonic()
     progress(
         f"Đang tạo ảnh {scene['index'] + 1}/{scene_count} bằng Google Flow",
         f"generating_flow_image {scene['index'] + 1}/{scene_count}",
     )
-    output = None
-    
-    # Check if this is a test or we don't have the worker actual runtime available
-    from auto_yt.services import google_flow_browser_service
-    browser_status = google_flow_browser_service.get_browser_service_status()
-    # if not browser_status.get("process_alive"):
-    #    raise VideoProductionError("Browser Google Flow chưa khởi động.")
-        
+
     db.upsert_video_artifact(
         video_id=video_id,
         artifact_type=artifact_type,
@@ -669,57 +740,31 @@ def _generate_scene_image(
             "reference_hash": reference_hash,
         },
     )
-    
-    import os
-    from auto_yt.services import google_flow_browser_service
-    import asyncio
-    
-    endpoint = google_flow_browser_service.get_browser_service_endpoint()
-    if not endpoint:
-        google_flow_browser_service.start_browser_service()
-        import time
-        time.sleep(5)
-        endpoint = google_flow_browser_service.get_browser_service_endpoint()
-        if not endpoint:
-            raise RuntimeError("Browser Google Flow chưa khởi động được.")
 
-        
-    async def _do_flow():
-        from playwright.async_api import async_playwright
-        from auto_yt.services.google_flow_worker import (
-            GoogleFlowWorker,
-            ReferenceAttachmentError,
-        )
-        
-        async with async_playwright() as p:
-            browser = await p.chromium.connect_over_cdp(endpoint)
-            context = browser.contexts[0]
-            # Prefer page already on flow.google.com or labs.google
-            page = None
-            for p_curr in context.pages:
-                url_lower = str(p_curr.url or "").lower()
-                if "flow.google.com" in url_lower or "labs.google" in url_lower:
-                    page = p_curr
-                    break
-            if page is None:
-                page = context.pages[0] if context.pages else await context.new_page()
+    try:
+        if _flow_mock_enabled():
+            from PIL import Image
 
-            worker = GoogleFlowWorker(page)
-            project_name = f"auto_yt_{video_id}"
-            await worker.ensure_project(project_name, force_new=force_new_project)
+            c1 = (int(scene.get("index", 0)) * 37 + 40) % 256
+            c2 = (int(scene.get("index", 0)) * 73 + 80) % 256
+            c3 = (int(scene.get("index", 0)) * 109 + 120) % 256
+            Image.new("RGB", (TARGET_WIDTH, TARGET_HEIGHT), color=(c1, c2, c3)).save(target)
+        else:
+            if worker is None:
+                raise VideoProductionError("Google Flow worker chưa được khởi tạo.")
+
+            from auto_yt.services.google_flow_worker import FlowGenerationError
 
             video_rec = db.get_video(video_id) or {}
             video_title = str(video_rec.get("title") or video_rec.get("generated_title") or "")
             scene_action = str(scene.get("action") or scene.get("transcript") or "")
             style_str = str(settings.get("style_prompt") or profile.get("style_prompt") or "")
-
             clean_prompt = _sanitize_scene_prompt_for_generation(
                 scene.get("prompt", ""),
                 video_title=video_title,
                 scene_action=scene_action,
                 style_prompt=style_str,
             )
-            avoid = negative_prompt
             refs = [reference_id] if reference_id else []
             reference_paths = (
                 {reference_id: str(reference_path)}
@@ -727,81 +772,80 @@ def _generate_scene_image(
                 else {}
             )
 
+            _log_scene_generation(
+                video_id=video_id,
+                scene_index=int(scene.get("index", 0)),
+                media_type="image",
+                state="submitted",
+                attempt=1,
+                started_at=started_at,
+            )
             try:
                 asset_url = await worker.generate_scene(
                     clean_prompt,
-                    avoid,
+                    negative_prompt,
                     refs,
                     reference_paths,
                 )
-            except ReferenceAttachmentError:
-                raise
-            except Exception as first_err:
+            except FlowGenerationError as first_error:
                 logger.warning(
-                    "First attempt generate_scene for scene %d failed (%s). Retrying with generic context-aware fallback prompt...",
+                    "Flow explicitly rejected scene %d (%s). Retrying once with a safe prompt.",
                     scene.get("index", 0),
-                    first_err,
+                    first_error,
                 )
-                concise_style = style_str.split("\n")[0][:200].strip() if style_str else "Cinematic documentary visual style, photorealistic, 8k resolution"
-                clean_action = _sanitize_scene_prompt_context(
-                    scene_action,
-                    max_chars=120,
+                concise_style = (
+                    style_str.split("\n")[0][:200].strip()
+                    if style_str
+                    else "Cinematic documentary visual style, photorealistic, 8k resolution"
                 )
+                clean_action = _sanitize_scene_prompt_context(scene_action, max_chars=120)
                 context_desc = f"Narrative action: {clean_action}. " if clean_action else ""
                 safe_prompt = (
                     f"A cinematic still photograph: {concise_style}. "
                     f"{context_desc}"
-                    f"16:9 widescreen still photograph, authentic realism, dramatic atmospheric lighting, clean visual without text."
+                    "16:9 widescreen still photograph, authentic realism, "
+                    "dramatic atmospheric lighting, clean visual without text."
                 ).replace("  ", " ").strip()
+                _log_scene_generation(
+                    video_id=video_id,
+                    scene_index=int(scene.get("index", 0)),
+                    media_type="image",
+                    state="retry_explicit_error",
+                    attempt=2,
+                    started_at=started_at,
+                    detail=str(first_error),
+                )
                 asset_url = await worker.generate_scene(
                     safe_prompt,
-                    avoid,
+                    negative_prompt,
                     refs,
                     reference_paths,
                 )
 
             await worker.download_image(asset_url, str(target))
-            
             if not target.exists() or target.stat().st_size == 0:
                 raise RuntimeError(f"Ảnh tạo từ Google Flow không hợp lệ hoặc rỗng: {target}")
-            
-            try:
-                from PIL import Image
-                with Image.open(target) as img_check:
-                    img_w, img_h = img_check.size
-                    if img_w < 800 or img_h < 400 or (img_w / max(1, img_h)) < 1.15:
-                        raise RuntimeError(
-                            f"Ảnh tải về từ Google Flow không đạt chuẩn 16:9 widescreen ({img_w}x{img_h}). Bỏ qua để tạo lại."
-                        )
-            except Exception as dim_err:
-                try:
-                    target.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                raise
-            
-    is_mock = (
-        os.environ.get("YOUTUBE_UPLOAD", "true") == "false"
-        or os.environ.get("FLOW_MOCK_GENERATION", "false") == "true"
-        or not endpoint
-    )
-    if is_mock:
-        from PIL import Image
-        c1 = (int(scene.get("index", 0)) * 37 + 40) % 256
-        c2 = (int(scene.get("index", 0)) * 73 + 80) % 256
-        c3 = (int(scene.get("index", 0)) * 109 + 120) % 256
-        img = Image.new('RGB', (TARGET_WIDTH, TARGET_HEIGHT), color=(c1, c2, c3))
-        img.save(target)
-    else:
-        asyncio.run(_do_flow())
-        
-    target_hash = _sha256_file(target)
-    if existing_hashes is not None and target_hash in existing_hashes:
-        logger.error(
-            "Generated image for scene %s is identical to an earlier scene (hash=%s). Marking failed and aborting duplicate.",
-            scene.get("index"),
-            target_hash,
-        )
+
+            from PIL import Image
+
+            with Image.open(target) as image_check:
+                image_width, image_height = image_check.size
+                if (
+                    image_width < 800
+                    or image_height < 400
+                    or image_width / max(1, image_height) < 1.15
+                ):
+                    raise RuntimeError(
+                        "Ảnh tải về từ Google Flow không đạt chuẩn 16:9 widescreen "
+                        f"({image_width}x{image_height})."
+                    )
+
+        target_hash = _sha256_file(target)
+        if existing_hashes is not None and target_hash in existing_hashes:
+            raise VideoProductionError(
+                "Tạo ảnh trùng hệt cảnh trước; dừng để tránh video lặp ảnh."
+            )
+    except Exception as exc:
         try:
             target.unlink(missing_ok=True)
         except Exception:
@@ -815,15 +859,23 @@ def _generate_scene_image(
             mime_type="image/png",
             metadata={
                 **scene,
-                "error": "Tạo ảnh trùng hệt cảnh trước",
+                "error": str(exc),
                 "generation_attempt": generation_attempt,
                 "reference_id": reference_id,
+                "reference_hash": reference_hash,
             },
         )
-        raise VideoProductionError("Tạo ảnh trùng hệt cảnh trước; dừng để tránh video lặp ảnh.")
+        _log_scene_generation(
+            video_id=video_id,
+            scene_index=int(scene.get("index", 0)),
+            media_type="image",
+            state="failed",
+            attempt=generation_attempt,
+            started_at=started_at,
+            detail=str(exc),
+        )
+        raise
 
-    output = target
-        
     progress(f"Đã tải ảnh {scene['index'] + 1}/{scene_count}", "downloading_flow_image")
     db.upsert_video_artifact(
         video_id=video_id,
@@ -838,10 +890,55 @@ def _generate_scene_image(
             "reference_id": reference_id,
         },
     )
+    _log_scene_generation(
+        video_id=video_id,
+        scene_index=int(scene.get("index", 0)),
+        media_type="image",
+        state="completed",
+        attempt=generation_attempt,
+        started_at=started_at,
+    )
     return target
 
 
-def generate_scene_images(
+def _generate_scene_image(
+    *,
+    video_id: int,
+    scene: dict,
+    scene_count: int,
+    profile: dict,
+    settings: dict,
+    reference_path: Path | None,
+    reference_id: str,
+    progress,
+    cancel_check,
+    existing_hashes: set[str] | None = None,
+    force_new_project: bool = False,
+) -> Path:
+    async def _run() -> Path:
+        async with _flow_worker_session(
+            video_id,
+            force_new_project=force_new_project,
+        ) as worker:
+            return await _generate_scene_image_async(
+                video_id=video_id,
+                scene=scene,
+                scene_count=scene_count,
+                profile=profile,
+                settings=settings,
+                reference_path=reference_path,
+                reference_id=reference_id,
+                progress=progress,
+                cancel_check=cancel_check,
+                worker=worker,
+                existing_hashes=existing_hashes,
+                force_new_project=force_new_project,
+            )
+
+    return asyncio.run(_run())
+
+
+async def _generate_scene_images_with_worker(
     *,
     video_id: int,
     scenes: list[dict],
@@ -850,11 +947,9 @@ def generate_scene_images(
     settings: dict | None = None,
     progress,
     cancel_check,
+    worker,
     force_new_project: bool = False,
 ) -> list[Path]:
-    if force_new_project:
-        purge_all_scene_artifacts(video_id)
-    cleanup_duplicate_scene_artifacts(video_id)
     settings = settings or {}
     references: dict[str, Path] = {}
     image_hashes: set[str] = set()
@@ -868,7 +963,7 @@ def generate_scene_images(
             reference_path = Path(scene_ref_path)
         else:
             reference_path = references.get(reference_id) if reference_id else None
-        image_path = _generate_scene_image(
+        image_path = await _generate_scene_image_async(
             video_id=video_id,
             scene=scene,
             scene_count=len(scenes),
@@ -878,6 +973,7 @@ def generate_scene_images(
             reference_id=reference_id,
             progress=progress,
             cancel_check=cancel_check,
+            worker=worker,
             existing_hashes=image_hashes,
             force_new_project=need_force_new,
         )
@@ -894,7 +990,42 @@ def generate_scene_images(
     return completed_paths
 
 
-def _generate_scene_video(
+def generate_scene_images(
+    *,
+    video_id: int,
+    scenes: list[dict],
+    profile: dict | None = None,
+    reference_profile: dict | None = None,
+    settings: dict | None = None,
+    progress,
+    cancel_check,
+    force_new_project: bool = False,
+) -> list[Path]:
+    if force_new_project:
+        purge_all_scene_artifacts(video_id)
+    cleanup_duplicate_scene_artifacts(video_id)
+
+    async def _run() -> list[Path]:
+        async with _flow_worker_session(
+            video_id,
+            force_new_project=force_new_project,
+        ) as worker:
+            return await _generate_scene_images_with_worker(
+                video_id=video_id,
+                scenes=scenes,
+                profile=profile,
+                reference_profile=reference_profile,
+                settings=settings,
+                progress=progress,
+                cancel_check=cancel_check,
+                worker=worker,
+                force_new_project=force_new_project,
+            )
+
+    return asyncio.run(_run())
+
+
+async def _generate_scene_video_async(
     *,
     video_id: int,
     scene: dict,
@@ -905,6 +1036,7 @@ def _generate_scene_video(
     settings: dict | None = None,
     progress,
     cancel_check,
+    worker,
     force_new_project: bool = False,
 ) -> Path:
     settings = settings or {}
@@ -929,6 +1061,7 @@ def _generate_scene_video(
     target.parent.mkdir(parents=True, exist_ok=True)
     generation_attempt = existing.get("metadata", {}).get("generation_attempt", 0) + 1 if existing else 1
     
+    started_at = time.monotonic()
     progress(
         f"Đang tạo video intro {scene['index'] + 1}/{scene_count} bằng Google Flow Veo",
         f"generating_flow_video {scene['index'] + 1}/{scene_count}",
@@ -950,42 +1083,37 @@ def _generate_scene_video(
         },
     )
 
-    import os
-    import asyncio
-    from auto_yt.services import google_flow_browser_service
-    
-    endpoint = google_flow_browser_service.get_browser_service_endpoint()
-    if not endpoint:
-        google_flow_browser_service.start_browser_service()
-        import time
-        time.sleep(5)
-        endpoint = google_flow_browser_service.get_browser_service_endpoint()
-        
-    async def _do_flow_video():
-        from playwright.async_api import async_playwright
-        from auto_yt.services.google_flow_worker import GoogleFlowWorker
-        
-        async with async_playwright() as p:
-            browser = await p.chromium.connect_over_cdp(endpoint)
-            context = browser.contexts[0]
-            page = None
-            for p_curr in context.pages:
-                url_lower = str(p_curr.url or "").lower()
-                if "flow.google.com" in url_lower or "labs.google" in url_lower:
-                    page = p_curr
-                    break
-            if page is None:
-                page = context.pages[0] if context.pages else await context.new_page()
-
-            worker = GoogleFlowWorker(page)
-            project_name = f"auto_yt_{video_id}"
-            await worker.ensure_project(project_name, force_new=force_new_project)
-            
+    try:
+        _log_scene_generation(
+            video_id=video_id,
+            scene_index=int(scene.get("index", 0)),
+            media_type="video",
+            state="submitted",
+            attempt=generation_attempt,
+            started_at=started_at,
+        )
+        if _flow_mock_enabled():
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            mock_duration = float(scene.get("duration", 8.0))
+            subprocess.run(
+                [
+                    ffmpeg_exe, "-hide_banner", "-y",
+                    "-loop", "1", "-i", str(start_frame_path),
+                    "-t", f"{mock_duration:.3f}",
+                    "-vf", f"scale={TARGET_WIDTH}:{TARGET_HEIGHT},fps={TARGET_FPS}",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    str(target),
+                ],
+                capture_output=True,
+                check=True,
+            )
+        else:
+            if worker is None:
+                raise VideoProductionError("Google Flow worker chưa được khởi tạo.")
             video_rec = db.get_video(video_id) or {}
             video_title = str(video_rec.get("title") or video_rec.get("generated_title") or "")
             scene_action = str(scene.get("action") or scene.get("transcript") or "")
-            style_str = str(settings.get("style_prompt") or profile.get("style_prompt") or "")
-
+            style_str = str(settings.get("style_prompt") or (profile or {}).get("style_prompt") or "")
             video_prompt = _format_scene_video_prompt(
                 scene.get("prompt", ""),
                 scene_action=scene_action,
@@ -994,47 +1122,52 @@ def _generate_scene_video(
                 has_start_frame=bool(start_frame_path and start_frame_path.is_file()),
                 has_end_frame=bool(end_frame_path and end_frame_path.is_file()),
             )
-            avoid = negative_prompt
-            
             ref_ids = []
             if scene.get("primary_reference_id"):
                 ref_ids.append(str(scene["primary_reference_id"]))
-                
+
             video_url = await worker.generate_scene_video(
                 prompt=video_prompt,
-                avoid_prompt=avoid,
+                avoid_prompt=negative_prompt,
                 start_frame_path=start_frame_path,
                 end_frame_path=end_frame_path,
                 reference_ids=ref_ids,
             )
             await worker.download_video(video_url, str(target))
-            
-            if not target.exists() or target.stat().st_size < 1000:
-                raise RuntimeError(f"Video tạo từ Google Flow Veo không hợp lệ hoặc quá nhỏ: {target}")
 
-    is_mock = (
-        os.environ.get("YOUTUBE_UPLOAD", "true") == "false"
-        or os.environ.get("FLOW_MOCK_GENERATION", "false") == "true"
-        or not endpoint
-    )
-    if is_mock:
-        # Create a mock video segment for testing using ffmpeg from the start frame
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        mock_duration = float(scene.get("duration", 8.0))
-        subprocess.run(
-            [
-                ffmpeg_exe, "-hide_banner", "-y",
-                "-loop", "1", "-i", str(start_frame_path),
-                "-t", f"{mock_duration:.3f}",
-                "-vf", f"scale={TARGET_WIDTH}:{TARGET_HEIGHT},fps={TARGET_FPS}",
-                "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                str(target)
-            ],
-            capture_output=True,
-            check=True,
+        if not target.exists() or target.stat().st_size < 1000:
+            raise RuntimeError(f"Video tạo từ Google Flow Veo không hợp lệ hoặc quá nhỏ: {target}")
+    except Exception as exc:
+        try:
+            target.unlink(missing_ok=True)
+        except Exception:
+            pass
+        db.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type=artifact_type,
+            path=str(target),
+            content_hash=content_hash,
+            status="failed",
+            mime_type="video/mp4",
+            metadata={
+                **scene,
+                "generation_attempt": generation_attempt,
+                "start_hash": start_hash,
+                "end_hash": end_hash,
+                "error": str(exc),
+                "fallback_reason": str(exc),
+            },
         )
-    else:
-        asyncio.run(_do_flow_video())
+        _log_scene_generation(
+            video_id=video_id,
+            scene_index=int(scene.get("index", 0)),
+            media_type="video",
+            state="failed",
+            attempt=generation_attempt,
+            started_at=started_at,
+            detail=str(exc),
+        )
+        raise
 
     progress(f"Đã tải video {scene['index'] + 1}/{scene_count}", "downloading_flow_video")
     db.upsert_video_artifact(
@@ -1049,7 +1182,50 @@ def _generate_scene_video(
             "generation_attempt": generation_attempt,
         },
     )
+    _log_scene_generation(
+        video_id=video_id,
+        scene_index=int(scene.get("index", 0)),
+        media_type="video",
+        state="completed",
+        attempt=generation_attempt,
+        started_at=started_at,
+    )
     return target
+
+
+def _generate_scene_video(
+    *,
+    video_id: int,
+    scene: dict,
+    scene_count: int,
+    start_frame_path: Path,
+    end_frame_path: Path | None = None,
+    profile: dict | None = None,
+    settings: dict | None = None,
+    progress,
+    cancel_check,
+    force_new_project: bool = False,
+) -> Path:
+    async def _run() -> Path:
+        async with _flow_worker_session(
+            video_id,
+            force_new_project=force_new_project,
+        ) as worker:
+            return await _generate_scene_video_async(
+                video_id=video_id,
+                scene=scene,
+                scene_count=scene_count,
+                start_frame_path=start_frame_path,
+                end_frame_path=end_frame_path,
+                profile=profile,
+                settings=settings,
+                progress=progress,
+                cancel_check=cancel_check,
+                worker=worker,
+                force_new_project=force_new_project,
+            )
+
+    return asyncio.run(_run())
 
 
 def generate_scene_media(
@@ -1071,57 +1247,88 @@ def generate_scene_media(
     """
     settings = settings or {}
     enable_intro_video = bool(settings.get("enable_intro_video", True))
-    
-    # Phase 1: Generate all base images
-    base_image_paths = generate_scene_images(
-        video_id=video_id,
-        scenes=scenes,
-        profile=profile,
-        reference_profile=reference_profile,
-        settings=settings,
-        progress=progress,
-        cancel_check=cancel_check,
-        force_new_project=force_new_project,
+    has_video_scenes = enable_intro_video and any(
+        bool(scene.get("is_video") or scene.get("media_type") == "video")
+        for scene in scenes
     )
-    
-    if not enable_intro_video:
-        return base_image_paths
 
-    # Phase 2: Animate intro scenes into video clips
-    media_paths: list[Path] = []
-    for idx, scene in enumerate(scenes):
-        cancel_check()
-        is_video = bool(scene.get("is_video") or scene.get("media_type") == "video")
-        if not is_video:
-            media_paths.append(base_image_paths[idx])
-            continue
-            
-        start_frame = base_image_paths[idx]
-        end_frame = base_image_paths[idx + 1] if idx + 1 < len(base_image_paths) else None
-        
-        try:
-            video_path = _generate_scene_video(
+    # Keep the public image-only facade intact while using one shared session for
+    # jobs that include both image and Veo phases.
+    if not has_video_scenes:
+        return generate_scene_images(
+            video_id=video_id,
+            scenes=scenes,
+            profile=profile,
+            reference_profile=reference_profile,
+            settings=settings,
+            progress=progress,
+            cancel_check=cancel_check,
+            force_new_project=force_new_project,
+        )
+
+    if force_new_project:
+        purge_all_scene_artifacts(video_id)
+    cleanup_duplicate_scene_artifacts(video_id)
+
+    async def _run_batch() -> list[Path]:
+        async with _flow_worker_session(
+            video_id,
+            force_new_project=force_new_project,
+        ) as worker:
+            base_image_paths = await _generate_scene_images_with_worker(
                 video_id=video_id,
-                scene=scene,
-                scene_count=len(scenes),
-                start_frame_path=start_frame,
-                end_frame_path=end_frame,
-                profile=profile or {},
+                scenes=scenes,
+                profile=profile,
+                reference_profile=reference_profile,
                 settings=settings,
                 progress=progress,
                 cancel_check=cancel_check,
-                force_new_project=False,
+                worker=worker,
+                force_new_project=force_new_project,
             )
-            media_paths.append(video_path)
-        except Exception as video_exc:
-            logger.warning(
-                "Tạo video Veo cho scene %d thất bại (%s). Tự động fallback sang ảnh tĩnh zoompan...",
-                idx,
-                video_exc,
-            )
-            media_paths.append(start_frame)
-            
-    return media_paths
+
+            media_paths: list[Path] = []
+            for index, scene in enumerate(scenes):
+                cancel_check()
+                is_video = bool(
+                    scene.get("is_video") or scene.get("media_type") == "video"
+                )
+                if not is_video:
+                    media_paths.append(base_image_paths[index])
+                    continue
+
+                start_frame = base_image_paths[index]
+                end_frame = (
+                    base_image_paths[index + 1]
+                    if index + 1 < len(base_image_paths)
+                    else None
+                )
+                try:
+                    video_path = await _generate_scene_video_async(
+                        video_id=video_id,
+                        scene=scene,
+                        scene_count=len(scenes),
+                        start_frame_path=start_frame,
+                        end_frame_path=end_frame,
+                        profile=profile or {},
+                        settings=settings,
+                        progress=progress,
+                        cancel_check=cancel_check,
+                        worker=worker,
+                        force_new_project=False,
+                    )
+                    media_paths.append(video_path)
+                except Exception as video_error:
+                    logger.warning(
+                        "Tạo video Veo cho scene %d thất bại (%s). "
+                        "Tự động fallback sang ảnh tĩnh zoompan...",
+                        index,
+                        video_error,
+                    )
+                    media_paths.append(start_frame)
+            return media_paths
+
+    return asyncio.run(_run_batch())
 
 
 def _format_srt_time(seconds: float) -> str:

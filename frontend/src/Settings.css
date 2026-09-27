@@ -5,18 +5,63 @@
   box-sizing: border-box;
 }
 
+.settings-header {
+  margin-bottom: 8px;
+}
+
 .version-control {
-  background-color: rgba(26, 26, 26, 0.8);
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  background-color: rgba(18, 16, 28, 0.92);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
   border-radius: 12px;
-  padding: 20px;
-  border: 1px solid #333;
-  margin-top: 20px;
-  margin-bottom: 30px;
+  padding: 16px 20px;
+  border: 1px solid rgba(139, 92, 246, 0.28);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.06);
+  margin-top: 16px;
+  margin-bottom: 26px;
   display: flex;
   justify-content: space-between;
   align-items: center;
   flex-wrap: wrap;
   gap: 15px;
+  transition: box-shadow 0.2s ease, border-color 0.2s ease;
+}
+
+.version-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.btn-save-all {
+  background: linear-gradient(135deg, #8b5cf6 0%, #6366f1 100%);
+  color: #ffffff;
+  border: 1px solid rgba(139, 92, 246, 0.5);
+  padding: 10px 18px;
+  border-radius: 8px;
+  font-weight: 600;
+  font-size: 0.95rem;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  box-shadow: 0 0 16px rgba(139, 92, 246, 0.35);
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  white-space: nowrap;
+}
+
+.btn-save-all:hover:not(:disabled) {
+  background: linear-gradient(135deg, #7c3aed 0%, #4f46e5 100%);
+  box-shadow: 0 0 24px rgba(139, 92, 246, 0.6);
+  transform: translateY(-1px);
+}
+
+.btn-save-all:active:not(:disabled) {
+  transform: translateY(0);
 }
 
 .prompt-lock-notice {
@@ -258,6 +303,11 @@ button:disabled {
   .version-editor .version-select,
   .version-name-input {
     width: 100%;
+  }
+
+  .version-actions {
+    width: 100%;
+    justify-content: flex-start;
   }
 
   .prompt-header {
