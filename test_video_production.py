@@ -1026,6 +1026,90 @@ class VideoProductionServiceTests(unittest.TestCase):
         artifact = database.get_latest_video_artifact(video_id, "scene:0")
         self.assertEqual(artifact["status"], "failed")
 
+    def test_scene_image_submission_failure_is_not_retried(self):
+        from auto_yt.services.google_flow_worker import FlowSubmissionError
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-no-submit-retry",
+            "No submission retry",
+            "Transcript",
+            "Script",
+        )
+        worker = MagicMock()
+        worker.generate_scene = AsyncMock(
+            side_effect=FlowSubmissionError("prompt not acknowledged")
+        )
+        worker.download_image = AsyncMock()
+        scene = {"index": 0, "prompt": "scene", "action": "action"}
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            with self.assertRaises(FlowSubmissionError):
+                asyncio.run(
+                    video_production._generate_scene_image_async(
+                        video_id=video_id,
+                        scene=scene,
+                        scene_count=1,
+                        profile={},
+                        settings={},
+                        reference_path=None,
+                        reference_id="",
+                        progress=lambda message, stage: None,
+                        cancel_check=lambda: None,
+                        worker=worker,
+                        existing_hashes=set(),
+                    )
+                )
+
+        self.assertEqual(worker.generate_scene.await_count, 1)
+        worker.download_image.assert_not_awaited()
+        artifact = database.get_latest_video_artifact(video_id, "scene:0")
+        self.assertEqual(artifact["status"], "failed")
+        self.assertIn("not acknowledged", artifact["metadata"]["error"])
+
+    def test_scene_image_invalid_output_is_not_retried(self):
+        from auto_yt.services.google_flow_worker import FlowInvalidOutputError
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-invalid-output-no-retry",
+            "Invalid output no retry",
+            "Transcript",
+            "Script",
+        )
+        worker = MagicMock()
+        worker.generate_scene = AsyncMock(
+            side_effect=FlowInvalidOutputError("invalid 433x461")
+        )
+        worker.download_image = AsyncMock()
+        scene = {"index": 0, "prompt": "scene", "action": "action"}
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            with self.assertRaises(FlowInvalidOutputError):
+                asyncio.run(
+                    video_production._generate_scene_image_async(
+                        video_id=video_id,
+                        scene=scene,
+                        scene_count=1,
+                        profile={},
+                        settings={},
+                        reference_path=None,
+                        reference_id="",
+                        progress=lambda message, stage: None,
+                        cancel_check=lambda: None,
+                        worker=worker,
+                        existing_hashes=set(),
+                    )
+                )
+
+        self.assertEqual(worker.generate_scene.await_count, 1)
+        worker.download_image.assert_not_awaited()
+        artifact = database.get_latest_video_artifact(video_id, "scene:0")
+        self.assertEqual(artifact["status"], "failed")
+        self.assertIn("433x461", artifact["metadata"]["error"])
+
     def test_failed_veo_attempt_marks_artifact_failed(self):
         from PIL import Image
         from auto_yt.services.google_flow_worker import FlowModeError

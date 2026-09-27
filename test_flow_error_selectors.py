@@ -37,7 +37,10 @@ class TestFlowErrorFiltering(unittest.TestCase):
     def test_canvas_error_selectors_do_not_contain_virtual_item_container(self):
         import inspect
         selector_src = inspect.getsource(GoogleFlowWorker._get_existing_error_texts)
-        generate_src = inspect.getsource(GoogleFlowWorker.generate_scene)
+        generate_src = (
+            inspect.getsource(GoogleFlowWorker.generate_scene)
+            + inspect.getsource(GoogleFlowWorker._generate_scene_on_canvas)
+        )
         src = f"{selector_src}\n{generate_src}"
         self.assertNotIn(".virtual-item-container:has-text('Failed')", src)
         self.assertNotIn("div:has-text('The agent failed')", src)

@@ -1,12 +1,18 @@
 import asyncio
+import io
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from PIL import Image
+
 from auto_yt.services.google_flow_worker import (
     FlowGenerationStartError,
+    FlowInvalidOutputError,
     FlowModeError,
+    FlowResultMissingError,
+    FlowSubmissionError,
     FlowUiStateError,
     GoogleFlowWorker,
     REFERENCE_RESULT_ATTACHED,
@@ -14,6 +20,12 @@ from auto_yt.services.google_flow_worker import (
     REFERENCE_RESULT_UI_ERROR,
     ReferenceAttachmentError,
 )
+
+
+def _image_bytes(size=(1376, 768)):
+    buffer = io.BytesIO()
+    Image.new("RGB", size, color=(20, 40, 60)).save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
@@ -110,7 +122,21 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
         worker = GoogleFlowWorker(page)
         with (
             patch.object(worker, "wait_for_editor", AsyncMock(return_value=editor_loc)),
-            patch.object(worker, "_get_existing_images", AsyncMock(return_value=set(existing_imgs_mock))),
+            patch.object(
+                worker,
+                "_capture_stable_image_baseline",
+                AsyncMock(return_value={worker._media_key(existing_imgs_mock[0])}),
+            ),
+            patch.object(
+                worker,
+                "_resolve_new_media_source",
+                AsyncMock(return_value="https://flow-content.google/image/new2"),
+            ),
+            patch.object(
+                worker,
+                "_submit_prompt_and_wait_for_ack",
+                AsyncMock(return_value=(0.0, "https://flow-content.google/image/new2")),
+            ),
         ):
             img_url = await worker.generate_scene("A sunset", "blur", [])
             self.assertEqual(img_url, "https://flow-content.google/image/new2")
@@ -202,7 +228,21 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
         worker = GoogleFlowWorker(page)
         with (
             patch.object(worker, "wait_for_editor", AsyncMock(return_value=editor_loc)),
-            patch.object(worker, "_get_existing_images", AsyncMock(return_value=set(existing_imgs_mock))),
+            patch.object(
+                worker,
+                "_capture_stable_image_baseline",
+                AsyncMock(return_value={worker._media_key(existing_imgs_mock[0])}),
+            ),
+            patch.object(
+                worker,
+                "_resolve_new_media_source",
+                AsyncMock(return_value="https://flow-content.google/image/new2"),
+            ),
+            patch.object(
+                worker,
+                "_submit_prompt_and_wait_for_ack",
+                AsyncMock(return_value=(0.0, "https://flow-content.google/image/new2")),
+            ),
         ):
             img_url = await worker.generate_scene("A sunset", "blur", [])
             self.assertEqual(img_url, "https://flow-content.google/image/new2")
@@ -640,10 +680,17 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
             "height": 768,
         }
 
-        with patch.object(
-            worker,
-            "_collect_image_candidates",
-            AsyncMock(side_effect=[[small], [small, large]]),
+        with (
+            patch.object(
+                worker,
+                "_collect_image_candidates",
+                AsyncMock(side_effect=[[small], [small, large]]),
+            ),
+            patch.object(
+                worker,
+                "_validate_image_candidate",
+                AsyncMock(side_effect=["", large["src"]]),
+            ),
         ):
             result = await worker._resolve_new_media_source("image", set())
 
@@ -700,6 +747,203 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
                     submitted_at=0.0,
                     timeout_seconds=240.0,
                 )
+
+    async def test_submit_uses_composer_button_and_does_not_press_enter_after_ack(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        page.keyboard = MagicMock()
+        page.keyboard.press = AsyncMock()
+        editor = MagicMock()
+        button = MagicMock()
+        button.click = AsyncMock()
+        worker = GoogleFlowWorker(page)
+
+        with (
+            patch.object(worker, "_capture_submission_marker", AsyncMock(return_value="baseline")),
+            patch.object(worker, "_find_prompt_submit_button", AsyncMock(return_value=button)),
+            patch.object(
+                worker,
+                "_wait_for_submission_ack",
+                AsyncMock(return_value=("", "conversation")),
+            ),
+            patch.object(worker, "dismiss_blocking_dialogs", AsyncMock()),
+        ):
+            _, source = await worker._submit_prompt_and_wait_for_ack(
+                editor=editor,
+                full_prompt="prompt",
+                media_type="image",
+                baseline_keys=set(),
+            )
+
+        self.assertEqual(source, "")
+        button.click.assert_awaited_once()
+        page.keyboard.press.assert_not_awaited()
+
+    async def test_submit_falls_back_to_enter_only_when_prompt_remains(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        page.keyboard = MagicMock()
+        page.keyboard.press = AsyncMock()
+        editor = MagicMock()
+        editor.focus = AsyncMock()
+        button = MagicMock()
+        button.click = AsyncMock()
+        worker = GoogleFlowWorker(page)
+
+        with (
+            patch.object(worker, "_capture_submission_marker", AsyncMock(return_value="baseline")),
+            patch.object(worker, "_find_prompt_submit_button", AsyncMock(return_value=button)),
+            patch.object(
+                worker,
+                "_wait_for_submission_ack",
+                AsyncMock(side_effect=[("", ""), ("", "activity")]),
+            ),
+            patch.object(worker, "_read_editor_text", AsyncMock(return_value="prompt")),
+            patch.object(worker, "dismiss_blocking_dialogs", AsyncMock()),
+        ):
+            await worker._submit_prompt_and_wait_for_ack(
+                editor=editor,
+                full_prompt="prompt",
+                media_type="image",
+                baseline_keys=set(),
+            )
+
+        button.click.assert_awaited_once()
+        page.keyboard.press.assert_awaited_once_with("Enter")
+
+    async def test_submit_does_not_retry_when_editor_clears_without_strong_ack(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        page.keyboard = MagicMock()
+        page.keyboard.press = AsyncMock()
+        editor = MagicMock()
+        button = MagicMock()
+        button.click = AsyncMock()
+        worker = GoogleFlowWorker(page)
+
+        with (
+            patch.object(worker, "_capture_submission_marker", AsyncMock(return_value="baseline")),
+            patch.object(worker, "_find_prompt_submit_button", AsyncMock(return_value=button)) as find_button,
+            patch.object(worker, "_wait_for_submission_ack", AsyncMock(return_value=("", ""))),
+            patch.object(worker, "_read_editor_text", AsyncMock(return_value="")),
+            patch.object(worker, "dismiss_blocking_dialogs", AsyncMock()),
+        ):
+            _, source = await worker._submit_prompt_and_wait_for_ack(
+                editor=editor,
+                full_prompt="prompt",
+                media_type="image",
+                baseline_keys=set(),
+            )
+
+        self.assertEqual(source, "")
+        self.assertEqual(find_button.await_count, 1)
+        button.click.assert_awaited_once()
+        page.keyboard.press.assert_not_awaited()
+
+    async def test_submit_failure_raises_without_starting_generation_wait(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        page.keyboard = MagicMock()
+        page.keyboard.press = AsyncMock()
+        editor = MagicMock()
+        editor.focus = AsyncMock()
+        button = MagicMock()
+        button.click = AsyncMock()
+        worker = GoogleFlowWorker(page)
+
+        with (
+            patch.object(worker, "_capture_submission_marker", AsyncMock(return_value="baseline")),
+            patch.object(worker, "_find_prompt_submit_button", AsyncMock(return_value=button)),
+            patch.object(worker, "_wait_for_submission_ack", AsyncMock(return_value=("", ""))),
+            patch.object(worker, "_read_editor_text", AsyncMock(return_value="prompt")),
+            patch.object(worker, "dismiss_blocking_dialogs", AsyncMock()),
+            patch.object(worker, "_save_debug_screenshot", AsyncMock()) as screenshot,
+        ):
+            with self.assertRaises(FlowSubmissionError):
+                await worker._submit_prompt_and_wait_for_ack(
+                    editor=editor,
+                    full_prompt="prompt",
+                    media_type="image",
+                    baseline_keys=set(),
+                )
+
+        button.click.assert_awaited_once()
+        page.keyboard.press.assert_awaited_once_with("Enter")
+        screenshot.assert_awaited_once_with("image_submit_failed")
+
+    async def test_submission_ack_detects_new_conversation_state_without_progress(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+
+        with (
+            patch.object(worker, "_resolve_new_media_source", AsyncMock(return_value="")),
+            patch.object(worker, "_read_generation_activity", AsyncMock(return_value=False)),
+            patch.object(worker, "_capture_submission_marker", AsyncMock(return_value="new-turn")),
+        ):
+            source, reason = await worker._wait_for_submission_ack(
+                media_type="image",
+                baseline_keys={"old-image"},
+                baseline_marker="old-turn",
+            )
+
+        self.assertEqual(source, "")
+        self.assertEqual(reason, "conversation")
+
+    async def test_previous_scene_state_does_not_acknowledge_new_submission(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+
+        with (
+            patch.object(worker, "_resolve_new_media_source", AsyncMock(return_value="")),
+            patch.object(worker, "_read_generation_activity", AsyncMock(return_value=False)),
+            patch.object(worker, "_capture_submission_marker", AsyncMock(return_value="old-turn")),
+            patch("auto_yt.services.google_flow_worker.SUBMISSION_ACK_TIMEOUT_SECONDS", 0.0),
+        ):
+            source, reason = await worker._wait_for_submission_ack(
+                media_type="image",
+                baseline_keys={"old-image"},
+                baseline_marker="old-turn",
+            )
+
+        self.assertEqual(source, "")
+        self.assertEqual(reason, "")
+
+    async def test_acknowledged_generation_can_start_after_twenty_seconds(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        regular_scans = 0
+
+        async def resolve(_media_type, _baseline_keys, *, recover=False):
+            nonlocal regular_scans
+            if recover:
+                return ""
+            regular_scans += 1
+            return "https://flow-content.google/image/generated" if regular_scans == 2 else ""
+
+        with (
+            patch.object(worker, "_resolve_new_media_source", AsyncMock(side_effect=resolve)),
+            patch.object(worker, "_read_generation_activity", AsyncMock(return_value=False)),
+            patch.object(worker, "_get_existing_error_texts", AsyncMock(return_value=set())),
+            patch.object(worker, "_get_snackbar_error", AsyncMock(return_value="")),
+            patch.object(worker, "handle_confirmation_prompts", AsyncMock()),
+            patch("auto_yt.services.google_flow_worker.asyncio.sleep", AsyncMock()),
+            patch(
+                "auto_yt.services.google_flow_worker.time.monotonic",
+                side_effect=[21.0, 22.0, 22.0],
+            ),
+        ):
+            result = await worker._wait_for_new_media(
+                media_type="image",
+                baseline_keys=set(),
+                initial_error_texts=set(),
+                submitted_at=0.0,
+                timeout_seconds=240.0,
+            )
+
+        self.assertEqual(result, "https://flow-content.google/image/generated")
 
     async def test_three_ui_poll_errors_fail_without_waiting_for_timeout(self):
         page = MagicMock()
@@ -786,6 +1030,11 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
                     "_wait_for_new_media",
                     AsyncMock(return_value="blob:https://flow.google/video-new"),
                 ),
+                patch.object(
+                    worker,
+                    "_submit_prompt_and_wait_for_ack",
+                    AsyncMock(return_value=(0.0, "blob:https://flow.google/video-new")),
+                ),
                 patch("auto_yt.services.google_flow_worker.asyncio.sleep", AsyncMock()),
             ):
                 result = await worker.generate_scene_video(
@@ -802,6 +1051,424 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
             [call.args[1] for call in attach_frame.await_args_list],
             ["start", "end"],
         )
+
+    async def test_wait_for_editor_rejects_asset_edit_route(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one/edit/asset-one"
+        worker = GoogleFlowWorker(page)
+
+        with self.assertRaises(FlowUiStateError):
+            await worker.wait_for_editor(timeout=0.1)
+
+    async def test_restore_project_canvas_navigates_when_done_is_unavailable(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one/edit/asset-one"
+        done = MagicMock()
+        done.first.is_visible = AsyncMock(return_value=False)
+        page.locator.return_value = done
+
+        async def navigate(url, **_kwargs):
+            page.url = url
+
+        page.goto = AsyncMock(side_effect=navigate)
+        worker = GoogleFlowWorker(page)
+        with patch.object(worker, "wait_for_load", AsyncMock()):
+            await worker._restore_project_canvas()
+
+        self.assertEqual(page.url, "https://flow.google.com/project/project-one")
+        page.goto.assert_awaited_once()
+
+    async def test_ensure_project_does_not_reuse_asset_edit_route(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one/edit/asset-one"
+        page.title = AsyncMock(return_value="auto_yt_236")
+        done = MagicMock()
+        done.first.is_visible = AsyncMock(return_value=False)
+        page.locator.return_value = done
+
+        async def navigate(url, **_kwargs):
+            page.url = url
+
+        page.goto = AsyncMock(side_effect=navigate)
+        worker = GoogleFlowWorker(page)
+        with (
+            patch.object(worker, "wait_for_load", AsyncMock()),
+            patch.object(worker, "wait_for_editor", AsyncMock()) as wait_for_editor,
+        ):
+            result = await worker.ensure_project("auto_yt_236")
+
+        self.assertEqual(result, "https://flow.google.com/project/project-one")
+        wait_for_editor.assert_awaited_once()
+
+    async def test_generate_scene_restores_canvas_before_prompt_work(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one/edit/asset-one"
+        done = MagicMock()
+        done.first.is_visible = AsyncMock(return_value=False)
+        page.locator.return_value = done
+
+        async def navigate(url, **_kwargs):
+            page.url = url
+
+        page.goto = AsyncMock(side_effect=navigate)
+        worker = GoogleFlowWorker(page)
+        with (
+            patch.object(worker, "wait_for_load", AsyncMock()),
+            patch.object(
+                worker,
+                "_generate_scene_on_canvas",
+                AsyncMock(return_value="https://flow-content.google/image/new"),
+            ) as generate,
+        ):
+            result = await worker.generate_scene("prompt", "avoid", [])
+
+        self.assertEqual(result, "https://flow-content.google/image/new")
+        self.assertEqual(page.url, "https://flow.google.com/project/project-one")
+        generate.assert_awaited_once()
+
+    async def test_reference_portrait_is_excluded_before_download_or_click(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        page.request.get = AsyncMock()
+        worker = GoogleFlowWorker(page)
+        worker._active_reference_filenames = {"le_trong_tan.jpg"}
+        reference = {
+            "src": "https://flow-content.google/image/reference",
+            "assetId": "reference-asset",
+            "labelText": "le_trong_tan.jpg\nHình ảnh",
+            "width": 433,
+            "height": 461,
+        }
+
+        with patch.object(
+            worker,
+            "_collect_image_candidates",
+            AsyncMock(return_value=[reference]),
+        ):
+            result = await worker._resolve_new_media_source("image", set())
+
+        self.assertEqual(result, "")
+        page.request.get.assert_not_awaited()
+
+    async def test_reference_asset_key_excludes_late_candidate(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        worker._active_reference_keys = {"asset:reference-asset"}
+        candidate = {
+            "src": "https://flow-content.google/image/reference-late",
+            "assetId": "reference-asset",
+            "labelText": "",
+        }
+
+        self.assertIsNone(worker._find_new_media_candidate([candidate], set()))
+
+    async def test_similar_reference_filename_is_not_excluded(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        worker._active_reference_filenames = {"le_trong_tan.jpg"}
+        candidate = {
+            "src": "https://flow-content.google/image/similar",
+            "assetId": "similar-asset",
+            "labelText": "le_trong_tan_old.jpg\nHình ảnh",
+        }
+
+        self.assertIs(
+            worker._find_new_media_candidate([candidate], set()),
+            candidate,
+        )
+
+    async def test_reference_and_generated_image_selects_generated_output(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        page.evaluate = AsyncMock()
+        response = MagicMock()
+        response.status = 200
+        response.body = AsyncMock(return_value=_image_bytes())
+        page.request.get = AsyncMock(return_value=response)
+        worker = GoogleFlowWorker(page)
+        worker._active_reference_filenames = {"le_trong_tan.jpg"}
+        reference = {
+            "src": "https://flow-content.google/image/reference",
+            "assetId": "reference-asset",
+            "labelText": "le_trong_tan.jpg\nHình ảnh",
+            "width": 433,
+            "height": 461,
+        }
+        generated = {
+            "src": "https://flow-content.google/image/generated",
+            "assetId": "generated-asset",
+            "labelText": "Generated scene",
+            "width": 320,
+            "height": 180,
+        }
+
+        with patch.object(
+            worker,
+            "_collect_image_candidates",
+            AsyncMock(return_value=[reference, generated]),
+        ):
+            result = await worker._resolve_new_media_source("image", set())
+
+        self.assertEqual(result, generated["src"])
+        page.request.get.assert_awaited_once_with(generated["src"], timeout=30000)
+        page.evaluate.assert_not_awaited()
+
+    async def test_reference_sync_happens_before_image_baseline(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        events = []
+
+        async def sync(*_args):
+            events.append("reference")
+
+        async def baseline():
+            events.append("baseline")
+            return set()
+
+        with (
+            patch.object(worker, "sync_reference_ingredients", AsyncMock(side_effect=sync)),
+            patch.object(worker, "_capture_stable_image_baseline", AsyncMock(side_effect=baseline)),
+            patch.object(worker, "_get_existing_error_texts", AsyncMock(return_value=set())),
+            patch.object(worker, "wait_for_editor", AsyncMock(side_effect=RuntimeError("stop"))),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                await worker._generate_scene_on_canvas("prompt", "avoid", [], {})
+
+        self.assertEqual(events, ["reference", "baseline"])
+
+    async def test_validated_payload_is_reused_by_download_image(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            page = MagicMock()
+            page.url = "https://flow.google.com/project/project-one"
+            response = MagicMock()
+            response.status = 200
+            response.body = AsyncMock(return_value=_image_bytes())
+            page.request.get = AsyncMock(return_value=response)
+            worker = GoogleFlowWorker(page)
+            asset_url = "https://flow-content.google/image/generated?token=one"
+
+            self.assertTrue(await worker._validate_image_url(asset_url))
+            target = Path(temp_dir) / "scene.png"
+            await worker.download_image(asset_url, str(target))
+
+            self.assertTrue(target.is_file())
+            self.assertEqual(page.request.get.await_count, 1)
+
+    async def test_invalid_candidate_does_not_hide_later_valid_candidate(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+
+        async def request_image(url, **_kwargs):
+            response = MagicMock()
+            response.status = 200
+            response.body = AsyncMock(
+                return_value=_image_bytes((433, 461))
+                if url.endswith("portrait")
+                else _image_bytes()
+            )
+            return response
+
+        page.request.get = AsyncMock(side_effect=request_image)
+        page.evaluate = AsyncMock()
+        worker = GoogleFlowWorker(page)
+        portrait = {
+            "src": "https://flow-content.google/image/portrait",
+            "assetId": "portrait",
+            "width": 433,
+            "height": 461,
+        }
+        generated = {
+            "src": "https://flow-content.google/image/generated",
+            "assetId": "generated",
+            "width": 320,
+            "height": 180,
+        }
+
+        with patch.object(
+            worker,
+            "_collect_image_candidates",
+            AsyncMock(return_value=[portrait, generated]),
+        ):
+            result = await worker._resolve_new_media_source("image", set())
+
+        self.assertEqual(result, generated["src"])
+        self.assertEqual(worker._last_invalid_image_size, (433, 461))
+        page.evaluate.assert_not_awaited()
+
+    async def test_thumbnail_and_original_query_variants_are_validated_separately(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+
+        async def request_image(url, **_kwargs):
+            response = MagicMock()
+            response.status = 200
+            response.body = AsyncMock(
+                return_value=_image_bytes((320, 180))
+                if "size=thumb" in url
+                else _image_bytes()
+            )
+            return response
+
+        page.request.get = AsyncMock(side_effect=request_image)
+        worker = GoogleFlowWorker(page)
+        thumbnail = "https://flow-content.google/image/asset?size=thumb"
+        original = "https://flow-content.google/image/asset?size=original"
+        candidate = {
+            "src": thumbnail,
+            "urls": [thumbnail, original],
+            "assetId": "asset-one",
+        }
+
+        result = await worker._validate_image_candidate(candidate)
+
+        self.assertEqual(result, original)
+        self.assertEqual(page.request.get.await_count, 2)
+
+    async def test_invalid_output_raises_after_flow_is_idle(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        worker._last_invalid_image_size = (433, 461)
+
+        with (
+            patch.object(worker, "_resolve_new_media_source", AsyncMock(return_value="")),
+            patch.object(worker, "_read_generation_activity", AsyncMock(return_value=False)),
+            patch.object(worker, "_get_existing_error_texts", AsyncMock(return_value=set())),
+            patch.object(worker, "_get_snackbar_error", AsyncMock(return_value="")),
+            patch.object(worker, "handle_confirmation_prompts", AsyncMock()),
+            patch.object(worker, "_save_debug_screenshot", AsyncMock()),
+            patch("auto_yt.services.google_flow_worker.GENERATION_START_TIMEOUT_SECONDS", 0.0),
+            patch("auto_yt.services.google_flow_worker.GENERATION_POLL_SECONDS", 0.0),
+            patch("auto_yt.services.google_flow_worker.asyncio.sleep", AsyncMock()),
+        ):
+            with self.assertRaises(FlowInvalidOutputError):
+                await worker._wait_for_new_media(
+                    media_type="image",
+                    baseline_keys=set(),
+                    initial_error_texts=set(),
+                    submitted_at=0.0,
+                    timeout_seconds=240.0,
+                )
+
+    async def test_only_reference_after_generation_returns_result_missing(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+
+        with (
+            patch.object(worker, "_resolve_new_media_source", AsyncMock(return_value="")),
+            patch.object(
+                worker,
+                "_read_generation_activity",
+                AsyncMock(side_effect=[True, False, False]),
+            ),
+            patch.object(worker, "_get_existing_error_texts", AsyncMock(return_value=set())),
+            patch.object(worker, "_get_snackbar_error", AsyncMock(return_value="")),
+            patch.object(worker, "handle_confirmation_prompts", AsyncMock()),
+            patch.object(worker, "_save_debug_screenshot", AsyncMock()),
+            patch("auto_yt.services.google_flow_worker.GENERATION_IDLE_GRACE_SECONDS", 0.0),
+            patch("auto_yt.services.google_flow_worker.GENERATION_POLL_SECONDS", 0.0),
+            patch("auto_yt.services.google_flow_worker.asyncio.sleep", AsyncMock()),
+        ):
+            with self.assertRaises(FlowResultMissingError):
+                await worker._wait_for_new_media(
+                    media_type="image",
+                    baseline_keys=set(),
+                    initial_error_texts=set(),
+                    submitted_at=asyncio.get_event_loop().time(),
+                    timeout_seconds=240.0,
+                )
+
+    async def test_detail_fallback_restores_canvas_before_returning(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        done = MagicMock()
+        done.first.is_visible = AsyncMock(return_value=True)
+
+        async def close_detail(**_kwargs):
+            page.url = "https://flow.google.com/project/project-one"
+
+        done.first.click = AsyncMock(side_effect=close_detail)
+        page.locator.return_value = done
+
+        async def open_detail(*_args):
+            page.url = "https://flow.google.com/project/project-one/edit/generated"
+            return True
+
+        page.evaluate = AsyncMock(side_effect=open_detail)
+        worker = GoogleFlowWorker(page)
+        candidate = {
+            "src": "https://flow-content.google/image/thumb",
+            "assetId": "generated",
+        }
+        detail = {
+            "src": "https://flow-content.google/image/full",
+            "assetId": "generated",
+        }
+
+        with (
+            patch.object(
+                worker,
+                "_collect_image_candidates",
+                AsyncMock(return_value=[detail]),
+            ),
+            patch.object(
+                worker,
+                "_validate_image_candidate",
+                AsyncMock(return_value=detail["src"]),
+            ),
+            patch("auto_yt.services.google_flow_worker.asyncio.sleep", AsyncMock()),
+        ):
+            result = await worker._inspect_image_candidate_detail(candidate, set())
+
+        self.assertEqual(result, detail["src"])
+        self.assertEqual(page.url, "https://flow.google.com/project/project-one")
+        done.first.click.assert_awaited_once()
+
+    async def test_detail_fallback_restores_canvas_when_validation_fails(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        done = MagicMock()
+        done.first.is_visible = AsyncMock(return_value=True)
+
+        async def close_detail(**_kwargs):
+            page.url = "https://flow.google.com/project/project-one"
+
+        done.first.click = AsyncMock(side_effect=close_detail)
+        page.locator.return_value = done
+
+        async def open_detail(*_args):
+            page.url = "https://flow.google.com/project/project-one/edit/generated"
+            return True
+
+        page.evaluate = AsyncMock(side_effect=open_detail)
+        worker = GoogleFlowWorker(page)
+        candidate = {
+            "src": "https://flow-content.google/image/thumb",
+            "assetId": "generated",
+        }
+
+        with (
+            patch.object(
+                worker,
+                "_collect_image_candidates",
+                AsyncMock(return_value=[candidate]),
+            ),
+            patch.object(
+                worker,
+                "_validate_image_candidate",
+                AsyncMock(side_effect=RuntimeError("validation failed")),
+            ),
+            patch("auto_yt.services.google_flow_worker.asyncio.sleep", AsyncMock()),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "validation failed"):
+                await worker._inspect_image_candidate_detail(candidate, set())
+
+        self.assertEqual(page.url, "https://flow.google.com/project/project-one")
+        done.first.click.assert_awaited_once()
 
 
 if __name__ == "__main__":

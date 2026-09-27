@@ -1,9 +1,11 @@
 import asyncio
 import datetime as dt
+import io
 import logging
 import re
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from PIL import Image
 from playwright.async_api import Page, Locator
@@ -21,11 +23,18 @@ REFERENCE_RESULT_UI_ERROR = "ui_error"
 REFERENCE_ASSET_SCAN_LIMIT = 100
 IMAGE_GENERATION_TIMEOUT_SECONDS = 240.0
 VIDEO_GENERATION_TIMEOUT_SECONDS = 180.0
-GENERATION_START_TIMEOUT_SECONDS = 20.0
+GENERATION_START_TIMEOUT_SECONDS = 45.0
 GENERATION_IDLE_GRACE_SECONDS = 10.0
 VIDEO_MODE_TIMEOUT_SECONDS = 10.0
 GENERATION_POLL_SECONDS = 1.0
+SUBMISSION_ACK_TIMEOUT_SECONDS = 10.0
+SUBMISSION_ACK_POLL_SECONDS = 0.5
 MAX_CONSECUTIVE_UI_ERRORS = 3
+IMAGE_BASELINE_STABILIZE_SECONDS = 2.0
+IMAGE_BASELINE_POLL_SECONDS = 0.25
+MIN_GENERATED_IMAGE_WIDTH = 800
+MIN_GENERATED_IMAGE_HEIGHT = 400
+MIN_GENERATED_IMAGE_ASPECT_RATIO = 1.15
 
 
 class ReferenceAttachmentError(RuntimeError):
@@ -38,6 +47,10 @@ class FlowGenerationError(RuntimeError):
 
 class FlowGenerationStartError(RuntimeError):
     """Raised when Flow never shows progress or a new result after submission."""
+
+
+class FlowSubmissionError(RuntimeError):
+    """Raised when Flow does not acknowledge a prompt submission."""
 
 
 class FlowUiStateError(RuntimeError):
@@ -54,6 +67,10 @@ class FlowGenerationTimeout(RuntimeError):
 
 class FlowModeError(RuntimeError):
     """Raised when the requested Flow generation mode cannot be confirmed."""
+
+
+class FlowInvalidOutputError(RuntimeError):
+    """Raised when Flow exposes a new image that fails output validation."""
 
 # ---------------------------------------------------------------------------
 # SynthID / Google Flow watermark removal
@@ -114,6 +131,131 @@ class GoogleFlowWorker:
         self.page = page
         self._current_project_name = ""
         self._uploaded_image_urls = self._session_uploaded_image_urls
+        self._project_root_url = self._project_root_from_url(str(page.url or ""))
+        self._active_reference_keys: set[str] = set()
+        self._active_reference_filenames: set[str] = set()
+        self._rejected_image_urls: set[str] = set()
+        self._inspected_detail_keys: set[str] = set()
+        self._last_invalid_image_size: tuple[int, int] | None = None
+        self._validated_image_payload: tuple[str, bytes] | None = None
+
+    @staticmethod
+    def _project_root_from_url(url: str) -> str:
+        match = re.search(
+            r"^(https?://[^/]+/project/[^/?#]+)",
+            str(url or ""),
+            flags=re.IGNORECASE,
+        )
+        return match.group(1) if match else ""
+
+    @staticmethod
+    def _is_asset_edit_url(url: str) -> bool:
+        path = urlsplit(str(url or "")).path.rstrip("/")
+        return bool(re.fullmatch(r"/project/[^/]+/edit/[^/]+", path, flags=re.IGNORECASE))
+
+    @staticmethod
+    def _is_project_canvas_url(url: str) -> bool:
+        path = urlsplit(str(url or "")).path.rstrip("/")
+        return bool(re.fullmatch(r"/project/[^/]+", path, flags=re.IGNORECASE))
+
+    def _remember_project_root(self) -> None:
+        project_root = self._project_root_from_url(str(self.page.url or ""))
+        if project_root:
+            self._project_root_url = project_root
+
+    async def _restore_project_canvas(self) -> None:
+        current_url = str(self.page.url or "")
+        if self._is_project_canvas_url(current_url):
+            self._remember_project_root()
+            return
+        if not self._is_asset_edit_url(current_url):
+            raise FlowUiStateError(
+                f"Google Flow không ở canvas project hợp lệ. URL hiện tại: {current_url}"
+            )
+
+        project_root = self._project_root_url or self._project_root_from_url(current_url)
+        done_button = self.page.locator(
+            "button:has-text('Xong'), button:has-text('Done'), "
+            "button[aria-label*='Xong' i], button[aria-label*='Done' i]"
+        ).first
+        try:
+            if await done_button.is_visible(timeout=1000):
+                await done_button.click(timeout=2000)
+                await asyncio.sleep(0.5)
+        except Exception as exc:
+            logger.info(
+                "flow_generation state=canvas_done_failed project=%s detail=%s",
+                self._project_id(),
+                exc,
+            )
+
+        if self._is_project_canvas_url(str(self.page.url or "")):
+            self._remember_project_root()
+            logger.info(
+                "flow_generation state=canvas_restored project=%s method=done",
+                self._project_id(),
+            )
+            return
+
+        if not project_root:
+            raise FlowUiStateError("Không xác định được URL canvas Google Flow để phục hồi.")
+        try:
+            await self.page.goto(project_root, wait_until="domcontentloaded", timeout=30000)
+            await self.wait_for_load()
+        except Exception as exc:
+            logger.error(
+                "flow_generation state=canvas_restore_failed project=%s detail=%s",
+                self._project_id(),
+                exc,
+            )
+            raise FlowUiStateError("Không thể quay lại canvas project Google Flow.") from exc
+
+        if not self._is_project_canvas_url(str(self.page.url or "")):
+            logger.error(
+                "flow_generation state=canvas_restore_failed project=%s detail=unexpected_url",
+                self._project_id(),
+            )
+            raise FlowUiStateError("Google Flow vẫn còn ở màn hình chỉnh sửa asset.")
+        self._remember_project_root()
+        logger.info(
+            "flow_generation state=canvas_restored project=%s method=navigate",
+            self._project_id(),
+        )
+
+    async def _ensure_project_canvas(self) -> None:
+        current_url = str(self.page.url or "")
+        if self._is_asset_edit_url(current_url):
+            await self._restore_project_canvas()
+            current_url = str(self.page.url or "")
+        if not self._is_project_canvas_url(current_url):
+            raise FlowUiStateError(
+                f"Google Flow không ở canvas project hợp lệ. URL hiện tại: {current_url}"
+            )
+        self._remember_project_root()
+
+    async def _close_media_detail(self) -> None:
+        if self._is_asset_edit_url(str(self.page.url or "")):
+            await self._restore_project_canvas()
+            return
+        close_button = self.page.locator(
+            "flow-media-detail button:has-text('Xong'), "
+            "flow-media-detail button:has-text('Done'), "
+            "[data-testid*='media-detail' i] button[aria-label*='close' i], "
+            "[data-testid*='media-detail' i] button[aria-label*='đóng' i]"
+        ).first
+        try:
+            if await close_button.is_visible(timeout=300):
+                await close_button.click(timeout=1500)
+                await asyncio.sleep(0.3)
+            else:
+                await self.page.keyboard.press("Escape")
+                await asyncio.sleep(0.2)
+        except Exception:
+            pass
+        if self._is_asset_edit_url(str(self.page.url or "")):
+            await self._restore_project_canvas()
+        elif not self._is_project_canvas_url(str(self.page.url or "")):
+            raise FlowUiStateError("Google Flow không trở lại canvas sau khi đóng media detail.")
 
     def _project_id(self) -> str:
         current_url = str(self.page.url or "")
@@ -292,8 +434,16 @@ class GoogleFlowWorker:
 
     async def wait_for_editor(self, timeout: float = 30.0) -> Locator:
         """Wait for the prompt editor element to become visible and interactive."""
+        if self._is_asset_edit_url(str(self.page.url or "")):
+            raise FlowUiStateError(
+                "Google Flow đang ở màn hình chỉnh sửa asset, không phải canvas tạo cảnh."
+            )
         start_time = asyncio.get_event_loop().time()
         candidate_selectors = [
+            "flow-prompt-box .ProseMirror",
+            "flow-prompt-box div[contenteditable='true']",
+            "flow-prompt-box textarea",
+            "flow-prompt-box [role='textbox']",
             ".ProseMirror",
             "div[contenteditable='true']",
             "textarea[placeholder*='create' i]",
@@ -306,6 +456,13 @@ class GoogleFlowWorker:
         ]
 
         while asyncio.get_event_loop().time() - start_time < timeout:
+            if self._is_asset_edit_url(str(self.page.url or "")):
+                raise FlowUiStateError(
+                    "Google Flow đã chuyển sang màn hình chỉnh sửa asset khi chờ prompt."
+                )
+            if not self._is_project_canvas_url(str(self.page.url or "")):
+                await asyncio.sleep(0.25)
+                continue
             await self.dismiss_blocking_dialogs()
 
             for sel in candidate_selectors:
@@ -397,11 +554,16 @@ class GoogleFlowWorker:
         current_url = str(self.page.url or "")
         current_title = (await self._get_page_title()).lower()
 
+        if not force_new and self._is_asset_edit_url(current_url):
+            await self._restore_project_canvas()
+            current_url = str(self.page.url or "")
+            current_title = (await self._get_page_title()).lower()
+
         # 1. Check if on 404/error page
         is_error_page = "/404" in current_url or "not found" in current_title
 
         # 2. If already inside a project URL, verify if it's the right project and editor is ready (only when NOT force_new)
-        if not force_new and "/project/" in current_url and not is_error_page:
+        if not force_new and self._is_project_canvas_url(current_url) and not is_error_page:
             # Check for conflict: if current title explicitly has auto_yt_<other_id>
             has_conflict = False
             match = re.search(r"auto_yt_\d+", current_title)
@@ -412,12 +574,14 @@ class GoogleFlowWorker:
             if not has_conflict:
                 try:
                     await self.wait_for_editor(timeout=10.0)
+                    self._remember_project_root()
                     return self.page.url
                 except Exception:
                     logger.warning("Project editor not ready in current project, trying reload...")
                     try:
                         await self.page.reload(wait_until="domcontentloaded", timeout=15000)
                         await self.wait_for_editor(timeout=10.0)
+                        self._remember_project_root()
                         return self.page.url
                     except Exception:
                         logger.warning("Reload failed to restore editor; returning to home...")
@@ -443,6 +607,7 @@ class GoogleFlowWorker:
                     await project_link.click()
                     await self.wait_for_load()
                     await self.wait_for_editor(timeout=25.0)
+                    self._remember_project_root()
                     return self.page.url
                 except Exception as e:
                     logger.warning("Could not open existing project link: %s. Will try creating new project.", e)
@@ -472,8 +637,9 @@ class GoogleFlowWorker:
 
         if not clicked:
             # Maybe the page already loaded straight into an untitled project session
-            if "/project/" in str(self.page.url or ""):
+            if self._is_project_canvas_url(str(self.page.url or "")):
                 await self.wait_for_editor(timeout=20.0)
+                self._remember_project_root()
                 return self.page.url
             await self._save_debug_screenshot("new_project_btn_missing")
             raise RuntimeError(
@@ -482,6 +648,7 @@ class GoogleFlowWorker:
 
         await self.wait_for_load()
         await self.wait_for_editor(timeout=30.0)
+        self._remember_project_root()
 
         # Optionally set title if title input is available
         try:
@@ -557,10 +724,20 @@ class GoogleFlowWorker:
     async def _collect_image_candidates(self) -> list[dict]:
         """Collect generated image candidates from the gallery and result panel."""
         result = await self.page.evaluate(r'''() => {
-            const candidates = [];
-            const seen = new Set();
+            const candidates = new Map();
+            const imageUrl = (value) => {
+                const url = String(value || '').trim();
+                if (!url || url.startsWith('data:')) return '';
+                const lower = url.toLowerCase();
+                const valid = lower.startsWith('blob:') ||
+                    lower.includes('flow-content.google/image') ||
+                    lower.includes('googleusercontent.com') ||
+                    /\.(?:png|jpe?g|webp)(?:\?|$)/i.test(url);
+                return valid && !/\.(?:mp4|webm)(?:\?|$)/i.test(url) ? url : '';
+            };
             const nodes = document.querySelectorAll(
-                "img[src], [data-image-url], [data-media-url], a[href], [style*='background-image']"
+                "img[src], img[srcset], [data-image-url], [data-media-url], " +
+                "[data-download-url], a[href], [style*='background-image']"
             );
             for (const node of nodes) {
                 if (node.closest(
@@ -569,29 +746,30 @@ class GoogleFlowWorker:
                     "[data-testid*='asset-picker' i], .asset-picker, .uploads-picker"
                 )) continue;
 
-                let src = node.currentSrc || node.src ||
-                    node.getAttribute('data-image-url') || node.getAttribute('data-media-url') ||
-                    node.href || '';
-                if (!src) {
-                    const background = getComputedStyle(node).backgroundImage || '';
-                    const match = background.match(/url\(["']?(.*?)["']?\)/);
-                    src = match ? match[1] : '';
-                }
-                if (!src || src.startsWith('data:')) continue;
-
-                const lowerSrc = src.toLowerCase();
-                const looksLikeImage = lowerSrc.startsWith('blob:') ||
-                    lowerSrc.includes('flow-content.google/image') ||
-                    lowerSrc.includes('googleusercontent.com') ||
-                    /\.(?:png|jpe?g|webp)(?:\?|$)/i.test(src);
-                if (!looksLikeImage || /\.(?:mp4|webm)(?:\?|$)/i.test(src)) continue;
+                const urls = [];
+                const addUrl = (value) => {
+                    const url = imageUrl(value);
+                    if (url && !urls.includes(url)) urls.push(url);
+                };
+                addUrl(node.currentSrc);
+                addUrl(node.src);
+                addUrl(node.getAttribute('data-image-url'));
+                addUrl(node.getAttribute('data-media-url'));
+                addUrl(node.getAttribute('data-download-url'));
+                addUrl(node.href);
+                const srcset = node.getAttribute('srcset') || '';
+                for (const part of srcset.split(',')) addUrl(part.trim().split(/\s+/)[0]);
+                const background = getComputedStyle(node).backgroundImage || '';
+                for (const match of background.matchAll(/url\(["']?(.*?)["']?\)/g)) addUrl(match[1]);
+                if (!urls.length) continue;
 
                 const alt = (node.alt || '').toLowerCase();
                 const className = String(node.className || '').toLowerCase();
                 const aria = (node.getAttribute('aria-label') || '').toLowerCase();
                 const parentAria = ((node.parentElement && node.parentElement.getAttribute('aria-label')) || '').toLowerCase();
-                if (lowerSrc.includes('s32-c-mo') || lowerSrc.includes('s96-c') ||
-                    lowerSrc.includes('pr_32px') || lowerSrc.includes('/a/acg8oc') ||
+                const lowerUrls = urls.join(' ').toLowerCase();
+                if (lowerUrls.includes('s32-c-mo') || lowerUrls.includes('s96-c') ||
+                    lowerUrls.includes('pr_32px') || lowerUrls.includes('/a/acg8oc') ||
                     alt.includes('google account') || alt.includes('tài khoản google') ||
                     parentAria.includes('google account') || parentAria.includes('tài khoản google') ||
                     className.includes('avatar') || className.includes('profile') ||
@@ -604,20 +782,29 @@ class GoogleFlowWorker:
                     card.getAttribute('data-media-id') || card.getAttribute('data-asset-id') ||
                     card.getAttribute('data-id') || ''
                 ) : '';
-                const key = assetId ? `asset:${assetId}` : src;
-                if (seen.has(key)) continue;
-                seen.add(key);
-                candidates.push({
-                    src,
+                const key = assetId ? `asset:${assetId}` : urls[0];
+                const existing = candidates.get(key);
+                if (existing) {
+                    for (const url of urls) {
+                        if (!existing.urls.includes(url)) existing.urls.push(url);
+                    }
+                    existing.width = Math.max(existing.width, Number(node.naturalWidth || node.width || 0) || 0);
+                    existing.height = Math.max(existing.height, Number(node.naturalHeight || node.height || 0) || 0);
+                    continue;
+                }
+                candidates.set(key, {
+                    src: urls[0],
+                    urls,
                     assetId,
                     className,
+                    labelText: String((card && card.innerText) || node.alt || node.getAttribute('aria-label') || ''),
                     width: Number(node.naturalWidth || node.videoWidth || node.width || 0) || 0,
                     height: Number(node.naturalHeight || node.videoHeight || node.height || 0) || 0,
                     source: node.closest('.sidebar, .mat-drawer, flow-prompt-history, [data-testid*="result" i]')
                         ? 'result_panel' : 'gallery'
                 });
             }
-            return candidates;
+            return Array.from(candidates.values());
         }''')
         if not isinstance(result, list):
             raise FlowUiStateError("Flow image candidate scan returned an invalid result.")
@@ -661,28 +848,57 @@ class GoogleFlowWorker:
             raise FlowUiStateError("Flow video candidate scan returned an invalid result.")
         return [item for item in result if isinstance(item, dict)]
 
-    def _find_new_media_source(
+    def _candidate_keys(self, candidate: dict) -> set[str]:
+        keys = {
+            self._media_key(url)
+            for url in [
+                candidate.get("src"),
+                candidate.get("url"),
+                *(candidate.get("urls") or []),
+            ]
+            if str(url or "").strip()
+        }
+        asset_id = str(candidate.get("assetId") or "").strip().casefold()
+        if asset_id:
+            keys.add(f"asset:{asset_id}")
+        return keys
+
+    def _candidate_matches_active_reference(self, candidate: dict) -> bool:
+        keys = self._candidate_keys(candidate)
+        if keys & self._active_reference_keys:
+            return True
+        label_lines = {
+            line.strip().casefold()
+            for line in str(candidate.get("labelText") or "").splitlines()
+            if line.strip()
+        }
+        return bool(label_lines & self._active_reference_filenames)
+
+    def _find_new_media_candidate(
         self,
         candidates: list[dict],
         baseline_keys: set[str],
         *,
         exclude_uploaded_images: bool = False,
-    ) -> str:
+    ) -> dict | None:
         uploaded_keys = {
             self._media_key(url) for url in self._uploaded_image_urls if str(url).strip()
         }
-        ranked: list[tuple[int, str]] = []
+        ranked: list[tuple[int, dict]] = []
         for candidate in candidates:
-            source = str(candidate.get("src") or candidate.get("url") or "").strip()
-            if not source:
+            keys = self._candidate_keys(candidate)
+            if not keys:
                 continue
-            asset_id = str(candidate.get("assetId") or "").strip().casefold()
-            keys = {self._media_key(source)}
-            if asset_id:
-                keys.add(f"asset:{asset_id}")
             if keys & baseline_keys:
                 continue
-            if exclude_uploaded_images and self._media_key(source) in uploaded_keys:
+            if exclude_uploaded_images and keys & uploaded_keys:
+                continue
+            if self._candidate_matches_active_reference(candidate):
+                logger.info(
+                    "flow_generation media=image state=reference_excluded project=%s asset=%s",
+                    self._project_id(),
+                    str(candidate.get("assetId") or "")[:80],
+                )
                 continue
             try:
                 width = int(candidate.get("width") or 0)
@@ -690,11 +906,27 @@ class GoogleFlowWorker:
             except (TypeError, ValueError):
                 width = 0
                 height = 0
-            ranked.append((width * height, source))
+            ranked.append((width * height, candidate))
         if not ranked:
-            return ""
+            return None
         ranked.sort(key=lambda item: item[0])
         return ranked[-1][1]
+
+    def _find_new_media_source(
+        self,
+        candidates: list[dict],
+        baseline_keys: set[str],
+        *,
+        exclude_uploaded_images: bool = False,
+    ) -> str:
+        candidate = self._find_new_media_candidate(
+            candidates,
+            baseline_keys,
+            exclude_uploaded_images=exclude_uploaded_images,
+        )
+        if candidate is None:
+            return ""
+        return str(candidate.get("src") or candidate.get("url") or "").strip()
 
     async def _read_generation_activity(self) -> bool:
         result = await self.page.evaluate(r'''() => {
@@ -708,24 +940,282 @@ class GoogleFlowWorker:
             const controls = Array.from(document.querySelectorAll(
                 "button, [role='button'], [role='progressbar'], [role='status'], " +
                 "[aria-busy='true'], [data-state='generating'], [data-state='processing'], " +
-                ".progress, .generating, .loading, .spinner, flow-media-tile"
+                ".progress, .generating, .loading, .spinner, flow-media-tile, " +
+                "mat-progress-spinner, mat-spinner, flow-thinking, " +
+                "[data-testid*='loading' i], [data-testid*='progress' i], " +
+                "[data-testid*='generating' i]"
             ));
             return controls.some((element) => {
                 if (!visible(element)) return false;
                 const text = (element.textContent || '').trim().toLowerCase();
                 const aria = (element.getAttribute('aria-label') || '').trim().toLowerCase();
+                const title = (element.getAttribute('title') || '').trim().toLowerCase();
                 const state = (element.getAttribute('data-state') || '').trim().toLowerCase();
+                const testId = (element.getAttribute('data-testid') || '').trim().toLowerCase();
+                const html = (element.innerHTML || '').toLowerCase();
                 return text === 'stop' || text === 'dừng' || aria.includes('stop') ||
-                    aria.includes('dừng') || element.getAttribute('role') === 'progressbar' ||
+                    aria.includes('dừng') || title.includes('stop') || title.includes('dừng') ||
+                    element.getAttribute('role') === 'progressbar' ||
                     element.getAttribute('aria-busy') === 'true' || state === 'generating' ||
                     state === 'processing' || element.classList.contains('generating') ||
                     element.classList.contains('progress') || element.classList.contains('loading') ||
                     element.classList.contains('spinner') || /(^|\s)\d{1,3}%($|\s)/.test(text) ||
                     text.includes('đang tạo') || text.includes('generating') ||
-                    text.includes('creating') || text.includes('hiện tiến trình tư duy');
+                    text.includes('creating') || text.includes('hiện tiến trình tư duy') ||
+                    testId.includes('loading') || testId.includes('progress') ||
+                    testId.includes('generating') || html.includes('stop_circle') ||
+                    html.includes('progress_spinner') || html.includes('hourglass');
             });
         }''')
         return result is True
+
+    async def _capture_submission_marker(self) -> str:
+        """Return a stable signature for the visible conversation/result panel."""
+        result = await self.page.evaluate(r'''() => {
+            const selectors = [
+                'flow-prompt-history',
+                'flow-chat-panel',
+                'flow-session-panel',
+                "[data-testid*='prompt-history' i]",
+                "[data-testid*='conversation' i]",
+                "[data-testid*='result-panel' i]",
+                '.sidebar',
+                '.mat-drawer'
+            ];
+            const roots = [];
+            const seen = new Set();
+            for (const selector of selectors) {
+                for (const root of document.querySelectorAll(selector)) {
+                    if (seen.has(root)) continue;
+                    seen.add(root);
+                    const style = getComputedStyle(root);
+                    const rect = root.getBoundingClientRect();
+                    if (style.display === 'none' || style.visibility === 'hidden' ||
+                        rect.width <= 0 || rect.height <= 0) continue;
+                    roots.push(root);
+                }
+            }
+            const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+            const parts = [];
+            for (const root of roots) {
+                const clone = root.cloneNode(true);
+                for (const node of clone.querySelectorAll(
+                    'flow-prompt-box, textarea, input, [contenteditable="true"], script, style'
+                )) node.remove();
+                const text = normalize(clone.textContent).slice(-6000);
+                const ids = Array.from(root.querySelectorAll(
+                    '[data-message-id], [data-turn-id], [data-response-id], ' +
+                    '[data-media-id], [data-asset-id]'
+                )).map((node) =>
+                    node.getAttribute('data-message-id') || node.getAttribute('data-turn-id') ||
+                    node.getAttribute('data-response-id') || node.getAttribute('data-media-id') ||
+                    node.getAttribute('data-asset-id') || ''
+                ).filter(Boolean).slice(-50);
+                parts.push(`${ids.join(',')}|${text}`);
+            }
+            return parts.join('||');
+        }''')
+        return str(result or "")
+
+    @staticmethod
+    def _normalize_prompt_text(value: str) -> str:
+        return re.sub(r"\s+", " ", str(value or "")).strip()
+
+    async def _read_editor_text(self, editor: Locator) -> str:
+        value = await editor.evaluate("el => el.innerText || el.value || ''")
+        return str(value or "")
+
+    async def _find_prompt_submit_button(self, editor: Locator) -> Locator | None:
+        semantic_selectors = [
+            "flow-prompt-box button[type='submit']",
+            "flow-prompt-box button.generate-icon-button",
+            "flow-prompt-box button[aria-label*='send' i]",
+            "flow-prompt-box button[aria-label*='submit' i]",
+            "flow-prompt-box button[aria-label*='generate' i]",
+            "flow-prompt-box button[aria-label*='start generation' i]",
+            "flow-prompt-box button[aria-label*='gửi' i]",
+            "flow-prompt-box button[aria-label*='tạo' i]",
+            "flow-prompt-box button:has-text('arrow_forward')",
+            "flow-prompt-box button:has-text('send')",
+        ]
+        for selector in semantic_selectors:
+            try:
+                button = self.page.locator(selector).first
+                if await button.is_visible(timeout=250) and await button.is_enabled(timeout=250):
+                    return button
+            except Exception:
+                continue
+
+        try:
+            prompt_box = editor.locator("xpath=ancestor::flow-prompt-box[1]")
+            if await prompt_box.count() == 0:
+                prompt_box = self.page.locator("flow-prompt-box").first
+            buttons = prompt_box.locator("button")
+            count = await buttons.count()
+        except Exception:
+            return None
+
+        excluded_terms = (
+            "add", "plus", "upload", "ingredient", "setting", "tune", "option",
+            "mode", "model", "thêm", "tải", "cài đặt", "tuỳ chọn", "tùy chọn",
+        )
+        for index in range(count - 1, -1, -1):
+            button = buttons.nth(index)
+            try:
+                if not await button.is_visible(timeout=200) or not await button.is_enabled(timeout=200):
+                    continue
+                label = " ".join(
+                    filter(
+                        None,
+                        [
+                            await button.get_attribute("aria-label"),
+                            await button.get_attribute("title"),
+                            await button.inner_text(),
+                        ],
+                    )
+                ).casefold()
+                if any(term in label for term in excluded_terms):
+                    continue
+                return button
+            except Exception:
+                continue
+        return None
+
+    async def _wait_for_submission_ack(
+        self,
+        *,
+        media_type: str,
+        baseline_keys: set[str],
+        baseline_marker: str,
+    ) -> tuple[str, str]:
+        deadline = time.monotonic() + SUBMISSION_ACK_TIMEOUT_SECONDS
+        while True:
+            source = await self._resolve_new_media_source(media_type, baseline_keys)
+            if source:
+                return source, "output"
+            if await self._read_generation_activity():
+                return "", "activity"
+            current_marker = await self._capture_submission_marker()
+            if current_marker and current_marker != baseline_marker:
+                return "", "conversation"
+            if time.monotonic() >= deadline:
+                return "", ""
+            await asyncio.sleep(SUBMISSION_ACK_POLL_SECONDS)
+
+    async def _submit_prompt_and_wait_for_ack(
+        self,
+        *,
+        editor: Locator,
+        full_prompt: str,
+        media_type: str,
+        baseline_keys: set[str],
+    ) -> tuple[float, str]:
+        baseline_marker = await self._capture_submission_marker()
+        attempted_methods: set[str] = set()
+
+        for attempt in range(1, 3):
+            button = await self._find_prompt_submit_button(editor)
+            if button is not None and "button" not in attempted_methods:
+                method = "button"
+                attempted_methods.add(method)
+                await self.dismiss_blocking_dialogs()
+                try:
+                    await button.click(timeout=3000)
+                except Exception as exc:
+                    logger.warning(
+                        "flow_generation media=%s state=submit_click_failed project=%s "
+                        "attempt=%d detail=%s",
+                        media_type,
+                        self._project_id(),
+                        attempt,
+                        exc,
+                    )
+                    continue
+            elif "enter" not in attempted_methods:
+                method = "enter"
+                attempted_methods.add(method)
+                try:
+                    focus_result = editor.focus()
+                    if asyncio.iscoroutine(focus_result):
+                        await focus_result
+                except Exception:
+                    pass
+                await self.page.keyboard.press("Enter")
+            else:
+                break
+
+            attempted_at = time.monotonic()
+            logger.info(
+                "flow_generation media=%s state=submit_attempt project=%s attempt=%d method=%s",
+                media_type,
+                self._project_id(),
+                attempt,
+                method,
+            )
+            source, reason = await self._wait_for_submission_ack(
+                media_type=media_type,
+                baseline_keys=baseline_keys,
+                baseline_marker=baseline_marker,
+            )
+            if reason:
+                self._log_generation_event(
+                    media_type,
+                    "submit_acknowledged",
+                    attempted_at,
+                    detail=f"attempt={attempt} method={method} reason={reason}",
+                )
+                self._log_generation_event(
+                    media_type,
+                    "submitted",
+                    attempted_at,
+                    detail=f"method={method}",
+                )
+                return attempted_at, source
+
+            editor_text = self._normalize_prompt_text(await self._read_editor_text(editor))
+            if not editor_text:
+                self._log_generation_event(
+                    media_type,
+                    "submit_ambiguous",
+                    attempted_at,
+                    detail=f"attempt={attempt} method={method}",
+                )
+                self._log_generation_event(
+                    media_type,
+                    "submitted",
+                    attempted_at,
+                    detail=f"method={method} acknowledgement=ambiguous",
+                )
+                return attempted_at, ""
+
+            if editor_text != self._normalize_prompt_text(full_prompt):
+                try:
+                    await editor.fill(full_prompt)
+                except Exception:
+                    await editor.click(timeout=2000)
+                    await self.page.keyboard.press("Control+A")
+                    await self.page.keyboard.insert_text(full_prompt)
+            if attempt < 2:
+                logger.info(
+                    "flow_generation media=%s state=submit_fallback project=%s "
+                    "attempt=%d previous_method=%s",
+                    media_type,
+                    self._project_id(),
+                    attempt + 1,
+                    method,
+                )
+
+        await self._save_debug_screenshot(f"{media_type}_submit_failed")
+        logger.error(
+            "flow_generation media=%s state=submit_failed project=%s methods=%s",
+            media_type,
+            self._project_id(),
+            ",".join(sorted(attempted_methods)),
+        )
+        raise FlowSubmissionError(
+            f"Google Flow không tiếp nhận prompt tạo {media_type} sau "
+            f"{len(attempted_methods)} lần thử."
+        )
 
     async def _get_snackbar_error(self) -> str:
         error_loc = self.page.locator(
@@ -758,14 +1248,53 @@ class GoogleFlowWorker:
         """Return image URLs currently visible outside upload/reference controls."""
         try:
             return {
-                str(item.get("src") or "").strip()
+                str(url or "").strip()
                 for item in await self._collect_image_candidates()
-                if str(item.get("src") or "").strip()
+                for url in [item.get("src"), *(item.get("urls") or [])]
+                if str(url or "").strip()
             }
         except Exception as exc:
             if strict:
                 raise FlowUiStateError("Không thể chụp baseline ảnh của Google Flow.") from exc
             return set()
+
+    async def _capture_stable_image_baseline(self) -> set[str]:
+        deadline = time.monotonic() + IMAGE_BASELINE_STABILIZE_SECONDS
+        previous_keys: set[str] | None = None
+        latest_keys: set[str] = set()
+        while True:
+            candidates = await self._collect_image_candidates()
+            latest_keys = set().union(
+                *(self._candidate_keys(candidate) for candidate in candidates)
+            ) if candidates else set()
+            for candidate in candidates:
+                if self._candidate_matches_active_reference(candidate):
+                    self._active_reference_keys.update(self._candidate_keys(candidate))
+            if previous_keys == latest_keys or time.monotonic() >= deadline:
+                return latest_keys | self._active_reference_keys
+            previous_keys = latest_keys
+            await asyncio.sleep(IMAGE_BASELINE_POLL_SECONDS)
+
+    def _set_active_reference_filenames(
+        self,
+        reference_ids: list[str] | None,
+        reference_paths: dict[str, str] | None,
+    ) -> None:
+        filenames: set[str] = set()
+        for reference_id in reference_ids or []:
+            reference_path = str((reference_paths or {}).get(str(reference_id)) or "").strip()
+            if reference_path:
+                filename = self._reference_filename(reference_path)
+                if filename:
+                    filenames.add(filename.casefold())
+        self._active_reference_filenames = filenames
+        self._active_reference_keys = set()
+
+    def _reset_image_candidate_state(self) -> None:
+        self._rejected_image_urls = set()
+        self._inspected_detail_keys = set()
+        self._last_invalid_image_size = None
+        self._validated_image_payload = None
 
     async def _get_existing_error_texts(self) -> set[str]:
         """Snapshot all existing error tile texts currently rendered on the page."""
@@ -884,6 +1413,43 @@ class GoogleFlowWorker:
                 return item
         return None
 
+    async def _remember_reference_locator_keys(self, locator: Locator) -> None:
+        try:
+            identity = await locator.evaluate(r'''(node) => {
+                const card = node.closest(
+                    "flow-media-tile, [data-media-id], [data-asset-id], " +
+                    "[data-testid*='asset' i], [role='option'], [role='listitem']"
+                ) || node;
+                const assetId = card.getAttribute('data-media-id') ||
+                    card.getAttribute('data-asset-id') || card.getAttribute('data-id') || '';
+                const urls = Array.from(card.querySelectorAll(
+                    "img[src], img[srcset], [data-image-url], [data-media-url], a[href]"
+                )).flatMap((item) => {
+                    const values = [
+                        item.currentSrc || '', item.src || '', item.href || '',
+                        item.getAttribute('data-image-url') || '',
+                        item.getAttribute('data-media-url') || ''
+                    ];
+                    const srcset = item.getAttribute('srcset') || '';
+                    for (const part of srcset.split(',')) {
+                        values.push(part.trim().split(/\s+/)[0]);
+                    }
+                    return values.filter(Boolean);
+                });
+                return {assetId, urls};
+            }''')
+        except Exception:
+            return
+        if not isinstance(identity, dict):
+            return
+        asset_id = str(identity.get("assetId") or "").strip().casefold()
+        if asset_id:
+            self._active_reference_keys.add(f"asset:{asset_id}")
+        for url in identity.get("urls") or []:
+            url_key = self._media_key(str(url or ""))
+            if url_key:
+                self._active_reference_keys.add(url_key)
+
     async def _has_ingredient_chip(self) -> bool:
         chip = self.page.locator(
             "flow-prompt-box flow-ingredient-chip, flow-ingredient-chip, "
@@ -944,6 +1510,7 @@ class GoogleFlowWorker:
                 await self._close_reference_ui()
                 return REFERENCE_RESULT_NOT_FOUND
 
+            await self._remember_reference_locator_keys(asset_item)
             await asset_item.click()
             await asyncio.sleep(0.5)
             if await self._has_ingredient_chip():
@@ -987,6 +1554,7 @@ class GoogleFlowWorker:
             if await card.count() == 0:
                 return REFERENCE_RESULT_UI_ERROR
 
+            await self._remember_reference_locator_keys(card)
             await card.hover()
             menu_btn = card.locator(
                 "button[aria-label*='More' i], button[aria-label*='Khác' i], "
@@ -1223,53 +1791,151 @@ class GoogleFlowWorker:
         finally:
             await self.dismiss_blocking_dialogs()
 
-    async def _open_latest_new_media_card(
+    async def _validate_image_url(self, url: str) -> bool:
+        url = str(url or "").strip()
+        variant_key = url.casefold()
+        if not url or not variant_key or variant_key in self._rejected_image_urls:
+            return False
+        if url.startswith("blob:"):
+            return False
+        try:
+            response = await self.page.request.get(url, timeout=30000)
+            if response.status != 200:
+                return False
+            body = await response.body()
+            if not body:
+                return False
+            with Image.open(io.BytesIO(body)) as image:
+                image.load()
+                width, height = image.size
+        except Exception as exc:
+            logger.info(
+                "flow_generation media=image state=candidate_unreadable project=%s detail=%s",
+                self._project_id(),
+                type(exc).__name__,
+            )
+            return False
+
+        if (
+            width < MIN_GENERATED_IMAGE_WIDTH
+            or height < MIN_GENERATED_IMAGE_HEIGHT
+            or width / max(1, height) < MIN_GENERATED_IMAGE_ASPECT_RATIO
+        ):
+            self._rejected_image_urls.add(variant_key)
+            self._last_invalid_image_size = (width, height)
+            logger.info(
+                "flow_generation media=image state=candidate_invalid project=%s size=%dx%d",
+                self._project_id(),
+                width,
+                height,
+            )
+            return False
+
+        self._validated_image_payload = (url, body)
+        logger.info(
+            "flow_generation media=image state=candidate_accepted project=%s size=%dx%d",
+            self._project_id(),
+            width,
+            height,
+        )
+        return True
+
+    async def _validate_image_candidate(self, candidate: dict) -> str:
+        urls: list[str] = []
+        for value in [
+            candidate.get("src"),
+            candidate.get("url"),
+            *(candidate.get("urls") or []),
+        ]:
+            url = str(value or "").strip()
+            if url and url not in urls:
+                urls.append(url)
+        for url in urls:
+            if await self._validate_image_url(url):
+                return url
+        return ""
+
+    async def _inspect_image_candidate_detail(
         self,
-        media_type: str,
+        candidate: dict,
         baseline_keys: set[str],
-    ) -> bool:
-        return bool(
-            await self.page.evaluate(
-                '''({kind, baseline}) => {
-                    const known = new Set(baseline);
-                    const cards = Array.from(document.querySelectorAll(
-                        "flow-media-tile, [data-media-id], [data-asset-id], " +
-                        "[data-testid*='media' i], .media-card"
-                    ));
-                    for (let index = cards.length - 1; index >= 0; index -= 1) {
-                        const card = cards[index];
-                        if (card.closest(
-                            "flow-upload-card, [data-testid*='upload' i], " +
-                            "[data-testid*='asset-picker' i], .asset-picker, .uploads-picker"
-                        )) continue;
-                        const video = card.querySelector(
-                            "video, [data-video-url], a[href*='.mp4'], a[href*='.webm']"
-                        );
-                        const image = card.querySelector(
-                            "img[src], [data-image-url], [style*='background-image']"
-                        );
-                        if (kind === 'video' && !video) continue;
-                        if (kind === 'image' && video && !image) continue;
-                        const media = kind === 'video' ? video : image;
-                        let src = media ? (
-                            media.currentSrc || media.src || media.href ||
-                            media.getAttribute('data-video-url') ||
-                            media.getAttribute('data-image-url') || ''
-                        ) : '';
-                        const assetId = card.getAttribute('data-media-id') ||
-                            card.getAttribute('data-asset-id') || card.getAttribute('data-id') || '';
-                        const urlKey = src ? src.split('?', 1)[0].trim().toLowerCase() : '';
-                        if ((urlKey && known.has(urlKey)) || (assetId && known.has(`asset:${assetId.toLowerCase()}`))) {
-                            continue;
-                        }
+    ) -> str:
+        candidate_keys = self._candidate_keys(candidate)
+        detail_key = next(
+            (key for key in candidate_keys if key.startswith("asset:")),
+            next(iter(candidate_keys), ""),
+        )
+        if not detail_key or detail_key in self._inspected_detail_keys:
+            return ""
+        self._inspected_detail_keys.add(detail_key)
+
+        payload = {
+            "assetId": str(candidate.get("assetId") or ""),
+            "urls": [
+                str(url or "").strip()
+                for url in [candidate.get("src"), *(candidate.get("urls") or [])]
+                if str(url or "").strip()
+            ],
+        }
+        clicked = await self.page.evaluate(
+            r'''({assetId, urls}) => {
+                const cards = Array.from(document.querySelectorAll(
+                    "flow-media-tile, [data-media-id], [data-asset-id], " +
+                    "[data-testid*='media' i], .media-card"
+                ));
+                for (const card of cards) {
+                    if (card.closest(
+                        "flow-upload-card, [data-testid*='upload' i], " +
+                        "[data-testid*='asset-picker' i], .asset-picker, .uploads-picker"
+                    )) continue;
+                    const cardId = card.getAttribute('data-media-id') ||
+                        card.getAttribute('data-asset-id') || card.getAttribute('data-id') || '';
+                    const cardUrls = Array.from(card.querySelectorAll(
+                        "img[src], img[srcset], [data-image-url], [data-media-url], a[href]"
+                    )).flatMap((node) => [
+                        node.currentSrc || '', node.src || '', node.href || '',
+                        node.getAttribute('data-image-url') || '',
+                        node.getAttribute('data-media-url') || ''
+                    ]).filter(Boolean);
+                    if ((assetId && cardId === assetId) || cardUrls.some((url) => urls.includes(url))) {
                         card.click();
                         return true;
                     }
-                    return false;
-                }''',
-                {"kind": media_type, "baseline": list(baseline_keys)},
-            )
+                }
+                return false;
+            }''',
+            payload,
         )
+        if not clicked:
+            return ""
+
+        logger.info(
+            "flow_generation media=image state=detail_opened project=%s asset=%s",
+            self._project_id(),
+            str(candidate.get("assetId") or "")[:80],
+        )
+        await asyncio.sleep(0.5)
+        try:
+            detailed_candidates = await self._collect_image_candidates()
+            asset_id = str(candidate.get("assetId") or "").casefold()
+            matching = [
+                item
+                for item in detailed_candidates
+                if not self._candidate_matches_active_reference(item)
+                and (
+                    not asset_id
+                    or str(item.get("assetId") or "").casefold() == asset_id
+                    or not str(item.get("assetId") or "").strip()
+                )
+                and not (self._candidate_keys(item) & baseline_keys)
+            ]
+            for item in reversed(matching):
+                source = await self._validate_image_candidate(item)
+                if source:
+                    return source
+            return ""
+        finally:
+            await self._close_media_detail()
 
     async def _resolve_new_media_source(
         self,
@@ -1280,88 +1946,51 @@ class GoogleFlowWorker:
     ) -> str:
         if media_type == "image":
             candidates = await self._collect_image_candidates()
-            source = self._find_new_media_source(
-                candidates,
-                baseline_keys,
-                exclude_uploaded_images=True,
-            )
-            if not source:
-                if not recover or not await self._open_latest_new_media_card(
-                    media_type,
-                    baseline_keys,
-                ):
-                    return ""
-                await asyncio.sleep(0.5)
-                candidates = await self._collect_image_candidates()
-                source = self._find_new_media_source(
-                    candidates,
+            remaining = list(candidates)
+            unresolved: list[dict] = []
+            while remaining:
+                selected = self._find_new_media_candidate(
+                    remaining,
                     baseline_keys,
                     exclude_uploaded_images=True,
                 )
-                if not source:
-                    return ""
+                if selected is None:
+                    break
+                remaining.remove(selected)
+                source = await self._validate_image_candidate(selected)
+                if source:
+                    return source
+                unresolved.append(selected)
 
-            selected = next(
-                (
-                    item for item in candidates
-                    if str(item.get("src") or item.get("url") or "").strip() == source
-                ),
-                {},
-            )
-            try:
-                width = int(selected.get("width") or 0)
-                height = int(selected.get("height") or 0)
-            except (TypeError, ValueError):
-                width = 0
-                height = 0
-            if width >= 800 and height >= 400:
-                return source
-
-            clicked = await self.page.evaluate(
-                r'''(targetUrl) => {
-                    const nodes = Array.from(document.querySelectorAll(
-                        "img[src], [data-image-url], [data-media-url], a[href], [style*='background-image']"
-                    ));
-                    for (const node of nodes) {
-                        let src = node.currentSrc || node.src ||
-                            node.getAttribute('data-image-url') || node.getAttribute('data-media-url') ||
-                            node.href || '';
-                        if (!src) {
-                            const background = getComputedStyle(node).backgroundImage || '';
-                            const match = background.match(/url\(["']?(.*?)["']?\)/);
-                            src = match ? match[1] : '';
-                        }
-                        if (src !== targetUrl) continue;
-                        const card = node.closest(
-                            "flow-media-tile, [data-media-id], [data-asset-id], " +
-                            "[data-testid*='media' i], .media-card"
-                        );
-                        (card || node).click();
-                        return true;
-                    }
-                    return false;
-                }''',
-                source,
-            )
-            if clicked:
-                await asyncio.sleep(0.5)
-                refreshed = await self._collect_image_candidates()
-                return self._find_new_media_source(
-                    refreshed,
-                    baseline_keys,
-                    exclude_uploaded_images=True,
-                ) or source
-            return source
+            for selected in unresolved:
+                source = await self._inspect_image_candidate_detail(selected, baseline_keys)
+                if source:
+                    return source
+            return ""
 
         candidates = await self._collect_video_candidates()
         source = self._find_new_media_source(candidates, baseline_keys)
-        if source or not recover:
-            return source
-        if not await self._open_latest_new_media_card(media_type, baseline_keys):
-            return ""
-        await asyncio.sleep(0.5)
-        candidates = await self._collect_video_candidates()
-        return self._find_new_media_source(candidates, baseline_keys)
+        return source
+
+    async def _raise_invalid_image_output(
+        self,
+        media_type: str,
+        submitted_at: float,
+    ) -> None:
+        if media_type != "image" or not self._last_invalid_image_size:
+            return
+        width, height = self._last_invalid_image_size
+        await self._save_debug_screenshot("image_invalid_output")
+        self._log_generation_event(
+            media_type,
+            "invalid_output",
+            submitted_at,
+            detail=f"{width}x{height}",
+        )
+        raise FlowInvalidOutputError(
+            "Google Flow trả về ảnh mới không đạt chuẩn 16:9 widescreen "
+            f"({width}x{height})."
+        )
 
     async def _wait_for_new_media(
         self,
@@ -1448,6 +2077,7 @@ class GoogleFlowWorker:
                     if source:
                         self._log_generation_event(media_type, "completed", submitted_at)
                         return source
+                    await self._raise_invalid_image_output(media_type, submitted_at)
                     await self._save_debug_screenshot(f"{media_type}_start_failed")
                     self._log_generation_event(media_type, "start_failed", submitted_at)
                     raise FlowGenerationStartError(
@@ -1466,6 +2096,7 @@ class GoogleFlowWorker:
                     if source:
                         self._log_generation_event(media_type, "completed", submitted_at)
                         return source
+                    await self._raise_invalid_image_output(media_type, submitted_at)
                     await self._save_debug_screenshot(f"{media_type}_result_missing")
                     self._log_generation_event(media_type, "result_missing", submitted_at)
                     raise FlowResultMissingError(
@@ -1481,6 +2112,7 @@ class GoogleFlowWorker:
                 if source:
                     self._log_generation_event(media_type, "completed", submitted_at)
                     return source
+                await self._raise_invalid_image_output(media_type, submitted_at)
                 await self._save_debug_screenshot(f"{media_type}_hard_timeout")
                 self._log_generation_event(media_type, "hard_timeout", submitted_at)
                 raise FlowGenerationTimeout(
@@ -1494,20 +2126,37 @@ class GoogleFlowWorker:
         reference_ids: list[str],
         reference_paths: dict[str, str] | None = None,
     ) -> str:
+        self._set_active_reference_filenames(reference_ids, reference_paths)
+        self._reset_image_candidate_state()
+        await self._ensure_project_canvas()
+        try:
+            return await self._generate_scene_on_canvas(
+                prompt,
+                avoid_prompt,
+                reference_ids,
+                reference_paths,
+            )
+        finally:
+            if self._is_asset_edit_url(str(self.page.url or "")):
+                await self._restore_project_canvas()
+
+    async def _generate_scene_on_canvas(
+        self,
+        prompt: str,
+        avoid_prompt: str,
+        reference_ids: list[str],
+        reference_paths: dict[str, str] | None = None,
+    ) -> str:
         # Clean any URL / bracket tags from prompt
         clean_prompt = re.sub(r"\[IMAGE_URL:[^\]]*\]", "", prompt)
         clean_prompt = re.sub(r"https?://\S+", "", clean_prompt)
         clean_prompt = re.sub(r"/api/thumbnails/\S+", "", clean_prompt).strip()
 
-        # Snapshot generated assets before attaching references or submitting the prompt.
-        baseline_keys = {
-            self._media_key(source)
-            for source in await self._get_existing_images(strict=True)
-        }
-        initial_error_texts = await self._get_existing_error_texts()
-
-        # Synchronize reference image ingredients with the prompt bar
+        # References must be visible before the baseline is captured so they can
+        # never be mistaken for the result of the next prompt.
         await self.sync_reference_ingredients(reference_ids, reference_paths)
+        baseline_keys = await self._capture_stable_image_baseline()
+        initial_error_texts = await self._get_existing_error_texts()
 
         strict_avoid = "text, letters, words, typography, watermark, logo, headline, caption, subtitle, poster text, overlay, title banner"
         if avoid_prompt and avoid_prompt.strip():
@@ -1565,45 +2214,15 @@ class GoogleFlowWorker:
 
         await asyncio.sleep(0.5)
 
-        # Trigger generation with Enter first, then use the visible generate button as fallback.
-        submitted_at = time.monotonic()
-        self._log_generation_event("image", "submitted", submitted_at)
-        try:
-            focus_res = editor.focus()
-            if asyncio.iscoroutine(focus_res):
-                await focus_res
-        except Exception:
-            pass
-        await self.page.keyboard.press("Enter")
-        await asyncio.sleep(1.0)
-
-        gen_btn_selectors = [
-            "button.generate-icon-button",
-            "button[aria-label*='Start generation' i]",
-            "button[aria-label*='Generate' i]",
-            "button:has-text('Generate')",
-            "button:has-text('arrow_forward')",
-        ]
-
-        generation_visible = False
-        try:
-            generation_visible = bool(
-                await self._resolve_new_media_source("image", baseline_keys)
-                or await self._read_generation_activity()
-            )
-        except Exception:
-            generation_visible = True
-
-        if not generation_visible:
-            for sel in gen_btn_selectors:
-                try:
-                    candidate = self.page.locator(sel).first
-                    if await candidate.is_visible(timeout=1000):
-                        await self.dismiss_blocking_dialogs()
-                        await candidate.click(timeout=3000, force=True)
-                        break
-                except Exception:
-                    continue
+        submitted_at, immediate_source = await self._submit_prompt_and_wait_for_ack(
+            editor=editor,
+            full_prompt=full_prompt,
+            media_type="image",
+            baseline_keys=baseline_keys,
+        )
+        if immediate_source:
+            self._log_generation_event("image", "completed", submitted_at)
+            return immediate_source
 
         return await self._wait_for_new_media(
             media_type="image",
@@ -1616,6 +2235,18 @@ class GoogleFlowWorker:
     async def download_image(self, asset_url: str, save_path: str):
         target = Path(save_path)
         target.parent.mkdir(parents=True, exist_ok=True)
+
+        cached_payload = self._validated_image_payload
+        if cached_payload and cached_payload[0] == str(asset_url or "").strip():
+            target.write_bytes(cached_payload[1])
+            self._validated_image_payload = None
+            logger.info(
+                "Wrote validated Flow image payload (%d bytes) to %s",
+                len(cached_payload[1]),
+                target,
+            )
+            _strip_watermark(target)
+            return
 
         last_error = None
         for attempt in range(3):
@@ -1836,6 +2467,27 @@ class GoogleFlowWorker:
         end_frame_path: Path | None = None,
         reference_ids: list[str] | None = None,
     ) -> str:
+        await self._ensure_project_canvas()
+        try:
+            return await self._generate_scene_video_on_canvas(
+                prompt,
+                avoid_prompt,
+                start_frame_path=start_frame_path,
+                end_frame_path=end_frame_path,
+                reference_ids=reference_ids,
+            )
+        finally:
+            if self._is_asset_edit_url(str(self.page.url or "")):
+                await self._restore_project_canvas()
+
+    async def _generate_scene_video_on_canvas(
+        self,
+        prompt: str,
+        avoid_prompt: str,
+        start_frame_path: Path | None = None,
+        end_frame_path: Path | None = None,
+        reference_ids: list[str] | None = None,
+    ) -> str:
         """Generate a video clip from start (and optional end) frame using Veo on Google Flow."""
         baseline_keys = {
             self._media_key(source)
@@ -1897,44 +2549,15 @@ class GoogleFlowWorker:
 
         await asyncio.sleep(0.5)
 
-        submitted_at = time.monotonic()
-        self._log_generation_event("video", "submitted", submitted_at)
-        try:
-            focus_res = editor.focus()
-            if asyncio.iscoroutine(focus_res):
-                await focus_res
-        except Exception:
-            pass
-        await self.page.keyboard.press("Enter")
-        await asyncio.sleep(1.0)
-
-        gen_btn_selectors = [
-            "button.generate-icon-button",
-            "button[aria-label*='Start generation' i]",
-            "button[aria-label*='Generate' i]",
-            "button:has-text('Generate')",
-            "button:has-text('arrow_forward')",
-        ]
-
-        generation_visible = False
-        try:
-            generation_visible = bool(
-                await self._resolve_new_media_source("video", baseline_keys)
-                or await self._read_generation_activity()
-            )
-        except Exception:
-            generation_visible = True
-
-        if not generation_visible:
-            for sel in gen_btn_selectors:
-                try:
-                    candidate = self.page.locator(sel).first
-                    if await candidate.is_visible(timeout=1000):
-                        await self.dismiss_blocking_dialogs()
-                        await candidate.click(timeout=3000, force=True)
-                        break
-                except Exception:
-                    continue
+        submitted_at, immediate_source = await self._submit_prompt_and_wait_for_ack(
+            editor=editor,
+            full_prompt=full_prompt,
+            media_type="video",
+            baseline_keys=baseline_keys,
+        )
+        if immediate_source:
+            self._log_generation_event("video", "completed", submitted_at)
+            return immediate_source
 
         return await self._wait_for_new_media(
             media_type="video",
