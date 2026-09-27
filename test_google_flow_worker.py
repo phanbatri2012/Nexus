@@ -1557,6 +1557,25 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(worker._validated_image_payload)
             self.assertEqual(worker._validated_image_payload[1], img_bytes)
 
+    async def test_has_ingredient_chip_finds_prompt_attachment_image(self):
+        page = MagicMock()
+        worker = GoogleFlowWorker(page)
+        page.locator = MagicMock()
+        img_loc = MagicMock()
+        img_loc.first = MagicMock()
+        img_loc.first.is_visible = AsyncMock(return_value=True)
+
+        def loc_router(sel):
+            if "flow-prompt-box" in sel:
+                return img_loc
+            mock_none = MagicMock()
+            mock_none.first.is_visible = AsyncMock(return_value=False)
+            return mock_none
+
+        page.locator.side_effect = loc_router
+        has_chip = await worker._has_ingredient_chip()
+        self.assertTrue(has_chip)
+
 
 
 if __name__ == "__main__":

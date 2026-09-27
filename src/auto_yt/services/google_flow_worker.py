@@ -1399,6 +1399,18 @@ class GoogleFlowWorker:
     async def clear_ingredient_chips(self) -> None:
         """Clear all ingredient chips currently attached to the prompt box."""
         chip_selectors = [
+            "flow-prompt-box flow-ingredient-chip",
+            "flow-prompt-box flow-prompt-attachment",
+            "flow-prompt-box flow-attachment",
+            "flow-prompt-box flow-reference-chip",
+            "flow-prompt-box [data-testid*='ingredient' i]",
+            "flow-prompt-box [data-testid*='attachment' i]",
+            "flow-prompt-box [data-testid*='reference' i]",
+            "flow-prompt-box .ingredient-chip",
+            "flow-prompt-box .reference-chip",
+            "flow-prompt-box .attachment-chip",
+            "flow-prompt-box .mat-mdc-chip",
+            "flow-prompt-box mat-chip",
             "flow-ingredient-chip",
             ".ingredient-chip",
             "mat-chip",
@@ -1406,7 +1418,6 @@ class GoogleFlowWorker:
             "[data-chip]",
             ".chip-item",
             ".reference-chip",
-            "flow-prompt-box flow-ingredient-chip",
         ]
 
         clear_btn_selectors = [
@@ -1415,6 +1426,8 @@ class GoogleFlowWorker:
             "button[aria-label*='Clear all' i]",
             "button[aria-label*='Xóa câu lệnh' i]",
             "button[aria-label*='Xóa tất cả' i]",
+            "flow-prompt-box button[aria-label*='Clear' i]",
+            "flow-prompt-box button[aria-label*='Xóa' i]",
         ]
 
         for c_sel in clear_btn_selectors:
@@ -1424,6 +1437,30 @@ class GoogleFlowWorker:
                     await c_btn.click()
                     await asyncio.sleep(0.3)
                     break
+            except Exception:
+                pass
+
+        # Direct close/remove buttons inside prompt box
+        direct_close_selectors = [
+            "flow-prompt-box button[aria-label*='Remove' i]",
+            "flow-prompt-box button[aria-label*='Delete' i]",
+            "flow-prompt-box button[aria-label*='Xóa' i]",
+            "flow-prompt-box button[aria-label*='Close' i]",
+            "flow-prompt-box button[aria-label*='Đóng' i]",
+            "flow-prompt-box button:has(mat-icon:has-text('close'))",
+            "flow-prompt-box button:has(mat-icon:has-text('cancel'))",
+            "flow-prompt-box mat-icon:has-text('close')",
+            "flow-prompt-box mat-icon:has-text('cancel')",
+        ]
+        for d_sel in direct_close_selectors:
+            try:
+                btns = self.page.locator(d_sel)
+                cnt = await btns.count()
+                for i in range(cnt):
+                    b = btns.nth(i)
+                    if await b.is_visible(timeout=200):
+                        await b.click(timeout=1000)
+                        await asyncio.sleep(0.2)
             except Exception:
                 pass
 
@@ -1445,12 +1482,18 @@ class GoogleFlowWorker:
                                     "mat-icon:has-text('cancel')",
                                     "mat-icon:has-text('close')",
                                     "mat-icon:has-text('clear')",
+                                    "mat-icon:has-text('x')",
                                     ".hover-icon-overlay",
                                     "button.delete-button",
                                     "button[aria-label*='Remove' i]",
                                     "button[aria-label*='Delete' i]",
                                     "button[aria-label*='Xóa' i]",
+                                    "button[aria-label*='Đóng' i]",
+                                    "button[aria-label*='Close' i]",
+                                    "button:has(mat-icon:has-text('close'))",
+                                    "button:has(mat-icon:has-text('cancel'))",
                                     ".remove-chip-button",
+                                    ".close-button",
                                 ]
                                 for d_sel in del_btn_selectors:
                                     try:
@@ -1528,12 +1571,59 @@ class GoogleFlowWorker:
                 self._active_reference_keys.add(url_key)
 
     async def _has_ingredient_chip(self) -> bool:
-        chip = self.page.locator(
-            "flow-prompt-box flow-ingredient-chip, flow-ingredient-chip, "
-            ".ingredient-chip, .reference-chip, [data-testid*='ingredient-chip']"
-        ).first
+        selectors = [
+            "flow-prompt-box flow-ingredient-chip",
+            "flow-prompt-box flow-prompt-attachment",
+            "flow-prompt-box flow-attachment",
+            "flow-prompt-box flow-reference-chip",
+            "flow-prompt-box [data-testid*='ingredient' i]",
+            "flow-prompt-box [data-testid*='attachment' i]",
+            "flow-prompt-box [data-testid*='reference' i]",
+            "flow-prompt-box .ingredient-chip",
+            "flow-prompt-box .reference-chip",
+            "flow-prompt-box .attachment-chip",
+            "flow-prompt-box .mat-mdc-chip",
+            "flow-prompt-box mat-chip",
+            "flow-prompt-box img:not([alt*='profile' i]):not([alt*='account' i]):not([alt*='avatar' i])",
+            "flow-prompt-box button:has(mat-icon:has-text('close'))",
+            "flow-prompt-box button:has(mat-icon:has-text('cancel'))",
+            "flow-prompt-box button[aria-label*='Remove' i]",
+            "flow-prompt-box button[aria-label*='Delete' i]",
+            "flow-prompt-box button[aria-label*='Xóa' i]",
+            "flow-prompt-box mat-icon:has-text('close')",
+            "flow-ingredient-chip",
+            ".ingredient-chip",
+            ".reference-chip",
+            "[data-testid*='ingredient-chip']",
+        ]
+        for sel in selectors:
+            try:
+                chip = self.page.locator(sel).first
+                if await chip.is_visible(timeout=300):
+                    return True
+            except Exception:
+                continue
+
         try:
-            return await chip.is_visible(timeout=1500)
+            return bool(await self.page.evaluate(r'''() => {
+                const promptBox = document.querySelector('flow-prompt-box');
+                if (!promptBox) return false;
+                const images = promptBox.querySelectorAll('img');
+                for (const img of images) {
+                    const src = (img.src || img.currentSrc || '').toLowerCase();
+                    const alt = (img.alt || '').toLowerCase();
+                    if (src && !src.includes('profile') && !src.includes('s32-c-mo') &&
+                        !alt.includes('profile') && !alt.includes('account')) {
+                        return true;
+                    }
+                }
+                const chipNodes = promptBox.querySelectorAll(
+                    'flow-ingredient-chip, flow-attachment, flow-prompt-attachment, ' +
+                    '.ingredient-chip, .reference-chip, .attachment-chip, mat-chip, .mat-mdc-chip, ' +
+                    '[data-testid*="attachment" i], [data-testid*="reference" i]'
+                );
+                return chipNodes.length > 0;
+            }'''))
         except Exception:
             return False
 
