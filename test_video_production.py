@@ -454,6 +454,7 @@ class VideoProductionServiceTests(unittest.TestCase):
                 "thumbnail_variant": "without_text",
             },
             "publishing_settings": {
+                "upload_method": "api",
                 "category_id": "22",
                 "language": "vi",
                 "made_for_kids": False,

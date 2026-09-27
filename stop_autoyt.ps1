@@ -203,8 +203,18 @@ try {
                 Write-Host "  - $reason" -ForegroundColor Red
             }
             foreach ($job in @($maintenanceStatus.blocking_jobs) | Select-Object -First 5) {
-                $desc = if ($job.title) { $job.title } elseif ($job.video_title) { $job.video_title } else { "ID: $($job.id)" }
-                Write-Host "    * [$($job.type)] $($job.status): $desc" -ForegroundColor Yellow
+                $desc = if ($job.PSObject.Properties['title'] -and $job.title) {
+                    [string]$job.title
+                } elseif ($job.PSObject.Properties['video_title'] -and $job.video_title) {
+                    [string]$job.video_title
+                } elseif ($job.PSObject.Properties['id']) {
+                    "ID: $($job.id)"
+                } else {
+                    "Unknown job"
+                }
+                $type = if ($job.PSObject.Properties['type'] -and $job.type) { [string]$job.type } else { "job" }
+                $status = if ($job.PSObject.Properties['status'] -and $job.status) { [string]$job.status } else { "running" }
+                Write-Host "    * [$type] $status: $desc" -ForegroundColor Yellow
             }
             Write-Host ""
             throw "Auto_YT restart/stop bi chan an toan vi he thong dang thuc hien tac vu quan trong (render, upload YouTube, dang bai, hoac GPM). Vui long doi cac job tren hoan tat truoc khi restart!"

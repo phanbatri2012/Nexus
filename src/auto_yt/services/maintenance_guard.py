@@ -33,6 +33,10 @@ def list_system_job_blockers() -> list[dict[str, Any]]:
             LEFT JOIN videos ON videos.id = system_jobs.video_id
             WHERE system_jobs.status IN ('running', 'processing', 'in_progress', 'queued')
               AND system_jobs.job_type != 'comment_publish'
+              AND (
+                  system_jobs.status = 'queued'
+                  OR datetime(system_jobs.updated_at) >= datetime('now', '-15 minutes')
+              )
             ORDER BY system_jobs.created_at ASC
             """
         ).fetchall()
@@ -46,6 +50,7 @@ def list_system_job_blockers() -> list[dict[str, Any]]:
                     "status": str(r["status"]),
                     "video_id": r["video_id"],
                     "video_title": str(r["video_title"] or ""),
+                    "title": str(r["video_title"] or f"Job #{r['id']}"),
                     "progress": str(r["progress"] or ""),
                     "started_at": str(r["started_at"] or ""),
                 }
@@ -160,6 +165,7 @@ def list_video_artifact_blockers() -> list[dict[str, Any]]:
                     "artifact_type": str(r["artifact_type"]),
                     "status": str(r["status"]),
                     "video_title": str(r["video_title"] or ""),
+                    "title": str(r["video_title"] or f"Artifact #{r['id']}"),
                     "created_at": str(r["created_at"] or ""),
                     "updated_at": str(r["updated_at"] or ""),
                 }
@@ -191,6 +197,7 @@ def list_fb_crossposter_blockers() -> list[dict[str, Any]]:
                     "type": "fb_crosspost",
                     "id": str(r["id"]),
                     "video_id": r["video_id"],
+                    "title": f"FB Crosspost #{r['video_id']}",
                     "status": str(r["status"]),
                     "target_page_id": str(r["target_page_id"] or ""),
                     "updated_at": str(r["updated_at"] or ""),
