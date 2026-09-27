@@ -792,16 +792,23 @@ class GoogleFlowWorker:
                     className.includes('avatar') || className.includes('profile') ||
                     aria.includes('profile')) continue;
 
-                const card = node.closest(
+                const mediaTile = node.closest(
                     "flow-media-tile, [data-media-id], [data-asset-id], [data-testid*='media' i], .media-card, " +
-                    "flow-canvas-tile, flow-canvas-item, .canvas-tile, flow-message-turn, .chat-message, " +
-                    "[data-message-id], [data-turn-id], [data-response-id]"
+                    "flow-canvas-tile, flow-canvas-item, .canvas-tile, flow-image-tile"
                 );
-                const assetId = card ? (
-                    card.getAttribute('data-media-id') || card.getAttribute('data-asset-id') ||
-                    card.getAttribute('data-id') || ''
-                ) : '';
-                const key = assetId ? `asset:${assetId}` : urls[0];
+                const assetId = (
+                    node.getAttribute('data-media-id') || node.getAttribute('data-asset-id') ||
+                    (mediaTile ? (mediaTile.getAttribute('data-media-id') || mediaTile.getAttribute('data-asset-id') || mediaTile.getAttribute('data-id') || '') : '')
+                );
+                const labelText = String(
+                    (mediaTile && mediaTile.querySelector('.asset-title, .title, .label, .caption')
+                        ? mediaTile.querySelector('.asset-title, .title, .label, .caption').innerText
+                        : (mediaTile ? mediaTile.innerText : '')) ||
+                    node.alt ||
+                    node.getAttribute('aria-label') ||
+                    ''
+                );
+                const key = urls[0] || (assetId ? `asset:${assetId}` : `item_${candidates.size}`);
                 const existing = candidates.get(key);
                 if (existing) {
                     for (const url of urls) {
@@ -816,7 +823,7 @@ class GoogleFlowWorker:
                     urls,
                     assetId,
                     className,
-                    labelText: String((card && card.innerText) || node.alt || node.getAttribute('aria-label') || ''),
+                    labelText,
                     width: Number(node.naturalWidth || node.videoWidth || node.width || 0) || 0,
                     height: Number(node.naturalHeight || node.videoHeight || node.height || 0) || 0,
                     source: node.closest('.sidebar, .mat-drawer, flow-prompt-history, [data-testid*="result" i], flow-chat-panel')
@@ -956,35 +963,80 @@ class GoogleFlowWorker:
                 return style.display !== 'none' && style.visibility !== 'hidden' &&
                     rect.width > 0 && rect.height > 0;
             };
-            const controls = Array.from(document.querySelectorAll(
-                "button, [role='button'], [role='progressbar'], [role='status'], " +
-                "[aria-busy='true'], [data-state='generating'], [data-state='processing'], " +
-                ".progress, .generating, .loading, .spinner, flow-media-tile, " +
-                "mat-progress-spinner, mat-spinner, flow-thinking, " +
-                "[data-testid*='loading' i], [data-testid*='progress' i], " +
-                "[data-testid*='generating' i]"
+
+            // 1. Explicit Stop / Dừng buttons
+            const stopButtons = Array.from(document.querySelectorAll(
+                "button, [role='button'], flow-prompt-box button, .prompt-box button"
             ));
-            return controls.some((element) => {
-                if (!visible(element)) return false;
-                const text = (element.textContent || '').trim().toLowerCase();
-                const aria = (element.getAttribute('aria-label') || '').trim().toLowerCase();
-                const title = (element.getAttribute('title') || '').trim().toLowerCase();
-                const state = (element.getAttribute('data-state') || '').trim().toLowerCase();
-                const testId = (element.getAttribute('data-testid') || '').trim().toLowerCase();
-                const html = (element.innerHTML || '').toLowerCase();
-                return text === 'stop' || text === 'dừng' || aria.includes('stop') ||
-                    aria.includes('dừng') || title.includes('stop') || title.includes('dừng') ||
-                    element.getAttribute('role') === 'progressbar' ||
-                    element.getAttribute('aria-busy') === 'true' || state === 'generating' ||
-                    state === 'processing' || element.classList.contains('generating') ||
-                    element.classList.contains('progress') || element.classList.contains('loading') ||
-                    element.classList.contains('spinner') || /(^|\s)\d{1,3}%($|\s)/.test(text) ||
-                    text.includes('đang tạo') || text.includes('generating') ||
-                    text.includes('creating') || text.includes('hiện tiến trình tư duy') ||
-                    testId.includes('loading') || testId.includes('progress') ||
-                    testId.includes('generating') || html.includes('stop_circle') ||
-                    html.includes('progress_spinner') || html.includes('hourglass');
-            });
+            for (const btn of stopButtons) {
+                if (!visible(btn)) continue;
+                const text = (btn.textContent || '').trim().toLowerCase();
+                const aria = (btn.getAttribute('aria-label') || '').trim().toLowerCase();
+                const title = (btn.getAttribute('title') || '').trim().toLowerCase();
+                const html = (btn.innerHTML || '').toLowerCase();
+                if (text === 'stop' || text === 'dừng' || aria === 'stop' || aria === 'dừng' ||
+                    aria.includes('stop generation') || aria.includes('dừng tạo') ||
+                    title === 'stop' || title === 'dừng' ||
+                    html.includes('stop_circle') || html.includes('cancel')) {
+                    return true;
+                }
+            }
+
+            // 2. Active Progress Bars, Spinners, and Busy Indicators
+            const progressElements = Array.from(document.querySelectorAll(
+                "mat-progress-spinner, mat-spinner, [role='progressbar'], [aria-busy='true'], " +
+                ".spinner, .mat-mdc-progress-spinner, .flow-spinner, .progress-spinner, " +
+                "[data-testid*='loading' i], [data-testid*='progress' i], [data-testid*='generating' i]"
+            ));
+            for (const el of progressElements) {
+                if (visible(el) && !el.closest('.initial-app-loader, .global-loading-screen')) {
+                    return true;
+                }
+            }
+
+            // 3. Active Generating Media Tiles & Canvas Placeholders
+            const activeTiles = Array.from(document.querySelectorAll(
+                "flow-media-tile.generating, flow-media-tile[data-state='generating'], " +
+                "flow-media-tile[data-state='processing'], flow-canvas-tile.generating, " +
+                "flow-canvas-tile[data-state='generating'], flow-placeholder-tile, " +
+                "[data-state='generating'], [data-state='processing'], " +
+                "[data-tile-state='generating'], [data-tile-state='processing'], " +
+                ".media-tile.generating, .canvas-tile.generating, " +
+                ".generating, .processing"
+            ));
+            for (const tile of activeTiles) {
+                if (visible(tile)) {
+                    const state = (tile.getAttribute('data-state') || tile.getAttribute('data-tile-state') || '').toLowerCase();
+                    if (state === 'generating' || state === 'processing' ||
+                        tile.classList.contains('generating') || tile.classList.contains('processing') ||
+                        tile.tagName.toLowerCase() === 'flow-placeholder-tile') {
+                        return true;
+                    }
+                }
+            }
+
+            // 4. Numerical Progress Indicators (e.g., 45%, 80%) in Active Tiles
+            const progressTexts = Array.from(document.querySelectorAll(
+                ".progress-text, flow-media-tile .progress, flow-canvas-tile .progress, .status-indicator"
+            ));
+            for (const el of progressTexts) {
+                if (!visible(el)) continue;
+                const text = (el.textContent || '').trim();
+                if (/(^|\s)\d{1,3}%($|\s)/.test(text)) return true;
+            }
+
+            // 5. Active Thinking / Streaming Indicators (in-progress only)
+            const activeThinking = Array.from(document.querySelectorAll(
+                "flow-thinking.active, flow-thinking.in-progress, flow-thinking[data-state='thinking'], " +
+                "flow-thinking mat-progress-spinner, flow-thinking mat-spinner, " +
+                ".thinking-active, .streaming-active, flow-streaming-indicator, " +
+                "[data-testid*='thinking' i].active, [data-testid*='thinking' i] mat-spinner"
+            ));
+            for (const el of activeThinking) {
+                if (visible(el)) return true;
+            }
+
+            return false;
         }''')
         return result is True
 

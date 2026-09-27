@@ -1576,6 +1576,59 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
         has_chip = await worker._has_ingredient_chip()
         self.assertTrue(has_chip)
 
+    async def test_candidate_matches_active_reference_does_not_exclude_generated_image(self):
+        page = MagicMock()
+        worker = GoogleFlowWorker(page)
+        worker._set_active_reference_filenames(["le_trong_tan.jpg"], {"le_trong_tan.jpg": "C:/path/le_trong_tan.jpg"})
+        worker._active_reference_keys.add("asset:ref_key_123")
+
+        # Reference candidate
+        ref_candidate = {
+            "src": "https://flow-content.google/image/ref",
+            "assetId": "ref_key_123",
+            "labelText": "le_trong_tan.jpg",
+        }
+        self.assertTrue(worker._candidate_matches_active_reference(ref_candidate))
+
+        # Generated scene image in the same turn
+        gen_candidate_1 = {
+            "src": "https://flow-content.google/image/gen_1",
+            "assetId": "turn_456",
+            "labelText": "",
+        }
+        gen_candidate_2 = {
+            "src": "https://flow-content.google/image/gen_2",
+            "assetId": "turn_456",
+            "labelText": "Ảnh 2",
+        }
+        self.assertFalse(worker._candidate_matches_active_reference(gen_candidate_1))
+        self.assertFalse(worker._candidate_matches_active_reference(gen_candidate_2))
+
+    async def test_multi_image_grid_candidates_are_both_collected(self):
+        page = MagicMock()
+        worker = GoogleFlowWorker(page)
+        candidates_data = [
+            {
+                "src": "https://flow-content.google/image/scene_a",
+                "urls": ["https://flow-content.google/image/scene_a"],
+                "assetId": "turn_123",
+                "width": 1376,
+                "height": 768,
+            },
+            {
+                "src": "https://flow-content.google/image/scene_b",
+                "urls": ["https://flow-content.google/image/scene_b"],
+                "assetId": "turn_123",
+                "width": 1376,
+                "height": 768,
+            },
+        ]
+        page.evaluate = AsyncMock(return_value=candidates_data)
+        collected = await worker._collect_image_candidates()
+        self.assertEqual(len(collected), 2)
+        self.assertEqual(collected[0]["src"], "https://flow-content.google/image/scene_a")
+        self.assertEqual(collected[1]["src"], "https://flow-content.google/image/scene_b")
+
 
 
 if __name__ == "__main__":
