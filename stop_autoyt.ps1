@@ -213,8 +213,8 @@ try {
                     "Unknown job"
                 }
                 $type = if ($job.PSObject.Properties['type'] -and $job.type) { [string]$job.type } else { "job" }
-                $status = if ($job.PSObject.Properties['status'] -and $job.status) { [string]$job.status } else { "running" }
-                Write-Host "    * [$type] $status: $desc" -ForegroundColor Yellow
+                $statusVal = if ($job.PSObject.Properties['status'] -and $job.status) { [string]$job.status } else { "running" }
+                Write-Host "    * [$type] $($statusVal): $desc" -ForegroundColor Yellow
             }
             Write-Host ""
             throw "Auto_YT restart/stop bi chan an toan vi he thong dang thuc hien tac vu quan trong (render, upload YouTube, dang bai, hoac GPM). Vui long doi cac job tren hoan tat truoc khi restart!"
