@@ -12,6 +12,16 @@ from auto_yt.services.google_flow_login import FLOW_HOME_URL
 logger = logging.getLogger(__name__)
 
 DEBUG_LOG_DIR = Path("data/logs")
+REFERENCE_ATTACH_RETRY_COUNT = 2
+REFERENCE_POST_UPLOAD_RETRY_COUNT = 3
+REFERENCE_RESULT_ATTACHED = "attached"
+REFERENCE_RESULT_NOT_FOUND = "not_found"
+REFERENCE_RESULT_UI_ERROR = "ui_error"
+REFERENCE_ASSET_SCAN_LIMIT = 100
+
+
+class ReferenceAttachmentError(RuntimeError):
+    """Raised when a required Flow reference cannot be attached safely."""
 
 # ---------------------------------------------------------------------------
 # SynthID / Google Flow watermark removal
@@ -65,13 +75,37 @@ def _is_valid_flow_error_text(text: str) -> bool:
 
 
 class GoogleFlowWorker:
-    _session_uploaded_references: set[str] = set()
+    _session_uploaded_references: dict[str, set[str]] = {}
     _session_uploaded_image_urls: set[str] = set()
 
     def __init__(self, page: Page):
         self.page = page
-        self._uploaded_references = self._session_uploaded_references
+        self._current_project_name = ""
         self._uploaded_image_urls = self._session_uploaded_image_urls
+
+    def _project_id(self) -> str:
+        current_url = str(self.page.url or "")
+        match = re.search(r"/project/([^/?#]+)", current_url, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).casefold()
+        return self._current_project_name.casefold() or "unknown-project"
+
+    def _project_reference_cache(self) -> set[str]:
+        return self._session_uploaded_references.setdefault(self._project_id(), set())
+
+    @staticmethod
+    def _reference_filename(reference_path: str) -> str:
+        return Path(reference_path).name.strip()
+
+    def _log_reference_event(self, status: str, filename: str, *, detail: str = "") -> None:
+        log_method = logger.error if status == "attach_failed" else logger.info
+        log_method(
+            "flow_reference status=%s project=%s filename=%s detail=%s",
+            status,
+            self._project_id(),
+            filename,
+            detail,
+        )
 
     async def wait_for_load(self, timeout_ms: int = 15000):
         try:
@@ -327,6 +361,7 @@ class GoogleFlowWorker:
     async def ensure_project(self, project_name: str, force_new: bool = False) -> str:
         """Ensure that the browser is inside an active project session matching project_name.
         If force_new is True, always create a brand-new project on Google Flow."""
+        self._current_project_name = str(project_name or "").strip()
         current_url = str(self.page.url or "")
         current_title = (await self._get_page_title()).lower()
 
@@ -364,7 +399,6 @@ class GoogleFlowWorker:
             await self.page.goto("https://flow.google.com/", wait_until="domcontentloaded", timeout=30000)
         await self.wait_for_load()
         if force_new:
-            self._uploaded_references.clear()
             self._uploaded_image_urls.clear()
         await self.dismiss_blocking_dialogs()
 
@@ -432,39 +466,57 @@ class GoogleFlowWorker:
         await self.dismiss_blocking_dialogs()
         return self.page.url
 
-    async def upload_reference(self, reference_path: str, label: str):
-        if not reference_path or not Path(reference_path).is_file():
-            return
-        ref_key = label or str(Path(reference_path).stem)
-        if ref_key in self._uploaded_references or str(reference_path) in self._uploaded_references:
-            logger.info("Reference '%s' already uploaded in this session, skipping re-upload.", ref_key)
-            return
-
+    async def _upload_reference_file(self, reference_path: str) -> None:
+        filename = self._reference_filename(reference_path)
+        if not filename or not Path(reference_path).is_file():
+            raise RuntimeError(f"Reference image does not exist: {reference_path}")
         add_btn = self.page.locator("button[aria-label*='Add ingredients' i], button.add-menu-trigger").first
-        if await add_btn.is_visible(timeout=3000):
-            try:
-                await add_btn.click()
-                await asyncio.sleep(1)
-                async with self.page.expect_file_chooser(timeout=5000) as fc_info:
-                    file_opt = self.page.locator(
-                        "button:has-text('Upload media'), .sidebar-upload-btn, button:has-text('Upload'), button:has-text('File'), [role='menuitem']:has-text('File'), [role='menuitem']:has-text('Upload')"
-                    ).first
-                    if await file_opt.is_visible(timeout=3000):
-                        await file_opt.click()
-                file_chooser = await fc_info.value
-                await file_chooser.set_files(reference_path)
-                await self.wait_for_load()
-                # Wait 2.5s for uploaded image to render and dismiss dialogs
-                await asyncio.sleep(2.5)
-                uploaded_snapshot = await self._get_existing_images()
-                self._uploaded_image_urls.update(uploaded_snapshot)
-                self._uploaded_references.add(ref_key)
-                self._uploaded_references.add(str(reference_path))
-                logger.info("Successfully uploaded reference asset: %s (%s)", ref_key, reference_path)
-            except Exception as e:
-                logger.warning("Could not upload reference: %s", e)
-            finally:
-                await self.dismiss_blocking_dialogs()
+        if not await add_btn.is_visible(timeout=3000):
+            raise RuntimeError("Add ingredients button is not visible for reference upload.")
+
+        try:
+            await add_btn.click()
+            await asyncio.sleep(1)
+            async with self.page.expect_file_chooser(timeout=5000) as fc_info:
+                file_opt = self.page.locator(
+                    "button:has-text('Upload media'), .sidebar-upload-btn, "
+                    "button:has-text('Tải nội dung'), button:has-text('Tải lên'), "
+                    "button:has-text('Upload'), button:has-text('File'), "
+                    "[role='menuitem']:has-text('File'), [role='menuitem']:has-text('Upload'), "
+                    "[role='menuitem']:has-text('Tải lên')"
+                ).first
+                if not await file_opt.is_visible(timeout=3000):
+                    raise RuntimeError("Reference upload menu item is not visible.")
+                await file_opt.click()
+            file_chooser = await fc_info.value
+            await file_chooser.set_files(reference_path)
+            # Treat an accepted file chooser as an upload attempt immediately. This
+            # prevents a transient UI verification failure from causing duplicates.
+            self._project_reference_cache().add(filename.casefold())
+            await self.wait_for_load()
+            await asyncio.sleep(2.5)
+            uploaded_snapshot = await self._get_existing_images()
+            self._uploaded_image_urls.update(uploaded_snapshot)
+        finally:
+            await self.dismiss_blocking_dialogs()
+
+    async def upload_reference(self, reference_path: str, label: str):
+        """Upload a non-scene reference while preserving legacy best-effort behavior."""
+        filename = self._reference_filename(reference_path)
+        if not filename or not Path(reference_path).is_file():
+            return
+        if filename.casefold() in self._project_reference_cache():
+            logger.info(
+                "Reference '%s' already uploaded in project '%s', skipping re-upload.",
+                label or filename,
+                self._project_id(),
+            )
+            return
+        try:
+            await self._upload_reference_file(reference_path)
+            self._log_reference_event("uploaded", filename, detail="legacy_upload")
+        except Exception as exc:
+            logger.warning("Could not upload reference '%s': %s", label or filename, exc)
 
     async def _get_existing_images(self) -> set[str]:
         """Collect all flow-content image URLs currently rendered on the page, strictly excluding Google account avatars, reference chips, and menus."""
@@ -588,7 +640,263 @@ class GoogleFlowWorker:
             if not found_any:
                 break
 
-    async def sync_reference_ingredients(self, reference_ids: list[str] | None) -> None:
+    @staticmethod
+    def _text_matches_asset_filename(text: str, filename: str) -> bool:
+        expected = str(filename or "").strip().casefold()
+        if not expected:
+            return False
+        lines = [line.strip().casefold() for line in str(text or "").splitlines()]
+        return expected in lines
+
+    async def _find_exact_picker_asset(self, filename: str) -> Locator | None:
+        asset_items = self.page.locator(
+            ".cdk-overlay-container button.asset-item, "
+            ".cdk-overlay-container [role='option'], "
+            ".cdk-overlay-container [role='listitem'], "
+            ".cdk-overlay-container .asset-title, "
+            ".cdk-overlay-container [data-testid*='asset']"
+        )
+        count = await asset_items.count()
+        for index in range(min(count, REFERENCE_ASSET_SCAN_LIMIT)):
+            item = asset_items.nth(index)
+            text = await item.inner_text(timeout=1000)
+            if self._text_matches_asset_filename(text, filename):
+                return item
+        return None
+
+    async def _has_ingredient_chip(self) -> bool:
+        chip = self.page.locator(
+            "flow-prompt-box flow-ingredient-chip, flow-ingredient-chip, "
+            ".ingredient-chip, .reference-chip, [data-testid*='ingredient-chip']"
+        ).first
+        try:
+            return await chip.is_visible(timeout=1500)
+        except Exception:
+            return False
+
+    async def _close_reference_ui(self) -> None:
+        try:
+            await self.page.keyboard.press("Escape")
+            await asyncio.sleep(0.3)
+        except Exception:
+            pass
+        await self.dismiss_blocking_dialogs()
+
+    async def _attach_reference_from_picker(self, filename: str) -> str:
+        """Attach an existing upload by exact filename using the searchable picker."""
+        await self.dismiss_blocking_dialogs()
+        add_btn = self.page.locator(
+            "button.add-menu-trigger, button[aria-label*='Add ingredients' i]"
+        ).first
+        try:
+            if not await add_btn.is_visible(timeout=4000):
+                return REFERENCE_RESULT_UI_ERROR
+            await add_btn.click()
+            await asyncio.sleep(0.8)
+
+            uploads_tab = self.page.locator(
+                ".cdk-overlay-container mat-list-item:has-text('Uploads'), "
+                ".cdk-overlay-container mat-list-item:has-text('Tệp tải lên'), "
+                ".cdk-overlay-container .side-nav-list-item:has-text('Uploads'), "
+                ".cdk-overlay-container .side-nav-list-item:has-text('Tệp tải lên'), "
+                ".cdk-overlay-container button:has-text('Uploads'), "
+                ".cdk-overlay-container button:has-text('Tệp tải lên')"
+            ).first
+            if await uploads_tab.is_visible(timeout=2000):
+                await uploads_tab.click()
+                await asyncio.sleep(0.5)
+
+            search_input = self.page.locator(
+                ".cdk-overlay-container input[placeholder*='Search' i], "
+                ".cdk-overlay-container input[aria-label*='Search' i], "
+                ".cdk-overlay-container input[placeholder*='Tìm kiếm' i], "
+                ".cdk-overlay-container input[aria-label*='Tìm kiếm' i]"
+            ).first
+            if not await search_input.is_visible(timeout=2000):
+                await self._close_reference_ui()
+                return REFERENCE_RESULT_UI_ERROR
+
+            await search_input.fill(filename)
+            await self.page.keyboard.press("Enter")
+            await asyncio.sleep(0.8)
+            asset_item = await self._find_exact_picker_asset(filename)
+            if asset_item is None:
+                await self._close_reference_ui()
+                return REFERENCE_RESULT_NOT_FOUND
+
+            await asset_item.click()
+            await asyncio.sleep(0.5)
+            if await self._has_ingredient_chip():
+                await self._close_reference_ui()
+                return REFERENCE_RESULT_ATTACHED
+
+            add_to_prompt_btn = self.page.locator(
+                ".cdk-overlay-container button.detail-add-to-prompt-btn, "
+                ".cdk-overlay-container button:has-text('Thêm vào câu lệnh'), "
+                ".cdk-overlay-container [role='menuitem']:has-text('Thêm vào câu lệnh'), "
+                ".cdk-overlay-container button:has-text('Add to prompt'), "
+                ".cdk-overlay-container [role='menuitem']:has-text('Add to prompt')"
+            ).first
+            if not await add_to_prompt_btn.is_visible(timeout=3000):
+                await self._close_reference_ui()
+                return REFERENCE_RESULT_UI_ERROR
+            await add_to_prompt_btn.click()
+            await asyncio.sleep(0.8)
+            attached = await self._has_ingredient_chip()
+            await self._close_reference_ui()
+            return REFERENCE_RESULT_ATTACHED if attached else REFERENCE_RESULT_UI_ERROR
+        except Exception as exc:
+            logger.warning("Reference picker failed for '%s': %s", filename, exc)
+            await self._close_reference_ui()
+            return REFERENCE_RESULT_UI_ERROR
+
+    async def _attach_reference_from_gallery(self, filename: str) -> str:
+        """Attach an existing upload from its gallery card context menu."""
+        await self._close_reference_ui()
+        try:
+            filename_label = self.page.get_by_text(filename, exact=True).first
+            if not await filename_label.is_visible(timeout=2000):
+                return REFERENCE_RESULT_NOT_FOUND
+
+            card = filename_label.locator(
+                "xpath=ancestor::*[self::flow-media-tile or @role='listitem' "
+                "or contains(@class, 'media') or contains(@class, 'asset')][1]"
+            )
+            if await card.count() == 0:
+                card = filename_label.locator("xpath=ancestor::*[.//button][1]")
+            if await card.count() == 0:
+                return REFERENCE_RESULT_UI_ERROR
+
+            await card.hover()
+            menu_btn = card.locator(
+                "button[aria-label*='More' i], button[aria-label*='Khác' i], "
+                "button[aria-label*='menu' i], button:has(mat-icon:text-is('more_vert')), "
+                "button:has-text('⋮')"
+            ).first
+            if not await menu_btn.is_visible(timeout=2000):
+                return REFERENCE_RESULT_UI_ERROR
+            await menu_btn.click()
+            await asyncio.sleep(0.4)
+
+            add_to_prompt = self.page.locator(
+                "[role='menu'] [role='menuitem']:has-text('Thêm vào câu lệnh'), "
+                "[role='menu'] [role='menuitem']:has-text('Add to prompt'), "
+                ".cdk-overlay-container button:has-text('Thêm vào câu lệnh'), "
+                ".cdk-overlay-container button:has-text('Add to prompt')"
+            ).first
+            if not await add_to_prompt.is_visible(timeout=2500):
+                await self._close_reference_ui()
+                return REFERENCE_RESULT_UI_ERROR
+            await add_to_prompt.click()
+            await asyncio.sleep(0.8)
+            attached = await self._has_ingredient_chip()
+            await self._close_reference_ui()
+            return REFERENCE_RESULT_ATTACHED if attached else REFERENCE_RESULT_UI_ERROR
+        except Exception as exc:
+            logger.warning("Reference gallery fallback failed for '%s': %s", filename, exc)
+            await self._close_reference_ui()
+            return REFERENCE_RESULT_UI_ERROR
+
+    async def _try_attach_existing_reference(self, filename: str) -> tuple[str, str]:
+        picker_result = await self._attach_reference_from_picker(filename)
+        if picker_result == REFERENCE_RESULT_ATTACHED:
+            return picker_result, "reused_picker"
+
+        gallery_result = await self._attach_reference_from_gallery(filename)
+        if gallery_result == REFERENCE_RESULT_ATTACHED:
+            return gallery_result, "reused_gallery"
+        if (
+            picker_result == REFERENCE_RESULT_NOT_FOUND
+            and gallery_result == REFERENCE_RESULT_NOT_FOUND
+        ):
+            return REFERENCE_RESULT_NOT_FOUND, ""
+        return REFERENCE_RESULT_UI_ERROR, ""
+
+    async def _sync_required_scene_reference(
+        self,
+        reference_id: str,
+        reference_path: str,
+    ) -> None:
+        filename = self._reference_filename(reference_path)
+        if not filename or not Path(reference_path).is_file():
+            self._log_reference_event(
+                "attach_failed",
+                filename or reference_id,
+                detail="local_file_missing",
+            )
+            raise ReferenceAttachmentError(f"Ảnh tham chiếu không tồn tại: {reference_path}")
+
+        cache = self._project_reference_cache()
+        filename_key = filename.casefold()
+        known_in_project = filename_key in cache
+        confirmed_missing = False
+
+        for _ in range(REFERENCE_ATTACH_RETRY_COUNT):
+            result, source = await self._try_attach_existing_reference(filename)
+            if result == REFERENCE_RESULT_ATTACHED:
+                cache.add(filename_key)
+                self._log_reference_event(source, filename)
+                return
+            if result == REFERENCE_RESULT_NOT_FOUND:
+                confirmed_missing = True
+                break
+            await asyncio.sleep(0.5)
+
+        if known_in_project:
+            self._log_reference_event(
+                "attach_failed",
+                filename,
+                detail="known_asset_could_not_be_attached",
+            )
+            raise ReferenceAttachmentError(
+                f"Không thể gắn ảnh tham chiếu đã có '{filename}' trong project Flow."
+            )
+        if not confirmed_missing:
+            self._log_reference_event(
+                "attach_failed",
+                filename,
+                detail="library_lookup_ui_error",
+            )
+            raise ReferenceAttachmentError(
+                f"Không thể kiểm tra thư viện Flow cho ảnh tham chiếu '{filename}'."
+            )
+
+        try:
+            await self._upload_reference_file(reference_path)
+        except Exception as exc:
+            self._log_reference_event(
+                "attach_failed",
+                filename,
+                detail=f"upload_failed:{type(exc).__name__}",
+            )
+            raise ReferenceAttachmentError(
+                f"Không thể upload ảnh tham chiếu '{filename}': {exc}"
+            ) from exc
+
+        for _ in range(REFERENCE_POST_UPLOAD_RETRY_COUNT):
+            if await self._has_ingredient_chip():
+                self._log_reference_event("uploaded", filename, detail="attached_by_upload")
+                return
+            result, _ = await self._try_attach_existing_reference(filename)
+            if result == REFERENCE_RESULT_ATTACHED:
+                self._log_reference_event("uploaded", filename, detail="attached_after_upload")
+                return
+            await asyncio.sleep(1)
+
+        self._log_reference_event(
+            "attach_failed",
+            filename,
+            detail="uploaded_but_not_attachable",
+        )
+        raise ReferenceAttachmentError(
+            f"Ảnh '{filename}' đã được gửi lên Flow nhưng không thể gắn vào câu lệnh."
+        )
+
+    async def sync_reference_ingredients(
+        self,
+        reference_ids: list[str] | None,
+        reference_paths: dict[str, str] | None = None,
+    ) -> None:
         """Ensure the prompt box has the desired reference image attached as an ingredient chip."""
         ref_ids = [str(r).strip() for r in (reference_ids or []) if str(r).strip()]
 
@@ -601,6 +909,11 @@ class GoogleFlowWorker:
         # Clear existing chips to avoid mixing wrong references
         await self.clear_ingredient_chips()
         await self.dismiss_blocking_dialogs()
+
+        reference_path = str((reference_paths or {}).get(target_ref) or "").strip()
+        if reference_path:
+            await self._sync_required_scene_reference(target_ref, reference_path)
+            return
 
         add_btn = self.page.locator("button.add-menu-trigger, button[aria-label*='Add ingredients' i]").first
         if not await add_btn.is_visible(timeout=4000):
@@ -690,7 +1003,13 @@ class GoogleFlowWorker:
         finally:
             await self.dismiss_blocking_dialogs()
 
-    async def generate_scene(self, prompt: str, avoid_prompt: str, reference_ids: list[str]) -> str:
+    async def generate_scene(
+        self,
+        prompt: str,
+        avoid_prompt: str,
+        reference_ids: list[str],
+        reference_paths: dict[str, str] | None = None,
+    ) -> str:
         # Clean any URL / bracket tags from prompt
         clean_prompt = re.sub(r"\[IMAGE_URL:[^\]]*\]", "", prompt)
         clean_prompt = re.sub(r"https?://\S+", "", clean_prompt)
@@ -701,7 +1020,7 @@ class GoogleFlowWorker:
         initial_error_texts = await self._get_existing_error_texts()
 
         # Synchronize reference image ingredients with the prompt bar
-        await self.sync_reference_ingredients(reference_ids)
+        await self.sync_reference_ingredients(reference_ids, reference_paths)
 
         strict_avoid = "text, letters, words, typography, watermark, logo, headline, caption, subtitle, poster text, overlay, title banner"
         if avoid_prompt and avoid_prompt.strip():

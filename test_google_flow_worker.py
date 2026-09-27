@@ -4,10 +4,19 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from auto_yt.services.google_flow_worker import GoogleFlowWorker
+from auto_yt.services.google_flow_worker import (
+    GoogleFlowWorker,
+    REFERENCE_RESULT_ATTACHED,
+    REFERENCE_RESULT_NOT_FOUND,
+    REFERENCE_RESULT_UI_ERROR,
+    ReferenceAttachmentError,
+)
 
 
 class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        GoogleFlowWorker._session_uploaded_references.clear()
+
     async def test_wait_for_editor_finds_prosemirror(self):
         page = MagicMock()
         page.url = "https://flow.google.com/project/123"
@@ -289,6 +298,255 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
         uploads_tab.first.click.assert_called()
         asset_btn.first.click.assert_called()
         add_to_prompt_btn.first.click.assert_called()
+
+    async def test_required_reference_uploads_once_then_reuses_existing_asset(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reference_path = Path(temp_dir) / "le_trong_tan.jpg"
+            reference_path.write_bytes(b"portrait")
+            page = MagicMock()
+            page.url = "https://flow.google.com/project/project-one"
+            worker = GoogleFlowWorker(page)
+
+            async def mark_uploaded(path):
+                worker._project_reference_cache().add(Path(path).name.casefold())
+
+            attach_existing = AsyncMock(
+                side_effect=[
+                    (REFERENCE_RESULT_NOT_FOUND, ""),
+                    (REFERENCE_RESULT_ATTACHED, "reused_picker"),
+                    (REFERENCE_RESULT_ATTACHED, "reused_picker"),
+                ]
+            )
+            upload = AsyncMock(side_effect=mark_uploaded)
+            with (
+                patch.object(worker, "_try_attach_existing_reference", attach_existing),
+                patch.object(worker, "_upload_reference_file", upload),
+                patch.object(worker, "_has_ingredient_chip", AsyncMock(return_value=False)),
+            ):
+                await worker._sync_required_scene_reference(
+                    "le_trong_tan",
+                    str(reference_path),
+                )
+                await worker._sync_required_scene_reference(
+                    "le_trong_tan",
+                    str(reference_path),
+                )
+
+            upload.assert_awaited_once_with(str(reference_path))
+
+    async def test_cold_cache_reuses_flow_library_asset_without_upload(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reference_path = Path(temp_dir) / "le_trong_tan.jpg"
+            reference_path.write_bytes(b"portrait")
+            page = MagicMock()
+            page.url = "https://flow.google.com/project/project-one"
+            worker = GoogleFlowWorker(page)
+
+            with (
+                patch.object(
+                    worker,
+                    "_try_attach_existing_reference",
+                    AsyncMock(return_value=(REFERENCE_RESULT_ATTACHED, "reused_picker")),
+                ),
+                patch.object(worker, "_upload_reference_file", AsyncMock()) as upload,
+            ):
+                await worker._sync_required_scene_reference(
+                    "le_trong_tan",
+                    str(reference_path),
+                )
+
+            upload.assert_not_awaited()
+            self.assertIn(
+                "le_trong_tan.jpg",
+                worker._project_reference_cache(),
+            )
+
+    async def test_picker_error_falls_back_to_gallery(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        with (
+            patch.object(
+                worker,
+                "_attach_reference_from_picker",
+                AsyncMock(return_value=REFERENCE_RESULT_UI_ERROR),
+            ),
+            patch.object(
+                worker,
+                "_attach_reference_from_gallery",
+                AsyncMock(return_value=REFERENCE_RESULT_ATTACHED),
+            ) as gallery,
+        ):
+            result = await worker._try_attach_existing_reference("le_trong_tan.jpg")
+
+        self.assertEqual(result, (REFERENCE_RESULT_ATTACHED, "reused_gallery"))
+        gallery.assert_awaited_once_with("le_trong_tan.jpg")
+
+    async def test_known_asset_ui_failure_never_uploads_duplicate(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reference_path = Path(temp_dir) / "le_trong_tan.jpg"
+            reference_path.write_bytes(b"portrait")
+            page = MagicMock()
+            page.url = "https://flow.google.com/project/project-one"
+            worker = GoogleFlowWorker(page)
+            worker._project_reference_cache().add("le_trong_tan.jpg")
+
+            with (
+                patch.object(
+                    worker,
+                    "_try_attach_existing_reference",
+                    AsyncMock(return_value=(REFERENCE_RESULT_UI_ERROR, "")),
+                ),
+                patch.object(worker, "_upload_reference_file", AsyncMock()) as upload,
+                patch("auto_yt.services.google_flow_worker.asyncio.sleep", AsyncMock()),
+            ):
+                with self.assertRaises(ReferenceAttachmentError):
+                    await worker._sync_required_scene_reference(
+                        "le_trong_tan",
+                        str(reference_path),
+                    )
+
+            upload.assert_not_awaited()
+
+    async def test_reference_cache_is_isolated_by_flow_project(self):
+        page_one = MagicMock()
+        page_one.url = "https://flow.google.com/project/project-one"
+        page_two = MagicMock()
+        page_two.url = "https://flow.google.com/project/project-two"
+        worker_one = GoogleFlowWorker(page_one)
+        worker_two = GoogleFlowWorker(page_two)
+
+        worker_one._project_reference_cache().add("le_trong_tan.jpg")
+
+        self.assertIn("le_trong_tan.jpg", worker_one._project_reference_cache())
+        self.assertNotIn("le_trong_tan.jpg", worker_two._project_reference_cache())
+
+    async def test_same_filename_uploads_once_in_each_project(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reference_path = Path(temp_dir) / "le_trong_tan.jpg"
+            reference_path.write_bytes(b"portrait")
+            upload_counts = []
+
+            for project_id in ("project-one", "project-two"):
+                page = MagicMock()
+                page.url = f"https://flow.google.com/project/{project_id}"
+                worker = GoogleFlowWorker(page)
+
+                async def mark_uploaded(path, current_worker=worker):
+                    current_worker._project_reference_cache().add(
+                        Path(path).name.casefold()
+                    )
+
+                upload = AsyncMock(side_effect=mark_uploaded)
+                with (
+                    patch.object(
+                        worker,
+                        "_try_attach_existing_reference",
+                        AsyncMock(
+                            side_effect=[
+                                (REFERENCE_RESULT_NOT_FOUND, ""),
+                                (REFERENCE_RESULT_ATTACHED, "reused_picker"),
+                                (REFERENCE_RESULT_ATTACHED, "reused_picker"),
+                            ]
+                        ),
+                    ),
+                    patch.object(worker, "_upload_reference_file", upload),
+                    patch.object(worker, "_has_ingredient_chip", AsyncMock(return_value=False)),
+                ):
+                    await worker._sync_required_scene_reference(
+                        "le_trong_tan",
+                        str(reference_path),
+                    )
+                    await worker._sync_required_scene_reference(
+                        "le_trong_tan",
+                        str(reference_path),
+                    )
+                upload_counts.append(upload.await_count)
+
+            self.assertEqual(upload_counts, [1, 1])
+
+    async def test_sync_reference_ingredients_routes_required_path(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        with (
+            patch.object(worker, "clear_ingredient_chips", AsyncMock()),
+            patch.object(worker, "dismiss_blocking_dialogs", AsyncMock()),
+            patch.object(
+                worker,
+                "_sync_required_scene_reference",
+                AsyncMock(),
+            ) as sync_required,
+        ):
+            await worker.sync_reference_ingredients(
+                ["le_trong_tan"],
+                {"le_trong_tan": "C:/assets/le_trong_tan.jpg"},
+            )
+
+        sync_required.assert_awaited_once_with(
+            "le_trong_tan",
+            "C:/assets/le_trong_tan.jpg",
+        )
+
+    async def test_same_filename_ignores_changed_file_content(self):
+        with tempfile.TemporaryDirectory() as first_dir, tempfile.TemporaryDirectory() as second_dir:
+            first_path = Path(first_dir) / "le_trong_tan.jpg"
+            second_path = Path(second_dir) / "le_trong_tan.jpg"
+            first_path.write_bytes(b"old portrait")
+            second_path.write_bytes(b"new portrait")
+            page = MagicMock()
+            page.url = "https://flow.google.com/project/project-one"
+            worker = GoogleFlowWorker(page)
+            worker._project_reference_cache().add(first_path.name.casefold())
+
+            with (
+                patch.object(
+                    worker,
+                    "_try_attach_existing_reference",
+                    AsyncMock(return_value=(REFERENCE_RESULT_ATTACHED, "reused_picker")),
+                ),
+                patch.object(worker, "_upload_reference_file", AsyncMock()) as upload,
+            ):
+                await worker._sync_required_scene_reference(
+                    "le_trong_tan",
+                    str(second_path),
+                )
+
+            upload.assert_not_awaited()
+
+    async def test_exact_filename_matching_rejects_similar_names(self):
+        self.assertTrue(
+            GoogleFlowWorker._text_matches_asset_filename(
+                "le_trong_tan.jpg\nHình ảnh",
+                "LE_TRONG_TAN.JPG",
+            )
+        )
+        self.assertFalse(
+            GoogleFlowWorker._text_matches_asset_filename(
+                "le_trong_tan_old.jpg\nHình ảnh",
+                "le_trong_tan.jpg",
+            )
+        )
+
+    async def test_exact_picker_match_uses_first_existing_duplicate(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        asset_items = MagicMock()
+        asset_items.count = AsyncMock(return_value=3)
+        similar = MagicMock()
+        similar.inner_text = AsyncMock(return_value="le_trong_tan_old.jpg\nHình ảnh")
+        first_exact = MagicMock()
+        first_exact.inner_text = AsyncMock(return_value="le_trong_tan.jpg\nHình ảnh")
+        second_exact = MagicMock()
+        second_exact.inner_text = AsyncMock(return_value="le_trong_tan.jpg\nHình ảnh")
+        asset_items.nth.side_effect = [similar, first_exact, second_exact]
+        page.locator.return_value = asset_items
+        worker = GoogleFlowWorker(page)
+
+        result = await worker._find_exact_picker_asset("le_trong_tan.jpg")
+
+        self.assertIs(result, first_exact)
+        second_exact.inner_text.assert_not_awaited()
 
 
 if __name__ == "__main__":

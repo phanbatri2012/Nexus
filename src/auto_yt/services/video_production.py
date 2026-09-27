@@ -685,15 +685,11 @@ def _generate_scene_image(
 
         
     async def _do_flow():
-        import importlib
-        import sys
-        if "auto_yt.services.google_flow_worker" in sys.modules:
-            try:
-                importlib.reload(sys.modules["auto_yt.services.google_flow_worker"])
-            except Exception:
-                pass
         from playwright.async_api import async_playwright
-        from auto_yt.services.google_flow_worker import GoogleFlowWorker
+        from auto_yt.services.google_flow_worker import (
+            GoogleFlowWorker,
+            ReferenceAttachmentError,
+        )
         
         async with async_playwright() as p:
             browser = await p.chromium.connect_over_cdp(endpoint)
@@ -711,10 +707,7 @@ def _generate_scene_image(
             worker = GoogleFlowWorker(page)
             project_name = f"auto_yt_{video_id}"
             await worker.ensure_project(project_name, force_new=force_new_project)
-            
-            if reference_path and reference_id:
-                await worker.upload_reference(str(reference_path), reference_id)
-                
+
             video_rec = db.get_video(video_id) or {}
             video_title = str(video_rec.get("title") or video_rec.get("generated_title") or "")
             scene_action = str(scene.get("action") or scene.get("transcript") or "")
@@ -728,9 +721,21 @@ def _generate_scene_image(
             )
             avoid = negative_prompt
             refs = [reference_id] if reference_id else []
-            
+            reference_paths = (
+                {reference_id: str(reference_path)}
+                if reference_id and reference_path
+                else {}
+            )
+
             try:
-                asset_url = await worker.generate_scene(clean_prompt, avoid, refs)
+                asset_url = await worker.generate_scene(
+                    clean_prompt,
+                    avoid,
+                    refs,
+                    reference_paths,
+                )
+            except ReferenceAttachmentError:
+                raise
             except Exception as first_err:
                 logger.warning(
                     "First attempt generate_scene for scene %d failed (%s). Retrying with generic context-aware fallback prompt...",
@@ -748,7 +753,12 @@ def _generate_scene_image(
                     f"{context_desc}"
                     f"16:9 widescreen still photograph, authentic realism, dramatic atmospheric lighting, clean visual without text."
                 ).replace("  ", " ").strip()
-                asset_url = await worker.generate_scene(safe_prompt, avoid, refs)
+                asset_url = await worker.generate_scene(
+                    safe_prompt,
+                    avoid,
+                    refs,
+                    reference_paths,
+                )
 
             await worker.download_image(asset_url, str(target))
             
