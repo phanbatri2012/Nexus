@@ -684,11 +684,33 @@ def get_thumbnail_image_identity(image_url: str) -> str:
     return image_url
 
 
+def get_existing_thumbnail_identities(page: Page) -> set[str]:
+    """Collect image identities currently visible in the DOM before sending a prompt."""
+    try:
+        images = page.locator(THUMBNAIL_IMAGE_SELECTOR)
+        if images.count() == 0:
+            return set()
+        image_snapshots = images.evaluate_all(
+            """
+            elements => elements.map(image => image.getAttribute('src') || image.currentSrc || '')
+            """
+        )
+        identities = set()
+        for src in image_snapshots:
+            if src:
+                identities.add(get_thumbnail_image_identity(src))
+        return identities
+    except Exception:
+        return set()
+
+
 def wait_for_thumbnail_images(
     page: Page,
     request_turn: int,
     download_image,
+    exclude_identities: set[str] | None = None,
 ) -> list[str]:
+    excluded = exclude_identities or set()
     deadline = time.time() + THUMBNAIL_IMAGE_WAIT_TIMEOUT_SECONDS
     response_turn = None
     snapshot_error_logged = False
@@ -758,6 +780,7 @@ def wait_for_thumbnail_images(
             if (
                 image_url
                 and image_snapshot.get("ready")
+                and image_identity not in excluded
                 and image_identity not in image_identities
             ):
                 image_urls.append(image_url)
@@ -801,8 +824,18 @@ def get_reusable_thumbnail_images(page: Page, download_image) -> list[str]:
         return []
 
 
-def wait_for_thumbnail_image(page: Page, request_turn: int, download_image) -> str:
-    image_urls = wait_for_thumbnail_images(page, request_turn, download_image)
+def wait_for_thumbnail_image(
+    page: Page,
+    request_turn: int,
+    download_image,
+    exclude_identities: set[str] | None = None,
+) -> str:
+    image_urls = wait_for_thumbnail_images(
+        page,
+        request_turn,
+        download_image,
+        exclude_identities=exclude_identities,
+    )
     return image_urls[0] if image_urls else ""
 
 
@@ -812,6 +845,7 @@ def send_thumbnail_prompt(
     download_image,
     reference_image_base64: str | None = None
 ) -> tuple[str, list[str]]:
+    existing_identities = get_existing_thumbnail_identities(page)
     previous_user_turn = get_latest_conversation_turn(page, "user")
     response_text = send_prompt(
         page,
@@ -822,7 +856,12 @@ def send_thumbnail_prompt(
     request_turn = wait_for_new_user_turn(page, previous_user_turn)
     if is_thumbnail_generation_error_response(response_text):
         return response_text, []
-    image_urls = wait_for_thumbnail_images(page, request_turn, download_image)
+    image_urls = wait_for_thumbnail_images(
+        page,
+        request_turn,
+        download_image,
+        exclude_identities=existing_identities,
+    )
     return response_text, image_urls
 
 

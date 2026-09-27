@@ -7061,14 +7061,17 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
                     section_pattern = rf'### \[{re.escape(section_title)}\]\n(.*?)(?=\n### \[|\Z)'
                     section_match = re.search(section_pattern, script, re.DOTALL)
                     current_text = section_match.group(1).strip() if section_match else ""
-                    updated_text = generated_text or current_text
+                    current_prompt_text = re.sub(r'\[IMAGE_URL:.*?\]', '', current_text).strip() if current_text else ""
+                    new_prompt_text = re.sub(r'\[IMAGE_URL:.*?\]', '', generated_text).strip() if generated_text else ""
+                    prompt_text = new_prompt_text or current_prompt_text
 
                     if image_urls:
-                        updated_text = re.sub(r'\[IMAGE_URL:.*?\]', '', updated_text).strip()
                         image_markers = "\n\n".join(
                             f"[IMAGE_URL:{image_url}]" for image_url in image_urls
                         )
-                        updated_text += f"\n\n{image_markers}"
+                        updated_text = f"{prompt_text}\n\n{image_markers}".strip() if prompt_text else image_markers
+                    else:
+                        updated_text = prompt_text
 
                     if section_match:
                         script = re.sub(
@@ -7077,6 +7080,8 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
                             script,
                             flags=re.DOTALL,
                         )
+                    else:
+                        script = script.rstrip() + f"\n\n### [{section_title}]\n{updated_text.strip()}\n" 
                         
                 db.update_script(req.video_id, script)
         

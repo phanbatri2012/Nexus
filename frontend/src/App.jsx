@@ -1015,7 +1015,10 @@ function App() {
             .join('\n\n');
           return script.replace(
             new RegExp(`(### \\[${sectionTitle}\\][\\s\\S]*?)(?=\\n### |$)`),
-            (section) => section.replace(/\[IMAGE_URL:.*?\]/g, '').trimEnd() + `\n\n${imageMarkers}`
+            (section) => {
+              const cleaned = section.replace(/\[IMAGE_URL:.*?\]/g, '').trimEnd();
+              return `${cleaned}\n\n${imageMarkers}`;
+            }
           );
         };
 
@@ -1031,6 +1034,9 @@ function App() {
           normalizeThumbnailUrls(data.image2_urls, data.image2_url)
         );
         setResultText(newScript);
+        if (currentVideoId) {
+          await fetchSavedVideos(currentPage, publishFilter);
+        }
       } else {
         alert('Lỗi tạo thumbnail: ' + (data.error || 'Unknown error'));
       }
