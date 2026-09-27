@@ -357,7 +357,6 @@ def select_reusable_outline_response(
         cleaned_response = clean_text(response_text)
         if (
             role == "assistant"
-            and "[PHAN]" in cleaned_response
             and split_outline_parts(cleaned_response)
         ):
             return cleaned_response
@@ -559,24 +558,62 @@ def get_response_turn_baseline(
     return previous_assistant_turn
 
 
+def strip_outline_preamble(outline: str) -> str:
+    clean_outline = outline.strip()
+    if not clean_outline:
+        return ""
+    first_marker = re.search(
+        r"(?:^|\n|\r\n)\s*(?:(?:#{1,6}\s*)?(?:\*\*)?(?:\[\s*)?(?:phần|phan|part|section|mục|đoạn)\s*\d*(?:[:\-–—.\s].*?)?(?:\])?(?:\*\*)?|(?:#{1,6}\s*)?(?:\*\*)?\d+[\.\)\/\-–—]\s+)",
+        clean_outline,
+        flags=re.IGNORECASE,
+    )
+    if first_marker and first_marker.start() > 0:
+        return clean_outline[first_marker.start():].strip()
+    return clean_outline
+
+
 def split_outline_parts(
     outline: str,
     max_chars: int = OUTLINE_PART_MAX_CHARS,
 ) -> list[str]:
-    clean_outline = outline.strip()
-    # Priority 1: Tag-based delimiters like [PHAN], [PHẦN], [Phần], [PART]
-    bracket_tag_pattern = re.compile(r"\[\s*(?:phần|phan|part|section)\s*\]", flags=re.IGNORECASE)
+    clean_outline = strip_outline_preamble(outline)
+    if not clean_outline:
+        return []
+
+    # Priority 1: Delimiters with [PHẦN ...], [PHAN ...], [PART ...], [SECTION ...]
+    bracket_tag_pattern = re.compile(
+        r"\[\s*(?:phần|phan|part|section)\s*(?:\d+)?(?:\s*[:\-–—].*?)?\s*\]",
+        flags=re.IGNORECASE,
+    )
+
+    # Priority 2: Line-based numbered headers like PHẦN 1:, ### Phần 1, **Phần 1:**, [Phần 1], Mục 1:, Đoạn 1:
+    header_tag_pattern = re.compile(
+        r"(?:^|\n|\r\n)\s*(?:#{1,6}\s*)?(?:\*\*)?(?:\[\s*)?(?:phần|phan|part|section|mục|đoạn)\s*\d+[:\-–—.\s]*(?:\])?(?:\*\*)?",
+        flags=re.IGNORECASE,
+    )
+
+    # Priority 3: Numbered list headers like 1. , 2. , ### 1. , **1.** (when there are at least 2 items)
+    numbered_tag_pattern = re.compile(
+        r"(?:^|\n|\r\n)\s*(?:#{1,6}\s*)?(?:\*\*)?(?:\d+|[ivxLCDM]+)[\.\)\/\-–—]\s+(?:\*\*)?",
+        flags=re.IGNORECASE,
+    )
+
     if bracket_tag_pattern.search(clean_outline):
         raw_parts = [
             part.strip()
             for part in bracket_tag_pattern.split(clean_outline)
             if part.strip()
         ]
-    # Priority 2: Line-based numbered headers like PHẦN 1:, PHẦN 2., ### PHẦN 1
-    elif re.search(r"(?:^|\n|\r\n)\s*(?:###?\s*)?(?:phần|phan|part|section)\s*\d+[:.]?", clean_outline, flags=re.IGNORECASE):
+    elif header_tag_pattern.search(clean_outline):
         raw_parts = [
             part.strip()
-            for part in re.split(r"(?:^|\n|\r\n)\s*(?:###?\s*)?(?:phần|phan|part|section)\s*\d+[:.]?", clean_outline, flags=re.IGNORECASE)
+            for part in header_tag_pattern.split(clean_outline)
+            if part.strip()
+        ]
+    elif len(numbered_tag_pattern.findall(clean_outline)) >= 2:
+        raw_parts = [
+            part.strip()
+            for part in numbered_tag_pattern.split(clean_outline)
             if part.strip()
         ]
     else:
@@ -3165,33 +3202,37 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 )
             print(f"    -> Chat URL: {state['chat_url']}", file=sys.stderr)
 
-            outline_strip = outline
-            for tag in ["[PHAN]", "[PHẦN]", "[Phần]", "[phan]"]:
-                if tag in outline_strip:
-                    outline_strip = outline_strip[outline_strip.index(tag):]
-                    break
-            outline = outline_strip
+            outline = strip_outline_preamble(outline)
 
             parts = split_outline_parts(outline)
             if not parts:
                 clear_pending_generation_prompt(state, "outline", prompt2)
                 persist_generation_state(state)
                 raise RuntimeError("ChatGPT returned an empty outline.")
-                
+
             filtered_parts = []
             removed_count = 0
             for part in parts:
-                header = part.lower()[:100]
-                if any(x in header for x in OUTLINE_INTRO_OUTRO_KEYWORDS):
+                lower_header = part.lower()[:80].strip()
+                words = part.split()
+                # Only filter out if it's a short boilerplate label (< 15 words) with purely meta intro/outro words
+                # NEVER remove substantive narrative/historical story content
+                is_pure_meta_intro = (
+                    len(words) < 15
+                    and any(lower_header.startswith(kw) for kw in ("intro:", "mở bài:", "lời chào:", "chào mừng"))
+                )
+                is_pure_meta_outro = (
+                    len(words) < 15
+                    and any(lower_header.startswith(kw) for kw in ("outro:", "kết bài:", "kêu gọi:", "like và subscribe"))
+                )
+                if len(parts) > 2 and (is_pure_meta_intro or is_pure_meta_outro):
                     removed_count += 1
                     continue
                 filtered_parts.append(part)
-                
+
             if removed_count > 0:
-                print(f"    -> Đã loại bỏ {removed_count} phần Intro/Outro bị lẫn vào dàn ý.", file=sys.stderr)
-                parts = filtered_parts
-                if not parts:
-                    raise RuntimeError("Tất cả dàn ý đều bị lọc bỏ vì chứa từ khóa Intro/Outro.")
+                print(f"    -> Đã loại bỏ {removed_count} phần nhãn Intro/Outro thuần túy.", file=sys.stderr)
+                parts = filtered_parts if filtered_parts else parts
 
             state["outline_parts"] = parts
             state["expected_body_parts"] = len(parts)
