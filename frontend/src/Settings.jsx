@@ -122,6 +122,7 @@ const DEFAULT_IMAGE_GENERATION_SETTINGS = {
 };
 
 const DEFAULT_PUBLISHING_SETTINGS = {
+  upload_method: 'browser',
   category_id: '',
   language: 'vi',
   made_for_kids: null,
@@ -1869,6 +1870,20 @@ export default function Settings({
           </div>
           <div className="production-settings-grid">
             <label>
+              Phương thức Upload YouTube
+              <select
+                className="version-select"
+                value={currentPublishing.upload_method || 'browser'}
+                onChange={event => handlePromptSettingChange(
+                  'publishing_settings', 'upload_method', event.target.value
+                )}
+                disabled={activeVersionLocked}
+              >
+                <option value="browser">🌐 UPLOAD Qua Giao diện Web Trình duyệt (Mặc định)</option>
+                <option value="api">🔌 UPLOAD Qua YouTube Data API (API ngầm)</option>
+              </select>
+            </label>
+            <label>
               Thumbnail dùng để upload
               <select
                 className="version-select"
@@ -1931,6 +1946,9 @@ export default function Settings({
             </label>
           </div>
           <div className="help-text" style={{ marginTop: 8, fontSize: '0.84rem', color: '#94a3b8', lineHeight: 1.5 }}>
+            💡 <strong>Phương thức Upload:</strong> <em>Giao diện Web Trình duyệt</em> (Playwright CDP qua profile GPM-Login) giữ nguyên toàn bộ cài đặt mặc định của kênh (ngôn ngữ, phụ đề, phân loại...), tự động thích ứng với kênh bật kiếm tiền và không tốn Quota YouTube API. <em>YouTube Data API</em> sử dụng HTTP API ngầm bằng OAuth token.
+          </div>
+          <div className="help-text" style={{ marginTop: 4, fontSize: '0.84rem', color: '#94a3b8', lineHeight: 1.5 }}>
             💡 <strong>YouTube Category ID:</strong> Nếu để trống, hệ thống sẽ tự động dùng mặc định là <strong>22 (People & Blogs / Mọi người & Blog)</strong>. Bạn có thể chọn nhanh từ danh sách gợi ý hoặc nhập ID tùy chỉnh (VD: <code>22</code>: Blogs, <code>24</code>: Giải trí, <code>27</code>: Giáo dục, <code>28</code>: Khoa học & CN, <code>10</code>: Âm nhạc, <code>20</code>: Trò chơi, <code>1</code>: Phim).
           </div>
           <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginTop: 12, alignItems: 'center' }}>

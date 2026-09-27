@@ -45,6 +45,7 @@ DEFAULT_PROMPTS_DATA = {
                 "scene_duration_max_seconds": 35,
             },
             "publishing_settings": {
+                "upload_method": "browser",
                 "category_id": "",
                 "language": "vi",
                 "made_for_kids": None,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -10,6 +11,7 @@ from urllib.parse import unquote, urlsplit
 
 from auto_yt.services import database as db
 from auto_yt.services import (
+    browser_youtube_uploader,
     publication_scheduler,
     secret_store,
     youtube_comments,
@@ -531,6 +533,140 @@ def execute_publish_job(
             _persist_refreshed_token,
             proxy=context["proxy"],
         )
+
+    upload_method = str(
+        context["publishing_settings"].get("upload_method") or "browser"
+    ).strip().lower()
+
+    if upload_method == "browser":
+        gpm_profile_id = str(context["channel"].get("gpm_profile_id") or "").strip()
+        if not gpm_profile_id:
+            raise PublishConfigurationRequired(
+                ["gpm_profile_id"],
+                "Kênh chưa được gán GPM Profile để upload qua trình duyệt.",
+            )
+
+        target_schedule_at = ""
+        if context["schedule_enabled"]:
+            target_schedule_at = db.reserve_youtube_publication_slot(workflow_id)
+
+        def persist_browser_video_id(vid_id: str) -> None:
+            if not vid_id:
+                return
+            publication = db.save_video_publication(
+                video_id=video_id,
+                youtube_channel_id=int(workflow["youtube_channel_id"]),
+                youtube_video_id=vid_id,
+                published_url=f"https://www.youtube.com/watch?v={vid_id}",
+                published_title=str(
+                    context["metadata"].get("snippet", {}).get("title") or ""
+                ),
+                published_at="",
+                privacy_status="private",
+                processing_status="processing",
+                scheduled_at=target_schedule_at if context["schedule_enabled"] else "",
+                artifact_hash=str(
+                    context["snapshot"].get("artifacts", {})
+                    .get("final_mp4", {})
+                    .get("sha256", "")
+                ),
+            )
+            db.update_youtube_publish_workflow(
+                workflow_id,
+                youtube_video_id=vid_id,
+                publication_id=int(publication["id"]),
+                stage="uploaded",
+                status="running",
+            )
+
+        title = str(context["metadata"].get("snippet", {}).get("title") or "")
+        description = str(context["metadata"].get("snippet", {}).get("description") or "")
+        tags = context["metadata"].get("snippet", {}).get("tags", [])
+        made_for_kids = bool(context["publishing_settings"].get("made_for_kids", False))
+        contains_synthetic_media = bool(
+            context["publishing_settings"].get("contains_synthetic_media", True)
+        )
+        notify_subscribers = bool(
+            context["publishing_settings"].get("notify_subscribers", True)
+        )
+
+        browser_result = asyncio.run(
+            browser_youtube_uploader.upload_video_via_browser(
+                profile_id=gpm_profile_id,
+                video_path=context["video_path"],
+                thumbnail_path=context["thumbnail_path"],
+                title=title,
+                description=description,
+                tags=tags,
+                made_for_kids=made_for_kids,
+                contains_synthetic_media=contains_synthetic_media,
+                notify_subscribers=notify_subscribers,
+                schedule_at=target_schedule_at if context["schedule_enabled"] else None,
+                progress=progress,
+                cancel_check=cancel_check,
+                persist_video_id=persist_browser_video_id,
+            )
+        )
+
+        youtube_video_id = str(browser_result.get("youtube_video_id") or "").strip()
+        persist_browser_video_id(youtube_video_id)
+
+        workflow = db.get_youtube_publish_workflow(workflow_id)
+        publication_id = int(workflow.get("publication_id") or 0)
+        if not publication_id:
+            publication = db.get_video_publication_by_youtube_id(youtube_video_id)
+            publication_id = int((publication or {}).get("id") or 0)
+
+        if context["schedule_enabled"]:
+            if publication_id:
+                try:
+                    db.complete_youtube_schedule(
+                        workflow_id, publication_id, target_schedule_at
+                    )
+                except Exception:
+                    pass
+            final_status = "scheduled"
+            final_stage = "scheduled"
+            scheduled_at = target_schedule_at
+        else:
+            if publication_id:
+                db.update_video_publication(
+                    publication_id,
+                    privacy_status="private",
+                    processing_status="processing",
+                    scheduled_at="",
+                    published_at="",
+                )
+            db.update_youtube_publish_workflow(
+                workflow_id,
+                status="uploaded_private",
+                stage="uploaded_private",
+                upload_session_encrypted="",
+                error="",
+            )
+            final_status = "uploaded_private"
+            final_stage = "uploaded_private"
+
+        db.update_video_production_state(
+            video_id,
+            publish_status=final_status,
+            current_stage=final_stage,
+            production_progress=(
+                "Đã đặt lịch đăng YouTube qua Trình duyệt Web"
+                if context["schedule_enabled"]
+                else "Đã upload Private qua Trình duyệt Web"
+            ),
+            blocking_reason="",
+        )
+        return {
+            "workflow_id": workflow_id,
+            "youtube_video_id": youtube_video_id,
+            "scheduled_at": scheduled_at,
+            "stage": final_stage,
+            "publish_stage": final_stage,
+            "ready": True,
+            "missing_configuration": [],
+        }
 
     workflow = db.get_youtube_publish_workflow(workflow_id)
     youtube_video_id = str(workflow.get("youtube_video_id") or "")

@@ -169,7 +169,11 @@ DEFAULT_IMAGE_GENERATION_SETTINGS = {
     "scene_duration_target_seconds": 30,
     "scene_duration_max_seconds": 35,
 }
+UPLOAD_METHODS = ("browser", "api")
+DEFAULT_UPLOAD_METHOD = "browser"
+
 DEFAULT_PUBLISHING_SETTINGS = {
+    "upload_method": DEFAULT_UPLOAD_METHOD,
     "category_id": "",
     "language": "vi",
     "made_for_kids": None,
@@ -385,6 +389,10 @@ def validate_image_generation_settings(value: object) -> dict:
 def normalize_publishing_settings(value: object) -> dict:
     settings = value if isinstance(value, dict) else {}
     normalized = dict(DEFAULT_PUBLISHING_SETTINGS)
+    upload_method = str(settings.get("upload_method") or DEFAULT_UPLOAD_METHOD).strip().lower()
+    normalized["upload_method"] = (
+        upload_method if upload_method in UPLOAD_METHODS else DEFAULT_UPLOAD_METHOD
+    )
     normalized["category_id"] = str(settings.get("category_id") or "").strip()
     normalized["language"] = str(settings.get("language") or "vi").strip() or "vi"
     normalized["made_for_kids"] = (
@@ -423,6 +431,9 @@ def validate_publishing_settings(value: object) -> dict:
             "Cấu hình đăng YouTube chứa trường không được hỗ trợ: "
             + ", ".join(sorted(unknown))
         )
+    upload_method = str(settings.get("upload_method") or DEFAULT_UPLOAD_METHOD).strip().lower()
+    if upload_method not in UPLOAD_METHODS:
+        raise ValueError("Phương thức upload YouTube không hợp lệ (chỉ hỗ trợ 'browser' hoặc 'api').")
     category_id = str(settings.get("category_id") or "").strip()
     if category_id and (not category_id.isdigit() or len(category_id) > 10):
         raise ValueError("YouTube Category ID không hợp lệ.")

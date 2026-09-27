@@ -33,7 +33,9 @@ class YouTubePublishPipelineTests(unittest.TestCase):
         self.database_patch.stop()
         self.temporary_directory.cleanup()
 
-    def _create_publish_job(self, *, schedule: bool) -> tuple[dict, dict]:
+    def _create_publish_job(
+        self, *, schedule: bool, upload_method: str = "api"
+    ) -> tuple[dict, dict]:
         video_id = database.save_video(
             "https://www.youtube.com/watch?v=publish-source",
             "Publish title",
@@ -101,6 +103,7 @@ class YouTubePublishPipelineTests(unittest.TestCase):
                 "thumbnail_variant": "without_text",
             },
             "publishing_settings": {
+                "upload_method": upload_method,
                 "category_id": "22",
                 "language": "vi",
                 "made_for_kids": False,
@@ -981,7 +984,7 @@ class YouTubePublishPipelineTests(unittest.TestCase):
                 progress=lambda *args: None,
                 cancel_check=lambda: None,
                 resolve_default_channel_id=lambda _ver: "",
-                resolve_publishing_settings=lambda _ver: {"made_for_kids": False, "category_id": "25"},
+                resolve_publishing_settings=lambda _ver: {"upload_method": "api", "made_for_kids": False, "category_id": "25"},
                 thumbnails_dir=self.thumbnails_dir,
             )
         self.assertEqual(result["youtube_video_id"], "dyn-yt-id")
@@ -1000,7 +1003,80 @@ class YouTubePublishPipelineTests(unittest.TestCase):
         self.assertEqual(metadata["snippet"]["defaultLanguage"], "vi")
         self.assertEqual(metadata["snippet"]["defaultAudioLanguage"], "vi")
 
+    def test_browser_upload_private_executes_and_persists_publication(self):
+        job, channel = self._create_publish_job(schedule=False, upload_method="browser")
+        fake_browser_result = {
+            "youtube_video_id": "browser-yt-vid-123",
+            "published_url": "https://www.youtube.com/watch?v=browser-yt-vid-123",
+            "status": "uploaded_private",
+            "scheduled_at": "",
+            "title": "Publish title",
+        }
+        async def fake_browser_upload(**kwargs):
+            kwargs["progress"]("Test progress", "uploading", 50)
+            kwargs["persist_video_id"]("browser-yt-vid-123")
+            return fake_browser_result
+
+        with patch.object(
+            youtube_publish_workflow.browser_youtube_uploader,
+            "upload_video_via_browser",
+            side_effect=fake_browser_upload,
+        ), patch.object(
+            youtube_publish_workflow.youtube_comments,
+            "access_token_for_channel",
+            return_value="access-token",
+        ):
+            events = []
+            result = youtube_publish_workflow.execute_publish_job(
+                job,
+                progress=lambda *args: events.append(args),
+                cancel_check=lambda: None,
+                resolve_default_channel_id=lambda _ver: "",
+                thumbnails_dir=self.thumbnails_dir,
+            )
+
+        self.assertEqual(result["youtube_video_id"], "browser-yt-vid-123")
+        self.assertEqual(result["stage"], "uploaded_private")
+        publication = database.get_video_publication_by_youtube_id("browser-yt-vid-123")
+        self.assertIsNotNone(publication)
+        self.assertEqual(publication["privacy_status"], "private")
+
+    def test_browser_upload_schedule_executes_and_reserves_slot(self):
+        job, channel = self._create_publish_job(schedule=True, upload_method="browser")
+        fake_browser_result = {
+            "youtube_video_id": "browser-yt-sched-456",
+            "published_url": "https://www.youtube.com/watch?v=browser-yt-sched-456",
+            "status": "scheduled",
+            "scheduled_at": "2026-09-27T23:55:00+07:00",
+            "title": "Publish title",
+        }
+        async def fake_browser_upload(**kwargs):
+            kwargs["persist_video_id"]("browser-yt-sched-456")
+            return fake_browser_result
+
+        with patch.object(
+            youtube_publish_workflow.browser_youtube_uploader,
+            "upload_video_via_browser",
+            side_effect=fake_browser_upload,
+        ), patch.object(
+            youtube_publish_workflow.youtube_comments,
+            "access_token_for_channel",
+            return_value="access-token",
+        ):
+            result = youtube_publish_workflow.execute_publish_job(
+                job,
+                progress=lambda *args: None,
+                cancel_check=lambda: None,
+                resolve_default_channel_id=lambda _ver: "",
+                thumbnails_dir=self.thumbnails_dir,
+            )
+
+        self.assertEqual(result["youtube_video_id"], "browser-yt-sched-456")
+        self.assertEqual(result["stage"], "scheduled")
+        self.assertTrue(bool(result["scheduled_at"]))
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
