@@ -685,15 +685,24 @@ def get_thumbnail_image_identity(image_url: str) -> str:
 
 
 def scroll_chatgpt_conversation_to_bottom(page: Page) -> None:
-    """Scroll ChatGPT conversation to bottom to ensure virtualized DOM renders the latest items."""
+    """Scroll ChatGPT conversation to bottom within <main> to ensure virtualized DOM renders the latest items, without touching sidebar history."""
     try:
         page.evaluate(
             """() => {
-                const scrollables = Array.from(document.querySelectorAll('*')).filter(el => {
+                const mainEl = document.querySelector('main') || document.querySelector('[role="main"]');
+                if (!mainEl) {
+                    window.scrollTo(0, document.body.scrollHeight);
+                    return;
+                }
+                const scrollables = Array.from(mainEl.querySelectorAll('*')).filter(el => {
+                    if (el.closest('nav, aside, header, [aria-label*="history" i], [aria-label*="sidebar" i], #sidebar')) {
+                        return false;
+                    }
                     const style = window.getComputedStyle(el);
                     return (style.overflowY === 'auto' || style.overflowY === 'scroll') && el.scrollHeight > el.clientHeight;
                 });
                 scrollables.forEach(s => s.scrollTop = s.scrollHeight);
+                mainEl.scrollTop = mainEl.scrollHeight;
                 window.scrollTo(0, document.body.scrollHeight);
             }"""
         )
