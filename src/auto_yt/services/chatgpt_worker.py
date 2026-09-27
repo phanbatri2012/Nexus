@@ -148,11 +148,12 @@ CHATGPT_COMPOSER_SELECTOR = (
 CHATGPT_VISIBLE_COMPOSER_SELECTOR = f":is({CHATGPT_COMPOSER_SELECTOR}):visible"
 CHATGPT_SEND_BUTTON_SELECTOR = (
     'button[data-testid="send-button"], '
+    'button[type="submit"]:not([aria-label*="Voice"]):not([aria-label*="thoại"]):not([aria-label*="Dictate"]), '
     'button[aria-label="Send"], '
     'button[aria-label="Gửi"], '
     'button[aria-label="Send prompt"], '
     'button[aria-label="Send message"], '
-    'button.bg-composer-primary'
+    'button.bg-composer-primary[type="submit"]:not([aria-label*="Voice"]):not([aria-label*="thoại"])'
 )
 CHATGPT_VISIBLE_SEND_BUTTON_SELECTOR = f":is({CHATGPT_SEND_BUTTON_SELECTOR}):visible"
 CHATGPT_STOP_BUTTON_SELECTOR = (
@@ -175,15 +176,26 @@ const isElementVisible = (element) => {{
 const findComposer = () => [...document.querySelectorAll(
     {json.dumps(CHATGPT_COMPOSER_SELECTOR)}
 )].find(isElementVisible) || null;
+const isVoiceOrDictateButton = (btn) => {{
+    if (!btn) return false;
+    const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+    const testId = (btn.getAttribute('data-testid') || '').toLowerCase();
+    return label.includes('voice') || label.includes('thoại') || label.includes('dictate')
+        || testId.includes('voice') || testId.includes('dictate') || testId.includes('speech');
+}};
 const findSendButton = (editor) => {{
     if (!editor) return null;
     const root = editor.closest('form')
         || editor.closest('[data-composer-root], [data-testid="composer"]')
         || editor.closest('[data-composer-body]');
     if (!root) return null;
-    return [...root.querySelectorAll(
+    const candidates = [...root.querySelectorAll(
         {json.dumps(CHATGPT_SEND_BUTTON_SELECTOR)}
-    )].find(isElementVisible) || null;
+    )].filter(btn => isElementVisible(btn) && !isVoiceOrDictateButton(btn));
+    return candidates.find(btn => btn.type === 'submit' || btn.getAttribute('data-testid') === 'send-button')
+        || candidates.find(btn => btn.getAttribute('aria-label') === 'Send' || btn.getAttribute('aria-label') === 'Gửi')
+        || candidates[0]
+        || null;
 }};
 """
 
@@ -2473,20 +2485,21 @@ def get_reusable_chapter_response(page: Page) -> str:
                 clone.querySelectorAll('button, .sr-only, [data-testid*="citation"]').forEach(b => b.remove());
                 return (clone.innerText || clone.textContent || '').trim();
             };
-            const legacy = [...document.querySelectorAll('[data-message-author-role]')];
-            if (legacy.length > 0) {
-                return legacy.map(el => [
-                    el.getAttribute('data-message-author-role') || '',
-                    cleanNode(el)
-                ]);
-            }
-            const units = [...document.querySelectorAll(
-                '[data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"]'
+            const nodes = [...document.querySelectorAll(
+                '[data-message-author-role], [data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"], [data-conversation-role]'
             )];
-            return units.map(u => [
-                u.getAttribute('data-user-message-bubble') === 'true' ? 'user' : 'assistant',
-                cleanNode(u)
-            ]);
+            const unique = nodes.filter((el, idx) => !nodes.some((other, otherIdx) => otherIdx !== idx && other.contains(el)));
+            return unique.map(el => {
+                let role = el.getAttribute('data-message-author-role') || el.getAttribute('data-conversation-role') || '';
+                if (!role) {
+                    if (el.getAttribute('data-user-message-bubble') === 'true' || el.closest('[data-user-message-bubble="true"]')) {
+                        role = 'user';
+                    } else if (el.getAttribute('data-markdown-text-style') === 'assistant-message' || el.closest('[data-markdown-text-style="assistant-message"]')) {
+                        role = 'assistant';
+                    }
+                }
+                return [role, cleanNode(el)];
+            }).filter(item => item[0] && item[1]);
         }"""
     )
     return select_reusable_chapter_response(
@@ -2503,20 +2516,21 @@ def get_reusable_outline_response(page: Page) -> str:
                 clone.querySelectorAll('button, .sr-only, [data-testid*="citation"]').forEach(b => b.remove());
                 return (clone.innerText || clone.textContent || '').trim();
             };
-            const legacy = [...document.querySelectorAll('[data-message-author-role]')];
-            if (legacy.length > 0) {
-                return legacy.map(el => [
-                    el.getAttribute('data-message-author-role') || '',
-                    cleanNode(el)
-                ]);
-            }
-            const units = [...document.querySelectorAll(
-                '[data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"]'
+            const nodes = [...document.querySelectorAll(
+                '[data-message-author-role], [data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"], [data-conversation-role]'
             )];
-            return units.map(u => [
-                u.getAttribute('data-user-message-bubble') === 'true' ? 'user' : 'assistant',
-                cleanNode(u)
-            ]);
+            const unique = nodes.filter((el, idx) => !nodes.some((other, otherIdx) => otherIdx !== idx && other.contains(el)));
+            return unique.map(el => {
+                let role = el.getAttribute('data-message-author-role') || el.getAttribute('data-conversation-role') || '';
+                if (!role) {
+                    if (el.getAttribute('data-user-message-bubble') === 'true' || el.closest('[data-user-message-bubble="true"]')) {
+                        role = 'user';
+                    } else if (el.getAttribute('data-markdown-text-style') === 'assistant-message' || el.closest('[data-markdown-text-style="assistant-message"]')) {
+                        role = 'assistant';
+                    }
+                }
+                return [role, cleanNode(el)];
+            }).filter(item => item[0] && item[1]);
         }"""
     )
     return select_reusable_outline_response(

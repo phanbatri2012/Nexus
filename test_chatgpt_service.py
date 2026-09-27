@@ -1353,6 +1353,27 @@ class ChatGptServiceTests(unittest.TestCase):
         self.assertEqual(result, p2)
 
 
+    def test_send_button_selector_excludes_voice_and_dictate_buttons(self):
+        selector = chatgpt_worker.CHATGPT_SEND_BUTTON_SELECTOR
+        self.assertIn('not([aria-label*="Voice"])', selector)
+        self.assertIn('not([aria-label*="thoại"])', selector)
+        self.assertIn('not([aria-label*="Dictate"])', selector)
+
+    def test_reusable_turn_parsing_selects_expected_turns(self):
+        turns = [
+            ("user", "Hãy tạo kịch bản với dàn ý chi tiết"),
+            ("assistant", "[PHAN]\nPhần 1: Bối cảnh lịch sử\n\n[PHAN]\nPhần 2: Diễn biến"),
+            ("user", "Hãy tạo các chapters cho video"),
+            ("assistant", "00:00 - Mở đầu\n05:00 - Diễn biến chính\n10:00 - Kết thúc"),
+        ]
+        outline = chatgpt_worker.select_reusable_outline_response(turns)
+        self.assertIn("[PHAN]", outline)
+        self.assertIn("Phần 1", outline)
+
+        chapter = chatgpt_worker.select_reusable_chapter_response(turns)
+        self.assertIn("00:00 - Mở đầu", chapter)
+
+
 if __name__ == "__main__":
     unittest.main()
 
