@@ -1341,5 +1341,46 @@ class SystemJobTests(unittest.TestCase):
         self.assertEqual(tiktok_jobs["items"][0]["type_label"], "Đăng video TikTok")
 
 
+
+    def test_force_stop_running_job(self):
+        database.create_system_job(
+            job_id="job-force-stop-1",
+            job_type="video_generation",
+            title="Force Stop Test",
+            payload={"video_id": 99},
+        )
+        database.update_system_job("job-force-stop-1", status="running", cancel_requested=1)
+        with patch("auto_yt.services.process_registry.kill_job_processes") as mock_kill:
+            result = main.force_stop_job("job-force-stop-1")
+            self.assertTrue(result["success"])
+            mock_kill.assert_any_call("job-force-stop-1")
+            mock_kill.assert_any_call("video:99")
+            
+            job = database.get_system_job("job-force-stop-1")
+            self.assertEqual(job["status"], "canceled")
+            self.assertEqual(job["cancel_requested"], 0)
+            self.assertIn("dừng cưỡng bức", job["progress"].lower())
+
+    def test_force_stop_bulk_action(self):
+        database.create_system_job(
+            job_id="job-force-bulk-1",
+            job_type="video_generation",
+            title="Force Bulk 1",
+            payload={"video_id": 101},
+        )
+        database.update_system_job("job-force-bulk-1", status="running")
+        with patch("auto_yt.services.process_registry.kill_job_processes") as mock_kill:
+            req = main.BulkJobActionRequest(
+                action="force_stop",
+                mode="explicit",
+                job_ids=["job-force-bulk-1"],
+            )
+            result = main.bulk_job_action(req)
+            self.assertTrue(result["success"])
+            self.assertEqual(result["succeeded"], 1)
+            job = database.get_system_job("job-force-bulk-1")
+            self.assertEqual(job["status"], "canceled")
+
+
 if __name__ == "__main__":
     unittest.main()

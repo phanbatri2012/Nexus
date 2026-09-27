@@ -17,6 +17,7 @@ from pathlib import Path
 
 import imageio_ffmpeg
 
+from auto_yt.services import process_registry
 from auto_yt.paths import (
     AUDIO_DIR,
     CAPTIONS_DIR,
@@ -1595,7 +1596,13 @@ def _render_segments(
             f"Đang dựng segment {index + 1}/{len(scenes)}" + (" (Video Intro)" if is_video_input else ""),
             "video_render_segment",
         )
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        process_registry.register_process(f'video:{video_id}', proc)
+        try:
+            stdout, stderr = proc.communicate()
+            result = subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+        finally:
+            process_registry.unregister_process(f'video:{video_id}', proc)
         if result.returncode != 0:
             temporary.unlink(missing_ok=True)
             raise VideoProductionError(

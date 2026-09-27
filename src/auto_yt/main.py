@@ -50,6 +50,7 @@ from auto_yt.services.youtube_service import get_video_transcript, get_video_tit
 from auto_yt.services.chatgpt_service import process_prompt_via_chatgpt
 from auto_yt.services.chatgpt_runtime import ChatGPTAttentionRequiredError
 from auto_yt.services.chatgpt_worker import sanitize_generated_script
+from auto_yt.services import process_registry
 import auto_yt.services.database as db
 import auto_yt.services.audio_utils as audio_utils
 import auto_yt.services.tts_registry as tts
@@ -608,7 +609,7 @@ class UpdateVideoJobRequest(BaseModel):
 
 
 class BulkJobActionRequest(BaseModel):
-    action: Literal["retry", "pause", "resume", "cancel"]
+    action: Literal["retry", "pause", "resume", "cancel", "force_stop"]
     mode: Literal["explicit", "all_matching"] = "explicit"
     job_ids: List[str] = Field(default_factory=list, max_length=5000)
     excluded_job_ids: List[str] = Field(default_factory=list, max_length=5000)
@@ -4464,6 +4465,7 @@ def _execute_video_job(job: dict) -> None:
                 prompt_version,
                 video_id,
                 pipeline=pipeline,
+                job_id=job_id,
             )
         _raise_if_video_job_canceled(job_id)
         summary_text = (
@@ -5485,6 +5487,7 @@ def continue_video_generation(video_id: int):
                 prompt_version,
                 video_id,
                 pipeline=pipeline,
+                job_id=job_id,
             )
             _finish_chatgpt_operation()
             profile_reserved = False
@@ -5716,6 +5719,11 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
         "updated_at": job.get("updated_at", ""),
         "started_at": job.get("started_at", ""),
         "finished_at": job.get("finished_at", ""),
+        "can_force_stop": (
+            status == "running"
+            or bool(job.get("cancel_requested"))
+            or (job_type in {"video_generation", "video_render", "visual_scene_plan", "youtube_upload", "youtube_publish"} and status in {"running", "retry_wait"})
+        ),
         "can_cancel": (
             status in {"queued", "retry_wait", "paused"}
             or (job_type in {"video_generation", "video_render", "visual_scene_plan", "youtube_upload", "youtube_publish", "fb_crosspost", "fb_crosspost_sync", "thumbnail_generation", "tiktok_publish"} and status == "running")
@@ -5907,6 +5915,7 @@ def _download_job_center_item(job: dict) -> dict:
         ),
         "created_at": job.get("created_at", ""),
         "updated_at": job.get("created_at", ""),
+        "can_force_stop": job.get("status") in {"running", "stopping", "downloading"},
         "can_cancel": job.get("status") in {"running", "paused"},
         "can_retry": False,
         "can_pause": job.get("status") == "running",
@@ -5975,7 +5984,7 @@ def _job_matches_video_search(item: dict, query: str) -> bool:
     return normalized_query in searchable
 
 
-JOB_CENTER_ACTIONS = ("retry", "pause", "resume", "cancel")
+JOB_CENTER_ACTIONS = ("retry", "pause", "resume", "cancel", "force_stop")
 JOB_CENTER_SYSTEM_JOB_TYPES = (
     "video_generation",
     *COMMENT_JOB_TYPES,
@@ -6229,6 +6238,19 @@ def _run_system_job_center_action(
                 logger.warning("Could not re-trigger fb_crosspost worker on retry: %s", retry_err)
     elif action == "pause":
         updated_job = db.pause_system_job(job_id)
+    elif action == "force_stop":
+        process_registry.kill_job_processes(job_id)
+        v_id = job.get("video_id") or (job.get("payload") or {}).get("video_id")
+        if v_id is not None:
+            process_registry.kill_job_processes(f"video:{v_id}")
+        if str(job.get("job_type")) == "fb_crosspost":
+            try:
+                from auto_yt.services import fb_crossposter_service
+                task_id = (job.get("payload") or {}).get("task_id")
+                fb_crossposter_service.cancel_schedule_ahead_batch(task_id=task_id)
+            except Exception:
+                pass
+        updated_job = db.force_stop_system_job(job_id)
     elif action == "resume":
         updated_job = db.resume_system_job(job_id)
     else:
@@ -6248,6 +6270,7 @@ def _run_system_job_center_action(
             workflow_status = {
                 "pause": "paused",
                 "cancel": "canceled",
+                "force_stop": "canceled",
                 "resume": "reserved",
                 "retry": "reserved",
             }.get(action)
@@ -6400,6 +6423,24 @@ def bulk_job_action(request: BulkJobActionRequest):
         "failed": len(failures),
         "skipped_by_reason": skipped_by_reason,
         "failures": failures,
+    }
+
+
+@app.post("/api/jobs/{job_id}/force-stop")
+def force_stop_job(job_id: str):
+    try:
+        updated_job = _run_system_job_center_action(
+            job_id,
+            "force_stop",
+            kick_queues=True,
+        )
+    except JobCenterItemNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (JobCenterActionNotAllowedError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "success": True,
+        "job": updated_job,
     }
 
 

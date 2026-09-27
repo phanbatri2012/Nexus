@@ -2,12 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { openVideoStudioInGpm } from './gpmOpener.js'
 
 const API_BASE = 'http://127.0.0.1:8080'
-const BULK_ACTIONS = ['retry', 'pause', 'resume', 'cancel']
+const BULK_ACTIONS = ['retry', 'pause', 'resume', 'cancel', 'force_stop']
 const BULK_ACTION_META = {
   retry: { label: 'Chạy lại', pastLabel: 'chạy lại' },
   pause: { label: 'Tạm dừng', pastLabel: 'tạm dừng' },
   resume: { label: 'Tiếp tục', pastLabel: 'tiếp tục' },
-  cancel: { label: 'Dừng', pastLabel: 'dừng' }
+  cancel: { label: 'Dừng an toàn', pastLabel: 'dừng an toàn' },
+  force_stop: { label: 'Dừng ngay', pastLabel: 'dừng ngay lập tức' }
 }
 
 const STATUS_META = {
@@ -109,7 +110,7 @@ function JobCenter({ onOpenVideo, refreshKey }) {
   const [filteredTotal, setFilteredTotal] = useState(0)
   const [selectableTotal, setSelectableTotal] = useState(0)
   const [serverActionCounts, setServerActionCounts] = useState({
-    retry: 0, pause: 0, resume: 0, cancel: 0
+    retry: 0, pause: 0, resume: 0, cancel: 0, force_stop: 0
   })
   const [listSnapshotAt, setListSnapshotAt] = useState('')
   const [filter, setFilter] = useState('all')
@@ -179,7 +180,8 @@ function JobCenter({ onOpenVideo, refreshKey }) {
         retry: Number(data.action_counts?.retry) || 0,
         pause: Number(data.action_counts?.pause) || 0,
         resume: Number(data.action_counts?.resume) || 0,
-        cancel: Number(data.action_counts?.cancel) || 0
+        cancel: Number(data.action_counts?.cancel) || 0,
+        force_stop: Number(data.action_counts?.force_stop) || 0
       })
       setListSnapshotAt(data.snapshot_at || '')
       const loadedById = new Map(loadedJobs.map(job => [job.id, job]))
@@ -426,11 +428,18 @@ function JobCenter({ onOpenVideo, refreshKey }) {
   }
 
   const runAction = async (job, action) => {
+    if (action === 'force_stop') {
+      if (!window.confirm(`⚠️ BẠN CÓ CHẮC MUỐN DỪNG NGAY LẬP TỨC?\n\nJob: "${job.title || job.id}"\n\nHành động này sẽ ngắt toàn bộ tiến trình con (FFmpeg/ChatGPT worker/download) và hủy job ngay lập tức!`)) {
+        return
+      }
+    }
     setActionId(`${job.id}:${action}`)
     setBulkMessage('')
     try {
       let endpoint = ''
-      if (job.type === 'youtube_download') {
+      if (action === 'force_stop') {
+        endpoint = `/api/jobs/${job.raw_id}/force-stop`
+      } else if (job.type === 'youtube_download') {
         endpoint = `/api/youtube-download/jobs/${job.raw_id}/${action}`
       } else {
         endpoint = `/api/jobs/${job.raw_id}/${action}`
@@ -601,10 +610,13 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                       onClick={() => runBulkAction(action)}
                       style={{
                         width: 'auto', padding: '8px 12px',
-                        color: action === 'cancel' ? '#ff6b6b' : undefined
+                        color: action === 'cancel' || action === 'force_stop' ? '#ff6b6b' : undefined,
+                        background: action === 'force_stop' ? '#331515' : undefined,
+                        borderColor: action === 'force_stop' ? '#ff4d4f' : undefined,
+                        fontWeight: action === 'force_stop' ? '600' : undefined
                       }}
                     >
-                      {meta.label} ({actionCount})
+                      {action === 'force_stop' ? '⏹️ ' : ''}{meta.label} ({actionCount})
                     </button>
                   )
                 })}
@@ -792,9 +804,27 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                         Tiếp tục
                       </button>
                     )}
-                    {job.can_cancel && (
+                    {job.can_cancel && !job.cancel_requested && (
                       <button className="btn-secondary" disabled={Boolean(actionId)} style={{ padding: '8px 12px', color: '#ff6b6b' }} onClick={() => runAction(job, job.type === 'youtube_download' ? 'stop' : 'cancel')}>
                         Dừng
+                      </button>
+                    )}
+                    {job.can_force_stop && (
+                      <button
+                        className="btn-secondary"
+                        disabled={Boolean(actionId)}
+                        style={{
+                          padding: '8px 12px',
+                          background: job.cancel_requested ? '#b32424' : '#331515',
+                          borderColor: '#ff4d4f',
+                          color: '#fff',
+                          fontWeight: '700',
+                          boxShadow: job.cancel_requested ? '0 0 10px rgba(255, 77, 79, 0.6)' : 'none'
+                        }}
+                        title="Ngắt tiến trình và dừng khẩn cấp ngay lập tức"
+                        onClick={() => runAction(job, 'force_stop')}
+                      >
+                        ⏹️ {job.cancel_requested ? 'DỪNG NGAY LẬP TỨC' : 'Dừng ngay'}
                       </button>
                     )}
                     {job.can_resume_checkpoint && (

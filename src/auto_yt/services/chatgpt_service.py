@@ -4,6 +4,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from auto_yt.services import process_registry
 from auto_yt.services.chatgpt_runtime import (
     ChatGPTAttentionRequiredError,
     decode_attention_error,
@@ -23,6 +24,7 @@ def process_prompt_via_chatgpt(
     prompt_version: str = "",
     video_id: int | None = None,
     pipeline: dict[str, bool] | None = None,
+    job_id: str | None = None,
 ) -> dict:
     """
     Spawns chatgpt_worker.py as a subprocess.
@@ -40,20 +42,33 @@ def process_prompt_via_chatgpt(
     if pipeline is not None:
         env["PROMPT_PIPELINE_JSON"] = json.dumps(pipeline)
 
-    result = subprocess.run(
+    proc = subprocess.Popen(
         [PYTHON_EXE, str(WORKER_SCRIPT)],
-        input=prompt_text.encode("utf-8"),
-        capture_output=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         env=env,
         cwd=str(PROJECT_ROOT),
     )
+    if job_id:
+        process_registry.register_process(str(job_id), proc)
+    if video_id is not None:
+        process_registry.register_process(f"video:{video_id}", proc)
 
-    stderr_output = result.stderr.decode("utf-8", errors="replace")
+    try:
+        stdout_bytes, stderr_bytes = proc.communicate(input=prompt_text.encode("utf-8"))
+    finally:
+        if job_id:
+            process_registry.unregister_process(str(job_id), proc)
+        if video_id is not None:
+            process_registry.unregister_process(f"video:{video_id}", proc)
+
+    stderr_output = stderr_bytes.decode("utf-8", errors="replace") if stderr_bytes else ""
     if stderr_output:
         import sys
         print(stderr_output, file=sys.stderr)
 
-    if result.returncode != 0:
+    if proc.returncode != 0:
         attention_message = decode_attention_error(stderr_output)
         if attention_message is not None:
             raise ChatGPTAttentionRequiredError(
@@ -62,7 +77,7 @@ def process_prompt_via_chatgpt(
             )
         raise Exception(f"Playwright worker failed: {stderr_output}")
 
-    output = result.stdout.decode("utf-8", errors="replace")
+    output = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
     
     worker_meta = {
         "warning": "",

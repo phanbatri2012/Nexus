@@ -3964,6 +3964,20 @@ def get_next_system_job_retry_delay(job_type: str) -> float | None:
     return max(0.0, (retry_at - now).total_seconds())
 
 
+def force_stop_system_job(job_id: str) -> dict | None:
+    job = get_system_job(job_id)
+    if not job:
+        return None
+    return update_system_job(
+        job_id,
+        status="canceled",
+        progress="Đã dừng cưỡng bức ngay lập tức",
+        error="Bị buộc dừng ngay lập tức bởi người dùng.",
+        cancel_requested=0,
+        finished_at=utc_now(),
+    )
+
+
 def request_cancel_system_job(job_id: str) -> dict | None:
     job = get_system_job(job_id)
     if not job:
