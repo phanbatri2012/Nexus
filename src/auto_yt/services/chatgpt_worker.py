@@ -1677,6 +1677,13 @@ def clean_text(text: str) -> str:
     result = '\n'.join(cleaned).strip()
     # Remove leading 'Edit' that might be left if it wasn't on its own line
     result = re.sub(r'^\s*Edit\s*\n*', '', result)
+    # Remove trailing Canvas Action Pills or suggestions attached to narrative ends
+    result = re.sub(
+        r"(?:rút gọn outro[^\n.]*|làm lời kết[^\n.]*|sắp xếp lời kêu gọi[^\n.]*|mở đầu bằng cú móc[^\n.]*|giảm tiết lộ[^\n.]*|làm rõ mốc[^\n.]*|tăng nhịp[^\n.]*|rút gọn chi tiết[^\n.]*)+\s*$",
+        "",
+        result,
+        flags=re.IGNORECASE,
+    ).strip()
     return result
 
 
@@ -1924,10 +1931,10 @@ def _extract_clean_markdown_text(node) -> str:
         cleaned = node.evaluate("""(el) => {
             const clone = el.cloneNode(true);
 
-            // 1. Remove all buttons (assistant responses are pure markdown/prose; all <button> elements are UI artifacts: Copy, Collapse, Suggestions, Search, Citations, etc.)
+            // 1. Remove all buttons (assistant responses are pure markdown/prose; all <button> elements are UI artifacts: Copy, Collapse, Suggestions, Search, Citations, Add to library, Open editor, etc.)
             clone.querySelectorAll('button').forEach((b) => b.remove());
 
-            // 2. Remove specific citation, search, attribution, and Canvas UI selectors
+            // 2. Remove specific citation, search, attribution, and Canvas/Writing Block UI selectors
             const junkSelectors = [
                 '[data-testid*="citation"]',
                 '[data-testid*="source"]',
@@ -1940,6 +1947,9 @@ def _extract_clean_markdown_text(node) -> str:
                 '[class*="attribution-"]',
                 '[data-citation-index]',
                 'sup.citation',
+                'header',
+                '[class*="header-"]',
+                '.title-Nx5xpW',
                 '[data-testid*="canvas-header"]',
                 '[data-testid*="document-header"]',
                 '[class*="canvas-header"]',
@@ -1956,8 +1966,8 @@ def _extract_clean_markdown_text(node) -> str:
                 clone.querySelectorAll(sel).forEach((badEl) => badEl.remove());
             });
 
-            // 3. Remove standalone Canvas title headers & controls
-            clone.querySelectorAll('div, span, p, header').forEach((elem) => {
+            // 3. Remove standalone Canvas title headers, buttons & action pill controls
+            clone.querySelectorAll('div, span, p, header, a').forEach((elem) => {
                 const txt = (elem.textContent || '').trim().toLowerCase();
                 if (
                     txt === 'nội dung chính' ||
@@ -1967,13 +1977,18 @@ def _extract_clean_markdown_text(node) -> str:
                     txt === 'thân bài' ||
                     txt === 'thu gọn' ||
                     txt === 'mở rộng' ||
+                    txt === 'mô tả video youtube' ||
+                    txt === 'tiêu đề video youtube' ||
                     txt.startsWith('mở đầu bằng cú móc') ||
                     txt.startsWith('giảm tiết lộ') ||
                     txt.startsWith('làm rõ mốc') ||
                     txt.startsWith('tăng nhịp') ||
-                    txt.startsWith('rút gọn chi tiết')
+                    txt.startsWith('rút gọn chi tiết') ||
+                    txt.startsWith('rút gọn outro') ||
+                    txt.startsWith('làm lời kết') ||
+                    txt.startsWith('sắp xếp lời kêu gọi')
                 ) {
-                    if (elem.children.length === 0) {
+                    if (elem.children.length === 0 || elem.tagName === 'HEADER') {
                         elem.remove();
                     }
                 }
@@ -2037,6 +2052,24 @@ def _read_assistant_message(message) -> str:
     return fallback
 
 
+def _get_message_node_role(node) -> str:
+    """Extract role string ('user' or 'assistant') from DOM node attributes."""
+    try:
+        role = (
+            node.get_attribute("data-message-author-role")
+            or node.get_attribute("data-conversation-role")
+        )
+        if role:
+            return role.casefold().strip()
+        if node.get_attribute("data-user-message-bubble") == "true":
+            return "user"
+        if node.get_attribute("data-markdown-text-style") == "assistant-message":
+            return "assistant"
+    except Exception:
+        pass
+    return ""
+
+
 def get_assistant_response_after_latest_user(
     page: Page,
     expected_user_text: str = "",
@@ -2055,11 +2088,7 @@ def get_assistant_response_after_latest_user(
             latest_user_index = -1
             for index in range(msg_count - 1, -1, -1):
                 node = messages.nth(index)
-                role = (
-                    node.get_attribute("data-message-author-role")
-                    or node.get_attribute("data-conversation-role")
-                    or ("user" if node.get_attribute("data-user-message-bubble") == "true" else "")
-                )
+                role = _get_message_node_role(node)
                 if role == "user":
                     if not expected_user_text or history_prompt_text_matches(
                         expected_user_text,
@@ -2071,11 +2100,7 @@ def get_assistant_response_after_latest_user(
                 response_text = ""
                 for index in range(latest_user_index + 1, msg_count):
                     message = messages.nth(index)
-                    role = (
-                        message.get_attribute("data-message-author-role")
-                        or message.get_attribute("data-conversation-role")
-                        or ("assistant" if message.get_attribute("data-markdown-text-style") == "assistant-message" else "")
-                    )
+                    role = _get_message_node_role(message)
                     if role == "user":
                         break
                     if role != "assistant":
@@ -2091,7 +2116,7 @@ def get_assistant_response_after_latest_user(
             const cleanNode = (el) => {
                 if (!el) return '';
                 const clone = el.cloneNode(true);
-                clone.querySelectorAll('button, .sr-only, [data-testid*="citation"], sup.citation').forEach(b => b.remove());
+                clone.querySelectorAll('button, .sr-only, [data-testid*="citation"], sup.citation, header, [class*="header-"], [class*="editorControls"], [class*="suggestion"], [class*="pill"]').forEach(b => b.remove());
                 return (clone.innerText || clone.textContent || '').trim();
             };
 
@@ -2101,9 +2126,14 @@ def get_assistant_response_after_latest_user(
             const topLevel = allNodes.filter((el, idx) => !allNodes.some((other, otherIdx) => otherIdx !== idx && other.contains(el)));
 
             return topLevel.map(u => {
-                const isUser = u.getAttribute('data-user-message-bubble') === 'true' || u.getAttribute('data-message-author-role') === 'user';
+                const isUser = u.getAttribute('data-user-message-bubble') === 'true'
+                    || (u.getAttribute('data-message-author-role') || '').toLowerCase() === 'user'
+                    || (u.getAttribute('data-conversation-role') || '').toLowerCase() === 'user';
+                const isAssistant = u.getAttribute('data-markdown-text-style') === 'assistant-message'
+                    || (u.getAttribute('data-message-author-role') || '').toLowerCase() === 'assistant'
+                    || (u.getAttribute('data-conversation-role') || '').toLowerCase() === 'assistant';
                 return {
-                    role: isUser ? 'user' : 'assistant',
+                    role: isUser ? 'user' : (isAssistant ? 'assistant' : ''),
                     text: cleanNode(u)
                 };
             }).filter(item => item.text.length > 0);
