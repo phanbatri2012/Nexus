@@ -123,6 +123,18 @@ def _is_valid_flow_error_text(text: str) -> bool:
     return True
 
 
+def _upgrade_google_cdn_image_url(url: str) -> str:
+    """If url is a Google CDN image with thumbnail size params (e.g. =s512, =w512-h288), upgrade to =s0."""
+    clean = str(url or "").strip()
+    if not clean or clean.startswith("blob:") or clean.startswith("data:"):
+        return clean
+    lower = clean.lower()
+    if "googleusercontent.com" in lower or "flow-content.google" in lower or "google.com" in lower:
+        upgraded = re.sub(r"=(?:s\d+|w\d+-h\d+)(-[a-zA-Z0-9_-]+)?(?=[?#]|$)", "=s0", clean)
+        return upgraded
+    return clean
+
+
 class GoogleFlowWorker:
     _session_uploaded_references: dict[str, set[str]] = {}
     _session_uploaded_image_urls: set[str] = set()
@@ -719,7 +731,10 @@ class GoogleFlowWorker:
 
     @staticmethod
     def _media_key(url: str) -> str:
-        return str(url or "").split("?", 1)[0].strip().casefold()
+        raw = str(url or "").split("?", 1)[0].strip().casefold()
+        if "googleusercontent.com" in raw or "flow-content.google" in raw or "google.com" in raw:
+            raw = re.sub(r"=(?:s\d+|w\d+-h\d+)(-[a-zA-Z0-9_-]+)?$", "", raw)
+        return raw
 
     async def _collect_image_candidates(self) -> list[dict]:
         """Collect generated image candidates from the gallery and result panel."""
@@ -732,12 +747,14 @@ class GoogleFlowWorker:
                 const valid = lower.startsWith('blob:') ||
                     lower.includes('flow-content.google/image') ||
                     lower.includes('googleusercontent.com') ||
+                    lower.includes('google.com') ||
                     /\.(?:png|jpe?g|webp)(?:\?|$)/i.test(url);
                 return valid && !/\.(?:mp4|webm)(?:\?|$)/i.test(url) ? url : '';
             };
             const nodes = document.querySelectorAll(
                 "img[src], img[srcset], [data-image-url], [data-media-url], " +
-                "[data-download-url], a[href], [style*='background-image']"
+                "[data-download-url], a[href], [style*='background-image'], " +
+                "flow-media-tile, flow-canvas-tile, flow-image-tile"
             );
             for (const node of nodes) {
                 if (node.closest(
@@ -776,7 +793,9 @@ class GoogleFlowWorker:
                     aria.includes('profile')) continue;
 
                 const card = node.closest(
-                    "flow-media-tile, [data-media-id], [data-asset-id], [data-testid*='media' i], .media-card"
+                    "flow-media-tile, [data-media-id], [data-asset-id], [data-testid*='media' i], .media-card, " +
+                    "flow-canvas-tile, flow-canvas-item, .canvas-tile, flow-message-turn, .chat-message, " +
+                    "[data-message-id], [data-turn-id], [data-response-id]"
                 );
                 const assetId = card ? (
                     card.getAttribute('data-media-id') || card.getAttribute('data-asset-id') ||
@@ -800,7 +819,7 @@ class GoogleFlowWorker:
                     labelText: String((card && card.innerText) || node.alt || node.getAttribute('aria-label') || ''),
                     width: Number(node.naturalWidth || node.videoWidth || node.width || 0) || 0,
                     height: Number(node.naturalHeight || node.videoHeight || node.height || 0) || 0,
-                    source: node.closest('.sidebar, .mat-drawer, flow-prompt-history, [data-testid*="result" i]')
+                    source: node.closest('.sidebar, .mat-drawer, flow-prompt-history, [data-testid*="result" i], flow-chat-panel')
                         ? 'result_panel' : 'gallery'
                 });
             }
@@ -1102,6 +1121,38 @@ class GoogleFlowWorker:
                 return "", ""
             await asyncio.sleep(SUBMISSION_ACK_POLL_SECONDS)
 
+    async def _has_prompt_in_conversation(self, prompt: str, baseline_marker: str) -> bool:
+        current_marker = await self._capture_submission_marker()
+        if current_marker and current_marker != baseline_marker:
+            return True
+        norm_prompt = self._normalize_prompt_text(prompt)
+        if not norm_prompt:
+            return False
+        clean_prefix = re.sub(r"(?i)\. avoid:.*", "", norm_prompt).strip()[:50].casefold()
+        if not clean_prefix:
+            clean_prefix = norm_prompt[:50].casefold()
+        try:
+            return bool(await self.page.evaluate(
+                r'''(sample) => {
+                    const selectors = [
+                        'flow-prompt-history', 'flow-chat-panel', 'flow-session-panel',
+                        "[data-testid*='prompt-history' i]", "[data-testid*='conversation' i]",
+                        "[data-testid*='result-panel' i]", '.sidebar', '.mat-drawer',
+                        'flow-message-turn', '.chat-message', '[data-message-id]', '[data-turn-id]'
+                    ];
+                    for (const sel of selectors) {
+                        for (const el of document.querySelectorAll(sel)) {
+                            const text = (el.textContent || '').toLowerCase();
+                            if (text.includes(sample)) return true;
+                        }
+                    }
+                    return false;
+                }''',
+                clean_prefix,
+            ))
+        except Exception:
+            return False
+
     async def _submit_prompt_and_wait_for_ack(
         self,
         *,
@@ -1172,21 +1223,47 @@ class GoogleFlowWorker:
                 )
                 return attempted_at, source
 
-            editor_text = self._normalize_prompt_text(await self._read_editor_text(editor))
-            if not editor_text:
+            if await self._has_prompt_in_conversation(full_prompt, baseline_marker):
                 self._log_generation_event(
                     media_type,
-                    "submit_ambiguous",
+                    "submit_acknowledged",
                     attempted_at,
-                    detail=f"attempt={attempt} method={method}",
+                    detail=f"attempt={attempt} method={method} reason=conversation_verified",
                 )
                 self._log_generation_event(
                     media_type,
                     "submitted",
                     attempted_at,
-                    detail=f"method={method} acknowledgement=ambiguous",
+                    detail=f"method={method}",
                 )
                 return attempted_at, ""
+
+            editor_text = self._normalize_prompt_text(await self._read_editor_text(editor))
+            if not editor_text:
+                logger.warning(
+                    "flow_generation media=%s state=submit_silent_drop project=%s "
+                    "attempt=%d method=%s (editor empty but message unacknowledged)",
+                    media_type,
+                    self._project_id(),
+                    attempt,
+                    method,
+                )
+                if attempt < 2:
+                    await self.dismiss_blocking_dialogs()
+                    try:
+                        await editor.click(timeout=2000)
+                    except Exception:
+                        pass
+                    await self.page.keyboard.press("Control+A")
+                    await self.page.keyboard.press("Backspace")
+                    try:
+                        await editor.fill(full_prompt)
+                    except Exception:
+                        await self.page.keyboard.insert_text(full_prompt)
+                    await asyncio.sleep(0.5)
+                    continue
+                else:
+                    break
 
             if editor_text != self._normalize_prompt_text(full_prompt):
                 try:
@@ -1791,20 +1868,56 @@ class GoogleFlowWorker:
         finally:
             await self.dismiss_blocking_dialogs()
 
+    async def _fetch_blob_payload(self, blob_url: str) -> bytes | None:
+        try:
+            base64_data = await self.page.evaluate(
+                '''async (blobUrl) => {
+                    const response = await fetch(blobUrl);
+                    const blob = await response.blob();
+                    return new Promise((resolve, reject) => {
+                        const reader = new FileReader();
+                        reader.onloadend = () => resolve(reader.result);
+                        reader.onerror = reject;
+                        reader.readAsDataURL(blob);
+                    });
+                }''',
+                blob_url,
+            )
+            if base64_data and "base64," in base64_data:
+                import base64
+                return base64.b64decode(base64_data.split("base64,")[1])
+        except Exception:
+            pass
+        return None
+
     async def _validate_image_url(self, url: str) -> bool:
         url = str(url or "").strip()
         variant_key = url.casefold()
         if not url or not variant_key or variant_key in self._rejected_image_urls:
             return False
+        body: bytes | None = None
         if url.startswith("blob:"):
-            return False
-        try:
-            response = await self.page.request.get(url, timeout=30000)
-            if response.status != 200:
-                return False
-            body = await response.body()
+            body = await self._fetch_blob_payload(url)
             if not body:
                 return False
+        else:
+            try:
+                response = await self.page.request.get(url, timeout=30000)
+                if response.status != 200:
+                    return False
+                body = await response.body()
+            except Exception as exc:
+                logger.info(
+                    "flow_generation media=image state=candidate_unreadable project=%s detail=%s",
+                    self._project_id(),
+                    type(exc).__name__,
+                )
+                return False
+
+        if not body:
+            return False
+
+        try:
             with Image.open(io.BytesIO(body)) as image:
                 image.load()
                 width, height = image.size
@@ -1848,8 +1961,14 @@ class GoogleFlowWorker:
             *(candidate.get("urls") or []),
         ]:
             url = str(value or "").strip()
-            if url and url not in urls:
+            if not url:
+                continue
+            upgraded = _upgrade_google_cdn_image_url(url)
+            if upgraded and upgraded not in urls:
+                urls.append(upgraded)
+            if url not in urls:
                 urls.append(url)
+
         for url in urls:
             if await self._validate_image_url(url):
                 return url
@@ -1881,7 +2000,10 @@ class GoogleFlowWorker:
             r'''({assetId, urls}) => {
                 const cards = Array.from(document.querySelectorAll(
                     "flow-media-tile, [data-media-id], [data-asset-id], " +
-                    "[data-testid*='media' i], .media-card"
+                    "[data-testid*='media' i], .media-card, " +
+                    "flow-canvas-tile, flow-canvas-item, .canvas-tile, " +
+                    "flow-message-turn img, [data-turn-id] img, .chat-message img, " +
+                    "flow-chat-panel img, .chat-panel img"
                 ));
                 for (const card of cards) {
                     if (card.closest(
@@ -2247,6 +2369,15 @@ class GoogleFlowWorker:
             )
             _strip_watermark(target)
             return
+
+        if str(asset_url or "").startswith("blob:"):
+            body = await self._fetch_blob_payload(asset_url)
+            if body and len(body) > 0:
+                target.write_bytes(body)
+                logger.info("Downloaded blob image successfully (%d bytes) to %s", len(body), target)
+                _strip_watermark(target)
+                return
+            raise RuntimeError(f"Không thể tải ảnh blob từ Google Flow: {asset_url}")
 
         last_error = None
         for attempt in range(3):

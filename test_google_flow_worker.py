@@ -19,6 +19,7 @@ from auto_yt.services.google_flow_worker import (
     REFERENCE_RESULT_NOT_FOUND,
     REFERENCE_RESULT_UI_ERROR,
     ReferenceAttachmentError,
+    _upgrade_google_cdn_image_url,
 )
 
 
@@ -811,12 +812,16 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
         button.click.assert_awaited_once()
         page.keyboard.press.assert_awaited_once_with("Enter")
 
-    async def test_submit_does_not_retry_when_editor_clears_without_strong_ack(self):
+    async def test_submit_retries_when_editor_clears_without_strong_ack_or_conversation(self):
         page = MagicMock()
         page.url = "https://flow.google.com/project/project-one"
         page.keyboard = MagicMock()
         page.keyboard.press = AsyncMock()
+        page.keyboard.insert_text = AsyncMock()
         editor = MagicMock()
+        editor.click = AsyncMock()
+        editor.fill = AsyncMock()
+        editor.focus = AsyncMock()
         button = MagicMock()
         button.click = AsyncMock()
         worker = GoogleFlowWorker(page)
@@ -824,9 +829,11 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(worker, "_capture_submission_marker", AsyncMock(return_value="baseline")),
             patch.object(worker, "_find_prompt_submit_button", AsyncMock(return_value=button)) as find_button,
-            patch.object(worker, "_wait_for_submission_ack", AsyncMock(return_value=("", ""))),
+            patch.object(worker, "_wait_for_submission_ack", AsyncMock(side_effect=[("", ""), ("", "conversation")])),
+            patch.object(worker, "_has_prompt_in_conversation", AsyncMock(side_effect=[False, True])),
             patch.object(worker, "_read_editor_text", AsyncMock(return_value="")),
             patch.object(worker, "dismiss_blocking_dialogs", AsyncMock()),
+            patch("auto_yt.services.google_flow_worker.asyncio.sleep", AsyncMock()),
         ):
             _, source = await worker._submit_prompt_and_wait_for_ack(
                 editor=editor,
@@ -836,9 +843,8 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(source, "")
-        self.assertEqual(find_button.await_count, 1)
         button.click.assert_awaited_once()
-        page.keyboard.press.assert_not_awaited()
+        page.keyboard.press.assert_awaited_with("Enter")
 
     async def test_submit_failure_raises_without_starting_generation_wait(self):
         page = MagicMock()
@@ -1469,6 +1475,88 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(page.url, "https://flow.google.com/project/project-one")
         done.first.click.assert_awaited_once()
+
+    def test_upgrade_google_cdn_image_url(self):
+        self.assertEqual(
+            _upgrade_google_cdn_image_url("https://lh3.googleusercontent.com/abc123xyz=s512"),
+            "https://lh3.googleusercontent.com/abc123xyz=s0",
+        )
+        self.assertEqual(
+            _upgrade_google_cdn_image_url("https://lh3.googleusercontent.com/abc123xyz=w1376-h768-no"),
+            "https://lh3.googleusercontent.com/abc123xyz=s0",
+        )
+        self.assertEqual(
+            _upgrade_google_cdn_image_url("https://flow-content.google/image/xyz=s256"),
+            "https://flow-content.google/image/xyz=s0",
+        )
+        self.assertEqual(
+            _upgrade_google_cdn_image_url("blob:https://flow.google.com/123"),
+            "blob:https://flow.google.com/123",
+        )
+        self.assertEqual(
+            _upgrade_google_cdn_image_url("https://example.com/image.png"),
+            "https://example.com/image.png",
+        )
+
+    def test_media_key_normalizes_google_cdn_thumbnail_params(self):
+        k1 = GoogleFlowWorker._media_key("https://lh3.googleusercontent.com/abc123xyz=s512")
+        k2 = GoogleFlowWorker._media_key("https://lh3.googleusercontent.com/abc123xyz=s0")
+        k3 = GoogleFlowWorker._media_key("https://lh3.googleusercontent.com/abc123xyz=w1376-h768")
+        self.assertEqual(k1, "https://lh3.googleusercontent.com/abc123xyz")
+        self.assertEqual(k2, "https://lh3.googleusercontent.com/abc123xyz")
+        self.assertEqual(k3, "https://lh3.googleusercontent.com/abc123xyz")
+
+    async def test_submit_prompt_retries_on_silent_drop_when_editor_empty_and_unacknowledged(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        page.keyboard = MagicMock()
+        page.keyboard.press = AsyncMock()
+        page.keyboard.insert_text = AsyncMock()
+
+        editor_loc = MagicMock()
+        editor_loc.focus = AsyncMock()
+        editor_loc.click = AsyncMock()
+        editor_loc.fill = AsyncMock()
+        editor_loc.evaluate = AsyncMock(return_value="")
+
+        btn_loc = MagicMock()
+        btn_loc.first = MagicMock()
+        btn_loc.first.is_visible = AsyncMock(return_value=True)
+        btn_loc.first.is_enabled = AsyncMock(return_value=True)
+        btn_loc.first.click = AsyncMock()
+
+        worker = GoogleFlowWorker(page)
+        with (
+            patch.object(worker, "dismiss_blocking_dialogs", AsyncMock()),
+            patch.object(worker, "_find_prompt_submit_button", AsyncMock(return_value=btn_loc.first)),
+            patch.object(worker, "_capture_submission_marker", AsyncMock(return_value="marker1")),
+            patch.object(worker, "_wait_for_submission_ack", AsyncMock(side_effect=[("", ""), ("", "conversation")])),
+            patch.object(worker, "_has_prompt_in_conversation", AsyncMock(side_effect=[False, True])),
+            patch("auto_yt.services.google_flow_worker.asyncio.sleep", AsyncMock()),
+        ):
+            attempted_at, source = await worker._submit_prompt_and_wait_for_ack(
+                editor=editor_loc,
+                full_prompt="Scene 1 soldiers",
+                media_type="image",
+                baseline_keys=set(),
+            )
+            self.assertGreater(attempted_at, 0)
+            self.assertEqual(btn_loc.first.click.await_count, 1)
+            page.keyboard.press.assert_awaited_with("Enter")
+            editor_loc.fill.assert_called()
+
+    async def test_validate_image_url_fetches_blob_payload(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        img_bytes = _image_bytes((1376, 768))
+
+        with patch.object(worker, "_fetch_blob_payload", AsyncMock(return_value=img_bytes)):
+            valid = await worker._validate_image_url("blob:https://flow.google.com/asset-123")
+            self.assertTrue(valid)
+            self.assertIsNotNone(worker._validated_image_payload)
+            self.assertEqual(worker._validated_image_payload[1], img_bytes)
+
 
 
 if __name__ == "__main__":
