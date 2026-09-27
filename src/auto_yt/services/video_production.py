@@ -755,6 +755,21 @@ def _generate_scene_image(
             if not target.exists() or target.stat().st_size == 0:
                 raise RuntimeError(f"Ảnh tạo từ Google Flow không hợp lệ hoặc rỗng: {target}")
             
+            try:
+                from PIL import Image
+                with Image.open(target) as img_check:
+                    img_w, img_h = img_check.size
+                    if img_w < 800 or img_h < 400 or (img_w / max(1, img_h)) < 1.15:
+                        raise RuntimeError(
+                            f"Ảnh tải về từ Google Flow không đạt chuẩn 16:9 widescreen ({img_w}x{img_h}). Bỏ qua để tạo lại."
+                        )
+            except Exception as dim_err:
+                try:
+                    target.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise
+            
     is_mock = (
         os.environ.get("YOUTUBE_UPLOAD", "true") == "false"
         or os.environ.get("FLOW_MOCK_GENERATION", "false") == "true"

@@ -467,29 +467,29 @@ class GoogleFlowWorker:
                 await self.dismiss_blocking_dialogs()
 
     async def _get_existing_images(self) -> set[str]:
-        """Collect all flow-content image URLs currently rendered on the page, strictly excluding Google account avatars."""
+        """Collect all flow-content image URLs currently rendered on the page, strictly excluding Google account avatars, reference chips, and menus."""
         try:
             imgs = await self.page.evaluate('''() => {
                 return Array.from(
                     document.querySelectorAll("img[src*='flow-content.google/image'], img.image, img[src*='googleusercontent.com']")
-                ).map(i => ({
-                    src: i.src,
-                    alt: i.alt || '',
-                    className: i.className || '',
-                    parentRole: (i.parentElement && i.parentElement.getAttribute('role')) || '',
-                    parentAria: (i.parentElement && i.parentElement.getAttribute('aria-label')) || ''
-                })).filter(item => {
-                    if (!item.src || item.src.startsWith('data:')) return false;
-                    const s = item.src.toLowerCase();
-                    const alt = item.alt.toLowerCase();
-                    const aria = item.parentAria.toLowerCase();
+                ).filter(i => {
+                    if (!i.src || i.src.startsWith('data:')) return false;
+                    // Exclude images inside reference chips, prompt box, dialogs, menus, and sidebars
+                    if (i.closest('flow-ingredient-chip, .ingredient-chip, .mat-mdc-chip, flow-prompt-box, .cdk-overlay-container, [role="menu"], [role="dialog"], .sidebar, .mat-drawer, flow-upload-card, .mat-mdc-dialog-container')) {
+                        return false;
+                    }
+                    const s = i.src.toLowerCase();
+                    const alt = (i.alt || '').toLowerCase();
+                    const className = (i.className || '').toLowerCase();
+                    const parentRole = ((i.parentElement && i.parentElement.getAttribute('role')) || '').toLowerCase();
+                    const parentAria = ((i.parentElement && i.parentElement.getAttribute('aria-label')) || '').toLowerCase();
                     // Blacklist all Google Account avatars and profile icons
                     if (s.includes('s32-c-mo') || s.includes('s96-c') || s.includes('pr_32px') || s.includes('/a/acg8oc') || s.includes('/a/')) return false;
                     if (alt.includes('google account') || alt.includes('tài khoản google') || alt.includes('profile')) return false;
-                    if (aria.includes('google account') || aria.includes('tài khoản google') || aria.includes('profile')) return false;
-                    if (item.className.includes('avatar') || item.className.includes('profile')) return false;
+                    if (parentAria.includes('google account') || parentAria.includes('tài khoản google') || parentAria.includes('profile')) return false;
+                    if (className.includes('avatar') || className.includes('profile')) return false;
                     return true;
-                }).map(item => item.src);
+                }).map(i => i.src);
             }''')
             return set(imgs) if isinstance(imgs, list) else set()
         except Exception:
@@ -860,17 +860,55 @@ class GoogleFlowWorker:
                 except Exception:
                     continue
 
+            # Check if generation is actively running via stop buttons or progress indicators
+            for s_sel in stop_btn_selectors:
+                try:
+                    if await self.page.locator(s_sel).first.is_visible(timeout=300):
+                        is_generating = True
+                        generation_started = True
+                        break
+                except Exception:
+                    continue
+
+            if not is_generating:
+                # Also check for active progress indicators on canvas (e.g. text containing "%", spinner, or progress tiles)
+                try:
+                    progress_loc = self.page.locator(".canvas [role='progressbar'], .canvas .progress, flow-media-tile:has-text('%'), .generating").first
+                    if await progress_loc.is_visible(timeout=200):
+                        is_generating = True
+                        generation_started = True
+                except Exception:
+                    pass
+
+            # If generation is actively running, NEVER capture early — continue waiting
+            if is_generating:
+                continue
+
             # 1. ALWAYS check for brand-new images FIRST before any error tile evaluation
             try:
                 current_imgs_info = await self.page.evaluate('''() => {
                     return Array.from(
                         document.querySelectorAll("img[src*='flow-content.google/image'], img.image, img[src*='googleusercontent.com']")
-                    ).map(i => ({
+                    ).filter(i => {
+                        if (!i.src || i.src.startsWith('data:')) return false;
+                        if (i.closest('flow-ingredient-chip, .ingredient-chip, .mat-mdc-chip, flow-prompt-box, .cdk-overlay-container, [role="menu"], [role="dialog"], .sidebar, .mat-drawer, flow-upload-card, .mat-mdc-dialog-container')) {
+                            return false;
+                        }
+                        const s = i.src.toLowerCase();
+                        const alt = (i.alt || '').toLowerCase();
+                        const className = (i.className || '').toLowerCase();
+                        const parentAria = ((i.parentElement && i.parentElement.getAttribute('aria-label')) || '').toLowerCase();
+                        if (s.includes('s32-c-mo') || s.includes('s96-c') || s.includes('pr_32px') || s.includes('/a/acg8oc') || s.includes('/a/')) return false;
+                        if (alt.includes('google account') || alt.includes('tài khoản google') || alt.includes('profile')) return false;
+                        if (parentAria.includes('google account') || parentAria.includes('tài khoản google') || parentAria.includes('profile')) return false;
+                        if (className.includes('avatar') || className.includes('profile')) return false;
+                        return true;
+                    }).map(i => ({
                         src: i.src,
                         className: i.className || '',
                         width: i.naturalWidth || i.width || 0,
                         height: i.naturalHeight || i.height || 0
-                    })).filter(item => item.src && !item.src.includes('s32-c-mo') && !item.src.includes('pr_32px'));
+                    }));
                 }''')
             except Exception:
                 current_imgs_info = []
@@ -878,7 +916,7 @@ class GoogleFlowWorker:
             if not isinstance(current_imgs_info, list):
                 current_imgs_info = []
 
-            # Find brand new images excluding existing and uploaded reference portraits
+            # Find brand new widescreen images excluding existing and uploaded reference portraits
             brand_new = [
                 img for img in current_imgs_info
                 if isinstance(img, dict) and img.get("src")
@@ -886,35 +924,27 @@ class GoogleFlowWorker:
                 and img.get("src").split("?")[0] not in existing_bases
                 and img.get("src") not in self._uploaded_image_urls
                 and img.get("src").split("?")[0] not in uploaded_bases
+                and (img.get("width", 0) >= 800 and img.get("height", 0) >= 400 and (img.get("width", 0) / max(1, img.get("height", 0))) >= 1.2)
             ]
 
-            # Priority 1: High-resolution full images (16:9 widescreen or width >= 1024, height >= 400)
+            # Priority 1: High-resolution widescreen images (width >= 1024, height >= 400)
             for item in brand_new:
                 w = item.get("width", 0)
                 h = item.get("height", 0)
-                is_widescreen = (w >= 1024) or (w >= 800 and w > h * 1.15) or (w > 0 and h > 0 and (w / h) >= 1.5)
-                if "thumbnail" not in item.get("className", "") and is_widescreen and h >= 400:
+                if "thumbnail" not in item.get("className", "") and w >= 1024 and h >= 400:
                     new_src = item["src"]
                     break
 
-            # Priority 2: Any brand-new image with width >= 800
+            # Priority 2: Standard widescreen image (width >= 800, height >= 400, aspect ratio >= 1.2)
             if not new_src:
                 for item in brand_new:
-                    if item.get("width", 0) >= 800:
+                    if "thumbnail" not in item.get("className", ""):
                         new_src = item["src"]
                         break
-
-            # Priority 3: Fallback brand-new image
-            if not new_src and brand_new:
-                new_src = brand_new[-1]["src"]
 
             if new_src:
                 logger.info("Found newly generated Google Flow image: %s", new_src)
                 break
-
-            # If generation is actively running (Stop button visible), keep waiting
-            if is_generating:
-                continue
 
             # 2. Check for NEW canvas error tiles ONLY when generation stopped and NO new image was found
             current_error_texts = await self._get_existing_error_texts()
@@ -943,18 +973,47 @@ class GoogleFlowWorker:
 
             # 4. If generation started and stop button disappeared, check again with diff
             if generation_started and not is_generating:
-                await asyncio.sleep(3)
-                # Re-query
-                updated_imgs = await self._get_existing_images()
+                await asyncio.sleep(2)
+                # Re-query with strict widescreen filter
+                try:
+                    updated_imgs_info = await self.page.evaluate('''() => {
+                        return Array.from(
+                            document.querySelectorAll("img[src*='flow-content.google/image'], img.image, img[src*='googleusercontent.com']")
+                        ).filter(i => {
+                            if (!i.src || i.src.startsWith('data:')) return false;
+                            if (i.closest('flow-ingredient-chip, .ingredient-chip, .mat-mdc-chip, flow-prompt-box, .cdk-overlay-container, [role="menu"], [role="dialog"], .sidebar, .mat-drawer, flow-upload-card, .mat-mdc-dialog-container')) {
+                                return false;
+                            }
+                            const s = i.src.toLowerCase();
+                            const alt = (i.alt || '').toLowerCase();
+                            const className = (i.className || '').toLowerCase();
+                            const parentAria = ((i.parentElement && i.parentElement.getAttribute('aria-label')) || '').toLowerCase();
+                            if (s.includes('s32-c-mo') || s.includes('s96-c') || s.includes('pr_32px') || s.includes('/a/acg8oc') || s.includes('/a/')) return false;
+                            if (alt.includes('google account') || alt.includes('tài khoản google') || alt.includes('profile')) return false;
+                            if (parentAria.includes('google account') || parentAria.includes('tài khoản google') || parentAria.includes('profile')) return false;
+                            if (className.includes('avatar') || className.includes('profile')) return false;
+                            return true;
+                        }).map(i => ({
+                            src: i.src,
+                            className: i.className || '',
+                            width: i.naturalWidth || i.width || 0,
+                            height: i.naturalHeight || i.height || 0
+                        }));
+                    }''')
+                except Exception:
+                    updated_imgs_info = []
+
                 diff = [
-                    u for u in updated_imgs
-                    if u not in existing_imgs
-                    and u.split("?")[0] not in existing_bases
-                    and u not in self._uploaded_image_urls
-                    and u.split("?")[0] not in uploaded_bases
+                    item for item in (updated_imgs_info or [])
+                    if isinstance(item, dict) and item.get("src")
+                    and item.get("src") not in existing_imgs
+                    and item.get("src").split("?")[0] not in existing_bases
+                    and item.get("src") not in self._uploaded_image_urls
+                    and item.get("src").split("?")[0] not in uploaded_bases
+                    and (item.get("width", 0) >= 800 and item.get("height", 0) >= 400 and (item.get("width", 0) / max(1, item.get("height", 0))) >= 1.2)
                 ]
                 if diff:
-                    new_src = diff[-1]
+                    new_src = diff[-1]["src"]
                     break
 
         if not new_src:
