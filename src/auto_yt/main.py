@@ -186,6 +186,61 @@ def _normalize_thumbnail_urls(value, fallback_url: str = "") -> list[str]:
     ]
 
 
+def _patch_thumbnail_section_in_script(
+    script: str,
+    thumbnail_type: str,
+    generated_text: str | None = None,
+    image_urls: list[str] | None = None,
+) -> str:
+    """Generic helper to patch thumbnail section in a script while preserving prompt text and updating image markers."""
+    if not script:
+        script = ""
+    thumbnail_configs = {
+        "with_text": "THUMBNAIL CÓ CHỮ",
+        "without_text": "THUMBNAIL KHÔNG CHỮ",
+    }
+    section_title = thumbnail_configs.get(thumbnail_type, "THUMBNAIL")
+
+    section_pattern = rf"### \[{re.escape(section_title)}\]\n(.*?)(?=\n### \[|\Z)"
+    section_match = re.search(section_pattern, script, re.DOTALL)
+    current_section_content = section_match.group(1).strip() if section_match else ""
+
+    current_prompt_text = (
+        re.sub(r"\[IMAGE_URL:.*?\]", "", current_section_content).strip()
+        if current_section_content
+        else ""
+    )
+    new_prompt_text = (
+        re.sub(r"\[IMAGE_URL:.*?\]", "", generated_text).strip()
+        if generated_text
+        else ""
+    )
+    prompt_text = new_prompt_text or current_prompt_text
+
+    normalized_urls = _normalize_thumbnail_urls(image_urls)
+    if normalized_urls:
+        image_markers = "\n\n".join(f"[IMAGE_URL:{u}]" for u in normalized_urls)
+        updated_body = f"{prompt_text}\n\n{image_markers}".strip() if prompt_text else image_markers
+    else:
+        updated_body = prompt_text
+
+    if section_match:
+        updated_script = re.sub(
+            rf"(### \[{re.escape(section_title)}\]\n).*?(?=\n### \[|\Z)",
+            rf"\1{updated_body}\n",
+            script,
+            flags=re.DOTALL,
+        )
+    else:
+        updated_script = (
+            f"{script.rstrip()}\n\n### [{section_title}]\n{updated_body}\n"
+            if script.strip()
+            else f"### [{section_title}]\n{updated_body}\n"
+        )
+
+    return updated_script
+
+
 def _try_start_chatgpt_operation(
     operation: str,
     prompt_version: str = "",
@@ -6918,7 +6973,6 @@ async def generate_chapters_endpoint(req: GenerateChaptersRequest):
 @app.post("/api/generate-thumbnails")
 async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, background_tasks: BackgroundTasks):
     from auto_yt.services.chatgpt_worker import generate_thumbnails_only
-    import concurrent.futures
 
     # Resolve the prompt version before reserving the ChatGPT profile so
     # Settings can lock only the version used by this thumbnail job.
@@ -6959,8 +7013,9 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
             job_id=sys_job_id,
             job_type="thumbnail_generation",
             title=f"Sinh Thumbnail: {v_title[:50]}",
-            video_id=req.video_id,
+            prompt_version=resolved_prompt_version,
             payload={"video_id": req.video_id, "thumbnail_type": req.thumbnail_type},
+            status="running",
         )
         db.update_system_job(sys_job_id, status="running", progress="Đang tạo ảnh qua ChatGPT...")
     except Exception as exc:
@@ -6969,122 +7024,66 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
     try:
         loop = asyncio.get_event_loop()
         def generate_requested_thumbnails():
-            requested_types = (
-                ("with_text", "without_text")
-                if req.thumbnail_type == "both"
-                else (req.thumbnail_type,)
+            return generate_thumbnails_only(
+                req.script,
+                resolved_chat_url,
+                resolved_prompt_version,
+                req.thumbnail_type,
             )
-            combined_result = {
-                "thumb_text": None,
-                "thumb_notext": None,
-                "image1_url": "",
-                "image2_url": "",
-                "image1_urls": [],
-                "image2_urls": [],
-            }
-            for thumbnail_type in requested_types:
-                partial_result = generate_thumbnails_only(
-                    req.script,
-                    resolved_chat_url,
-                    resolved_prompt_version,
-                    thumbnail_type,
-                )
-                expected_image_key = (
-                    "image1_url"
-                    if thumbnail_type == "with_text"
-                    else "image2_url"
-                )
-                expected_images_key = (
-                    "image1_urls"
-                    if thumbnail_type == "with_text"
-                    else "image2_urls"
-                )
-                image_urls = _normalize_thumbnail_urls(
-                    partial_result.get(expected_images_key),
-                    partial_result.get(expected_image_key, ""),
-                )
-                if not image_urls:
-                    thumbnail_label = (
-                        "có chữ"
-                        if thumbnail_type == "with_text"
-                        else "không chữ"
-                    )
-                    raise RuntimeError(
-                        "ChatGPT không trả về ảnh thumbnail mới "
-                        f"{thumbnail_label}. Ảnh cũ được giữ nguyên."
-                    )
-                partial_result[expected_images_key] = image_urls
-                partial_result[expected_image_key] = image_urls[0]
-                for key, value in partial_result.items():
-                    if value:
-                        combined_result[key] = value
-            return combined_result
 
-        result = await loop.run_in_executor(None, generate_requested_thumbnails)
-        
+        raw_result = await loop.run_in_executor(None, generate_requested_thumbnails)
+        result = dict(raw_result or {})
+        result["image1_urls"] = _normalize_thumbnail_urls(
+            result.get("image1_urls"), result.get("image1_url", "")
+        )
+        result["image2_urls"] = _normalize_thumbnail_urls(
+            result.get("image2_urls"), result.get("image2_url", "")
+        )
+        result["image1_url"] = result["image1_urls"][0] if result["image1_urls"] else ""
+        result["image2_url"] = result["image2_urls"][0] if result["image2_urls"] else ""
+
+        has_img1 = bool(result["image1_urls"])
+        has_img2 = bool(result["image2_urls"])
+
+        # Determine success / warning status
+        warning_msg = None
+        if req.thumbnail_type == "both":
+            if not has_img1 and not has_img2:
+                raise RuntimeError("ChatGPT không tạo được ảnh thumbnail mới nào. Ảnh cũ được giữ nguyên.")
+            elif not has_img1:
+                warning_msg = "Đã tạo thumbnail không chữ thành công, nhưng không tạo được thumbnail có chữ."
+            elif not has_img2:
+                warning_msg = "Đã tạo thumbnail có chữ thành công, nhưng không tạo được thumbnail không chữ."
+        elif req.thumbnail_type == "with_text":
+            if not has_img1:
+                raise RuntimeError("ChatGPT không tạo được ảnh thumbnail có chữ mới. Ảnh cũ được giữ nguyên.")
+        elif req.thumbnail_type == "without_text":
+            if not has_img2:
+                raise RuntimeError("ChatGPT không tạo được ảnh thumbnail không chữ mới. Ảnh cũ được giữ nguyên.")
+
         # If video_id provided, patch the stored script to add image URLs
         if req.video_id:
             video = _require_actionable_video(req.video_id)
             if video:
-                script = video["generated_script"]
-                import re
-                
-                thumbnail_types = (
-                    ("with_text", "without_text")
-                    if req.thumbnail_type == "both"
-                    else (req.thumbnail_type,)
-                )
-                thumbnail_configs = {
-                    "with_text": (
-                        "THUMBNAIL CÓ CHỮ",
-                        "thumb_text",
-                        "image1_url",
-                        "image1_urls",
-                    ),
-                    "without_text": (
-                        "THUMBNAIL KHÔNG CHỮ",
-                        "thumb_notext",
-                        "image2_url",
-                        "image2_urls",
-                    ),
-                }
-
-                for thumbnail_type in thumbnail_types:
-                    section_title, text_key, image_key, images_key = thumbnail_configs[
-                        thumbnail_type
-                    ]
-                    generated_text = result.get(text_key)
-                    image_urls = _normalize_thumbnail_urls(
-                        result.get(images_key),
-                        result.get(image_key, ""),
+                script = video.get("generated_script") or ""
+                if has_img1 or result.get("thumb_text"):
+                    script = _patch_thumbnail_section_in_script(
+                        script=script,
+                        thumbnail_type="with_text",
+                        generated_text=result.get("thumb_text"),
+                        image_urls=result.get("image1_urls"),
                     )
-                    section_pattern = rf'### \[{re.escape(section_title)}\]\n(.*?)(?=\n### \[|\Z)'
-                    section_match = re.search(section_pattern, script, re.DOTALL)
-                    current_text = section_match.group(1).strip() if section_match else ""
-                    current_prompt_text = re.sub(r'\[IMAGE_URL:.*?\]', '', current_text).strip() if current_text else ""
-                    new_prompt_text = re.sub(r'\[IMAGE_URL:.*?\]', '', generated_text).strip() if generated_text else ""
-                    prompt_text = new_prompt_text or current_prompt_text
+                if has_img2 or result.get("thumb_notext"):
+                    script = _patch_thumbnail_section_in_script(
+                        script=script,
+                        thumbnail_type="without_text",
+                        generated_text=result.get("thumb_notext"),
+                        image_urls=result.get("image2_urls"),
+                    )
 
-                    if image_urls:
-                        image_markers = "\n\n".join(
-                            f"[IMAGE_URL:{image_url}]" for image_url in image_urls
-                        )
-                        updated_text = f"{prompt_text}\n\n{image_markers}".strip() if prompt_text else image_markers
-                    else:
-                        updated_text = prompt_text
-
-                    if section_match:
-                        script = re.sub(
-                            rf'(### \[{re.escape(section_title)}\]\n).*?(?=\n### \[|\Z)',
-                            rf'\1{updated_text.strip()}\n',
-                            script,
-                            flags=re.DOTALL,
-                        )
-                    else:
-                        script = script.rstrip() + f"\n\n### [{section_title}]\n{updated_text.strip()}\n" 
-                        
                 db.update_script(req.video_id, script)
-        
+                result["script"] = script
+
         try:
             db.update_system_job(
                 sys_job_id,
@@ -7095,7 +7094,10 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
         except Exception:
             pass
 
-        return {"success": True, **result}
+        response_payload = {"success": True, **result}
+        if warning_msg:
+            response_payload["warning"] = warning_msg
+        return response_payload
     except Exception as e:
         print(f"Error in generate_thumbnails_endpoint: {e}", file=sys.stderr)
         try:

@@ -684,9 +684,27 @@ def get_thumbnail_image_identity(image_url: str) -> str:
     return image_url
 
 
+def scroll_chatgpt_conversation_to_bottom(page: Page) -> None:
+    """Scroll ChatGPT conversation to bottom to ensure virtualized DOM renders the latest items."""
+    try:
+        page.evaluate(
+            """() => {
+                const scrollables = Array.from(document.querySelectorAll('*')).filter(el => {
+                    const style = window.getComputedStyle(el);
+                    return (style.overflowY === 'auto' || style.overflowY === 'scroll') && el.scrollHeight > el.clientHeight;
+                });
+                scrollables.forEach(s => s.scrollTop = s.scrollHeight);
+                window.scrollTo(0, document.body.scrollHeight);
+            }"""
+        )
+    except Exception:
+        pass
+
+
 def get_existing_thumbnail_identities(page: Page) -> set[str]:
     """Collect image identities currently visible in the DOM before sending a prompt."""
     try:
+        scroll_chatgpt_conversation_to_bottom(page)
         images = page.locator(THUMBNAIL_IMAGE_SELECTOR)
         if images.count() == 0:
             return set()
@@ -715,6 +733,7 @@ def wait_for_thumbnail_images(
     response_turn = None
     snapshot_error_logged = False
     while time.time() < deadline:
+        scroll_chatgpt_conversation_to_bottom(page)
         if response_turn is None:
             response_turn = select_thumbnail_response_turn_number(
                 get_visible_conversation_turns(page),
@@ -756,6 +775,26 @@ def wait_for_thumbnail_images(
                         ready: image.complete && image.naturalWidth > 0,
                     }))
                     """
+                )
+            if not image_snapshots:
+                image_snapshots = page.evaluate(
+                    """() => {
+                        const imgs = Array.from(document.querySelectorAll('img')).filter(img => {
+                            const src = img.getAttribute('src') || img.currentSrc || '';
+                            const alt = img.getAttribute('alt') || '';
+                            return (
+                                src.startsWith('blob:') ||
+                                src.includes('backend-api') ||
+                                src.includes('oaiusercontent') ||
+                                alt.includes('Generated image') ||
+                                alt.includes('DALL')
+                            );
+                        });
+                        return imgs.map(img => ({
+                            src: img.getAttribute('src') || img.currentSrc || '',
+                            ready: img.complete && img.naturalWidth > 0,
+                        }));
+                    }"""
                 )
             generation_active = (
                 page.locator(CHATGPT_STOP_BUTTON_SELECTOR).count() > 0
@@ -3871,7 +3910,7 @@ def generate_thumbnails_only(
     Otherwise opens a new chat.
     Uses the specified prompt_version if provided.
     """
-    if thumbnail_type is not None:
+    if thumbnail_type in ("with_text", "without_text"):
         return _generate_single_thumbnail(
             script_text,
             chat_url,
@@ -3950,6 +3989,8 @@ def generate_thumbnails_only(
                 page,
                 lambda image_url: _download_image(page, image_url),
             )
+
+        time.sleep(3)  # Brief settle delay between consecutive DALL-E prompts
 
         print(">>> GEN THUMBNAIL (KHÔNG CHỮ)", file=sys.stderr)
         prompt9 = build_thumbnail_generation_prompt(

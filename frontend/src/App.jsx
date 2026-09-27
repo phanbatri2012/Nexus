@@ -1002,38 +1002,45 @@ function App() {
       });
       const data = await res.json();
       if (data.success) {
-        const normalizeThumbnailUrls = (urls, fallbackUrl) => {
-          const candidates = Array.isArray(urls) && urls.length > 0
-            ? urls
-            : (fallbackUrl ? [fallbackUrl] : []);
-          return [...new Set(candidates.filter(Boolean))].slice(0, 2);
-        };
-        const patchThumbnailImages = (script, sectionTitle, imageUrls) => {
-          if (imageUrls.length === 0) return script;
-          const imageMarkers = imageUrls
-            .map((imageUrl) => `[IMAGE_URL:${imageUrl}]`)
-            .join('\n\n');
-          return script.replace(
-            new RegExp(`(### \\[${sectionTitle}\\][\\s\\S]*?)(?=\\n### |$)`),
-            (section) => {
-              const cleaned = section.replace(/\[IMAGE_URL:.*?\]/g, '').trimEnd();
-              return `${cleaned}\n\n${imageMarkers}`;
-            }
-          );
-        };
+        if (data.warning) {
+          alert('Cảnh báo: ' + data.warning);
+        }
+        if (data.script) {
+          setResultText(data.script);
+        } else {
+          const normalizeThumbnailUrls = (urls, fallbackUrl) => {
+            const candidates = Array.isArray(urls) && urls.length > 0
+              ? urls
+              : (fallbackUrl ? [fallbackUrl] : []);
+            return [...new Set(candidates.filter(Boolean))].slice(0, 2);
+          };
+          const patchThumbnailImages = (script, sectionTitle, imageUrls) => {
+            if (imageUrls.length === 0) return script;
+            const imageMarkers = imageUrls
+              .map((imageUrl) => `[IMAGE_URL:${imageUrl}]`)
+              .join('\n\n');
+            return script.replace(
+              new RegExp(`(### \\[${sectionTitle}\\][\\s\\S]*?)(?=\\n### |$)`),
+              (section) => {
+                const cleaned = section.replace(/\[IMAGE_URL:.*?\]/g, '').trimEnd();
+                return `${cleaned}\n\n${imageMarkers}`;
+              }
+            );
+          };
 
-        let newScript = resultText;
-        newScript = patchThumbnailImages(
-          newScript,
-          'THUMBNAIL CÓ CHỮ',
-          normalizeThumbnailUrls(data.image1_urls, data.image1_url)
-        );
-        newScript = patchThumbnailImages(
-          newScript,
-          'THUMBNAIL KHÔNG CHỮ',
-          normalizeThumbnailUrls(data.image2_urls, data.image2_url)
-        );
-        setResultText(newScript);
+          let newScript = resultText;
+          newScript = patchThumbnailImages(
+            newScript,
+            'THUMBNAIL CÓ CHỮ',
+            normalizeThumbnailUrls(data.image1_urls, data.image1_url)
+          );
+          newScript = patchThumbnailImages(
+            newScript,
+            'THUMBNAIL KHÔNG CHỮ',
+            normalizeThumbnailUrls(data.image2_urls, data.image2_url)
+          );
+          setResultText(newScript);
+        }
         if (currentVideoId) {
           await fetchSavedVideos(currentPage, publishFilter);
         }
