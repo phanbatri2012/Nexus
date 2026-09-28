@@ -1879,8 +1879,8 @@ export default function Settings({
                 )}
                 disabled={activeVersionLocked}
               >
-                <option value="browser">🌐 UPLOAD Qua Giao diện Web Trình duyệt (Mặc định)</option>
-                <option value="api">🔌 UPLOAD Qua YouTube Data API (API ngầm)</option>
+                <option value="browser">🌐 UPLOAD Qua Trình duyệt GPM (Tự động kiếm tiền & Đặt lịch - Khuyên dùng)</option>
+                <option value="api">🔌 UPLOAD Qua YouTube Data API (API ngầm - Tốn Quota)</option>
               </select>
             </label>
             <label>
@@ -1943,9 +1943,49 @@ export default function Settings({
               </select>
             </label>
           </div>
-          <div className="help-text" style={{ marginTop: 8, fontSize: '0.84rem', color: '#94a3b8', lineHeight: 1.5 }}>
-            💡 <strong>Phương thức Upload:</strong> <em>Giao diện Web Trình duyệt</em> (Playwright CDP qua profile GPM-Login) tự động điền thông tin và áp dụng cài đặt, tự động thích ứng với kênh bật kiếm tiền và không tốn Quota YouTube API. <em>YouTube Data API</em> sử dụng HTTP API ngầm bằng OAuth token.
-          </div>
+          {(currentPublishing.upload_method || 'browser') === 'browser' ? (
+            <div
+              style={{
+                marginTop: 10,
+                padding: '10px 14px',
+                background: 'rgba(56, 189, 248, 0.08)',
+                border: '1px solid rgba(56, 189, 248, 0.25)',
+                borderRadius: 8,
+                fontSize: '0.84rem',
+                color: '#e2e8f0',
+                lineHeight: 1.5
+              }}
+            >
+              <strong style={{ color: '#38bdf8' }}>🌐 Chế độ Trình duyệt GPM (Khuyên dùng):</strong>
+              <div style={{ marginTop: 3, color: '#cbd5e1' }}>
+                • <strong>Yêu cầu:</strong> Kênh được gán GPM Profile ID và Proxy riêng trong tab Quản lý Kênh.
+              </div>
+              <div style={{ color: '#cbd5e1' }}>
+                • <strong>Lợi thế:</strong> Không tốn Quota YouTube API (không giới hạn lượt đăng), tự động hoàn tất khảo sát kiếm tiền (Ad Suitability) và hỗ trợ Đặt lịch trên YouTube Studio mà không cần xác minh Google Audit.
+              </div>
+            </div>
+          ) : (
+            <div
+              style={{
+                marginTop: 10,
+                padding: '10px 14px',
+                background: 'rgba(245, 158, 11, 0.08)',
+                border: '1px solid rgba(245, 158, 11, 0.25)',
+                borderRadius: 8,
+                fontSize: '0.84rem',
+                color: '#e2e8f0',
+                lineHeight: 1.5
+              }}
+            >
+              <strong style={{ color: '#f59e0b' }}>🔌 Chế độ YouTube Data API v3:</strong>
+              <div style={{ marginTop: 3, color: '#cbd5e1' }}>
+                • <strong>Yêu cầu:</strong> Kênh đã kết nối OAuth YouTube thành công. Nếu đặt lịch cần Google Cloud Project đã được Google Audit phê duyệt.
+              </div>
+              <div style={{ color: '#cbd5e1' }}>
+                • <strong>Lưu ý:</strong> Tốn ~1.600 units Quota mỗi video. Không tự động tick khảo sát bật kiếm tiền.
+              </div>
+            </div>
+          )}
           <div className="help-text" style={{ marginTop: 4, fontSize: '0.84rem', color: '#94a3b8', lineHeight: 1.5 }}>
             💡 <strong>Thể loại video:</strong> Tự động chọn đúng thể loại trên YouTube Studio khi upload. Nếu chọn <em>Mặc định theo kênh</em>, hệ thống sẽ giữ nguyên thể loại mặc định của kênh bạn đã cài đặt trên YouTube Studio.
           </div>

@@ -5636,6 +5636,22 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
         if hydrate and job_type in {"youtube_upload", "youtube_publish"}
         else None
     )
+    upload_method = ""
+    if job_type in {"youtube_upload", "youtube_publish"}:
+        snap = payload.get("snapshot") or (publish_workflow or {}).get("snapshot")
+        if isinstance(snap, dict):
+            pub_set = snap.get("publishing_settings")
+            if isinstance(pub_set, dict):
+                upload_method = str(pub_set.get("upload_method") or "").strip().lower()
+        if not upload_method and isinstance(result, dict):
+            upload_method = str(result.get("upload_method") or "").strip().lower()
+        if not upload_method:
+            upload_method = "browser"
+        if upload_method == "api":
+            type_label = "Upload YouTube (Data API v3)"
+        else:
+            type_label = "Upload YouTube (Trình duyệt GPM)"
+
     publish_stage = str(
         result.get("publish_stage")
         or result.get("stage")
@@ -5748,6 +5764,7 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
         "missing_configuration": result.get("missing_configuration") or [],
         "publish_stage": publish_stage,
         "upload_percent": upload_percent,
+        "upload_method": upload_method,
         "scheduled_at": scheduled_at,
         "youtube_video_id": youtube_video_id,
         "artifact_download_url": artifact_download_url,

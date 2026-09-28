@@ -865,6 +865,18 @@ class VideoProductionServiceTests(unittest.TestCase):
         self.assertNotIn("dramatic opening scene hook for", scene0["prompt"])
         self.assertIn("clean visual without text", scene0["prompt"])
 
+    def test_video_prompt_explicitly_requests_one_video_with_two_frames(self):
+        prompt = video_production._format_scene_video_prompt(
+            "scene",
+            scene_action="camera moves forward",
+            has_start_frame=True,
+            has_end_frame=True,
+        )
+        self.assertTrue(prompt.startswith("Generate exactly one 16:9 video"))
+        self.assertIn("first attached image", prompt)
+        self.assertIn("second attached image", prompt)
+        self.assertIn("not a still image", prompt)
+
     def test_scene_media_reuses_one_flow_worker_session_for_images_and_video(self):
         shared_worker = MagicMock()
         session_entries = []
@@ -910,7 +922,7 @@ class VideoProductionServiceTests(unittest.TestCase):
         self.assertIs(generate_video.await_args.kwargs["worker"], shared_worker)
         self.assertEqual(result, [video_path, image_paths[1]])
 
-    def test_scene_media_falls_back_immediately_when_veo_fails(self):
+    def test_scene_media_stops_immediately_when_veo_fails(self):
         from auto_yt.services.google_flow_worker import FlowModeError
 
         shared_worker = MagicMock()
@@ -934,16 +946,130 @@ class VideoProductionServiceTests(unittest.TestCase):
             ) as generate_video,
             patch.object(video_production, "cleanup_duplicate_scene_artifacts"),
         ):
+            with self.assertRaises(FlowModeError):
+                video_production.generate_scene_media(
+                    video_id=42,
+                    scenes=[{"index": 0, "prompt": "scene", "is_video": True}],
+                    settings={"enable_intro_video": True},
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                )
+
+        generate_video.assert_awaited_once()
+
+    def test_scene_media_resumes_from_first_failed_video_checkpoint(self):
+        from PIL import Image
+        from auto_yt.services.google_flow_worker import FlowModeError
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-video-checkpoint",
+            "Flow checkpoint",
+            "Transcript",
+            "Script",
+        )
+        image_paths = []
+        for index in range(3):
+            image_path = Path(self.temporary_directory.name) / f"scene-{index}.png"
+            Image.new("RGB", (1376, 768), color=(30 + index, 40, 50)).save(image_path)
+            image_paths.append(image_path)
+
+        scenes = [
+            {"index": 0, "prompt": "scene zero", "is_video": True},
+            {"index": 1, "prompt": "scene one", "is_video": True},
+            {"index": 2, "prompt": "scene two", "is_video": False},
+        ]
+        first_video = Path(self.temporary_directory.name) / "scene-0.mp4"
+        first_video.write_bytes(b"v" * 2048)
+        start_hash = video_production._sha256_file(image_paths[0])
+        end_hash = video_production._sha256_file(image_paths[1])
+        first_hash = video_production._scene_hash(
+            video_id,
+            scenes[0],
+            {},
+            "",
+            f"{start_hash}:{end_hash}",
+        )
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene_video:0",
+            path=str(first_video),
+            content_hash=first_hash,
+            status="completed",
+            mime_type="video/mp4",
+            metadata={"generation_attempt": 1},
+        )
+
+        worker = MagicMock()
+        worker.generate_scene_video = AsyncMock(
+            side_effect=FlowModeError("temporary Veo failure")
+        )
+        worker.download_video = AsyncMock()
+
+        @asynccontextmanager
+        async def fake_session(video_id, *, force_new_project=False):
+            yield worker
+
+        common_patches = (
+            patch.object(video_production, "_flow_worker_session", fake_session),
+            patch.object(
+                video_production,
+                "_generate_scene_images_with_worker",
+                AsyncMock(return_value=image_paths),
+            ),
+            patch.object(video_production, "cleanup_duplicate_scene_artifacts"),
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        )
+        with common_patches[0], common_patches[1], common_patches[2], common_patches[3], common_patches[4]:
+            with self.assertRaises(FlowModeError):
+                video_production.generate_scene_media(
+                    video_id=video_id,
+                    scenes=scenes,
+                    settings={"enable_intro_video": True},
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                )
+
+        self.assertEqual(worker.generate_scene_video.await_count, 1)
+        self.assertEqual(
+            database.get_latest_video_artifact(video_id, "scene_video:0")["status"],
+            "completed",
+        )
+        self.assertEqual(
+            database.get_latest_video_artifact(video_id, "scene_video:1")["status"],
+            "failed",
+        )
+
+        worker.generate_scene_video.reset_mock()
+        worker.generate_scene_video.side_effect = None
+        worker.generate_scene_video.return_value = "https://flow/video/scene-one"
+
+        async def save_video(_url, save_path):
+            Path(save_path).write_bytes(b"v" * 2048)
+
+        worker.download_video.side_effect = save_video
+        with (
+            patch.object(video_production, "_flow_worker_session", fake_session),
+            patch.object(
+                video_production,
+                "_generate_scene_images_with_worker",
+                AsyncMock(return_value=image_paths),
+            ),
+            patch.object(video_production, "cleanup_duplicate_scene_artifacts"),
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
             result = video_production.generate_scene_media(
-                video_id=42,
-                scenes=[{"index": 0, "prompt": "scene", "is_video": True}],
+                video_id=video_id,
+                scenes=scenes,
                 settings={"enable_intro_video": True},
                 progress=lambda message, stage: None,
                 cancel_check=lambda: None,
             )
 
-        self.assertEqual(result, image_paths)
-        generate_video.assert_awaited_once()
+        self.assertEqual(worker.generate_scene_video.await_count, 1)
+        self.assertEqual(result[0], first_video)
+        self.assertEqual(result[2], image_paths[2])
 
     def test_scene_image_retries_once_only_for_explicit_flow_error(self):
         from PIL import Image
@@ -1121,7 +1247,9 @@ class VideoProductionServiceTests(unittest.TestCase):
             "Script",
         )
         start_frame = Path(self.temporary_directory.name) / "start-frame.png"
+        end_frame = Path(self.temporary_directory.name) / "end-frame.png"
         Image.new("RGB", (1376, 768), color=(30, 40, 50)).save(start_frame)
+        Image.new("RGB", (1376, 768), color=(50, 40, 30)).save(end_frame)
         worker = MagicMock()
         worker.generate_scene_video = AsyncMock(
             side_effect=FlowModeError("video mode unavailable")
@@ -1139,6 +1267,7 @@ class VideoProductionServiceTests(unittest.TestCase):
                         scene=scene,
                         scene_count=1,
                         start_frame_path=start_frame,
+                        end_frame_path=end_frame,
                         profile={},
                         settings={},
                         progress=lambda message, stage: None,
@@ -1150,6 +1279,47 @@ class VideoProductionServiceTests(unittest.TestCase):
         artifact = database.get_latest_video_artifact(video_id, "scene_video:0")
         self.assertEqual(artifact["status"], "failed")
         self.assertIn("video mode unavailable", artifact["metadata"]["fallback_reason"])
+        self.assertEqual(artifact["metadata"]["failure_stage"], "legacy_video_mode")
+
+    def test_missing_end_frame_marks_checkpoint_failed_before_submit(self):
+        from PIL import Image
+        from auto_yt.services.google_flow_worker import FlowFrameAttachmentError
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-missing-end-frame",
+            "Missing end frame",
+            "Transcript",
+            "Script",
+        )
+        start_frame = Path(self.temporary_directory.name) / "start-frame.png"
+        Image.new("RGB", (1376, 768), color=(30, 40, 50)).save(start_frame)
+        worker = MagicMock()
+        worker.generate_scene_video = AsyncMock()
+        scene = {"index": 0, "prompt": "scene", "is_video": True}
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            with self.assertRaises(FlowFrameAttachmentError):
+                asyncio.run(
+                    video_production._generate_scene_video_async(
+                        video_id=video_id,
+                        scene=scene,
+                        scene_count=1,
+                        start_frame_path=start_frame,
+                        end_frame_path=None,
+                        profile={},
+                        settings={},
+                        progress=lambda message, stage: None,
+                        cancel_check=lambda: None,
+                        worker=worker,
+                    )
+                )
+
+        worker.generate_scene_video.assert_not_awaited()
+        artifact = database.get_latest_video_artifact(video_id, "scene_video:0")
+        self.assertEqual(artifact["status"], "failed")
+        self.assertEqual(artifact["metadata"]["failure_stage"], "frame_sync")
 
 if __name__ == "__main__":
     unittest.main()

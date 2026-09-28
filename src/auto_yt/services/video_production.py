@@ -564,14 +564,18 @@ def _format_scene_video_prompt(
     # 1. Determine frame interpolation / animation directive based on attached images
     if has_start_frame and has_end_frame:
         frame_directive = (
+            "Generate exactly one 16:9 video, not a still image. "
             "Using the first attached image as the starting frame and "
             "the second attached image as the ending frame, generate a seamless "
             "cinematic video transition from the first frame to the second frame."
         )
     elif has_start_frame:
-        frame_directive = "Using the attached image as the starting frame, animate it into a cinematic video clip."
+        frame_directive = (
+            "Generate exactly one 16:9 video, not a still image. Using the attached "
+            "image as the starting frame, animate it into a cinematic video clip."
+        )
     else:
-        frame_directive = "Generate a high-quality cinematic video clip."
+        frame_directive = "Generate exactly one 16:9 high-quality cinematic video clip, not a still image."
 
     # 2. Extract and sanitize action context (completely topic-agnostic)
     action_clean = _sanitize_scene_prompt_context(scene_action or raw_prompt, max_chars=140)
@@ -713,6 +717,11 @@ async def _generate_scene_image_async(
                 except Exception:
                     pass
             else:
+                if worker is not None and hasattr(worker, "register_video_frame_metadata"):
+                    worker.register_video_frame_metadata(
+                        artifact_path,
+                        existing.get("metadata") or {},
+                    )
                 return artifact_path
 
     target = SCENES_DIR / f"{video_id}_{scene['index']}_{content_hash[:8]}.png"
@@ -741,6 +750,7 @@ async def _generate_scene_image_async(
         },
     )
 
+    flow_frame_metadata: dict[str, str] = {}
     try:
         if _flow_mock_enabled():
             from PIL import Image
@@ -840,6 +850,14 @@ async def _generate_scene_image_async(
                         f"({image_width}x{image_height})."
                     )
 
+            if hasattr(worker, "register_generated_video_frame"):
+                registered_frame = worker.register_generated_video_frame(
+                    target,
+                    asset_url,
+                )
+                if isinstance(registered_frame, dict):
+                    flow_frame_metadata = registered_frame
+
         target_hash = _sha256_file(target)
         if existing_hashes is not None and target_hash in existing_hashes:
             raise VideoProductionError(
@@ -888,6 +906,7 @@ async def _generate_scene_image_async(
             **scene,
             "generation_attempt": generation_attempt,
             "reference_id": reference_id,
+            **flow_frame_metadata,
         },
     )
     _log_scene_generation(
@@ -1080,10 +1099,22 @@ async def _generate_scene_video_async(
             "generation_attempt": generation_attempt,
             "start_hash": start_hash,
             "end_hash": end_hash,
+            "start_frame": start_frame_path.name if start_frame_path else "",
+            "end_frame": end_frame_path.name if end_frame_path else "",
         },
     )
 
     try:
+        from auto_yt.services.google_flow_worker import FlowFrameAttachmentError
+
+        if not start_frame_path or not start_frame_path.is_file():
+            raise FlowFrameAttachmentError(
+                f"Thiếu start frame cho video scene {scene['index']}."
+            )
+        if not end_frame_path or not end_frame_path.is_file():
+            raise FlowFrameAttachmentError(
+                f"Thiếu end frame cho video scene {scene['index']}; cần đủ cặp ảnh gối đầu."
+            )
         _log_scene_generation(
             video_id=video_id,
             scene_index=int(scene.get("index", 0)),
@@ -1132,12 +1163,30 @@ async def _generate_scene_video_async(
                 start_frame_path=start_frame_path,
                 end_frame_path=end_frame_path,
                 reference_ids=ref_ids,
+                video_settings={
+                    "video_model": str(settings.get("video_model") or "veo_3_1_lite"),
+                    "video_aspect_ratio": str(settings.get("video_aspect_ratio") or "16:9"),
+                    "video_output_count": int(settings.get("video_output_count") or 1),
+                },
+                scene_index=int(scene.get("index", 0)),
             )
             await worker.download_video(video_url, str(target))
 
         if not target.exists() or target.stat().st_size < 1000:
             raise RuntimeError(f"Video tạo từ Google Flow Veo không hợp lệ hoặc quá nhỏ: {target}")
     except Exception as exc:
+        failure_stage_by_error = {
+            "FlowAgentSettingsError": "agent_settings",
+            "FlowFrameAttachmentError": "frame_sync",
+            "FlowModeError": "legacy_video_mode",
+            "FlowSubmissionError": "submit",
+            "FlowGenerationStartError": "generation_start",
+            "FlowGenerationTimeout": "generation_timeout",
+            "FlowAgentStalledError": "generation_timeout",
+            "FlowResultMissingError": "result_missing",
+            "FlowUiStateError": "ui_state",
+        }
+        failure_stage = failure_stage_by_error.get(type(exc).__name__, "video_generation")
         try:
             target.unlink(missing_ok=True)
         except Exception:
@@ -1154,7 +1203,10 @@ async def _generate_scene_video_async(
                 "generation_attempt": generation_attempt,
                 "start_hash": start_hash,
                 "end_hash": end_hash,
+                "start_frame": start_frame_path.name if start_frame_path else "",
+                "end_frame": end_frame_path.name if end_frame_path else "",
                 "error": str(exc),
+                "failure_stage": failure_stage,
                 "fallback_reason": str(exc),
             },
         )
@@ -1162,10 +1214,10 @@ async def _generate_scene_video_async(
             video_id=video_id,
             scene_index=int(scene.get("index", 0)),
             media_type="video",
-            state="failed",
+            state="video_checkpoint_failed",
             attempt=generation_attempt,
             started_at=started_at,
-            detail=str(exc),
+            detail=f"{failure_stage}:{exc}",
         )
         raise
 
@@ -1180,6 +1232,10 @@ async def _generate_scene_video_async(
         metadata={
             **scene,
             "generation_attempt": generation_attempt,
+            "start_hash": start_hash,
+            "end_hash": end_hash,
+            "start_frame": start_frame_path.name if start_frame_path else "",
+            "end_frame": end_frame_path.name if end_frame_path else "",
         },
     )
     _log_scene_generation(
@@ -1243,7 +1299,7 @@ def generate_scene_media(
     
     1. Phase 1: Generates base images for all scenes (Image 0..N).
     2. Phase 2: For intro scenes (is_video=True), animates Image[i] -> Image[i+1] into video clips.
-       If video generation fails, falls back safely to Image[i].
+       Any video failure stops at that scene so a later run can resume from the checkpoint.
     """
     settings = settings or {}
     enable_intro_video = bool(settings.get("enable_intro_video", True))
@@ -1303,29 +1359,20 @@ def generate_scene_media(
                     if index + 1 < len(base_image_paths)
                     else None
                 )
-                try:
-                    video_path = await _generate_scene_video_async(
-                        video_id=video_id,
-                        scene=scene,
-                        scene_count=len(scenes),
-                        start_frame_path=start_frame,
-                        end_frame_path=end_frame,
-                        profile=profile or {},
-                        settings=settings,
-                        progress=progress,
-                        cancel_check=cancel_check,
-                        worker=worker,
-                        force_new_project=False,
-                    )
-                    media_paths.append(video_path)
-                except Exception as video_error:
-                    logger.warning(
-                        "Tạo video Veo cho scene %d thất bại (%s). "
-                        "Tự động fallback sang ảnh tĩnh zoompan...",
-                        index,
-                        video_error,
-                    )
-                    media_paths.append(start_frame)
+                video_path = await _generate_scene_video_async(
+                    video_id=video_id,
+                    scene=scene,
+                    scene_count=len(scenes),
+                    start_frame_path=start_frame,
+                    end_frame_path=end_frame,
+                    profile=profile or {},
+                    settings=settings,
+                    progress=progress,
+                    cancel_check=cancel_check,
+                    worker=worker,
+                    force_new_project=False,
+                )
+                media_paths.append(video_path)
             return media_paths
 
     return asyncio.run(_run_batch())

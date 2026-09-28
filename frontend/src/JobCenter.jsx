@@ -58,7 +58,17 @@ const PUBLISH_STAGE_LABELS = {
   uploaded_private: 'Đã upload Private',
   scheduled: 'Đã đặt lịch',
   public: 'Đã Public',
-  completed: 'Hoàn tất'
+  completed: 'Hoàn tất',
+  browser_launching: 'Đang mở GPM Browser',
+  navigating_studio: 'Đang tải YouTube Studio',
+  opening_upload_dialog: 'Đang mở hộp thoại Tải lên',
+  filling_details: 'Đang điền thông tin video',
+  uploading_thumbnail: 'Đang tải thumbnail',
+  monetization_step: 'Đang cài đặt kiếm tiền',
+  self_certification: 'Đang tự đánh giá quảng cáo',
+  navigating_tabs: 'Đang duyệt các bước',
+  visibility_and_publish: 'Đang đặt chế độ hiển thị & lịch',
+  finishing_upload: 'Đang hoàn tất'
 }
 
 const CONFIGURATION_LABELS = {
@@ -683,6 +693,18 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                       <span style={{ color: status.color, border: `1px solid ${status.color}`, borderRadius: '12px', padding: '2px 9px', fontSize: '0.78em' }}>
                         {status.label}
                       </span>
+                      {job.upload_method && (
+                        <span style={{
+                          color: job.upload_method === 'browser' ? '#38bdf8' : '#f59e0b',
+                          border: `1px solid ${job.upload_method === 'browser' ? 'rgba(56, 189, 248, 0.4)' : 'rgba(245, 158, 11, 0.4)'}`,
+                          borderRadius: '12px',
+                          padding: '2px 8px',
+                          fontSize: '0.76em',
+                          background: job.upload_method === 'browser' ? 'rgba(56, 189, 248, 0.1)' : 'rgba(245, 158, 11, 0.1)'
+                        }}>
+                          {job.upload_method === 'browser' ? '🌐 Trình duyệt GPM' : '🔌 YouTube Data API'}
+                        </span>
+                      )}
                       {job.queue_position && (
                         <span style={{ color: '#f39c12', fontSize: '0.82em' }}>
                           Vị trí #{job.queue_position}

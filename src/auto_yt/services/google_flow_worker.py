@@ -1,5 +1,6 @@
 import asyncio
 import datetime as dt
+import hashlib
 import io
 import logging
 import re
@@ -39,6 +40,17 @@ IMAGE_BASELINE_POLL_SECONDS = 0.25
 MIN_GENERATED_IMAGE_WIDTH = 800
 MIN_GENERATED_IMAGE_HEIGHT = 400
 MIN_GENERATED_IMAGE_ASPECT_RATIO = 1.15
+VIDEO_FRAME_ATTACH_TIMEOUT_SECONDS = 8.0
+FLOW_VIDEO_MODEL_LABELS = {
+    "omni_1_1_flash": ("Omni 1.1 Flash",),
+    "veo_3_1_lite": ("Veo 3.1 Lite", "Veo 3.1 – Lite", "Veo 3.1 - Lite"),
+    "veo_3_1_fast": ("Veo 3.1 Fast", "Veo 3.1 – Fast", "Veo 3.1 - Fast"),
+    "veo_3_1_quality": (
+        "Veo 3.1 Quality",
+        "Veo 3.1 – Quality",
+        "Veo 3.1 - Quality",
+    ),
+}
 PROMPT_ROOT_SELECTOR = (
     "flow-creative-agent-prompt-box, flow-base-prompt-box, flow-prompt-box"
 )
@@ -78,6 +90,14 @@ class FlowAgentStalledError(FlowGenerationTimeout):
 
 class FlowModeError(RuntimeError):
     """Raised when the requested Flow generation mode cannot be confirmed."""
+
+
+class FlowAgentSettingsError(RuntimeError):
+    """Raised when required Google Flow Agent settings cannot be saved."""
+
+
+class FlowFrameAttachmentError(RuntimeError):
+    """Raised when an Agent video frame cannot be attached without duplication."""
 
 
 class FlowInvalidOutputError(RuntimeError):
@@ -149,6 +169,8 @@ def _upgrade_google_cdn_image_url(url: str) -> str:
 class GoogleFlowWorker:
     _session_uploaded_references: dict[str, set[str]] = {}
     _session_uploaded_image_urls: set[str] = set()
+    _session_video_frame_assets: dict[str, dict[str, dict[str, str]]] = {}
+    _session_configured_agent_projects: set[str] = set()
 
     def __init__(self, page: Page):
         self.page = page
@@ -161,6 +183,7 @@ class GoogleFlowWorker:
         self._inspected_detail_keys: set[str] = set()
         self._last_invalid_image_size: tuple[int, int] | None = None
         self._validated_image_payload: tuple[str, bytes] | None = None
+        self._last_generated_image_identity: dict[str, str] = {}
         self._agent_interface_detected = False
 
     @staticmethod
@@ -290,6 +313,21 @@ class GoogleFlowWorker:
 
     def _project_reference_cache(self) -> set[str]:
         return self._session_uploaded_references.setdefault(self._project_id(), set())
+
+    def _project_video_frame_cache(self) -> dict[str, dict[str, str]]:
+        return self._session_video_frame_assets.setdefault(self._project_id(), {})
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @classmethod
+    def _video_frame_key(cls, frame_path: Path) -> str:
+        return f"{frame_path.name.casefold()}:{cls._file_sha256(frame_path)}"
 
     @staticmethod
     def _reference_filename(reference_path: str) -> str:
@@ -434,6 +472,138 @@ class GoogleFlowWorker:
         except Exception:
             pass
         return False
+
+    async def _is_agent_interface_active(self) -> bool:
+        try:
+            active = await self.page.locator("flow-creative-agent-prompt-box").first.is_visible(
+                timeout=500
+            )
+        except Exception:
+            active = False
+        self._agent_interface_detected = bool(active)
+        return bool(active)
+
+    async def _click_agent_setting_text(
+        self,
+        panel: Locator,
+        labels: tuple[str, ...],
+        *,
+        use_last: bool = False,
+    ) -> bool:
+        for label in labels:
+            try:
+                matches = panel.get_by_text(label, exact=True)
+                target = matches.last if use_last else matches.first
+                if await target.is_visible(timeout=500):
+                    await target.click(force=True, timeout=2000)
+                    await asyncio.sleep(0.2)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def ensure_agent_video_settings(self, video_settings: dict | None = None) -> None:
+        """Persist deterministic Agent defaults once for the active Flow project."""
+        project_id = self._project_id()
+        if project_id in self._session_configured_agent_projects:
+            return
+
+        settings = video_settings if isinstance(video_settings, dict) else {}
+        aspect_ratio = "16:9"
+        output_count = 1
+        model_id = str(settings.get("video_model") or "veo_3_1_lite").strip()
+        model_labels = FLOW_VIDEO_MODEL_LABELS.get(model_id)
+        if not model_labels:
+            raise FlowAgentSettingsError(
+                f"Model video '{model_id}' chưa có ánh xạ giao diện Google Flow Agent."
+            )
+
+        settings_button = self.page.locator(
+            "flow-creative-agent-prompt-box button[aria-label*='settings' i], "
+            "flow-creative-agent-prompt-box button[aria-label*='cài đặt' i], "
+            "flow-creative-agent-prompt-box button:has(mat-icon:text-is('tune')), "
+            "flow-creative-agent-prompt-box button:has(mat-icon:text-is('settings')), "
+            "flow-creative-agent-prompt-box button.settings-button"
+        ).first
+        try:
+            if not await settings_button.is_visible(timeout=3000):
+                raise FlowAgentSettingsError("Không tìm thấy nút Cài đặt tác nhân.")
+            await settings_button.click(timeout=2000)
+            await asyncio.sleep(0.4)
+
+            panel = self.page.locator(
+                "flow-agent-settings, flow-agent-panel, .cdk-overlay-pane, mat-dialog-container"
+            ).filter(has_text=re.compile("Cài đặt tác nhân|Agent settings", re.IGNORECASE)).first
+            if not await panel.is_visible(timeout=3000):
+                raise FlowAgentSettingsError("Bảng Cài đặt tác nhân không xuất hiện.")
+
+            if not await self._click_agent_setting_text(
+                panel,
+                ("Không bao giờ", "Never"),
+            ):
+                raise FlowAgentSettingsError("Không chọn được chế độ xác nhận 'Không bao giờ'.")
+            if not await self._click_agent_setting_text(
+                panel,
+                (aspect_ratio,),
+                use_last=True,
+            ):
+                raise FlowAgentSettingsError(
+                    f"Không chọn được tỷ lệ video Agent {aspect_ratio}."
+                )
+            if not await self._click_agent_setting_text(
+                panel,
+                (f"x{output_count}",),
+                use_last=True,
+            ):
+                raise FlowAgentSettingsError(
+                    f"Không chọn được số lượng video Agent x{output_count}."
+                )
+
+            model_select = panel.locator(
+                "[role='combobox'], mat-select, button:has(mat-icon:text-is('arrow_drop_down'))"
+            ).last
+            if not await model_select.is_visible(timeout=1000):
+                raise FlowAgentSettingsError("Không tìm thấy bộ chọn model video Agent.")
+            await model_select.click(timeout=2000)
+            await asyncio.sleep(0.2)
+            model_option = None
+            for label in model_labels:
+                option = self.page.get_by_text(label, exact=True).last
+                if await option.is_visible(timeout=500):
+                    model_option = option
+                    break
+            if model_option is None:
+                raise FlowAgentSettingsError(
+                    f"Model video '{model_id}' không có trong Google Flow Agent."
+                )
+            await model_option.click(force=True, timeout=2000)
+            await asyncio.sleep(0.2)
+
+            save_button = panel.get_by_text(re.compile(r"^(Lưu|Save)$", re.IGNORECASE)).first
+            if not await save_button.is_visible(timeout=1000):
+                raise FlowAgentSettingsError("Không tìm thấy nút Lưu cài đặt Agent.")
+            await save_button.click(timeout=2000)
+            deadline = time.monotonic() + 5.0
+            while await panel.is_visible(timeout=100):
+                if time.monotonic() >= deadline:
+                    raise FlowAgentSettingsError("Bảng Cài đặt tác nhân không đóng sau khi lưu.")
+                await asyncio.sleep(0.2)
+        except FlowAgentSettingsError:
+            await self._save_debug_screenshot("agent_settings_failed")
+            raise
+        except Exception as exc:
+            await self._save_debug_screenshot("agent_settings_failed")
+            raise FlowAgentSettingsError("Không thể lưu cài đặt Google Flow Agent.") from exc
+
+        self._session_configured_agent_projects.add(project_id)
+        logger.info(
+            "flow_generation media=video state=agent_settings_saved project=%s "
+            "aspect=%s outputs=%d model=%s",
+            project_id,
+            aspect_ratio,
+            output_count,
+            model_id,
+        )
 
     async def handle_confirmation_prompts(self) -> bool:
         """Automatically approve credit spend or assistant confirmation prompts, strictly prioritizing 'Always approve'."""
@@ -804,6 +974,75 @@ class GoogleFlowWorker:
         if "googleusercontent.com" in raw or "flow-content.google" in raw or "google.com" in raw:
             raw = re.sub(r"=(?:s\d+|w\d+-h\d+)(-[a-zA-Z0-9_-]+)?$", "", raw)
         return raw
+
+    def _remember_generated_image_identity(self, candidate: dict, source: str) -> None:
+        self._last_generated_image_identity = {
+            "flow_project_id": self._project_id(),
+            "flow_asset_id": str(candidate.get("assetId") or "").strip(),
+            "flow_media_key": self._media_key(source),
+        }
+
+    def register_generated_video_frame(
+        self,
+        frame_path: Path,
+        asset_url: str,
+    ) -> dict[str, str]:
+        """Associate a downloaded scene frame with its Flow asset in this project."""
+        path = Path(frame_path)
+        if not path.is_file():
+            return {}
+        frame_key = self._video_frame_key(path)
+        media_key = self._media_key(asset_url)
+        last_identity = self._last_generated_image_identity
+        asset_id = ""
+        if (
+            last_identity.get("flow_project_id") == self._project_id()
+            and last_identity.get("flow_media_key") == media_key
+        ):
+            asset_id = last_identity.get("flow_asset_id", "")
+        if not asset_id and (not media_key or media_key.startswith("blob:")):
+            return {}
+        record = {
+            "filename": path.name,
+            "frame_sha256": frame_key.rsplit(":", 1)[-1],
+            "flow_project_id": self._project_id(),
+            "flow_asset_id": asset_id,
+            "flow_media_key": media_key,
+            "source": "generated",
+        }
+        self._project_video_frame_cache()[frame_key] = record
+        return {
+            "frame_sha256": record["frame_sha256"],
+            "flow_project_id": record["flow_project_id"],
+            "flow_asset_id": record["flow_asset_id"],
+            "flow_media_key": record["flow_media_key"],
+            "flow_frame_source": record["source"],
+        }
+
+    def register_video_frame_metadata(
+        self,
+        frame_path: Path,
+        metadata: dict | None,
+    ) -> bool:
+        """Restore a persisted frame locator only when it belongs to this project."""
+        path = Path(frame_path)
+        data = metadata if isinstance(metadata, dict) else {}
+        if not path.is_file() or str(data.get("flow_project_id") or "").casefold() != self._project_id():
+            return False
+        frame_key = self._video_frame_key(path)
+        expected_hash = str(data.get("frame_sha256") or "").casefold()
+        actual_hash = frame_key.rsplit(":", 1)[-1]
+        if expected_hash and expected_hash != actual_hash:
+            return False
+        self._project_video_frame_cache()[frame_key] = {
+            "filename": path.name,
+            "frame_sha256": actual_hash,
+            "flow_project_id": self._project_id(),
+            "flow_asset_id": str(data.get("flow_asset_id") or ""),
+            "flow_media_key": str(data.get("flow_media_key") or ""),
+            "source": str(data.get("flow_frame_source") or "generated"),
+        }
+        return True
 
     async def _collect_image_candidates(self) -> list[dict]:
         """Collect generated image candidates from the gallery and result panel."""
@@ -1568,6 +1807,7 @@ class GoogleFlowWorker:
         self._inspected_detail_keys = set()
         self._last_invalid_image_size = None
         self._validated_image_payload = None
+        self._last_generated_image_identity = {}
 
     async def _get_existing_error_texts(self) -> set[str]:
         """Snapshot all existing error tile texts currently rendered on the page."""
@@ -1915,6 +2155,475 @@ class GoogleFlowWorker:
             if time.monotonic() >= deadline:
                 return False
             await asyncio.sleep(REFERENCE_CHIP_CONFIRM_POLL_SECONDS)
+
+    async def _prompt_attachment_identities(self) -> list[dict[str, object]]:
+        result = await self.page.evaluate(r'''() => {
+            const root = document.querySelector(
+                'flow-creative-agent-prompt-box, flow-base-prompt-box, flow-prompt-box'
+            );
+            if (!root) return [];
+            let nodes = Array.from(root.querySelectorAll(
+                'flow-image-ingredient-chip, flow-ingredient-chip, flow-prompt-attachment, ' +
+                'flow-attachment, flow-reference-chip, [data-testid*="attachment" i], ' +
+                '[data-testid*="ingredient" i], [data-testid*="reference" i]'
+            ));
+            if (!nodes.length) nodes = Array.from(root.querySelectorAll('img'));
+            const unique = [];
+            const seen = new Set();
+            for (const node of nodes) {
+                const chip = node.closest(
+                    'flow-image-ingredient-chip, flow-ingredient-chip, flow-prompt-attachment, ' +
+                    'flow-attachment, flow-reference-chip, [data-testid*="attachment" i], ' +
+                    '[data-testid*="ingredient" i], [data-testid*="reference" i]'
+                ) || node;
+                if (seen.has(chip)) continue;
+                seen.add(chip);
+                const urls = Array.from(chip.querySelectorAll(
+                    'img[src], img[srcset], [data-image-url], [data-media-url], [data-download-url]'
+                )).flatMap((item) => {
+                    const values = [
+                        item.currentSrc || '', item.src || '',
+                        item.getAttribute('data-image-url') || '',
+                        item.getAttribute('data-media-url') || '',
+                        item.getAttribute('data-download-url') || ''
+                    ];
+                    const srcset = item.getAttribute('srcset') || '';
+                    for (const part of srcset.split(',')) {
+                        values.push(part.trim().split(/\s+/)[0]);
+                    }
+                    return values.filter(Boolean);
+                });
+                if (chip.tagName === 'IMG') {
+                    urls.push(chip.currentSrc || chip.src || '');
+                }
+                unique.push({
+                    assetId: chip.getAttribute('data-media-id') ||
+                        chip.getAttribute('data-asset-id') || chip.getAttribute('data-id') || '',
+                    urls: Array.from(new Set(urls.filter(Boolean)))
+                });
+            }
+            return unique;
+        }''')
+        if not isinstance(result, list):
+            raise FlowUiStateError("Không thể đọc attachment trong prompt Google Flow.")
+        return [item for item in result if isinstance(item, dict)]
+
+    async def _wait_for_prompt_attachment_count(
+        self,
+        expected: int,
+        *,
+        timeout: float = VIDEO_FRAME_ATTACH_TIMEOUT_SECONDS,
+    ) -> bool:
+        deadline = time.monotonic() + timeout
+        while True:
+            identities = await self._prompt_attachment_identities()
+            if len(identities) == expected:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(REFERENCE_CHIP_CONFIRM_POLL_SECONDS)
+
+    async def _find_picker_asset_by_identity(self, record: dict[str, str]) -> Locator | None:
+        expected_asset_id = str(record.get("flow_asset_id") or "").casefold()
+        expected_media_key = str(record.get("flow_media_key") or "").casefold()
+        if not expected_asset_id and not expected_media_key:
+            return None
+        asset_items = self.page.locator(
+            ".cdk-overlay-container button.asset-item, "
+            ".cdk-overlay-container [role='option'], "
+            ".cdk-overlay-container [role='listitem'], "
+            ".cdk-overlay-container [data-testid*='asset']"
+        )
+        count = await asset_items.count()
+        for index in range(min(count, REFERENCE_ASSET_SCAN_LIMIT)):
+            item = asset_items.nth(index)
+            try:
+                identity = await item.evaluate(r'''(node) => {
+                    const card = node.closest(
+                        '[data-media-id], [data-asset-id], [role="option"], [role="listitem"]'
+                    ) || node;
+                    const urls = Array.from(card.querySelectorAll(
+                        'img[src], img[srcset], [data-image-url], [data-media-url], a[href]'
+                    )).flatMap((child) => {
+                        const values = [
+                            child.currentSrc || '', child.src || '', child.href || '',
+                            child.getAttribute('data-image-url') || '',
+                            child.getAttribute('data-media-url') || ''
+                        ];
+                        const srcset = child.getAttribute('srcset') || '';
+                        for (const part of srcset.split(',')) {
+                            values.push(part.trim().split(/\s+/)[0]);
+                        }
+                        return values.filter(Boolean);
+                    });
+                    return {
+                        assetId: card.getAttribute('data-media-id') ||
+                            card.getAttribute('data-asset-id') || card.getAttribute('data-id') || '',
+                        urls
+                    };
+                }''')
+            except Exception:
+                continue
+            asset_id = str((identity or {}).get("assetId") or "").casefold()
+            media_keys = {
+                self._media_key(url)
+                for url in (identity or {}).get("urls", [])
+                if str(url or "").strip()
+            }
+            if (
+                expected_asset_id
+                and asset_id == expected_asset_id
+            ) or (
+                expected_media_key
+                and expected_media_key in media_keys
+            ):
+                return item
+        return None
+
+    async def _attach_video_frame_from_picker(
+        self,
+        frame_path: Path,
+        expected_count: int,
+        *,
+        record: dict[str, str] | None = None,
+    ) -> str:
+        await self.dismiss_blocking_dialogs()
+        add_btn = self.page.locator(
+            "flow-creative-agent-prompt-box button[aria-label*='Add ingredients' i], "
+            "flow-creative-agent-prompt-box button[aria-label*='Thêm thành phần' i], "
+            "button.add-menu-trigger"
+        ).first
+        try:
+            if not await add_btn.is_visible(timeout=3000):
+                return REFERENCE_RESULT_UI_ERROR
+            await add_btn.click()
+            await asyncio.sleep(0.5)
+
+            asset_item = None
+            if record and (
+                record.get("flow_asset_id") or record.get("flow_media_key")
+            ):
+                asset_item = await self._find_picker_asset_by_identity(record)
+
+            if asset_item is None:
+                uploads_tab = self.page.locator(
+                    ".cdk-overlay-container mat-list-item:has-text('Uploads'), "
+                    ".cdk-overlay-container mat-list-item:has-text('Tệp tải lên'), "
+                    ".cdk-overlay-container .side-nav-list-item:has-text('Uploads'), "
+                    ".cdk-overlay-container .side-nav-list-item:has-text('Tệp tải lên')"
+                ).first
+                if await uploads_tab.is_visible(timeout=1500):
+                    await uploads_tab.click()
+                    await asyncio.sleep(0.3)
+                search_input = self.page.locator(
+                    ".cdk-overlay-container input[placeholder*='Search' i], "
+                    ".cdk-overlay-container input[aria-label*='Search' i], "
+                    ".cdk-overlay-container input[placeholder*='Tìm kiếm' i], "
+                    ".cdk-overlay-container input[aria-label*='Tìm kiếm' i]"
+                ).first
+                if not await search_input.is_visible(timeout=1500):
+                    await self._close_reference_ui()
+                    return REFERENCE_RESULT_UI_ERROR
+                await search_input.fill(frame_path.name)
+                await self.page.keyboard.press("Enter")
+                await asyncio.sleep(0.5)
+                asset_item = await self._find_exact_picker_asset(frame_path.name)
+
+            if asset_item is None:
+                await self._close_reference_ui()
+                return REFERENCE_RESULT_NOT_FOUND
+
+            await asset_item.click()
+            await asyncio.sleep(0.2)
+            add_to_prompt = self.page.locator(
+                ".cdk-overlay-container button.detail-add-to-prompt-btn, "
+                ".cdk-overlay-container button:has-text('Thêm vào câu lệnh'), "
+                ".cdk-overlay-container button:has-text('Add to prompt')"
+            ).first
+            if await add_to_prompt.is_visible(timeout=1000):
+                await add_to_prompt.click()
+            await self._close_reference_ui()
+            attached = await self._wait_for_prompt_attachment_count(expected_count)
+            return REFERENCE_RESULT_ATTACHED if attached else REFERENCE_RESULT_UI_ERROR
+        except Exception as exc:
+            logger.warning("Video frame picker failed for '%s': %s", frame_path.name, exc)
+            await self._close_reference_ui()
+            return REFERENCE_RESULT_UI_ERROR
+
+    async def _upload_video_frame_file(
+        self,
+        frame_path: Path,
+        expected_count: int,
+    ) -> bool:
+        add_btn = self.page.locator(
+            "flow-creative-agent-prompt-box button[aria-label*='Add ingredients' i], "
+            "flow-creative-agent-prompt-box button[aria-label*='Thêm thành phần' i], "
+            "button.add-menu-trigger"
+        ).first
+        if not await add_btn.is_visible(timeout=3000):
+            raise FlowFrameAttachmentError("Không tìm thấy nút thêm frame video.")
+        await add_btn.click()
+        await asyncio.sleep(0.5)
+        try:
+            async with self.page.expect_file_chooser(timeout=5000) as chooser_info:
+                upload_option = self.page.locator(
+                    "button:has-text('Upload media'), button:has-text('Tải nội dung'), "
+                    "button:has-text('Tải lên'), [role='menuitem']:has-text('Upload'), "
+                    "[role='menuitem']:has-text('Tải lên')"
+                ).first
+                if not await upload_option.is_visible(timeout=2000):
+                    raise FlowFrameAttachmentError("Không tìm thấy lệnh upload frame video.")
+                await upload_option.click()
+            chooser = await chooser_info.value
+            await chooser.set_files(str(frame_path))
+            await self.wait_for_load()
+            await self._close_reference_ui()
+            return await self._wait_for_prompt_attachment_count(expected_count)
+        finally:
+            await self._close_reference_ui()
+
+    async def _attach_video_frame_from_gallery_identity(
+        self,
+        record: dict[str, str],
+        expected_count: int,
+    ) -> str:
+        expected_asset_id = str(record.get("flow_asset_id") or "").casefold()
+        expected_media_key = str(record.get("flow_media_key") or "").casefold()
+        if not expected_asset_id and not expected_media_key:
+            return REFERENCE_RESULT_NOT_FOUND
+        cards = self.page.locator(
+            "flow-media-tile, [data-media-id], [data-asset-id], "
+            "flow-canvas-tile, flow-canvas-item, .canvas-tile, .media-card"
+        )
+        try:
+            count = await cards.count()
+            matched = None
+            for index in range(min(count, REFERENCE_ASSET_SCAN_LIMIT)):
+                card = cards.nth(index)
+                identity = await card.evaluate(r'''(node) => ({
+                    assetId: node.getAttribute('data-media-id') ||
+                        node.getAttribute('data-asset-id') || node.getAttribute('data-id') || '',
+                    urls: Array.from(node.querySelectorAll(
+                        'img[src], img[srcset], [data-image-url], [data-media-url], a[href]'
+                    )).flatMap((child) => [
+                        child.currentSrc || '', child.src || '', child.href || '',
+                        child.getAttribute('data-image-url') || '',
+                        child.getAttribute('data-media-url') || ''
+                    ]).filter(Boolean)
+                })''')
+                asset_id = str((identity or {}).get("assetId") or "").casefold()
+                media_keys = {
+                    self._media_key(url)
+                    for url in (identity or {}).get("urls", [])
+                    if str(url or "").strip()
+                }
+                if (
+                    expected_asset_id
+                    and asset_id == expected_asset_id
+                ) or (
+                    expected_media_key
+                    and expected_media_key in media_keys
+                ):
+                    matched = card
+                    break
+            if matched is None:
+                return REFERENCE_RESULT_NOT_FOUND
+            await matched.hover()
+            menu_button = matched.locator(
+                "button[aria-label*='More' i], button[aria-label*='Khác' i], "
+                "button[aria-label*='menu' i], button:has(mat-icon:text-is('more_vert'))"
+            ).first
+            if not await menu_button.is_visible(timeout=1500):
+                return REFERENCE_RESULT_UI_ERROR
+            await menu_button.click()
+            add_to_prompt = self.page.locator(
+                "[role='menu'] [role='menuitem']:has-text('Thêm vào câu lệnh'), "
+                "[role='menu'] [role='menuitem']:has-text('Add to prompt'), "
+                ".cdk-overlay-container button:has-text('Thêm vào câu lệnh'), "
+                ".cdk-overlay-container button:has-text('Add to prompt')"
+            ).first
+            if not await add_to_prompt.is_visible(timeout=2000):
+                await self._close_reference_ui()
+                return REFERENCE_RESULT_UI_ERROR
+            await add_to_prompt.click()
+            await self._close_reference_ui()
+            attached = await self._wait_for_prompt_attachment_count(expected_count)
+            return REFERENCE_RESULT_ATTACHED if attached else REFERENCE_RESULT_UI_ERROR
+        except Exception as exc:
+            logger.warning("Video frame gallery lookup failed: %s", exc)
+            await self._close_reference_ui()
+            return REFERENCE_RESULT_UI_ERROR
+
+    def _log_video_frame_event(
+        self,
+        status: str,
+        frame_path: Path,
+        role: str,
+        *,
+        scene_index: int | None,
+        detail: str = "",
+    ) -> None:
+        log_method = logger.error if status == "frame_attach_failed" else logger.info
+        log_method(
+            "flow_video_frame status=%s project=%s scene=%s role=%s filename=%s detail=%s",
+            status,
+            self._project_id(),
+            scene_index if scene_index is not None else "unknown",
+            role,
+            frame_path.name,
+            detail,
+        )
+
+    async def _ensure_agent_video_frame(
+        self,
+        frame_path: Path,
+        role: str,
+        expected_count: int,
+        *,
+        scene_index: int | None,
+    ) -> None:
+        path = Path(frame_path)
+        if not path.is_file():
+            raise FlowFrameAttachmentError(f"Video {role} frame không tồn tại: {path}")
+        frame_key = self._video_frame_key(path)
+        cache = self._project_video_frame_cache()
+        record = cache.get(frame_key)
+
+        result = await self._attach_video_frame_from_picker(
+            path,
+            expected_count,
+            record=record,
+        )
+        if (
+            result == REFERENCE_RESULT_NOT_FOUND
+            and record
+            and (record.get("flow_asset_id") or record.get("flow_media_key"))
+        ):
+            result = await self._attach_video_frame_from_gallery_identity(
+                record,
+                expected_count,
+            )
+        if result == REFERENCE_RESULT_ATTACHED:
+            identities = await self._prompt_attachment_identities()
+            identity = identities[expected_count - 1] if len(identities) >= expected_count else {}
+            cache[frame_key] = {
+                "filename": path.name,
+                "frame_sha256": frame_key.rsplit(":", 1)[-1],
+                "flow_project_id": self._project_id(),
+                "flow_asset_id": str(identity.get("assetId") or (record or {}).get("flow_asset_id") or ""),
+                "flow_media_key": next(
+                    (
+                        self._media_key(url)
+                        for url in identity.get("urls", [])
+                        if str(url or "").strip()
+                    ),
+                    str((record or {}).get("flow_media_key") or ""),
+                ),
+                "source": str((record or {}).get("source") or "picker"),
+            }
+            status = (
+                "frame_reused_generated"
+                if record and record.get("source") == "generated"
+                else "frame_reused_picker"
+            )
+            self._log_video_frame_event(
+                status,
+                path,
+                role,
+                scene_index=scene_index,
+            )
+            return
+
+        if result == REFERENCE_RESULT_UI_ERROR or record is not None:
+            self._log_video_frame_event(
+                "frame_attach_failed",
+                path,
+                role,
+                scene_index=scene_index,
+                detail="picker_ui_error" if result == REFERENCE_RESULT_UI_ERROR else "known_asset_missing",
+            )
+            raise FlowFrameAttachmentError(
+                f"Không thể gắn {role} frame đã có '{path.name}' trong project Flow."
+            )
+
+        # Mark the frame as known before opening the file chooser. A later UI
+        # confirmation failure must never cause the same file to be uploaded again.
+        cache[frame_key] = {
+            "filename": path.name,
+            "frame_sha256": frame_key.rsplit(":", 1)[-1],
+            "flow_project_id": self._project_id(),
+            "flow_asset_id": "",
+            "flow_media_key": "",
+            "source": "upload",
+        }
+        attached = await self._upload_video_frame_file(path, expected_count)
+        if not attached:
+            retry = await self._attach_video_frame_from_picker(
+                path,
+                expected_count,
+                record=cache[frame_key],
+            )
+            attached = retry == REFERENCE_RESULT_ATTACHED
+        if not attached:
+            self._log_video_frame_event(
+                "frame_attach_failed",
+                path,
+                role,
+                scene_index=scene_index,
+                detail="uploaded_but_not_attached",
+            )
+            raise FlowFrameAttachmentError(
+                f"Frame '{path.name}' đã upload nhưng không thể gắn vào prompt Agent."
+            )
+        identities = await self._prompt_attachment_identities()
+        identity = identities[expected_count - 1] if len(identities) >= expected_count else {}
+        cache[frame_key].update(
+            {
+                "flow_asset_id": str(identity.get("assetId") or ""),
+                "flow_media_key": next(
+                    (
+                        self._media_key(url)
+                        for url in identity.get("urls", [])
+                        if str(url or "").strip()
+                    ),
+                    "",
+                ),
+            }
+        )
+        self._log_video_frame_event(
+            "frame_uploaded",
+            path,
+            role,
+            scene_index=scene_index,
+        )
+
+    async def sync_agent_video_frames(
+        self,
+        start_frame_path: Path,
+        end_frame_path: Path,
+        *,
+        scene_index: int | None = None,
+    ) -> None:
+        await self.clear_ingredient_chips()
+        if not await self._wait_for_prompt_attachment_count(0):
+            raise FlowFrameAttachmentError("Không thể xóa attachment cũ trước khi tạo video.")
+        await self._ensure_agent_video_frame(
+            Path(start_frame_path),
+            "start",
+            1,
+            scene_index=scene_index,
+        )
+        await self._ensure_agent_video_frame(
+            Path(end_frame_path),
+            "end",
+            2,
+            scene_index=scene_index,
+        )
+        identities = await self._prompt_attachment_identities()
+        if len(identities) != 2:
+            raise FlowFrameAttachmentError(
+                f"Prompt Agent phải có đúng 2 frame, hiện có {len(identities)}."
+            )
 
     async def _close_reference_ui(self) -> None:
         try:
@@ -2511,12 +3220,14 @@ class GoogleFlowWorker:
                 remaining.remove(selected)
                 source = await self._validate_image_candidate(selected)
                 if source:
+                    self._remember_generated_image_identity(selected, source)
                     return source
                 unresolved.append(selected)
 
             for selected in unresolved:
                 source = await self._inspect_image_candidate_detail(selected, baseline_keys)
                 if source:
+                    self._remember_generated_image_identity(selected, source)
                     return source
             return ""
 
@@ -3041,6 +3752,8 @@ class GoogleFlowWorker:
         start_frame_path: Path | None = None,
         end_frame_path: Path | None = None,
         reference_ids: list[str] | None = None,
+        video_settings: dict | None = None,
+        scene_index: int | None = None,
     ) -> str:
         await self._ensure_project_canvas()
         try:
@@ -3050,6 +3763,8 @@ class GoogleFlowWorker:
                 start_frame_path=start_frame_path,
                 end_frame_path=end_frame_path,
                 reference_ids=reference_ids,
+                video_settings=video_settings,
+                scene_index=scene_index,
             )
         finally:
             if self._is_asset_edit_url(str(self.page.url or "")):
@@ -3062,30 +3777,40 @@ class GoogleFlowWorker:
         start_frame_path: Path | None = None,
         end_frame_path: Path | None = None,
         reference_ids: list[str] | None = None,
+        video_settings: dict | None = None,
+        scene_index: int | None = None,
     ) -> str:
         """Generate a video clip from start (and optional end) frame using Veo on Google Flow."""
+        if not start_frame_path or not Path(start_frame_path).is_file():
+            raise FlowFrameAttachmentError("Video start frame không tồn tại.")
+        if not end_frame_path or not Path(end_frame_path).is_file():
+            raise FlowFrameAttachmentError("Video end frame không tồn tại.")
+
+        editor = await self.wait_for_editor(timeout=25.0)
+        agent_interface = await self._is_agent_interface_active()
+        if agent_interface:
+            await self.ensure_agent_video_settings(video_settings)
+            await self.sync_agent_video_frames(
+                Path(start_frame_path),
+                Path(end_frame_path),
+                scene_index=scene_index,
+            )
+            editor = await self.wait_for_editor(timeout=25.0)
+        else:
+            # Legacy Flow keeps character ingredients separate from dedicated
+            # image-to-video start/end slots.
+            await self.sync_reference_ingredients(reference_ids or [])
+            await self._activate_video_mode()
+            if not await self._attach_video_frame(Path(start_frame_path), "start"):
+                raise FlowModeError("Không thể gắn start frame vào chế độ Video của Google Flow.")
+            if not await self._attach_video_frame(Path(end_frame_path), "end"):
+                raise FlowModeError("Không thể gắn end frame vào chế độ Video của Google Flow.")
+
         baseline_keys = {
             self._media_key(source)
             for source in await self._get_existing_videos(strict=True)
         }
         initial_error_texts = await self._get_existing_error_texts()
-
-        # Character/style references remain ingredients. Start/end images use
-        # dedicated image-to-video frame slots and must not be mixed into this list.
-        await self.sync_reference_ingredients(reference_ids or [])
-        await self._activate_video_mode()
-
-        if start_frame_path and Path(start_frame_path).is_file():
-            if not await self._attach_video_frame(Path(start_frame_path), "start"):
-                raise FlowModeError("Không thể gắn start frame vào chế độ Video của Google Flow.")
-        if end_frame_path and Path(end_frame_path).is_file():
-            attached = await self._attach_video_frame(Path(end_frame_path), "end")
-            if not attached:
-                logger.info(
-                    "flow_generation media=video state=end_frame_unsupported project=%s path=%s",
-                    self._project_id(),
-                    end_frame_path,
-                )
 
         # 2. Add strict negative prompt for text/watermarks and static still frames
         strict_avoid = "still frame, static image, cartoon, text, letters, words, typography, watermark, logo, headline, caption, subtitle, poster text"
@@ -3101,8 +3826,6 @@ class GoogleFlowWorker:
         clean_prompt = re.sub(r"\s+", " ", clean_prompt).strip()
         full_prompt = f"{clean_prompt}. Avoid: {combined_avoid}"
 
-        # 3. Locate prompt editor
-        editor = await self.wait_for_editor(timeout=25.0)
         for click_attempt in range(3):
             await self.dismiss_blocking_dialogs()
             try:
@@ -3130,17 +3853,24 @@ class GoogleFlowWorker:
             media_type="video",
             baseline_keys=baseline_keys,
         )
+        logger.info(
+            "flow_generation media=video state=video_submitted project=%s scene=%s",
+            self._project_id(),
+            scene_index if scene_index is not None else "unknown",
+        )
         if immediate_source:
-            self._log_generation_event("video", "completed", submitted_at)
+            self._log_generation_event("video", "video_completed", submitted_at)
             return immediate_source
 
-        return await self._wait_for_new_media(
+        result = await self._wait_for_new_media(
             media_type="video",
             baseline_keys=baseline_keys,
             initial_error_texts=initial_error_texts,
             submitted_at=submitted_at,
             timeout_seconds=VIDEO_GENERATION_TIMEOUT_SECONDS,
         )
+        self._log_generation_event("video", "video_completed", submitted_at)
+        return result
 
     async def download_video(self, asset_url: str, save_path: str) -> None:
         """Download generated video file from URL/Blob to local path."""

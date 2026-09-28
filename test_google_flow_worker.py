@@ -8,7 +8,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from PIL import Image
 
 from auto_yt.services.google_flow_worker import (
+    FlowAgentSettingsError,
     FlowAgentStalledError,
+    FlowFrameAttachmentError,
     FlowGenerationStartError,
     FlowInvalidOutputError,
     FlowModeError,
@@ -34,6 +36,8 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         GoogleFlowWorker._session_uploaded_references.clear()
         GoogleFlowWorker._session_uploaded_image_urls.clear()
+        GoogleFlowWorker._session_video_frame_assets.clear()
+        GoogleFlowWorker._session_configured_agent_projects.clear()
 
     async def test_wait_for_editor_finds_prosemirror(self):
         page = MagicMock()
@@ -1285,22 +1289,34 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
         page.keyboard = MagicMock()
         page.keyboard.press = AsyncMock()
         worker = GoogleFlowWorker(page)
+        editor = MagicMock()
 
-        with (
-            patch.object(worker, "_get_existing_videos", AsyncMock(return_value=set())),
-            patch.object(worker, "_get_existing_error_texts", AsyncMock(return_value=set())),
-            patch.object(worker, "sync_reference_ingredients", AsyncMock()),
-            patch.object(
-                worker,
-                "_activate_video_mode",
-                AsyncMock(side_effect=FlowModeError("mode unavailable")),
-            ),
-            patch.object(worker, "wait_for_editor", AsyncMock()) as wait_for_editor,
-        ):
-            with self.assertRaises(FlowModeError):
-                await worker.generate_scene_video("prompt", "avoid")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            start_frame = Path(temp_dir) / "start.png"
+            end_frame = Path(temp_dir) / "end.png"
+            start_frame.write_bytes(b"start")
+            end_frame.write_bytes(b"end")
+            with (
+                patch.object(worker, "_get_existing_videos", AsyncMock(return_value=set())),
+                patch.object(worker, "_get_existing_error_texts", AsyncMock(return_value=set())),
+                patch.object(worker, "sync_reference_ingredients", AsyncMock()),
+                patch.object(worker, "_is_agent_interface_active", AsyncMock(return_value=False)),
+                patch.object(
+                    worker,
+                    "_activate_video_mode",
+                    AsyncMock(side_effect=FlowModeError("mode unavailable")),
+                ),
+                patch.object(worker, "wait_for_editor", AsyncMock(return_value=editor)) as wait_for_editor,
+            ):
+                with self.assertRaises(FlowModeError):
+                    await worker.generate_scene_video(
+                        "prompt",
+                        "avoid",
+                        start_frame_path=start_frame,
+                        end_frame_path=end_frame,
+                    )
 
-        wait_for_editor.assert_not_awaited()
+        wait_for_editor.assert_awaited_once()
 
     async def test_video_frames_use_slots_and_not_ingredient_references(self):
         page = MagicMock()
@@ -1322,6 +1338,7 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(worker, "_get_existing_videos", AsyncMock(return_value=set())),
                 patch.object(worker, "_get_existing_error_texts", AsyncMock(return_value=set())),
                 patch.object(worker, "sync_reference_ingredients", AsyncMock()) as sync_refs,
+                patch.object(worker, "_is_agent_interface_active", AsyncMock(return_value=False)),
                 patch.object(worker, "_activate_video_mode", AsyncMock()),
                 patch.object(
                     worker,
@@ -1360,6 +1377,341 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
             [call.args[1] for call in attach_frame.await_args_list],
             ["start", "end"],
         )
+
+    async def test_agent_video_skips_legacy_mode_and_uses_two_prompt_frames(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        page.keyboard = MagicMock()
+        page.keyboard.press = AsyncMock()
+        editor = MagicMock()
+        editor.click = AsyncMock()
+        editor.fill = AsyncMock()
+        worker = GoogleFlowWorker(page)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            start_frame = Path(temp_dir) / "start.png"
+            end_frame = Path(temp_dir) / "end.png"
+            start_frame.write_bytes(b"start")
+            end_frame.write_bytes(b"end")
+            with (
+                patch.object(worker, "wait_for_editor", AsyncMock(return_value=editor)),
+                patch.object(worker, "_is_agent_interface_active", AsyncMock(return_value=True)),
+                patch.object(worker, "ensure_agent_video_settings", AsyncMock()) as settings,
+                patch.object(worker, "sync_agent_video_frames", AsyncMock()) as sync_frames,
+                patch.object(worker, "sync_reference_ingredients", AsyncMock()) as sync_refs,
+                patch.object(worker, "_activate_video_mode", AsyncMock()) as activate_mode,
+                patch.object(worker, "_attach_video_frame", AsyncMock()) as attach_slot,
+                patch.object(worker, "_get_existing_videos", AsyncMock(return_value=set())),
+                patch.object(worker, "_get_existing_error_texts", AsyncMock(return_value=set())),
+                patch.object(
+                    worker,
+                    "_submit_prompt_and_wait_for_ack",
+                    AsyncMock(return_value=(0.0, "blob:https://flow.google/video-new")),
+                ),
+                patch("auto_yt.services.google_flow_worker.asyncio.sleep", AsyncMock()),
+            ):
+                result = await worker.generate_scene_video(
+                    "Generate exactly one 16:9 video",
+                    "text",
+                    start_frame_path=start_frame,
+                    end_frame_path=end_frame,
+                    reference_ids=["character-one"],
+                    video_settings={"video_model": "omni_1_1_flash"},
+                    scene_index=2,
+                )
+
+        self.assertEqual(result, "blob:https://flow.google/video-new")
+        settings.assert_awaited_once()
+        sync_frames.assert_awaited_once_with(start_frame, end_frame, scene_index=2)
+        sync_refs.assert_not_awaited()
+        activate_mode.assert_not_awaited()
+        attach_slot.assert_not_awaited()
+
+    async def test_agent_video_requires_both_frames_before_submission(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            start_frame = Path(temp_dir) / "start.png"
+            start_frame.write_bytes(b"start")
+            with patch.object(worker, "wait_for_editor", AsyncMock()) as editor:
+                with self.assertRaises(FlowFrameAttachmentError):
+                    await worker.generate_scene_video(
+                        "Generate video",
+                        "",
+                        start_frame_path=start_frame,
+                        end_frame_path=None,
+                    )
+        editor.assert_not_awaited()
+
+    async def test_video_frame_upload_is_reused_in_same_project(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            frame = Path(temp_dir) / "236_1_deadbeef.png"
+            frame.write_bytes(b"frame-one")
+            with (
+                patch.object(
+                    worker,
+                    "_attach_video_frame_from_picker",
+                    AsyncMock(
+                        side_effect=[REFERENCE_RESULT_NOT_FOUND, REFERENCE_RESULT_ATTACHED]
+                    ),
+                ),
+                patch.object(
+                    worker,
+                    "_upload_video_frame_file",
+                    AsyncMock(return_value=True),
+                ) as upload,
+                patch.object(
+                    worker,
+                    "_prompt_attachment_identities",
+                    AsyncMock(return_value=[{"assetId": "asset-one", "urls": []}]),
+                ),
+            ):
+                await worker._ensure_agent_video_frame(
+                    frame,
+                    "end",
+                    1,
+                    scene_index=0,
+                )
+                await worker._ensure_agent_video_frame(
+                    frame,
+                    "start",
+                    1,
+                    scene_index=1,
+                )
+
+        upload.assert_awaited_once()
+
+    async def test_video_frame_picker_ui_error_never_uploads(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            frame = Path(temp_dir) / "236_1_deadbeef.png"
+            frame.write_bytes(b"frame-one")
+            with (
+                patch.object(
+                    worker,
+                    "_attach_video_frame_from_picker",
+                    AsyncMock(return_value=REFERENCE_RESULT_UI_ERROR),
+                ),
+                patch.object(worker, "_upload_video_frame_file", AsyncMock()) as upload,
+            ):
+                with self.assertRaises(FlowFrameAttachmentError):
+                    await worker._ensure_agent_video_frame(
+                        frame,
+                        "start",
+                        1,
+                        scene_index=0,
+                    )
+
+        upload.assert_not_awaited()
+
+    async def test_cold_frame_cache_reuses_exact_flow_upload(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            frame = Path(temp_dir) / "236_1_deadbeef.png"
+            frame.write_bytes(b"frame-one")
+            with (
+                patch.object(
+                    worker,
+                    "_attach_video_frame_from_picker",
+                    AsyncMock(return_value=REFERENCE_RESULT_ATTACHED),
+                ),
+                patch.object(worker, "_upload_video_frame_file", AsyncMock()) as upload,
+                patch.object(
+                    worker,
+                    "_prompt_attachment_identities",
+                    AsyncMock(return_value=[{"assetId": "asset-one", "urls": []}]),
+                ),
+            ):
+                await worker._ensure_agent_video_frame(
+                    frame,
+                    "start",
+                    1,
+                    scene_index=0,
+                )
+
+        upload.assert_not_awaited()
+
+    async def test_generated_frame_identity_is_reused_without_upload(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            frame = Path(temp_dir) / "236_1_deadbeef.png"
+            frame.write_bytes(b"frame-one")
+            worker._last_generated_image_identity = {
+                "flow_project_id": "project-one",
+                "flow_asset_id": "generated-one",
+                "flow_media_key": "https://flow-content.google/image/generated-one",
+            }
+            worker.register_generated_video_frame(
+                frame,
+                "https://flow-content.google/image/generated-one?size=original",
+            )
+            with (
+                patch.object(
+                    worker,
+                    "_attach_video_frame_from_picker",
+                    AsyncMock(return_value=REFERENCE_RESULT_ATTACHED),
+                ) as attach,
+                patch.object(worker, "_upload_video_frame_file", AsyncMock()) as upload,
+                patch.object(
+                    worker,
+                    "_prompt_attachment_identities",
+                    AsyncMock(return_value=[{"assetId": "generated-one", "urls": []}]),
+                ),
+            ):
+                await worker._ensure_agent_video_frame(
+                    frame,
+                    "start",
+                    1,
+                    scene_index=0,
+                )
+
+        upload.assert_not_awaited()
+        self.assertEqual(
+            attach.await_args.kwargs["record"]["source"],
+            "generated",
+        )
+
+    async def test_video_frame_cache_is_isolated_by_project(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            frame = Path(temp_dir) / "236_1_deadbeef.png"
+            frame.write_bytes(b"frame-one")
+            page_one = MagicMock()
+            page_one.url = "https://flow.google.com/project/project-one"
+            page_two = MagicMock()
+            page_two.url = "https://flow.google.com/project/project-two"
+            worker_one = GoogleFlowWorker(page_one)
+            worker_two = GoogleFlowWorker(page_two)
+            frame_key = worker_one._video_frame_key(frame)
+            worker_one._project_video_frame_cache()[frame_key] = {"source": "upload"}
+
+            self.assertIn(frame_key, worker_one._project_video_frame_cache())
+            self.assertNotIn(frame_key, worker_two._project_video_frame_cache())
+
+    async def test_agent_video_frames_are_attached_start_then_end(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            start_frame = Path(temp_dir) / "start.png"
+            end_frame = Path(temp_dir) / "end.png"
+            start_frame.write_bytes(b"start")
+            end_frame.write_bytes(b"end")
+            with (
+                patch.object(worker, "clear_ingredient_chips", AsyncMock()),
+                patch.object(
+                    worker,
+                    "_wait_for_prompt_attachment_count",
+                    AsyncMock(return_value=True),
+                ),
+                patch.object(worker, "_ensure_agent_video_frame", AsyncMock()) as ensure,
+                patch.object(
+                    worker,
+                    "_prompt_attachment_identities",
+                    AsyncMock(return_value=[{"assetId": "start"}, {"assetId": "end"}]),
+                ),
+            ):
+                await worker.sync_agent_video_frames(
+                    start_frame,
+                    end_frame,
+                    scene_index=4,
+                )
+
+        self.assertEqual(
+            [(call.args[0], call.args[1], call.args[2]) for call in ensure.await_args_list],
+            [(start_frame, "start", 1), (end_frame, "end", 2)],
+        )
+
+    async def test_unknown_agent_video_model_fails_without_opening_settings(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        with self.assertRaises(FlowAgentSettingsError):
+            await worker.ensure_agent_video_settings(
+                {"video_model": "unknown-model"}
+            )
+        page.locator.assert_not_called()
+
+    async def test_agent_video_settings_are_saved_once_per_project(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+
+        settings_button = MagicMock()
+        settings_button.is_visible = AsyncMock(return_value=True)
+        settings_button.click = AsyncMock()
+        settings_locator = MagicMock()
+        settings_locator.first = settings_button
+
+        panel = MagicMock()
+        panel.is_visible = AsyncMock(side_effect=[True, False])
+        choices = {}
+
+        def text_choice(label, exact=True):
+            key = str(getattr(label, "pattern", label))
+            choice = choices.setdefault(key, MagicMock())
+            choice.is_visible = AsyncMock(return_value=True)
+            choice.click = AsyncMock()
+            locator = MagicMock()
+            locator.first = choice
+            locator.last = choice
+            return locator
+
+        panel.get_by_text.side_effect = text_choice
+        model_select = MagicMock()
+        model_select.is_visible = AsyncMock(return_value=True)
+        model_select.click = AsyncMock()
+        model_selects = MagicMock()
+        model_selects.last = model_select
+        panel.locator.return_value = model_selects
+
+        panel_collection = MagicMock()
+        filtered_panel = MagicMock()
+        filtered_panel.first = panel
+        panel_collection.filter.return_value = filtered_panel
+
+        model_option = MagicMock()
+        model_option.is_visible = AsyncMock(return_value=True)
+        model_option.click = AsyncMock()
+        model_options = MagicMock()
+        model_options.last = model_option
+        page.get_by_text.return_value = model_options
+
+        def locate(selector):
+            if "flow-agent-settings" in selector:
+                return panel_collection
+            return settings_locator
+
+        page.locator.side_effect = locate
+        worker = GoogleFlowWorker(page)
+        with (
+            patch.object(worker, "_save_debug_screenshot", AsyncMock()),
+            patch("auto_yt.services.google_flow_worker.asyncio.sleep", AsyncMock()),
+        ):
+            settings = {
+                "video_model": "omni_1_1_flash",
+                "video_aspect_ratio": "16:9",
+                "video_output_count": 1,
+            }
+            await worker.ensure_agent_video_settings(settings)
+            await worker.ensure_agent_video_settings(settings)
+
+        settings_button.click.assert_awaited_once()
+        choices["Không bao giờ"].click.assert_awaited_once()
+        choices["16:9"].click.assert_awaited_once()
+        choices["x1"].click.assert_awaited_once()
+        choices["^(Lưu|Save)$"].click.assert_awaited_once()
+        model_select.click.assert_awaited_once()
+        model_option.click.assert_awaited_once()
+        self.assertIn("project-one", GoogleFlowWorker._session_configured_agent_projects)
 
     async def test_wait_for_editor_rejects_asset_edit_route(self):
         page = MagicMock()
