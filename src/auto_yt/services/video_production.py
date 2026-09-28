@@ -32,6 +32,7 @@ from auto_yt.paths import (
     VISUAL_PLANS_DIR,
 )
 from auto_yt.services import database as db
+from auto_yt.services.visual_action_translator import translate_transcript_to_visual_action
 
 logger = logging.getLogger(__name__)
 
@@ -2330,6 +2331,7 @@ def build_default_visual_scene_plan(
             clean_thumb_concept = _sanitize_thumbnail_concept_for_scene0(sec_content)
 
     scenes = []
+    prev_visual_actions: list[str] = []
     for w in windows:
         transcript_snippet = w.get("transcript", "").strip()
         matched = prompt_assets.match_scene_reference(transcript_snippet, assets)
@@ -2342,8 +2344,17 @@ def build_default_visual_scene_plan(
             ref_path = matched["path"]
             ref_note = f"Depicting {matched['display_name']}. "
 
-        clean_context = _sanitize_scene_prompt_context(transcript_snippet, max_chars=120)
-        context_part = f"Narrative scene: {clean_context}. " if clean_context else ""
+        # Transform raw Vietnamese transcript into rich, concrete English visual action
+        visual_action = translate_transcript_to_visual_action(
+            transcript_snippet,
+            video_title=title,
+            reference_name=matched.get("display_name") if matched else "",
+            scene_index=w["index"],
+            total_scenes=len(windows),
+            prev_actions=prev_visual_actions,
+        )
+        prev_visual_actions.append(visual_action)
+        context_part = f"Narrative scene: {visual_action}. " if visual_action else ""
 
         is_video = bool(w.get("is_video") or w.get("media_type") == "video")
 
@@ -2361,8 +2372,8 @@ def build_default_visual_scene_plan(
                     custom_p
                     .replace("{style}", style)
                     .replace("{reference}", ref_note.strip())
-                    .replace("{thumbnail_concept}", clean_thumb_concept or clean_context)
-                    .replace("{action}", clean_context)
+                    .replace("{thumbnail_concept}", clean_thumb_concept or visual_action)
+                    .replace("{action}", visual_action)
                     .replace("{scene_index}", "1")
                 )
                 prompt = re.sub(r"\s+", " ", custom_p).strip()
@@ -2388,7 +2399,7 @@ def build_default_visual_scene_plan(
                     custom_p
                     .replace("{style}", style)
                     .replace("{reference}", ref_note.strip())
-                    .replace("{action}", clean_context)
+                    .replace("{action}", visual_action)
                     .replace("{scene_index}", str(w["index"] + 1))
                 )
                 prompt = re.sub(r"\s+", " ", custom_p).strip()
@@ -2407,7 +2418,7 @@ def build_default_visual_scene_plan(
                     custom_p
                     .replace("{style}", style)
                     .replace("{reference}", ref_note.strip())
-                    .replace("{action}", clean_context)
+                    .replace("{action}", visual_action)
                     .replace("{scene_index}", str(w["index"] + 1))
                 )
                 prompt = re.sub(r"\s+", " ", custom_p).strip()
@@ -2428,8 +2439,8 @@ def build_default_visual_scene_plan(
                 "transcript": transcript_snippet,
                 "is_video": is_video,
                 "media_type": "video" if is_video else "image",
-                "subject": matched["display_name"] if matched else (clean_context[:60] if clean_context else f"Scene {w['index'] + 1}"),
-                "action": clean_context[:100] if clean_context else transcript_snippet[:100],
+                "subject": matched["display_name"] if matched else (visual_action[:60] if visual_action else f"Scene {w['index'] + 1}"),
+                "action": visual_action,
                 "setting": "cinematic scene",
                 "era": "contemporary",
                 "composition": "wide shot, 16:9 cinematic framing",
