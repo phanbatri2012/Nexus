@@ -439,11 +439,70 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
                 "_attach_reference_from_gallery",
                 AsyncMock(return_value=REFERENCE_RESULT_ATTACHED),
             ) as gallery,
+            patch.object(
+                worker,
+                "_wait_for_ingredient_chip",
+                AsyncMock(return_value=False),
+            ),
         ):
             result = await worker._try_attach_existing_reference("le_trong_tan.jpg")
 
         self.assertEqual(result, (REFERENCE_RESULT_ATTACHED, "reused_gallery"))
         gallery.assert_awaited_once_with("le_trong_tan.jpg")
+
+    async def test_picker_ui_error_accepts_reference_chip_that_appears_late(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        with (
+            patch.object(
+                worker,
+                "_attach_reference_from_picker",
+                AsyncMock(return_value=REFERENCE_RESULT_UI_ERROR),
+            ),
+            patch.object(
+                worker,
+                "_wait_for_ingredient_chip",
+                AsyncMock(return_value=True),
+            ) as wait_for_chip,
+            patch.object(
+                worker,
+                "_attach_reference_from_gallery",
+                AsyncMock(),
+            ) as gallery,
+        ):
+            result = await worker._try_attach_existing_reference("le_trong_tan.jpg")
+
+        self.assertEqual(result, (REFERENCE_RESULT_ATTACHED, "reused_picker"))
+        wait_for_chip.assert_awaited_once_with(timeout=2.0)
+        gallery.assert_not_awaited()
+
+    async def test_reference_chip_confirmation_polls_until_visible(self):
+        page = MagicMock()
+        worker = GoogleFlowWorker(page)
+        with (
+            patch.object(
+                worker,
+                "_has_ingredient_chip",
+                AsyncMock(side_effect=[False, False, True]),
+            ) as has_chip,
+            patch("auto_yt.services.google_flow_worker.asyncio.sleep", AsyncMock()),
+        ):
+            attached = await worker._wait_for_ingredient_chip(timeout=5.0)
+
+        self.assertTrue(attached)
+        self.assertEqual(has_chip.await_count, 3)
+
+    async def test_generation_activity_does_not_treat_chip_cancel_icon_as_stop(self):
+        page = MagicMock()
+        page.evaluate = AsyncMock(return_value=False)
+        worker = GoogleFlowWorker(page)
+
+        self.assertFalse(await worker._read_generation_activity())
+
+        script = page.evaluate.await_args.args[0]
+        self.assertIn("button.stop-button", script)
+        self.assertNotIn("html.includes('cancel')", script)
 
     async def test_known_asset_ui_failure_never_uploads_duplicate(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -461,6 +520,11 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
                     AsyncMock(return_value=(REFERENCE_RESULT_UI_ERROR, "")),
                 ),
                 patch.object(worker, "_upload_reference_file", AsyncMock()) as upload,
+                patch.object(
+                    worker,
+                    "_wait_for_ingredient_chip",
+                    AsyncMock(return_value=False),
+                ),
                 patch("auto_yt.services.google_flow_worker.asyncio.sleep", AsyncMock()),
             ):
                 with self.assertRaises(ReferenceAttachmentError):
@@ -842,6 +906,76 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(source, "")
         button.click.assert_awaited_once()
         page.keyboard.press.assert_not_awaited()
+
+    async def test_submit_button_fallback_never_selects_agent_instructions(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        missing = MagicMock()
+        missing.first.is_visible = AsyncMock(return_value=False)
+        page.locator.return_value = missing
+
+        instruction_button = MagicMock()
+        instruction_button.is_visible = AsyncMock(return_value=True)
+        instruction_button.is_enabled = AsyncMock(return_value=True)
+        instruction_button.get_attribute = AsyncMock(
+            side_effect=lambda name: {
+                "aria-label": "Chỉ dẫn cho tác nhân",
+                "title": "",
+                "class": "agent-action-button",
+            }.get(name)
+        )
+        instruction_button.inner_text = AsyncMock(return_value="article_spark")
+
+        generate_button = MagicMock()
+        generate_button.is_visible = AsyncMock(return_value=True)
+        generate_button.is_enabled = AsyncMock(return_value=False)
+
+        buttons = MagicMock()
+        buttons.count = AsyncMock(return_value=2)
+        buttons.nth.side_effect = (
+            lambda index: instruction_button if index == 1 else generate_button
+        )
+        prompt_box = MagicMock()
+        prompt_box.count = AsyncMock(return_value=1)
+        prompt_box.locator.return_value = buttons
+        editor = MagicMock()
+        editor.locator.return_value = prompt_box
+        worker = GoogleFlowWorker(page)
+
+        with patch(
+            "auto_yt.services.google_flow_worker.PROMPT_SUBMIT_READY_TIMEOUT_SECONDS",
+            0.0,
+        ):
+            selected = await worker._find_prompt_submit_button(editor)
+
+        self.assertIsNone(selected)
+
+    async def test_close_agent_instructions_panel_clicks_done(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        panel = MagicMock()
+        panel.is_visible = AsyncMock(side_effect=[True, False])
+        title = MagicMock()
+        title.inner_text = AsyncMock(return_value="Chỉ dẫn cho tác nhân")
+        done = MagicMock()
+        done.is_visible = AsyncMock(return_value=True)
+        done.click = AsyncMock()
+
+        def panel_locator(selector):
+            result = MagicMock()
+            result.first = title if "header-title" in selector else done
+            return result
+
+        panel.locator.side_effect = panel_locator
+        root = MagicMock()
+        root.first = panel
+        page.locator.return_value = root
+        worker = GoogleFlowWorker(page)
+
+        closed = await worker.close_agent_instructions_panel()
+
+        self.assertTrue(closed)
+        done.click.assert_awaited_once_with(timeout=2000)
 
     async def test_submit_falls_back_to_enter_only_when_prompt_remains(self):
         page = MagicMock()

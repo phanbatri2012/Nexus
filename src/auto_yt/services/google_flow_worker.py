@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 DEBUG_LOG_DIR = Path("data/logs")
 REFERENCE_ATTACH_RETRY_COUNT = 2
 REFERENCE_POST_UPLOAD_RETRY_COUNT = 3
+REFERENCE_CHIP_CONFIRM_TIMEOUT_SECONDS = 5.0
+REFERENCE_CHIP_CONFIRM_POLL_SECONDS = 0.2
 REFERENCE_RESULT_ATTACHED = "attached"
 REFERENCE_RESULT_NOT_FOUND = "not_found"
 REFERENCE_RESULT_UI_ERROR = "ui_error"
@@ -30,6 +32,7 @@ VIDEO_MODE_TIMEOUT_SECONDS = 10.0
 GENERATION_POLL_SECONDS = 1.0
 SUBMISSION_ACK_TIMEOUT_SECONDS = 10.0
 SUBMISSION_ACK_POLL_SECONDS = 0.5
+PROMPT_SUBMIT_READY_TIMEOUT_SECONDS = 5.0
 MAX_CONSECUTIVE_UI_ERRORS = 3
 IMAGE_BASELINE_STABILIZE_SECONDS = 2.0
 IMAGE_BASELINE_POLL_SECONDS = 0.25
@@ -352,11 +355,51 @@ class GoogleFlowWorker:
             except Exception:
                 continue
 
-        # 3. Check and auto-configure Agent Settings dialog if open
+        # 3. Close the persistent Agent Instructions side panel if it was opened accidentally.
+        await self.close_agent_instructions_panel()
+
+        # 4. Check and auto-configure Agent Settings dialog if open
         await self.handle_agent_settings_dialog()
 
-        # 4. Check and approve credit or assistant confirmation prompts
+        # 5. Check and approve credit or assistant confirmation prompts
         await self.handle_confirmation_prompts()
+
+    async def close_agent_instructions_panel(self) -> bool:
+        """Close Flow's Agent Instructions panel without touching the generation chat."""
+        panel = self.page.locator("flow-agent-panel").first
+        try:
+            if not await panel.is_visible(timeout=200):
+                return False
+            title = panel.locator("h2.header-title, .agent-panel-header h2").first
+            title_text = (await title.inner_text(timeout=500) or "").strip().casefold()
+        except Exception:
+            return False
+        if title_text not in {"chỉ dẫn cho tác nhân", "agent instructions"}:
+            return False
+
+        close_button = panel.locator(
+            "button.done-button, button:has-text('Xong'), button:has-text('Done'), "
+            "button[aria-label='Đóng' i], button[aria-label='Close' i]"
+        ).first
+        try:
+            if not await close_button.is_visible(timeout=500):
+                raise FlowUiStateError("Không tìm thấy nút đóng bảng Chỉ dẫn cho tác nhân.")
+            await close_button.click(timeout=2000)
+            deadline = time.monotonic() + 5.0
+            while await panel.is_visible(timeout=100):
+                if time.monotonic() >= deadline:
+                    raise FlowUiStateError("Không thể đóng bảng Chỉ dẫn cho tác nhân.")
+                await asyncio.sleep(0.2)
+        except FlowUiStateError:
+            raise
+        except Exception as exc:
+            raise FlowUiStateError("Không thể đóng bảng Chỉ dẫn cho tác nhân.") from exc
+
+        logger.info(
+            "flow_generation state=agent_instructions_closed project=%s",
+            self._project_id(),
+        )
+        return True
 
     async def handle_agent_settings_dialog(self) -> bool:
         """If Agent Settings dialog ('Cài đặt tác nhân') is open, select 'Không bao giờ' (Never) and close."""
@@ -1006,8 +1049,10 @@ class GoogleFlowWorker:
 
             // 1. Explicit Stop / Dừng buttons
             const stopButtons = Array.from(document.querySelectorAll(
-                "button, [role='button'], flow-creative-agent-prompt-box button, " +
-                "flow-base-prompt-box button, flow-prompt-box button, .prompt-box button"
+                "button.stop-button, button[aria-label='Stop' i], button[aria-label='Dừng' i], " +
+                "button[aria-label*='stop generation' i], button[aria-label*='dừng tạo' i], " +
+                "flow-generate-icon-button button, flow-creative-agent-prompt-box button.generate-icon-button, " +
+                "flow-base-prompt-box button.generate-icon-button, flow-prompt-box button.generate-icon-button"
             ));
             for (const btn of stopButtons) {
                 if (!visible(btn)) continue;
@@ -1018,7 +1063,7 @@ class GoogleFlowWorker:
                 if (text === 'stop' || text === 'dừng' || aria === 'stop' || aria === 'dừng' ||
                     aria.includes('stop generation') || aria.includes('dừng tạo') ||
                     title === 'stop' || title === 'dừng' ||
-                    html.includes('stop_circle') || html.includes('cancel')) {
+                    html.includes('stop_circle')) {
                     return true;
                 }
             }
@@ -1146,21 +1191,23 @@ class GoogleFlowWorker:
 
     async def _find_prompt_submit_button(self, editor: Locator) -> Locator | None:
         semantic_selectors = [
+            "flow-creative-agent-prompt-box flow-generate-icon-button button",
             "flow-creative-agent-prompt-box button[type='submit']",
             "flow-creative-agent-prompt-box button.generate-icon-button",
             "flow-creative-agent-prompt-box button[aria-label*='send' i]",
             "flow-creative-agent-prompt-box button[aria-label*='submit' i]",
             "flow-creative-agent-prompt-box button[aria-label*='generate' i]",
             "flow-creative-agent-prompt-box button[aria-label*='gửi' i]",
-            "flow-creative-agent-prompt-box button[aria-label*='tạo' i]",
+            "flow-creative-agent-prompt-box button[aria-label*='Bắt đầu tạo' i]",
             "flow-creative-agent-prompt-box button:has-text('arrow_forward')",
+            "flow-base-prompt-box flow-generate-icon-button button",
             "flow-base-prompt-box button[type='submit']",
             "flow-base-prompt-box button.generate-icon-button",
             "flow-base-prompt-box button[aria-label*='send' i]",
             "flow-base-prompt-box button[aria-label*='submit' i]",
             "flow-base-prompt-box button[aria-label*='generate' i]",
             "flow-base-prompt-box button[aria-label*='gửi' i]",
-            "flow-base-prompt-box button[aria-label*='tạo' i]",
+            "flow-base-prompt-box button[aria-label*='Bắt đầu tạo' i]",
             "flow-base-prompt-box button:has-text('arrow_forward')",
             "flow-prompt-box button[type='submit']",
             "flow-prompt-box button.generate-icon-button",
@@ -1169,17 +1216,22 @@ class GoogleFlowWorker:
             "flow-prompt-box button[aria-label*='generate' i]",
             "flow-prompt-box button[aria-label*='start generation' i]",
             "flow-prompt-box button[aria-label*='gửi' i]",
-            "flow-prompt-box button[aria-label*='tạo' i]",
+            "flow-prompt-box button[aria-label*='Bắt đầu tạo' i]",
             "flow-prompt-box button:has-text('arrow_forward')",
             "flow-prompt-box button:has-text('send')",
         ]
-        for selector in semantic_selectors:
-            try:
-                button = self.page.locator(selector).first
-                if await button.is_visible(timeout=250) and await button.is_enabled(timeout=250):
-                    return button
-            except Exception:
-                continue
+        ready_deadline = time.monotonic() + PROMPT_SUBMIT_READY_TIMEOUT_SECONDS
+        while True:
+            for selector in semantic_selectors:
+                try:
+                    button = self.page.locator(selector).first
+                    if await button.is_visible(timeout=100) and await button.is_enabled(timeout=100):
+                        return button
+                except Exception:
+                    continue
+            if time.monotonic() >= ready_deadline:
+                break
+            await asyncio.sleep(0.2)
 
         try:
             prompt_box = editor.locator(
@@ -1198,6 +1250,10 @@ class GoogleFlowWorker:
             "mode", "model", "stop", "cancel", "dừng", "hủy", "thêm", "tải",
             "cài đặt", "tuỳ chọn", "tùy chọn",
         )
+        submit_terms = (
+            "send", "submit", "generate", "start generation", "arrow_forward",
+            "gửi", "bắt đầu tạo",
+        )
         for index in range(count - 1, -1, -1):
             button = buttons.nth(index)
             try:
@@ -1214,6 +1270,9 @@ class GoogleFlowWorker:
                     )
                 ).casefold()
                 if any(term in label for term in excluded_terms):
+                    continue
+                class_name = str(await button.get_attribute("class") or "").casefold()
+                if "generate" not in class_name and not any(term in label for term in submit_terms):
                     continue
                 return button
             except Exception:
@@ -1303,6 +1362,21 @@ class GoogleFlowWorker:
                         attempt,
                         exc,
                     )
+                    continue
+                await asyncio.sleep(0.2)
+                if await self.close_agent_instructions_panel():
+                    logger.warning(
+                        "flow_generation media=%s state=wrong_agent_control project=%s attempt=%d",
+                        media_type,
+                        self._project_id(),
+                        attempt,
+                    )
+                    try:
+                        await editor.click(timeout=2000)
+                        await editor.fill(full_prompt)
+                    except Exception:
+                        await self.page.keyboard.press("Control+A")
+                        await self.page.keyboard.insert_text(full_prompt)
                     continue
             elif "enter" not in attempted_methods:
                 method = "enter"
@@ -1796,11 +1870,6 @@ class GoogleFlowWorker:
             "flow-prompt-box button[aria-label*='Delete' i]",
             "flow-prompt-box button[aria-label*='Xóa' i]",
             "flow-prompt-box mat-icon:has-text('close')",
-            "flow-ingredient-chip",
-            "flow-image-ingredient-chip",
-            ".ingredient-chip",
-            ".reference-chip",
-            "[data-testid*='ingredient-chip']",
         ]
         for sel in selectors:
             try:
@@ -1834,6 +1903,18 @@ class GoogleFlowWorker:
             }'''))
         except Exception:
             return False
+
+    async def _wait_for_ingredient_chip(
+        self,
+        timeout: float = REFERENCE_CHIP_CONFIRM_TIMEOUT_SECONDS,
+    ) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            if await self._has_ingredient_chip():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(REFERENCE_CHIP_CONFIRM_POLL_SECONDS)
 
     async def _close_reference_ui(self) -> None:
         try:
@@ -1892,8 +1973,7 @@ class GoogleFlowWorker:
 
             await self._remember_reference_locator_keys(asset_item)
             await asset_item.click()
-            await asyncio.sleep(0.5)
-            if await self._has_ingredient_chip():
+            if await self._wait_for_ingredient_chip():
                 await self._close_reference_ui()
                 return REFERENCE_RESULT_ATTACHED
 
@@ -1908,8 +1988,7 @@ class GoogleFlowWorker:
                 await self._close_reference_ui()
                 return REFERENCE_RESULT_UI_ERROR
             await add_to_prompt_btn.click()
-            await asyncio.sleep(0.8)
-            attached = await self._has_ingredient_chip()
+            attached = await self._wait_for_ingredient_chip()
             await self._close_reference_ui()
             return REFERENCE_RESULT_ATTACHED if attached else REFERENCE_RESULT_UI_ERROR
         except Exception as exc:
@@ -1956,8 +2035,7 @@ class GoogleFlowWorker:
                 await self._close_reference_ui()
                 return REFERENCE_RESULT_UI_ERROR
             await add_to_prompt.click()
-            await asyncio.sleep(0.8)
-            attached = await self._has_ingredient_chip()
+            attached = await self._wait_for_ingredient_chip()
             await self._close_reference_ui()
             return REFERENCE_RESULT_ATTACHED if attached else REFERENCE_RESULT_UI_ERROR
         except Exception as exc:
@@ -1969,10 +2047,28 @@ class GoogleFlowWorker:
         picker_result = await self._attach_reference_from_picker(filename)
         if picker_result == REFERENCE_RESULT_ATTACHED:
             return picker_result, "reused_picker"
+        if (
+            picker_result == REFERENCE_RESULT_UI_ERROR
+            and await self._wait_for_ingredient_chip(timeout=2.0)
+        ):
+            logger.info(
+                "Reference '%s' attached after picker confirmation delay.",
+                filename,
+            )
+            return REFERENCE_RESULT_ATTACHED, "reused_picker"
 
         gallery_result = await self._attach_reference_from_gallery(filename)
         if gallery_result == REFERENCE_RESULT_ATTACHED:
             return gallery_result, "reused_gallery"
+        if (
+            gallery_result == REFERENCE_RESULT_UI_ERROR
+            and await self._wait_for_ingredient_chip(timeout=2.0)
+        ):
+            logger.info(
+                "Reference '%s' attached after gallery confirmation delay.",
+                filename,
+            )
+            return REFERENCE_RESULT_ATTACHED, "reused_gallery"
         if (
             picker_result == REFERENCE_RESULT_NOT_FOUND
             and gallery_result == REFERENCE_RESULT_NOT_FOUND
@@ -2043,7 +2139,7 @@ class GoogleFlowWorker:
             ) from exc
 
         for _ in range(REFERENCE_POST_UPLOAD_RETRY_COUNT):
-            if await self._has_ingredient_chip():
+            if await self._wait_for_ingredient_chip():
                 await self._remember_attached_reference_keys()
                 self._log_reference_event("uploaded", filename, detail="attached_by_upload")
                 return
@@ -2070,6 +2166,7 @@ class GoogleFlowWorker:
     ) -> None:
         """Ensure the prompt box has the desired reference image attached as an ingredient chip."""
         ref_ids = [str(r).strip() for r in (reference_ids or []) if str(r).strip()]
+        await self.dismiss_blocking_dialogs()
 
         if not ref_ids:
             await self.clear_ingredient_chips()
@@ -2079,7 +2176,6 @@ class GoogleFlowWorker:
 
         # Clear existing chips to avoid mixing wrong references
         await self.clear_ingredient_chips()
-        await self.dismiss_blocking_dialogs()
 
         reference_path = str((reference_paths or {}).get(target_ref) or "").strip()
         if reference_path:
