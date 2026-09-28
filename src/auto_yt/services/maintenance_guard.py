@@ -7,6 +7,7 @@ import sqlite3
 from typing import Any
 
 from auto_yt.services import database as db
+from auto_yt.services import google_flow_browser_service
 
 
 def _get_db_connection() -> sqlite3.Connection | None:
@@ -241,17 +242,41 @@ def list_gpm_restart_blockers() -> list[dict[str, Any]]:
     return blockers
 
 
+def list_google_flow_restart_blockers() -> list[dict[str, Any]]:
+    """Block maintenance while the shared Flow browser is generating media."""
+    status = google_flow_browser_service.get_browser_service_status()
+    if not status.get("connected") or not status.get("generation_active"):
+        return []
+    return [
+        {
+            "type": "google_flow_generation",
+            "id": "google-flow-browser",
+            "status": "generating",
+            "title": "Google Flow generation",
+            "checked_at": str(status.get("generation_checked_at") or ""),
+        }
+    ]
+
+
 def get_maintenance_status() -> dict[str, Any]:
     system_job_blockers = list_system_job_blockers()
     youtube_blockers = list_youtube_publish_blockers()
     artifact_blockers = list_video_artifact_blockers()
     fb_blockers = list_fb_crossposter_blockers()
     gpm_blockers = list_gpm_restart_blockers()
+    google_flow_blockers = list_google_flow_restart_blockers()
 
     # De-duplicate blockers by (type, id)
     seen_keys = set()
     all_blockers = []
-    for b in system_job_blockers + youtube_blockers + artifact_blockers + fb_blockers + gpm_blockers:
+    for b in (
+        system_job_blockers
+        + youtube_blockers
+        + artifact_blockers
+        + fb_blockers
+        + gpm_blockers
+        + google_flow_blockers
+    ):
         key = (b.get("type"), b.get("id"))
         if key not in seen_keys:
             seen_keys.add(key)
@@ -268,6 +293,8 @@ def get_maintenance_status() -> dict[str, Any]:
         reasons.append(f"{len(fb_blockers)} Facebook crosspost(s) uploading")
     if gpm_blockers:
         reasons.append(f"{len(gpm_blockers)} GPM browser task(s) active")
+    if google_flow_blockers:
+        reasons.append("Google Flow is still generating media in the browser")
 
     return {
         "safe_to_restart": len(all_blockers) == 0,
@@ -279,6 +306,7 @@ def get_maintenance_status() -> dict[str, Any]:
             "video_artifacts": len(artifact_blockers),
             "fb_crossposts": len(fb_blockers),
             "gpm_browsers": len(gpm_blockers),
+            "google_flow_generations": len(google_flow_blockers),
         },
         "reasons": reasons,
     }
@@ -286,4 +314,3 @@ def get_maintenance_status() -> dict[str, Any]:
 
 if __name__ == "__main__":
     print(json.dumps(get_maintenance_status(), ensure_ascii=False, indent=2))
-

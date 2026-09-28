@@ -141,6 +141,18 @@ class GoogleFlowBrowserServiceTests(unittest.TestCase):
         saved = save_account.call_args.args[0]
         self.assertEqual(saved["session_cookies"], [authentication_cookie])
 
+    def test_service_detects_active_agent_generation(self):
+        page = Mock()
+        page.url = "https://flow.google.com/project/project-one"
+        page.evaluate.return_value = True
+
+        self.assertTrue(
+            google_flow_browser_service._page_has_active_flow_generation(page)
+        )
+        script = page.evaluate.call_args.args[0]
+        self.assertIn("flow-chat-thinking-indicator", script)
+        self.assertIn("flow-creative-agent-prompt-box", script)
+
 
 class GoogleFlowEndpointTests(unittest.IsolatedAsyncioTestCase):
     async def test_login_check_reuses_the_connected_browser(self):

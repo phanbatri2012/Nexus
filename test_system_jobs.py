@@ -129,6 +129,26 @@ class SystemJobTests(unittest.TestCase):
         self.assertTrue(status["safe_to_restart"])
         self.assertEqual(status["summary"]["gpm_browsers"], 0)
 
+    def test_maintenance_status_blocks_active_google_flow_generation(self):
+        browser_status = {
+            "connected": True,
+            "generation_active": True,
+            "generation_checked_at": "2026-09-28T01:00:00+00:00",
+        }
+        with patch.object(
+            main.maintenance_guard.google_flow_browser_service,
+            "get_browser_service_status",
+            return_value=browser_status,
+        ):
+            status = main.get_maintenance_status()
+
+        self.assertFalse(status["safe_to_restart"])
+        self.assertEqual(status["summary"]["google_flow_generations"], 1)
+        self.assertEqual(
+            status["blocking_jobs"][0]["type"],
+            "google_flow_generation",
+        )
+
     def test_claims_video_jobs_in_fifo_order(self):
         self.create_job("first")
         self.create_job("second")

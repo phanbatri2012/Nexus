@@ -22,6 +22,7 @@ REFERENCE_RESULT_NOT_FOUND = "not_found"
 REFERENCE_RESULT_UI_ERROR = "ui_error"
 REFERENCE_ASSET_SCAN_LIMIT = 100
 IMAGE_GENERATION_TIMEOUT_SECONDS = 240.0
+AGENT_IMAGE_GENERATION_TIMEOUT_SECONDS = 600.0
 VIDEO_GENERATION_TIMEOUT_SECONDS = 180.0
 GENERATION_START_TIMEOUT_SECONDS = 45.0
 GENERATION_IDLE_GRACE_SECONDS = 10.0
@@ -35,6 +36,9 @@ IMAGE_BASELINE_POLL_SECONDS = 0.25
 MIN_GENERATED_IMAGE_WIDTH = 800
 MIN_GENERATED_IMAGE_HEIGHT = 400
 MIN_GENERATED_IMAGE_ASPECT_RATIO = 1.15
+PROMPT_ROOT_SELECTOR = (
+    "flow-creative-agent-prompt-box, flow-base-prompt-box, flow-prompt-box"
+)
 
 
 class ReferenceAttachmentError(RuntimeError):
@@ -63,6 +67,10 @@ class FlowResultMissingError(RuntimeError):
 
 class FlowGenerationTimeout(RuntimeError):
     """Raised when Flow remains active beyond the hard generation deadline."""
+
+
+class FlowAgentStalledError(FlowGenerationTimeout):
+    """Raised when the Flow agent remains active beyond its extended deadline."""
 
 
 class FlowModeError(RuntimeError):
@@ -150,6 +158,7 @@ class GoogleFlowWorker:
         self._inspected_detail_keys: set[str] = set()
         self._last_invalid_image_size: tuple[int, int] | None = None
         self._validated_image_payload: tuple[str, bytes] | None = None
+        self._agent_interface_detected = False
 
     @staticmethod
     def _project_root_from_url(url: str) -> str:
@@ -452,6 +461,14 @@ class GoogleFlowWorker:
             )
         start_time = asyncio.get_event_loop().time()
         candidate_selectors = [
+            "flow-creative-agent-prompt-box flow-rich-text-editor .ProseMirror",
+            "flow-creative-agent-prompt-box .ProseMirror",
+            "flow-creative-agent-prompt-box div[contenteditable='true']",
+            "flow-creative-agent-prompt-box [role='textbox']",
+            "flow-base-prompt-box flow-rich-text-editor .ProseMirror",
+            "flow-base-prompt-box .ProseMirror",
+            "flow-base-prompt-box div[contenteditable='true']",
+            "flow-base-prompt-box [role='textbox']",
             "flow-prompt-box .ProseMirror",
             "flow-prompt-box div[contenteditable='true']",
             "flow-prompt-box textarea",
@@ -481,6 +498,8 @@ class GoogleFlowWorker:
                 try:
                     loc = self.page.locator(sel).first
                     if await loc.is_visible(timeout=500):
+                        if sel.startswith(("flow-creative-agent-prompt-box", "flow-base-prompt-box")):
+                            self._agent_interface_detected = True
                         try:
                             backdrop = self.page.locator(".cdk-overlay-backdrop-showing, .cdk-overlay-backdrop").first
                             if await backdrop.is_visible(timeout=200):
@@ -681,7 +700,14 @@ class GoogleFlowWorker:
         filename = self._reference_filename(reference_path)
         if not filename or not Path(reference_path).is_file():
             raise RuntimeError(f"Reference image does not exist: {reference_path}")
-        add_btn = self.page.locator("button[aria-label*='Add ingredients' i], button.add-menu-trigger").first
+        add_btn = self.page.locator(
+            "flow-creative-agent-prompt-box button[aria-label*='Add ingredients' i], "
+            "flow-creative-agent-prompt-box button[aria-label*='Thêm thành phần' i], "
+            "flow-base-prompt-box button[aria-label*='Add ingredients' i], "
+            "flow-base-prompt-box button[aria-label*='Thêm thành phần' i], "
+            "button[aria-label*='Add ingredients' i], button[aria-label*='Thêm thành phần' i], "
+            "button.add-menu-trigger"
+        ).first
         if not await add_btn.is_visible(timeout=3000):
             raise RuntimeError("Add ingredients button is not visible for reference upload.")
 
@@ -747,18 +773,21 @@ class GoogleFlowWorker:
                 const valid = lower.startsWith('blob:') ||
                     lower.includes('flow-content.google/image') ||
                     lower.includes('googleusercontent.com') ||
-                    lower.includes('google.com') ||
                     /\.(?:png|jpe?g|webp)(?:\?|$)/i.test(url);
                 return valid && !/\.(?:mp4|webm)(?:\?|$)/i.test(url) ? url : '';
             };
             const nodes = document.querySelectorAll(
                 "img[src], img[srcset], [data-image-url], [data-media-url], " +
-                "[data-download-url], a[href], [style*='background-image'], " +
+                "[data-download-url], a[download][href], a[data-image-url], " +
+                "a[data-download-url], [style*='background-image'], " +
                 "flow-media-tile, flow-canvas-tile, flow-image-tile"
             );
             for (const node of nodes) {
                 if (node.closest(
-                    "flow-ingredient-chip, .ingredient-chip, .mat-mdc-chip, flow-prompt-box, " +
+                    "flow-image-ingredient-chip, flow-ingredient-chip, flow-chat-ingredient-row, " +
+                    ".ingredient-chip, .mat-mdc-chip, flow-creative-agent-prompt-box, " +
+                    "flow-base-prompt-box, flow-prompt-box, .message-row.user-row, " +
+                    "flow-chat-bubble[data-role='user'], [data-message-role='user'], " +
                     "[role='menu'], flow-upload-card, [data-testid*='upload' i], .upload-card, " +
                     "[data-testid*='asset-picker' i], .asset-picker, .uploads-picker"
                 )) continue;
@@ -800,6 +829,11 @@ class GoogleFlowWorker:
                     node.getAttribute('data-media-id') || node.getAttribute('data-asset-id') ||
                     (mediaTile ? (mediaTile.getAttribute('data-media-id') || mediaTile.getAttribute('data-asset-id') || mediaTile.getAttribute('data-id') || '') : '')
                 );
+                const agentTurn = node.closest(
+                    ".message-row.agent-row, flow-chat-bubble[data-role='assistant'], " +
+                    "flow-chat-bubble[data-role='agent'], [data-message-role='assistant'], " +
+                    "[data-message-role='agent']"
+                );
                 const labelText = String(
                     (mediaTile && mediaTile.querySelector('.asset-title, .title, .label, .caption')
                         ? mediaTile.querySelector('.asset-title, .title, .label, .caption').innerText
@@ -826,7 +860,11 @@ class GoogleFlowWorker:
                     labelText,
                     width: Number(node.naturalWidth || node.videoWidth || node.width || 0) || 0,
                     height: Number(node.naturalHeight || node.videoHeight || node.height || 0) || 0,
-                    source: node.closest('.sidebar, .mat-drawer, flow-prompt-history, [data-testid*="result" i], flow-chat-panel')
+                    turnRole: agentTurn ? 'agent' : '',
+                    source: node.closest(
+                        '.sidebar, .mat-drawer, flow-prompt-history, [data-testid*="result" i], ' +
+                        'flow-chat-panel, flow-chat-view, flow-chat-scroller, .message-row.agent-row'
+                    )
                         ? 'result_panel' : 'gallery'
                 });
             }
@@ -912,6 +950,8 @@ class GoogleFlowWorker:
         }
         ranked: list[tuple[int, dict]] = []
         for candidate in candidates:
+            if str(candidate.get("turnRole") or "").casefold() == "user":
+                continue
             keys = self._candidate_keys(candidate)
             if not keys:
                 continue
@@ -966,7 +1006,8 @@ class GoogleFlowWorker:
 
             // 1. Explicit Stop / Dừng buttons
             const stopButtons = Array.from(document.querySelectorAll(
-                "button, [role='button'], flow-prompt-box button, .prompt-box button"
+                "button, [role='button'], flow-creative-agent-prompt-box button, " +
+                "flow-base-prompt-box button, flow-prompt-box button, .prompt-box button"
             ));
             for (const btn of stopButtons) {
                 if (!visible(btn)) continue;
@@ -1029,7 +1070,7 @@ class GoogleFlowWorker:
             const activeThinking = Array.from(document.querySelectorAll(
                 "flow-thinking.active, flow-thinking.in-progress, flow-thinking[data-state='thinking'], " +
                 "flow-thinking mat-progress-spinner, flow-thinking mat-spinner, " +
-                ".thinking-active, .streaming-active, flow-streaming-indicator, " +
+                "flow-chat-thinking-indicator, .thinking-active, .streaming-active, flow-streaming-indicator, " +
                 "[data-testid*='thinking' i].active, [data-testid*='thinking' i] mat-spinner"
             ));
             for (const el of activeThinking) {
@@ -1046,6 +1087,12 @@ class GoogleFlowWorker:
             const selectors = [
                 'flow-prompt-history',
                 'flow-chat-panel',
+                'flow-chat-view',
+                'flow-chat-scroller',
+                'flow-chat-bubble',
+                '.messages-list',
+                '.message-row.user-row',
+                '.message-row.agent-row',
                 'flow-session-panel',
                 "[data-testid*='prompt-history' i]",
                 "[data-testid*='conversation' i]",
@@ -1071,7 +1118,8 @@ class GoogleFlowWorker:
             for (const root of roots) {
                 const clone = root.cloneNode(true);
                 for (const node of clone.querySelectorAll(
-                    'flow-prompt-box, textarea, input, [contenteditable="true"], script, style'
+                    'flow-creative-agent-prompt-box, flow-base-prompt-box, flow-prompt-box, ' +
+                    'textarea, input, [contenteditable="true"], script, style'
                 )) node.remove();
                 const text = normalize(clone.textContent).slice(-6000);
                 const ids = Array.from(root.querySelectorAll(
@@ -1098,6 +1146,22 @@ class GoogleFlowWorker:
 
     async def _find_prompt_submit_button(self, editor: Locator) -> Locator | None:
         semantic_selectors = [
+            "flow-creative-agent-prompt-box button[type='submit']",
+            "flow-creative-agent-prompt-box button.generate-icon-button",
+            "flow-creative-agent-prompt-box button[aria-label*='send' i]",
+            "flow-creative-agent-prompt-box button[aria-label*='submit' i]",
+            "flow-creative-agent-prompt-box button[aria-label*='generate' i]",
+            "flow-creative-agent-prompt-box button[aria-label*='gửi' i]",
+            "flow-creative-agent-prompt-box button[aria-label*='tạo' i]",
+            "flow-creative-agent-prompt-box button:has-text('arrow_forward')",
+            "flow-base-prompt-box button[type='submit']",
+            "flow-base-prompt-box button.generate-icon-button",
+            "flow-base-prompt-box button[aria-label*='send' i]",
+            "flow-base-prompt-box button[aria-label*='submit' i]",
+            "flow-base-prompt-box button[aria-label*='generate' i]",
+            "flow-base-prompt-box button[aria-label*='gửi' i]",
+            "flow-base-prompt-box button[aria-label*='tạo' i]",
+            "flow-base-prompt-box button:has-text('arrow_forward')",
             "flow-prompt-box button[type='submit']",
             "flow-prompt-box button.generate-icon-button",
             "flow-prompt-box button[aria-label*='send' i]",
@@ -1118,9 +1182,12 @@ class GoogleFlowWorker:
                 continue
 
         try:
-            prompt_box = editor.locator("xpath=ancestor::flow-prompt-box[1]")
+            prompt_box = editor.locator(
+                "xpath=ancestor::*[self::flow-creative-agent-prompt-box or "
+                "self::flow-base-prompt-box or self::flow-prompt-box][1]"
+            )
             if await prompt_box.count() == 0:
-                prompt_box = self.page.locator("flow-prompt-box").first
+                prompt_box = self.page.locator(PROMPT_ROOT_SELECTOR).first
             buttons = prompt_box.locator("button")
             count = await buttons.count()
         except Exception:
@@ -1128,7 +1195,8 @@ class GoogleFlowWorker:
 
         excluded_terms = (
             "add", "plus", "upload", "ingredient", "setting", "tune", "option",
-            "mode", "model", "thêm", "tải", "cài đặt", "tuỳ chọn", "tùy chọn",
+            "mode", "model", "stop", "cancel", "dừng", "hủy", "thêm", "tải",
+            "cài đặt", "tuỳ chọn", "tùy chọn",
         )
         for index in range(count - 1, -1, -1):
             button = buttons.nth(index)
@@ -1188,6 +1256,8 @@ class GoogleFlowWorker:
                 r'''(sample) => {
                     const selectors = [
                         'flow-prompt-history', 'flow-chat-panel', 'flow-session-panel',
+                        'flow-chat-view', 'flow-chat-scroller', 'flow-chat-bubble',
+                        '.messages-list', '.message-row.user-row',
                         "[data-testid*='prompt-history' i]", "[data-testid*='conversation' i]",
                         "[data-testid*='result-panel' i]", '.sidebar', '.mat-drawer',
                         'flow-message-turn', '.chat-message', '[data-message-id]', '[data-turn-id]'
@@ -1451,6 +1521,14 @@ class GoogleFlowWorker:
     async def clear_ingredient_chips(self) -> None:
         """Clear all ingredient chips currently attached to the prompt box."""
         chip_selectors = [
+            "flow-creative-agent-prompt-box flow-image-ingredient-chip",
+            "flow-creative-agent-prompt-box flow-ingredient-chip",
+            "flow-creative-agent-prompt-box flow-prompt-attachment",
+            "flow-creative-agent-prompt-box [data-testid*='attachment' i]",
+            "flow-base-prompt-box flow-image-ingredient-chip",
+            "flow-base-prompt-box flow-ingredient-chip",
+            "flow-base-prompt-box flow-prompt-attachment",
+            "flow-base-prompt-box [data-testid*='attachment' i]",
             "flow-prompt-box flow-ingredient-chip",
             "flow-prompt-box flow-prompt-attachment",
             "flow-prompt-box flow-attachment",
@@ -1464,6 +1542,7 @@ class GoogleFlowWorker:
             "flow-prompt-box .mat-mdc-chip",
             "flow-prompt-box mat-chip",
             "flow-ingredient-chip",
+            "flow-image-ingredient-chip",
             ".ingredient-chip",
             "mat-chip",
             ".mat-mdc-chip",
@@ -1480,6 +1559,10 @@ class GoogleFlowWorker:
             "button[aria-label*='Xóa tất cả' i]",
             "flow-prompt-box button[aria-label*='Clear' i]",
             "flow-prompt-box button[aria-label*='Xóa' i]",
+            "flow-creative-agent-prompt-box button[aria-label*='Clear' i]",
+            "flow-creative-agent-prompt-box button[aria-label*='Xóa' i]",
+            "flow-base-prompt-box button[aria-label*='Clear' i]",
+            "flow-base-prompt-box button[aria-label*='Xóa' i]",
         ]
 
         for c_sel in clear_btn_selectors:
@@ -1494,6 +1577,14 @@ class GoogleFlowWorker:
 
         # Direct close/remove buttons inside prompt box
         direct_close_selectors = [
+            "flow-creative-agent-prompt-box button[aria-label*='Remove' i]",
+            "flow-creative-agent-prompt-box button[aria-label*='Delete' i]",
+            "flow-creative-agent-prompt-box button[aria-label*='Xóa' i]",
+            "flow-creative-agent-prompt-box button[aria-label*='Close' i]",
+            "flow-base-prompt-box button[aria-label*='Remove' i]",
+            "flow-base-prompt-box button[aria-label*='Delete' i]",
+            "flow-base-prompt-box button[aria-label*='Xóa' i]",
+            "flow-base-prompt-box button[aria-label*='Close' i]",
             "flow-prompt-box button[aria-label*='Remove' i]",
             "flow-prompt-box button[aria-label*='Delete' i]",
             "flow-prompt-box button[aria-label*='Xóa' i]",
@@ -1622,8 +1713,70 @@ class GoogleFlowWorker:
             if url_key:
                 self._active_reference_keys.add(url_key)
 
+    async def _remember_attached_reference_keys(self) -> None:
+        """Capture identities from reference chips in the current prompt composer."""
+        try:
+            identities = await self.page.evaluate(r'''() => {
+                const roots = Array.from(document.querySelectorAll(
+                    'flow-creative-agent-prompt-box, flow-base-prompt-box, flow-prompt-box'
+                ));
+                const records = [];
+                for (const root of roots) {
+                    const chips = root.querySelectorAll(
+                        'flow-image-ingredient-chip, flow-ingredient-chip, flow-prompt-attachment, ' +
+                        'flow-attachment, flow-reference-chip, [data-testid*="attachment" i], ' +
+                        '[data-testid*="ingredient" i], [data-testid*="reference" i]'
+                    );
+                    for (const chip of chips) {
+                        const urls = Array.from(chip.querySelectorAll(
+                            'img[src], img[srcset], [data-image-url], [data-media-url], [data-download-url]'
+                        )).flatMap((item) => {
+                            const values = [
+                                item.currentSrc || '', item.src || '',
+                                item.getAttribute('data-image-url') || '',
+                                item.getAttribute('data-media-url') || '',
+                                item.getAttribute('data-download-url') || ''
+                            ];
+                            const srcset = item.getAttribute('srcset') || '';
+                            for (const part of srcset.split(',')) {
+                                values.push(part.trim().split(/\s+/)[0]);
+                            }
+                            return values.filter(Boolean);
+                        });
+                        const assetId = chip.getAttribute('data-media-id') ||
+                            chip.getAttribute('data-asset-id') || chip.getAttribute('data-id') || '';
+                        records.push({assetId, urls});
+                    }
+                }
+                return records;
+            }''')
+        except Exception:
+            return
+        if not isinstance(identities, list):
+            return
+        for identity in identities:
+            if not isinstance(identity, dict):
+                continue
+            asset_id = str(identity.get("assetId") or "").strip().casefold()
+            if asset_id:
+                self._active_reference_keys.add(f"asset:{asset_id}")
+            for url in identity.get("urls") or []:
+                url_key = self._media_key(str(url or ""))
+                if url_key:
+                    self._active_reference_keys.add(url_key)
+
     async def _has_ingredient_chip(self) -> bool:
         selectors = [
+            "flow-creative-agent-prompt-box flow-image-ingredient-chip",
+            "flow-creative-agent-prompt-box flow-ingredient-chip",
+            "flow-creative-agent-prompt-box flow-prompt-attachment",
+            "flow-creative-agent-prompt-box [data-testid*='attachment' i]",
+            "flow-creative-agent-prompt-box img:not([alt*='profile' i]):not([alt*='account' i]):not([alt*='avatar' i])",
+            "flow-base-prompt-box flow-image-ingredient-chip",
+            "flow-base-prompt-box flow-ingredient-chip",
+            "flow-base-prompt-box flow-prompt-attachment",
+            "flow-base-prompt-box [data-testid*='attachment' i]",
+            "flow-base-prompt-box img:not([alt*='profile' i]):not([alt*='account' i]):not([alt*='avatar' i])",
             "flow-prompt-box flow-ingredient-chip",
             "flow-prompt-box flow-prompt-attachment",
             "flow-prompt-box flow-attachment",
@@ -1644,6 +1797,7 @@ class GoogleFlowWorker:
             "flow-prompt-box button[aria-label*='Xóa' i]",
             "flow-prompt-box mat-icon:has-text('close')",
             "flow-ingredient-chip",
+            "flow-image-ingredient-chip",
             ".ingredient-chip",
             ".reference-chip",
             "[data-testid*='ingredient-chip']",
@@ -1658,7 +1812,9 @@ class GoogleFlowWorker:
 
         try:
             return bool(await self.page.evaluate(r'''() => {
-                const promptBox = document.querySelector('flow-prompt-box');
+                const promptBox = document.querySelector(
+                    'flow-creative-agent-prompt-box, flow-base-prompt-box, flow-prompt-box'
+                );
                 if (!promptBox) return false;
                 const images = promptBox.querySelectorAll('img');
                 for (const img of images) {
@@ -1670,7 +1826,7 @@ class GoogleFlowWorker:
                     }
                 }
                 const chipNodes = promptBox.querySelectorAll(
-                    'flow-ingredient-chip, flow-attachment, flow-prompt-attachment, ' +
+                    'flow-image-ingredient-chip, flow-ingredient-chip, flow-attachment, flow-prompt-attachment, ' +
                     '.ingredient-chip, .reference-chip, .attachment-chip, mat-chip, .mat-mdc-chip, ' +
                     '[data-testid*="attachment" i], [data-testid*="reference" i]'
                 );
@@ -1691,7 +1847,12 @@ class GoogleFlowWorker:
         """Attach an existing upload by exact filename using the searchable picker."""
         await self.dismiss_blocking_dialogs()
         add_btn = self.page.locator(
-            "button.add-menu-trigger, button[aria-label*='Add ingredients' i]"
+            "flow-creative-agent-prompt-box button[aria-label*='Add ingredients' i], "
+            "flow-creative-agent-prompt-box button[aria-label*='Thêm thành phần' i], "
+            "flow-base-prompt-box button[aria-label*='Add ingredients' i], "
+            "flow-base-prompt-box button[aria-label*='Thêm thành phần' i], "
+            "button.add-menu-trigger, button[aria-label*='Add ingredients' i], "
+            "button[aria-label*='Thêm thành phần' i]"
         ).first
         try:
             if not await add_btn.is_visible(timeout=4000):
@@ -1841,6 +2002,7 @@ class GoogleFlowWorker:
         for _ in range(REFERENCE_ATTACH_RETRY_COUNT):
             result, source = await self._try_attach_existing_reference(filename)
             if result == REFERENCE_RESULT_ATTACHED:
+                await self._remember_attached_reference_keys()
                 cache.add(filename_key)
                 self._log_reference_event(source, filename)
                 return
@@ -1882,10 +2044,12 @@ class GoogleFlowWorker:
 
         for _ in range(REFERENCE_POST_UPLOAD_RETRY_COUNT):
             if await self._has_ingredient_chip():
+                await self._remember_attached_reference_keys()
                 self._log_reference_event("uploaded", filename, detail="attached_by_upload")
                 return
             result, _ = await self._try_attach_existing_reference(filename)
             if result == REFERENCE_RESULT_ATTACHED:
+                await self._remember_attached_reference_keys()
                 self._log_reference_event("uploaded", filename, detail="attached_after_upload")
                 return
             await asyncio.sleep(1)
@@ -1922,7 +2086,14 @@ class GoogleFlowWorker:
             await self._sync_required_scene_reference(target_ref, reference_path)
             return
 
-        add_btn = self.page.locator("button.add-menu-trigger, button[aria-label*='Add ingredients' i]").first
+        add_btn = self.page.locator(
+            "flow-creative-agent-prompt-box button[aria-label*='Add ingredients' i], "
+            "flow-creative-agent-prompt-box button[aria-label*='Thêm thành phần' i], "
+            "flow-base-prompt-box button[aria-label*='Add ingredients' i], "
+            "flow-base-prompt-box button[aria-label*='Thêm thành phần' i], "
+            "button.add-menu-trigger, button[aria-label*='Add ingredients' i], "
+            "button[aria-label*='Thêm thành phần' i]"
+        ).first
         if not await add_btn.is_visible(timeout=4000):
             logger.warning("Add ingredients button not visible; continuing without attached chip.")
             return
@@ -2265,7 +2436,15 @@ class GoogleFlowWorker:
         submitted_at: float,
         timeout_seconds: float,
     ) -> str:
-        hard_deadline = submitted_at + timeout_seconds
+        agent_timeout = (
+            media_type == "image" and self._agent_interface_detected
+        )
+        effective_timeout = (
+            max(timeout_seconds, AGENT_IMAGE_GENERATION_TIMEOUT_SECONDS)
+            if agent_timeout
+            else timeout_seconds
+        )
+        hard_deadline = submitted_at + effective_timeout
         start_deadline = submitted_at + GENERATION_START_TIMEOUT_SECONDS
         generation_started = False
         idle_since: float | None = None
@@ -2376,11 +2555,17 @@ class GoogleFlowWorker:
                 if source:
                     self._log_generation_event(media_type, "completed", submitted_at)
                     return source
-                await self._raise_invalid_image_output(media_type, submitted_at)
+                if not is_generating:
+                    await self._raise_invalid_image_output(media_type, submitted_at)
                 await self._save_debug_screenshot(f"{media_type}_hard_timeout")
                 self._log_generation_event(media_type, "hard_timeout", submitted_at)
+                if agent_timeout and is_generating:
+                    raise FlowAgentStalledError(
+                        "Google Flow Agent vẫn đang xử lý nhưng không trả về "
+                        f"{media_type} mới sau {effective_timeout:.0f} giây."
+                    )
                 raise FlowGenerationTimeout(
-                    f"Google Flow không trả về {media_type} mới sau {timeout_seconds:.0f} giây."
+                    f"Google Flow không trả về {media_type} mới sau {effective_timeout:.0f} giây."
                 )
 
     async def generate_scene(

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from PIL import Image
 
 from auto_yt.services.google_flow_worker import (
+    FlowAgentStalledError,
     FlowGenerationStartError,
     FlowInvalidOutputError,
     FlowModeError,
@@ -44,6 +45,23 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
         worker = GoogleFlowWorker(page)
         ed = await worker.wait_for_editor(timeout=5.0)
         self.assertIsNotNone(ed)
+
+    async def test_wait_for_editor_prefers_new_agent_composer(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/123"
+        agent_editor = MagicMock()
+        agent_editor.first.is_visible = AsyncMock(return_value=True)
+        page.locator.return_value = agent_editor
+
+        worker = GoogleFlowWorker(page)
+        editor = await worker.wait_for_editor(timeout=1.0)
+
+        self.assertIs(editor, agent_editor.first)
+        self.assertTrue(worker._agent_interface_detected)
+        selectors = [call.args[0] for call in page.locator.call_args_list]
+        self.assertTrue(
+            any("flow-creative-agent-prompt-box" in selector for selector in selectors)
+        )
 
     async def test_ensure_project_reuses_current_project(self):
         page = MagicMock()
@@ -643,6 +661,36 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, "blob:https://flow.google/video-new")
 
+    async def test_active_agent_timeout_is_not_reported_as_invalid_reference(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        worker._agent_interface_detected = True
+        worker._last_invalid_image_size = (433, 461)
+
+        with (
+            patch.object(worker, "_resolve_new_media_source", AsyncMock(return_value="")),
+            patch.object(worker, "_read_generation_activity", AsyncMock(return_value=True)),
+            patch.object(worker, "_get_existing_error_texts", AsyncMock(return_value=set())),
+            patch.object(worker, "_get_snackbar_error", AsyncMock(return_value="")),
+            patch.object(worker, "handle_confirmation_prompts", AsyncMock()),
+            patch.object(worker, "_save_debug_screenshot", AsyncMock()),
+            patch.object(worker, "_raise_invalid_image_output", AsyncMock()) as invalid_output,
+            patch("auto_yt.services.google_flow_worker.AGENT_IMAGE_GENERATION_TIMEOUT_SECONDS", 0.0),
+            patch("auto_yt.services.google_flow_worker.GENERATION_POLL_SECONDS", 0.0),
+            patch("auto_yt.services.google_flow_worker.asyncio.sleep", AsyncMock()),
+        ):
+            with self.assertRaises(FlowAgentStalledError):
+                await worker._wait_for_new_media(
+                    media_type="image",
+                    baseline_keys=set(),
+                    initial_error_texts=set(),
+                    submitted_at=0.0,
+                    timeout_seconds=0.0,
+                )
+
+        invalid_output.assert_not_awaited()
+
     async def test_collect_image_candidates_keeps_result_panel_assets(self):
         page = MagicMock()
         page.url = "https://flow.google.com/project/project-one"
@@ -662,6 +710,21 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
         candidates = await worker._collect_image_candidates()
 
         self.assertEqual(candidates[0]["source"], "result_panel")
+
+    async def test_image_collector_uses_new_chat_scope_without_generic_google_links(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        page.evaluate = AsyncMock(return_value=[])
+        worker = GoogleFlowWorker(page)
+
+        await worker._collect_image_candidates()
+
+        script = page.evaluate.await_args.args[0]
+        self.assertIn("flow-chat-ingredient-row", script)
+        self.assertIn(".message-row.user-row", script)
+        self.assertIn("flow-chat-view", script)
+        self.assertNotIn("lower.includes('google.com')", script)
+        self.assertNotIn("[data-download-url], a[href]", script)
 
     async def test_thumbnail_is_opened_to_resolve_full_size_image(self):
         page = MagicMock()
@@ -1575,6 +1638,30 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
         page.locator.side_effect = loc_router
         has_chip = await worker._has_ingredient_chip()
         self.assertTrue(has_chip)
+
+    async def test_new_agent_reference_chip_identity_is_excluded_from_results(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        page.evaluate = AsyncMock(
+            return_value=[
+                {
+                    "assetId": "reference-asset",
+                    "urls": ["https://flow-content.google/image/reference?size=thumb"],
+                }
+            ]
+        )
+        worker = GoogleFlowWorker(page)
+
+        await worker._remember_attached_reference_keys()
+
+        self.assertIn("asset:reference-asset", worker._active_reference_keys)
+        self.assertIn(
+            "https://flow-content.google/image/reference",
+            worker._active_reference_keys,
+        )
+        script = page.evaluate.await_args.args[0]
+        self.assertIn("flow-image-ingredient-chip", script)
+        self.assertIn("flow-creative-agent-prompt-box", script)
 
     async def test_candidate_matches_active_reference_does_not_exclude_generated_image(self):
         page = MagicMock()

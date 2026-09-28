@@ -211,6 +211,8 @@ def get_browser_service_status() -> dict:
         "pid": pid or None,
         "started_at": str(state.get("started_at") or ""),
         "window_visible": window_visible,
+        "generation_active": bool(state.get("generation_active", False)),
+        "generation_checked_at": str(state.get("generation_checked_at") or ""),
         "message": message,
     }
 
@@ -464,6 +466,54 @@ def _initialize_service_page(context) -> None:
         )
 
 
+def _page_has_active_flow_generation(page) -> bool:
+    if "/project/" not in str(page.url or ""):
+        return False
+    try:
+        result = page.evaluate(
+            r'''() => {
+                const visible = (element) => {
+                    if (!element) return false;
+                    const style = getComputedStyle(element);
+                    const rect = element.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' &&
+                        rect.width > 0 && rect.height > 0;
+                };
+                const stopButtons = Array.from(document.querySelectorAll(
+                    "flow-creative-agent-prompt-box button, flow-base-prompt-box button, " +
+                    "flow-prompt-box button, button[aria-label], [role='button'][aria-label]"
+                ));
+                if (stopButtons.some((button) => {
+                    if (!visible(button)) return false;
+                    const text = String(button.textContent || '').trim().toLowerCase();
+                    const aria = String(button.getAttribute('aria-label') || '').trim().toLowerCase();
+                    return text === 'stop' || text === 'dừng' || aria === 'stop' || aria === 'dừng' ||
+                        aria.includes('stop generation') || aria.includes('dừng tạo');
+                })) return true;
+                return Array.from(document.querySelectorAll(
+                    "flow-chat-thinking-indicator, [aria-busy='true'], [role='progressbar'], " +
+                    "[data-state='generating'], [data-state='processing']"
+                )).some(visible);
+            }'''
+        )
+    except Exception:
+        return False
+    return result is True
+
+
+def _refresh_generation_state(state: dict, context) -> None:
+    persisted_state = _read_json(SERVICE_STATE_PATH)
+    if persisted_state.get("instance_id") == state.get("instance_id"):
+        state["window_visible"] = bool(
+            persisted_state.get("window_visible", state.get("window_visible", False))
+        )
+    state["generation_active"] = any(
+        _page_has_active_flow_generation(page) for page in context.pages
+    )
+    state["generation_checked_at"] = _utc_now()
+    _write_json(SERVICE_STATE_PATH, state)
+
+
 def _stop_requested(instance_id: str) -> bool:
     request = _read_json(SERVICE_STOP_PATH)
     return bool(request) and request.get("instance_id") == instance_id
@@ -530,7 +580,7 @@ def run_browser_service() -> int:
             if not _cdp_is_ready(endpoint):
                 raise RuntimeError("Chromium did not expose its local CDP endpoint.")
             state["ready"] = True
-            _write_json(SERVICE_STATE_PATH, state)
+            _refresh_generation_state(state, context)
             print(f"Google Flow Browser Service ready at {endpoint}", flush=True)
 
             next_health_check = time.monotonic() + SERVICE_HEALTH_CHECK_SECONDS
@@ -542,6 +592,7 @@ def run_browser_service() -> int:
                         raise RuntimeError(
                             "Chromium closed or its CDP endpoint was lost."
                         )
+                    _refresh_generation_state(state, context)
                     next_health_check = (
                         time.monotonic() + SERVICE_HEALTH_CHECK_SECONDS
                     )
