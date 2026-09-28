@@ -556,6 +556,8 @@ def _format_scene_video_prompt(
     *,
     scene_action: str = "",
     style_prompt: str = "",
+    video_style_prompt: str = "",
+    video_prompt_template: str = "",
     video_motion_prompt: str = "",
     video_title: str = "",
     has_start_frame: bool = True,
@@ -583,7 +585,8 @@ def _format_scene_video_prompt(
     action_directive = f"Scene action: {action_clean}." if action_clean else ""
 
     # 3. Clean style prompt without still photo keywords
-    style_clean = (style_prompt or "").split("\n")[0][:180].strip()
+    effective_style = video_style_prompt.strip() if video_style_prompt and video_style_prompt.strip() else (style_prompt or "")
+    style_clean = effective_style.split("\n")[0][:180].strip()
     style_clean = re.sub(
         r"(?i)\b(?:still photograph|photography|35mm photography|photo|film still|raw photo|movie still|still photo)\b",
         "cinematic video",
@@ -608,7 +611,18 @@ def _format_scene_video_prompt(
     else:
         anti_text_directive = "Clean video without any text, letters, watermark, or subtitles."
 
-    full_video_prompt = f"{frame_directive} {action_directive} {style_directive} {motion_directive} {anti_text_directive}"
+    if video_prompt_template and video_prompt_template.strip():
+        custom_video = video_prompt_template.strip()
+        custom_video = (
+            custom_video
+            .replace("{frame_directive}", frame_directive)
+            .replace("{action}", action_clean)
+            .replace("{style}", style_clean)
+            .replace("{motion}", motion_directive)
+        )
+        full_video_prompt = re.sub(r"\s+", " ", custom_video).strip()
+    else:
+        full_video_prompt = f"{frame_directive} {action_directive} {style_directive} {motion_directive} {anti_text_directive}"
     full_video_prompt = re.sub(r"\s+", " ", full_video_prompt).strip()
     return full_video_prompt
 
@@ -1070,7 +1084,8 @@ async def _generate_scene_video_async(
     force_new_project: bool = False,
 ) -> Path:
     settings = settings or {}
-    negative_prompt = str(settings.get("avoid_prompt") or settings.get("negative_prompt") or "")
+    video_neg = str(settings.get("video_negative_prompt") or "").strip()
+    negative_prompt = video_neg if video_neg else str(settings.get("avoid_prompt") or settings.get("negative_prompt") or "")
     fixed_seed = int(_sha256_bytes(str(video_id).encode("utf-8"))[:15], 16)
     cancel_check()
     start_hash = _sha256_file(start_frame_path) if start_frame_path and start_frame_path.is_file() else ""
@@ -1160,6 +1175,8 @@ async def _generate_scene_video_async(
                 scene.get("prompt", ""),
                 scene_action=scene_action,
                 style_prompt=style_str,
+                video_style_prompt=str(settings.get("video_style_prompt") or ""),
+                video_prompt_template=str(settings.get("video_prompt_template") or ""),
                 video_motion_prompt=str(settings.get("video_motion_prompt") or ""),
                 video_title=video_title,
                 has_start_frame=bool(start_frame_path and start_frame_path.is_file()),

@@ -123,6 +123,13 @@ const SCENE_BODY_TAGS = [
   { tag: '{scene_index}', label: '+ {scene_index} (Số thứ tự)' }
 ];
 
+const VIDEO_PROMPT_TAGS = [
+  { tag: '{frame_directive}', label: '+ {frame_directive} (Ảnh gốc)' },
+  { tag: '{action}', label: '+ {action} (Kịch bản)' },
+  { tag: '{style}', label: '+ {style} (Phong cách video)' },
+  { tag: '{motion}', label: '+ {motion} (Chuyển động camera)' }
+];
+
 const DEFAULT_IMAGE_GENERATION_SETTINGS = {
   provider: 'google_flow',
   model: 'nano_banana_pro',
@@ -139,6 +146,9 @@ const DEFAULT_IMAGE_GENERATION_SETTINGS = {
   enable_intro_video: true,
   intro_scene_target_seconds: 8.0,
   intro_crop_watermark: true,
+  video_style_prompt: 'Cinematic documentary film, 35mm motion picture composition, natural atmospheric lighting, realistic textures, balanced color grading, 4k cinematic video footage.',
+  video_negative_prompt: 'still image, static photo, cartoon, anime, 3D CGI render, illustration, deformed hands, distorted anatomy, text, watermark, signature, logo, blurry, low resolution.',
+  video_prompt_template: '{frame_directive} Scene action: {action}. Visual style: {style}. {motion} Clean video without any text, letters, watermark, or subtitles.',
   video_motion_prompt: 'Motion: smooth cinematic camera movement, natural realistic motion, 4k 24fps high-fidelity video.',
   scene_0_prompt_template: 'A cinematic movie still: {style}, opening scene hook. {reference} Story visual core: {thumbnail_concept}. 16:9 widescreen, photorealistic 8k, authentic documentary realism, clean framing without text.',
   scene_body_prompt_template: 'A still photograph: {style}, scene {scene_index}. {reference} Narrative scene: {action}. 16:9 widescreen still photograph, authentic documentary realism, natural lighting, clean visual without text.',
@@ -1509,10 +1519,10 @@ export default function Settings({
             </div>
           </div>
 
-          {/* Section 1: Image Generation Configuration */}
+          {/* Section 1: AI Image Models Configuration */}
           <div style={{ marginBottom: 18 }}>
             <h4 style={{ margin: '0 0 10px 0', fontSize: '0.95rem', color: '#6ee7b7', display: 'flex', alignItems: 'center', gap: 6 }}>
-              <span>📸</span> 1. Cấu hình Tạo Hình Ảnh (Image Models)
+              <span>📸</span> 1. Cấu hình Tạo Hình Ảnh Phân Cảnh (AI Image Models)
             </h4>
             <div className="production-settings-grid" style={{ marginBottom: 10 }}>
               <label>
@@ -1617,7 +1627,8 @@ export default function Settings({
                     border: '1px solid rgba(255, 255, 255, 0.08)',
                     borderRadius: 8,
                     padding: '8px 12px',
-                    fontSize: '0.82rem'
+                    fontSize: '0.82rem',
+                    marginBottom: 12
                   }}
                 >
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 3 }}>
@@ -1630,6 +1641,183 @@ export default function Settings({
                 </div>
               );
             })()}
+
+            {/* Image Style Prompt */}
+            <div style={{ marginTop: 12 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                <label className="production-field-label" style={{ margin: 0, fontWeight: 600, color: '#f1f5f9' }}>
+                  🎨 Style Prompt Hình Ảnh (Phong cách chung các Scene tĩnh)
+                </label>
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  style={{ padding: '2px 8px', fontSize: '0.78rem' }}
+                  onClick={() => handlePromptSettingChange(
+                    'image_generation_settings',
+                    'style_prompt',
+                    DEFAULT_IMAGE_GENERATION_SETTINGS.style_prompt
+                  )}
+                  disabled={activeVersionLocked}
+                  title="Khôi phục Style prompt ảnh mặc định"
+                >
+                  🔄 Mặc định
+                </button>
+              </div>
+              <textarea
+                className="prompt-textarea"
+                rows={3}
+                value={currentImageGeneration.style_prompt}
+                onChange={event => handlePromptSettingChange(
+                  'image_generation_settings', 'style_prompt', event.target.value
+                )}
+                disabled={activeVersionLocked}
+                placeholder="Phong cách hình ảnh dùng chung cho các scene tĩnh"
+              />
+              <div className="help-text" style={{ marginTop: 4 }}>
+                Định hình phong cách mỹ thuật, ánh sáng, nhiếp ảnh dùng làm giá trị cho biến <code>{'{style}'}</code> trong các prompt tạo ảnh.
+              </div>
+            </div>
+
+            {/* Image Negative Prompt */}
+            <div style={{ marginTop: 12 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                <label className="production-field-label" style={{ margin: 0, fontWeight: 600, color: '#f1f5f9' }}>
+                  🚫 Negative Prompt Hình Ảnh (Tránh tạo trong ảnh tĩnh)
+                </label>
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  style={{ padding: '2px 8px', fontSize: '0.78rem' }}
+                  onClick={() => handlePromptSettingChange(
+                    'image_generation_settings',
+                    'negative_prompt',
+                    DEFAULT_IMAGE_GENERATION_SETTINGS.negative_prompt
+                  )}
+                  disabled={activeVersionLocked}
+                  title="Khôi phục Negative prompt ảnh mặc định"
+                >
+                  🔄 Mặc định
+                </button>
+              </div>
+              <textarea
+                className="prompt-textarea"
+                rows={2}
+                value={currentImageGeneration.negative_prompt}
+                onChange={event => handlePromptSettingChange(
+                  'image_generation_settings', 'negative_prompt', event.target.value
+                )}
+                disabled={activeVersionLocked}
+                placeholder="Các đặc điểm cần loại trừ khi sinh ảnh tĩnh (deformed hands, text, blurry, cartoon...)"
+              />
+            </div>
+
+            {/* Scene 0 Template */}
+            <div style={{ marginTop: 14 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                <label className="production-field-label" style={{ margin: 0, fontWeight: 600, color: '#f1f5f9' }}>
+                  🖼️ Template Cảnh mở đầu (Scene 0 / Hook Image)
+                </label>
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  style={{ padding: '2px 8px', fontSize: '0.78rem' }}
+                  onClick={() => handlePromptSettingChange(
+                    'image_generation_settings',
+                    'scene_0_prompt_template',
+                    DEFAULT_IMAGE_GENERATION_SETTINGS.scene_0_prompt_template
+                  )}
+                  disabled={activeVersionLocked}
+                  title="Khôi phục công thức Scene 0 mặc định"
+                >
+                  🔄 Mặc định
+                </button>
+              </div>
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 6 }}>
+                {SCENE_0_TAGS.map(item => (
+                  <button
+                    key={item.tag}
+                    type="button"
+                    className="btn-secondary"
+                    style={{ padding: '2px 7px', fontSize: '0.76rem', background: 'rgba(96, 165, 250, 0.12)', borderColor: 'rgba(96, 165, 250, 0.3)', color: '#93c5fd' }}
+                    onClick={() => {
+                      const cur = currentImageGeneration.scene_0_prompt_template ?? DEFAULT_IMAGE_GENERATION_SETTINGS.scene_0_prompt_template;
+                      handlePromptSettingChange('image_generation_settings', 'scene_0_prompt_template', cur ? `${cur.trimEnd()} ${item.tag}` : item.tag);
+                    }}
+                    disabled={activeVersionLocked}
+                    title={`Chèn biến ${item.tag}`}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+              <textarea
+                className="prompt-textarea"
+                rows={3}
+                value={currentImageGeneration.scene_0_prompt_template ?? DEFAULT_IMAGE_GENERATION_SETTINGS.scene_0_prompt_template}
+                onChange={event => handlePromptSettingChange(
+                  'image_generation_settings', 'scene_0_prompt_template', event.target.value
+                )}
+                disabled={activeVersionLocked}
+                placeholder="Ví dụ: A cinematic movie still: {style}, opening scene hook. {reference} Story visual core: {thumbnail_concept}. 16:9 widescreen, photorealistic 8k, authentic documentary realism, clean framing without text."
+              />
+              <div className="help-text" style={{ marginTop: 4 }}>
+                Công thức tạo ảnh khung hình đầu tiên của video. Hỗ trợ <code>{'{style}'}</code>, <code>{'{reference}'}</code>, <code>{'{thumbnail_concept}'}</code>, <code>{'{action}'}</code>, <code>{'{scene_index}'}</code>.
+              </div>
+            </div>
+
+            {/* Body Scenes Template */}
+            <div style={{ marginTop: 14 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                <label className="production-field-label" style={{ margin: 0, fontWeight: 600, color: '#f1f5f9' }}>
+                  🖼️ Template Cảnh thân bài & kết thúc (Body Scenes)
+                </label>
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  style={{ padding: '2px 8px', fontSize: '0.78rem' }}
+                  onClick={() => handlePromptSettingChange(
+                    'image_generation_settings',
+                    'scene_body_prompt_template',
+                    DEFAULT_IMAGE_GENERATION_SETTINGS.scene_body_prompt_template
+                  )}
+                  disabled={activeVersionLocked}
+                  title="Khôi phục công thức cảnh thân bài mặc định"
+                >
+                  🔄 Mặc định
+                </button>
+              </div>
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 6 }}>
+                {SCENE_BODY_TAGS.map(item => (
+                  <button
+                    key={item.tag}
+                    type="button"
+                    className="btn-secondary"
+                    style={{ padding: '2px 7px', fontSize: '0.76rem', background: 'rgba(96, 165, 250, 0.12)', borderColor: 'rgba(96, 165, 250, 0.3)', color: '#93c5fd' }}
+                    onClick={() => {
+                      const cur = currentImageGeneration.scene_body_prompt_template ?? DEFAULT_IMAGE_GENERATION_SETTINGS.scene_body_prompt_template;
+                      handlePromptSettingChange('image_generation_settings', 'scene_body_prompt_template', cur ? `${cur.trimEnd()} ${item.tag}` : item.tag);
+                    }}
+                    disabled={activeVersionLocked}
+                    title={`Chèn biến ${item.tag}`}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+              <textarea
+                className="prompt-textarea"
+                rows={3}
+                value={currentImageGeneration.scene_body_prompt_template ?? DEFAULT_IMAGE_GENERATION_SETTINGS.scene_body_prompt_template}
+                onChange={event => handlePromptSettingChange(
+                  'image_generation_settings', 'scene_body_prompt_template', event.target.value
+                )}
+                disabled={activeVersionLocked}
+                placeholder="Ví dụ: A still photograph: {style}, scene {scene_index}. {reference} Narrative scene: {action}. 16:9 widescreen still photograph, authentic documentary realism, natural lighting, clean visual without text."
+              />
+              <div className="help-text" style={{ marginTop: 4 }}>
+                Công thức tạo ảnh cho các phân đoạn nối tiếp suốt video. Hỗ trợ <code>{'{style}'}</code>, <code>{'{reference}'}</code>, <code>{'{action}'}</code>, <code>{'{scene_index}'}</code>.
+              </div>
+            </div>
           </div>
 
           {/* Section 2: AI Video Intro Configuration */}
@@ -1727,7 +1915,8 @@ export default function Settings({
                         border: '1px solid rgba(255, 255, 255, 0.08)',
                         borderRadius: 8,
                         padding: '8px 12px',
-                        fontSize: '0.82rem'
+                        fontSize: '0.82rem',
+                        marginBottom: 12
                       }}
                     >
                       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 3 }}>
@@ -1741,6 +1930,76 @@ export default function Settings({
                   );
                 })()}
 
+                {/* Video Style Prompt */}
+                <div style={{ marginTop: 12 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                    <label className="production-field-label" style={{ margin: 0, fontWeight: 600, color: '#f1f5f9' }}>
+                      🎨 Style Prompt Video (Phong cách Video Độc lập)
+                    </label>
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      style={{ padding: '2px 8px', fontSize: '0.78rem' }}
+                      onClick={() => handlePromptSettingChange(
+                        'image_generation_settings',
+                        'video_style_prompt',
+                        DEFAULT_IMAGE_GENERATION_SETTINGS.video_style_prompt
+                      )}
+                      disabled={activeVersionLocked}
+                      title="Khôi phục Style prompt video mặc định"
+                    >
+                      🔄 Mặc định
+                    </button>
+                  </div>
+                  <textarea
+                    className="prompt-textarea"
+                    rows={3}
+                    value={currentImageGeneration.video_style_prompt ?? DEFAULT_IMAGE_GENERATION_SETTINGS.video_style_prompt}
+                    onChange={event => handlePromptSettingChange(
+                      'image_generation_settings', 'video_style_prompt', event.target.value
+                    )}
+                    disabled={activeVersionLocked}
+                    placeholder="Phong cách điện ảnh, ánh sáng và màu sắc chuyên biệt cho video AI (Veo/Omni)"
+                  />
+                  <div className="help-text" style={{ marginTop: 4 }}>
+                    Phong cách video độc lập hoàn toàn với ảnh tĩnh, định hình chất liệu chuyển động và không gian điện ảnh. Chèn vào biến <code>{'{style}'}</code> của template video.
+                  </div>
+                </div>
+
+                {/* Video Negative Prompt */}
+                <div style={{ marginTop: 12 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                    <label className="production-field-label" style={{ margin: 0, fontWeight: 600, color: '#f1f5f9' }}>
+                      🚫 Negative Prompt Video (Tránh tạo trong Video AI)
+                    </label>
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      style={{ padding: '2px 8px', fontSize: '0.78rem' }}
+                      onClick={() => handlePromptSettingChange(
+                        'image_generation_settings',
+                        'video_negative_prompt',
+                        DEFAULT_IMAGE_GENERATION_SETTINGS.video_negative_prompt
+                      )}
+                      disabled={activeVersionLocked}
+                      title="Khôi phục Negative prompt video mặc định"
+                    >
+                      🔄 Mặc định
+                    </button>
+                  </div>
+                  <textarea
+                    className="prompt-textarea"
+                    rows={2}
+                    value={currentImageGeneration.video_negative_prompt ?? DEFAULT_IMAGE_GENERATION_SETTINGS.video_negative_prompt}
+                    onChange={event => handlePromptSettingChange(
+                      'image_generation_settings', 'video_negative_prompt', event.target.value
+                    )}
+                    disabled={activeVersionLocked}
+                    placeholder="Các đặc điểm cần loại trừ khi sinh video AI (still image, static photo, deformed hands, watermark...)"
+                  />
+                </div>
+
+                {/* Video Motion Directive */}
                 <div style={{ marginTop: 12 }}>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
                     <label style={{ fontWeight: 600, color: '#f1f5f9', fontSize: '0.88rem' }}>
@@ -1791,168 +2050,86 @@ export default function Settings({
                     placeholder="Ví dụ: Motion: smooth cinematic camera movement, natural realistic motion, 4k 24fps high-fidelity video."
                   />
                   <div className="help-text" style={{ marginTop: 4 }}>
-                    Chỉ đạo góc quay camera, chuyển động chủ thể, tốc độ khung hình và watermark khi tạo video mở đầu bằng Veo / Omni Flash. Hỗ trợ placeholder <code>{'{style}'}</code> và <code>{'{action}'}</code>.
+                    Chỉ đạo góc quay camera, zoom, pan, tilt, chuyển động chủ thể và tốc độ khung hình. Chèn vào biến <code>{'{motion}'}</code> của prompt video.
+                  </div>
+                </div>
+
+                {/* Video Prompt Template */}
+                <div style={{ marginTop: 14 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                    <label className="production-field-label" style={{ margin: 0, fontWeight: 600, color: '#f1f5f9' }}>
+                      🎬 Template Tạo Video Tổng Quát (Video Prompt Template)
+                    </label>
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      style={{ padding: '2px 8px', fontSize: '0.78rem' }}
+                      onClick={() => handlePromptSettingChange(
+                        'image_generation_settings',
+                        'video_prompt_template',
+                        DEFAULT_IMAGE_GENERATION_SETTINGS.video_prompt_template
+                      )}
+                      disabled={activeVersionLocked}
+                      title="Khôi phục công thức Video mặc định"
+                    >
+                      🔄 Mặc định
+                    </button>
+                  </div>
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 6 }}>
+                    {VIDEO_PROMPT_TAGS.map(item => (
+                      <button
+                        key={item.tag}
+                        type="button"
+                        className="btn-secondary"
+                        style={{ padding: '2px 7px', fontSize: '0.76rem', background: 'rgba(167, 139, 250, 0.12)', borderColor: 'rgba(167, 139, 250, 0.3)', color: '#c4b5fd' }}
+                        onClick={() => {
+                          const cur = currentImageGeneration.video_prompt_template ?? DEFAULT_IMAGE_GENERATION_SETTINGS.video_prompt_template;
+                          handlePromptSettingChange('image_generation_settings', 'video_prompt_template', cur ? `${cur.trimEnd()} ${item.tag}` : item.tag);
+                        }}
+                        disabled={activeVersionLocked}
+                        title={`Chèn biến ${item.tag}`}
+                      >
+                        {item.label}
+                      </button>
+                    ))}
+                  </div>
+                  <textarea
+                    className="prompt-textarea"
+                    rows={3}
+                    value={currentImageGeneration.video_prompt_template ?? DEFAULT_IMAGE_GENERATION_SETTINGS.video_prompt_template}
+                    onChange={event => handlePromptSettingChange(
+                      'image_generation_settings', 'video_prompt_template', event.target.value
+                    )}
+                    disabled={activeVersionLocked}
+                    placeholder="Ví dụ: {frame_directive} Scene action: {action}. Visual style: {style}. {motion} Clean video without any text, letters, watermark, or subtitles."
+                  />
+                  <div className="help-text" style={{ marginTop: 4 }}>
+                    Công thức tổng hợp gửi cho Google Flow khi tạo video intro. Hỗ trợ các biến <code>{'{frame_directive}'}</code> (chỉ thị gắn ảnh gốc Scene 0), <code>{'{action}'}</code> (hành động cảnh), <code>{'{style}'}</code> (Video Style), <code>{'{motion}'}</code> (Motion directive).
                   </div>
                 </div>
               </>
             )}
           </div>
 
-          <div className="help-text" style={{ marginBottom: 12 }}>
-            Hệ thống ưu tiên biên câu trong khoảng 25–35 giây, rồi dùng ChatGPT qua
-            Playwright để tạo visual bible và prompt riêng cho từng cảnh.
-          </div>
-          <label className="production-field-label">
-            Style prompt
-            <textarea
-              className="prompt-textarea"
-              rows={3}
-              value={currentImageGeneration.style_prompt}
-              onChange={event => handlePromptSettingChange(
-                'image_generation_settings', 'style_prompt', event.target.value
-              )}
-              disabled={activeVersionLocked}
-              placeholder="Phong cách hình ảnh dùng chung cho các scene"
-            />
-          </label>
-          <label className="production-field-label">
-            Negative prompt (Tránh tạo)
-            <textarea
-              className="prompt-textarea"
-              rows={3}
-              value={currentImageGeneration.negative_prompt}
-              onChange={event => handlePromptSettingChange(
-                'image_generation_settings', 'negative_prompt', event.target.value
-              )}
-              disabled={activeVersionLocked}
-              placeholder="Các đặc điểm cần loại trừ"
-            />
-          </label>
-
-          {/* Section 3: Scene Prompt Templates */}
+          {/* Section 3: Live Prompt Preview */}
           <div style={{ marginTop: 18, borderTop: '1px solid rgba(255, 255, 255, 0.08)', paddingTop: 14 }}>
-            <h4 style={{ margin: '0 0 8px 0', fontSize: '0.95rem', color: '#60a5fa', display: 'flex', alignItems: 'center', gap: 6 }}>
-              <span>🎨</span> 3. Cấu hình Prompt Template Từng Phân Cảnh (Scene Prompt Templates)
+            <h4 style={{ margin: '0 0 8px 0', fontSize: '0.95rem', color: '#38bdf8', display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span>🔍</span> 3. Xem trước Prompt Mẫu Thực Tế khi gửi AI (Live Prompt Preview)
             </h4>
-            <div className="help-text" style={{ marginBottom: 12 }}>
-              Tùy biến công thức câu prompt tiếng Anh gửi cho Google Flow khi tạo ảnh cho Cảnh mở đầu (Scene 0) và các Cảnh thân bài. Bấm vào các thẻ biến bên dưới để chèn nhanh vào công thức.
+            <div className="help-text" style={{ marginBottom: 10 }}>
+              Trực quan hóa câu lệnh prompt tiếng Anh hoàn chỉnh được tạo tự động cho AI Image & Video theo cấu hình và template hiện tại.
             </div>
 
-            {/* Scene 0 Template */}
-            <div style={{ marginBottom: 16 }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
-                <label className="production-field-label" style={{ margin: 0, fontWeight: 600, color: '#f1f5f9' }}>
-                  🖼️ Template Cảnh mở đầu (Scene 0 / Hook Image)
-                </label>
-                <button
-                  type="button"
-                  className="btn-secondary"
-                  style={{ padding: '2px 8px', fontSize: '0.78rem' }}
-                  onClick={() => handlePromptSettingChange(
-                    'image_generation_settings',
-                    'scene_0_prompt_template',
-                    DEFAULT_IMAGE_GENERATION_SETTINGS.scene_0_prompt_template
-                  )}
-                  disabled={activeVersionLocked}
-                  title="Khôi phục công thức Scene 0 mặc định"
-                >
-                  🔄 Khôi phục mặc định
-                </button>
-              </div>
-              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 6 }}>
-                {SCENE_0_TAGS.map(item => (
-                  <button
-                    key={item.tag}
-                    type="button"
-                    className="btn-secondary"
-                    style={{ padding: '2px 7px', fontSize: '0.76rem', background: 'rgba(96, 165, 250, 0.12)', borderColor: 'rgba(96, 165, 250, 0.3)', color: '#93c5fd' }}
-                    onClick={() => {
-                      const cur = currentImageGeneration.scene_0_prompt_template ?? DEFAULT_IMAGE_GENERATION_SETTINGS.scene_0_prompt_template;
-                      handlePromptSettingChange('image_generation_settings', 'scene_0_prompt_template', cur ? `${cur.trimEnd()} ${item.tag}` : item.tag);
-                    }}
-                    disabled={activeVersionLocked}
-                    title={`Chèn biến ${item.tag}`}
-                  >
-                    {item.label}
-                  </button>
-                ))}
-              </div>
-              <textarea
-                className="prompt-textarea"
-                rows={3}
-                value={currentImageGeneration.scene_0_prompt_template ?? DEFAULT_IMAGE_GENERATION_SETTINGS.scene_0_prompt_template}
-                onChange={event => handlePromptSettingChange(
-                  'image_generation_settings', 'scene_0_prompt_template', event.target.value
-                )}
-                disabled={activeVersionLocked}
-                placeholder="Ví dụ: A cinematic movie still: {style}, opening scene hook. {reference} Story visual core: {thumbnail_concept}. 16:9 widescreen, photorealistic 8k, authentic documentary realism, clean framing without text."
-              />
-              <div className="help-text" style={{ marginTop: 4 }}>
-                Công thức tạo ảnh khung hình đầu tiên của video. Hỗ trợ <code>{'{style}'}</code>, <code>{'{reference}'}</code>, <code>{'{thumbnail_concept}'}</code>, <code>{'{action}'}</code>, <code>{'{scene_index}'}</code>.
-              </div>
-            </div>
-
-            {/* Body Scenes Template */}
-            <div style={{ marginBottom: 16 }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
-                <label className="production-field-label" style={{ margin: 0, fontWeight: 600, color: '#f1f5f9' }}>
-                  🖼️ Template Cảnh thân bài & kết thúc (Body Scenes)
-                </label>
-                <button
-                  type="button"
-                  className="btn-secondary"
-                  style={{ padding: '2px 8px', fontSize: '0.78rem' }}
-                  onClick={() => handlePromptSettingChange(
-                    'image_generation_settings',
-                    'scene_body_prompt_template',
-                    DEFAULT_IMAGE_GENERATION_SETTINGS.scene_body_prompt_template
-                  )}
-                  disabled={activeVersionLocked}
-                  title="Khôi phục công thức cảnh thân bài mặc định"
-                >
-                  🔄 Khôi phục mặc định
-                </button>
-              </div>
-              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 6 }}>
-                {SCENE_BODY_TAGS.map(item => (
-                  <button
-                    key={item.tag}
-                    type="button"
-                    className="btn-secondary"
-                    style={{ padding: '2px 7px', fontSize: '0.76rem', background: 'rgba(96, 165, 250, 0.12)', borderColor: 'rgba(96, 165, 250, 0.3)', color: '#93c5fd' }}
-                    onClick={() => {
-                      const cur = currentImageGeneration.scene_body_prompt_template ?? DEFAULT_IMAGE_GENERATION_SETTINGS.scene_body_prompt_template;
-                      handlePromptSettingChange('image_generation_settings', 'scene_body_prompt_template', cur ? `${cur.trimEnd()} ${item.tag}` : item.tag);
-                    }}
-                    disabled={activeVersionLocked}
-                    title={`Chèn biến ${item.tag}`}
-                  >
-                    {item.label}
-                  </button>
-                ))}
-              </div>
-              <textarea
-                className="prompt-textarea"
-                rows={3}
-                value={currentImageGeneration.scene_body_prompt_template ?? DEFAULT_IMAGE_GENERATION_SETTINGS.scene_body_prompt_template}
-                onChange={event => handlePromptSettingChange(
-                  'image_generation_settings', 'scene_body_prompt_template', event.target.value
-                )}
-                disabled={activeVersionLocked}
-                placeholder="Ví dụ: A still photograph: {style}, scene {scene_index}. {reference} Narrative scene: {action}. 16:9 widescreen still photograph, authentic documentary realism, natural lighting, clean visual without text."
-              />
-              <div className="help-text" style={{ marginTop: 4 }}>
-                Công thức tạo ảnh cho các phân đoạn nối tiếp suốt video. Hỗ trợ <code>{'{style}'}</code>, <code>{'{reference}'}</code>, <code>{'{action}'}</code>, <code>{'{scene_index}'}</code>.
-              </div>
-            </div>
-
-            {/* Live Prompt Preview Accordion */}
             {(() => {
-              const liveStyle = (currentImageGeneration.style_prompt || DEFAULT_IMAGE_GENERATION_SETTINGS.style_prompt).split('\n')[0].slice(0, 100);
+              const liveImgStyle = (currentImageGeneration.style_prompt || DEFAULT_IMAGE_GENERATION_SETTINGS.style_prompt).split('\n')[0].slice(0, 100);
+              const liveVidStyle = (currentImageGeneration.video_style_prompt || DEFAULT_IMAGE_GENERATION_SETTINGS.video_style_prompt).split('\n')[0].slice(0, 100);
+              const liveMotion = currentImageGeneration.video_motion_prompt || DEFAULT_IMAGE_GENERATION_SETTINGS.video_motion_prompt;
+              const liveVidTemplate = currentImageGeneration.video_prompt_template || DEFAULT_IMAGE_GENERATION_SETTINGS.video_prompt_template;
+
               const previewScene0 = (
                 currentImageGeneration.scene_0_prompt_template || DEFAULT_IMAGE_GENERATION_SETTINGS.scene_0_prompt_template
               )
-                .replace('{style}', liveStyle)
+                .replace('{style}', liveImgStyle)
                 .replace('{reference}', 'Depicting Bác Ba. ')
                 .replace('{thumbnail_concept}', 'Ngôi nhà cổ kính bên rặng tre làng quê thanh bình')
                 .replace('{action}', 'Bác Ba ngồi trầm ngâm bên tách trà sớm')
@@ -1961,51 +2138,45 @@ export default function Settings({
               const previewBody = (
                 currentImageGeneration.scene_body_prompt_template || DEFAULT_IMAGE_GENERATION_SETTINGS.scene_body_prompt_template
               )
-                .replace('{style}', liveStyle)
+                .replace('{style}', liveImgStyle)
                 .replace('{reference}', 'Depicting Bác Ba. ')
                 .replace('{action}', 'Hai người bạn lâu năm trò chuyện bên hiên nhà ấm cúng')
                 .replace('{scene_index}', '2');
 
-              const previewMotionClean = (
-                currentImageGeneration.video_motion_prompt || DEFAULT_IMAGE_GENERATION_SETTINGS.video_motion_prompt
-              )
-                .replace('{style}', liveStyle)
-                .replace('{action}', 'Bác Ba ngồi trầm ngâm bên tách trà sớm');
-
-              const previewVideo = `Generate exactly one 16:9 video, not a still image. Using the attached image as the starting frame, animate it into a cinematic video clip. Scene action: Bác Ba ngồi trầm ngâm bên tách trà sớm. Visual style: ${liveStyle}. ${previewMotionClean}${previewMotionClean.toLowerCase().includes('without text') ? '' : ' Clean video without any text, letters, watermark, or subtitles.'}`;
+              const previewVideo = liveVidTemplate
+                .replace('{frame_directive}', 'Generate exactly one 16:9 video, not a still image. Using the attached image as the starting frame, animate it into a cinematic video clip.')
+                .replace('{action}', 'Bác Ba ngồi trầm ngâm bên tách trà sớm')
+                .replace('{style}', liveVidStyle)
+                .replace('{motion}', liveMotion);
 
               return (
-                <details style={{ marginTop: 10, background: 'rgba(0, 0, 0, 0.25)', border: '1px solid rgba(255, 255, 255, 0.08)', borderRadius: 8, padding: '8px 12px' }}>
-                  <summary style={{ cursor: 'pointer', fontWeight: 600, color: '#38bdf8', fontSize: '0.85rem' }}>
-                    🔍 Xem trước Prompt Mẫu Thực Tế khi gửi AI (Live Preview)
-                  </summary>
-                  <div style={{ marginTop: 8, fontSize: '0.8rem', display: 'flex', flexDirection: 'column', gap: 8 }}>
-                    <div style={{ background: 'rgba(255, 255, 255, 0.03)', padding: '6px 10px', borderRadius: 6 }}>
-                      <strong style={{ color: '#60a5fa' }}>📷 Prompt Ảnh Scene 0 (Hook):</strong>
-                      <div style={{ color: '#94a3b8', marginTop: 2, fontFamily: 'monospace', lineHeight: 1.35 }}>
+                <div style={{ background: 'rgba(0, 0, 0, 0.25)', border: '1px solid rgba(255, 255, 255, 0.08)', borderRadius: 8, padding: '10px 14px' }}>
+                  <div style={{ fontSize: '0.8rem', display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    <div style={{ background: 'rgba(255, 255, 255, 0.03)', padding: '8px 12px', borderRadius: 6, border: '1px solid rgba(96, 165, 250, 0.2)' }}>
+                      <strong style={{ color: '#60a5fa' }}>📷 Prompt Tạo Ảnh Scene 0 (Hook Image):</strong>
+                      <div style={{ color: '#94a3b8', marginTop: 4, fontFamily: 'monospace', lineHeight: 1.4, fontSize: '0.78rem' }}>
                         {previewScene0}
                       </div>
                     </div>
-                    <div style={{ background: 'rgba(255, 255, 255, 0.03)', padding: '6px 10px', borderRadius: 6 }}>
-                      <strong style={{ color: '#60a5fa' }}>📷 Prompt Ảnh Scene 2 (Body):</strong>
-                      <div style={{ color: '#94a3b8', marginTop: 2, fontFamily: 'monospace', lineHeight: 1.35 }}>
+                    <div style={{ background: 'rgba(255, 255, 255, 0.03)', padding: '8px 12px', borderRadius: 6, border: '1px solid rgba(110, 231, 183, 0.2)' }}>
+                      <strong style={{ color: '#6ee7b7' }}>📷 Prompt Tạo Ảnh Scene 2 (Body Scenes):</strong>
+                      <div style={{ color: '#94a3b8', marginTop: 4, fontFamily: 'monospace', lineHeight: 1.4, fontSize: '0.78rem' }}>
                         {previewBody}
                       </div>
                     </div>
                     {currentImageGeneration.enable_intro_video !== false && (
-                      <div style={{ background: 'rgba(255, 255, 255, 0.03)', padding: '6px 10px', borderRadius: 6 }}>
-                        <strong style={{ color: '#a78bfa' }}>🎬 Prompt Video Intro (Veo / Omni):</strong>
-                        <div style={{ color: '#94a3b8', marginTop: 2, fontFamily: 'monospace', lineHeight: 1.35 }}>
+                      <div style={{ background: 'rgba(255, 255, 255, 0.03)', padding: '8px 12px', borderRadius: 6, border: '1px solid rgba(167, 139, 250, 0.2)' }}>
+                        <strong style={{ color: '#a78bfa' }}>🎬 Prompt Tạo Video Intro (Veo / Omni):</strong>
+                        <div style={{ color: '#94a3b8', marginTop: 4, fontFamily: 'monospace', lineHeight: 1.4, fontSize: '0.78rem' }}>
                           {previewVideo}
                         </div>
                       </div>
                     )}
                   </div>
-                </details>
+                </div>
               );
             })()}
-          </div>
-        </div>
+          </div></div>
       )}
 
       <div className="prompt-item" style={{ marginBottom: '20px' }}>

@@ -165,6 +165,9 @@ DEFAULT_IMAGE_GENERATION_SETTINGS = {
     "enable_intro_video": True,
     "intro_scene_target_seconds": 8.0,
     "intro_crop_watermark": True,
+    "video_style_prompt": "Cinematic documentary film, 35mm motion picture composition, natural atmospheric lighting, realistic textures, balanced color grading, 4k cinematic video footage.",
+    "video_negative_prompt": "still image, static photo, cartoon, anime, 3D CGI render, illustration, deformed hands, distorted anatomy, text, watermark, signature, logo, blurry, low resolution.",
+    "video_prompt_template": "{frame_directive} Scene action: {action}. Visual style: {style}. {motion} Clean video without any text, letters, watermark, or subtitles.",
     "video_motion_prompt": "Motion: smooth cinematic camera movement, natural realistic motion, 4k 24fps high-fidelity video.",
     "scene_0_prompt_template": "A cinematic movie still: {style}, opening scene hook. {reference} Story visual core: {thumbnail_concept}. 16:9 widescreen, photorealistic 8k, authentic documentary realism, clean framing without text.",
     "scene_body_prompt_template": "A still photograph: {style}, scene {scene_index}. {reference} Narrative scene: {action}. 16:9 widescreen still photograph, authentic documentary realism, natural lighting, clean visual without text.",
@@ -400,6 +403,18 @@ def normalize_image_generation_settings(value: object) -> dict:
     except (TypeError, ValueError):
         normalized["intro_scene_target_seconds"] = 8.0
     normalized["intro_crop_watermark"] = bool(settings.get("intro_crop_watermark", True))
+    normalized["video_style_prompt"] = str(
+        settings.get("video_style_prompt") if settings.get("video_style_prompt") is not None
+        else DEFAULT_IMAGE_GENERATION_SETTINGS["video_style_prompt"]
+    ).strip()
+    normalized["video_negative_prompt"] = str(
+        settings.get("video_negative_prompt") if settings.get("video_negative_prompt") is not None
+        else DEFAULT_IMAGE_GENERATION_SETTINGS["video_negative_prompt"]
+    ).strip()
+    normalized["video_prompt_template"] = str(
+        settings.get("video_prompt_template") if settings.get("video_prompt_template") is not None
+        else DEFAULT_IMAGE_GENERATION_SETTINGS["video_prompt_template"]
+    ).strip()
     normalized["video_motion_prompt"] = str(
         settings.get("video_motion_prompt") if settings.get("video_motion_prompt") is not None
         else DEFAULT_IMAGE_GENERATION_SETTINGS["video_motion_prompt"]

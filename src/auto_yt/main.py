@@ -362,6 +362,9 @@ class PromptImageGenerationData(BaseModel):
     enable_intro_video: bool = True
     intro_scene_target_seconds: float = 8.0
     intro_crop_watermark: bool = True
+    video_style_prompt: str = Field(default="", max_length=8000)
+    video_negative_prompt: str = Field(default="", max_length=8000)
+    video_prompt_template: str = Field(default="", max_length=8000)
     video_motion_prompt: str = Field(default="", max_length=8000)
     scene_0_prompt_template: str = Field(default="", max_length=8000)
     scene_body_prompt_template: str = Field(default="", max_length=8000)
