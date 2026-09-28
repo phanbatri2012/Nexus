@@ -64,6 +64,46 @@ async def _safe_fill(page, selectors: list[str], text: str, timeout_ms: int = 50
     return False
 
 
+async def _cdp_set_input_files(
+    page, selector: str, file_path: str | Path, *, timeout_ms: int = 15000
+) -> None:
+    """Set file input via CDP protocol directly, bypassing Playwright's 50MB limit.
+
+    When Playwright connects via connect_over_cdp(), it marks the browser as remote
+    and refuses to transfer files >50MB. Since our GPM browser runs locally,
+    we use DOM.setFileInputFiles to pass the local path directly to Chromium.
+    """
+    resolved = str(Path(file_path).resolve())
+
+    el = await page.wait_for_selector(selector, state="attached", timeout=timeout_ms)
+    if not el:
+        raise BrowserUploadError(f"Không tìm thấy element: {selector}")
+
+    cdp = await page.context.new_cdp_session(page)
+    try:
+        # Get the remote object ID from element handle
+        js_handle = await el.evaluate_handle("el => el")
+        remote_object_id = js_handle._impl_obj._remote_object.get("objectId")
+
+        if not remote_object_id:
+            raise BrowserUploadError("Không lấy được remoteObjectId của file input element.")
+
+        # Resolve to DOM backend node
+        node_info = await cdp.send("DOM.describeNode", {
+            "objectId": remote_object_id,
+        })
+        backend_node_id = node_info["node"]["backendNodeId"]
+
+        # Set files directly via CDP — no size limit
+        await cdp.send("DOM.setFileInputFiles", {
+            "files": [resolved],
+            "backendNodeId": backend_node_id,
+        })
+        logger.info("CDP set_input_files OK: %s (%s)", resolved, selector)
+    finally:
+        await cdp.detach()
+
+
 async def upload_video_via_browser(
     *,
     profile_id: str,
@@ -150,17 +190,9 @@ async def upload_video_via_browser(
                     timeout_ms=5000,
                 )
 
-            # 3. Inject Video MP4 File
+            # 3. Inject Video MP4 File (via CDP to bypass Playwright 50MB limit)
             progress("Đang nạp file video MP4...", "uploading_file", 20)
-            file_input = await page.wait_for_selector(
-                "input[type='file']",
-                state="attached",
-                timeout=15000,
-            )
-            if not file_input:
-                raise BrowserUploadError("Không tìm thấy ô chọn file video trên YouTube Studio.")
-
-            await file_input.set_input_files(str(video_path))
+            await _cdp_set_input_files(page, "input[type='file']", video_path, timeout_ms=15000)
             await asyncio.sleep(3.0)
             cancel_check()
 
