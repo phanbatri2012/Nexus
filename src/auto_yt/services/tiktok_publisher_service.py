@@ -81,18 +81,19 @@ async def upload_video_via_gpm(
             raise RuntimeError("Không tìm thấy khung tải file video trên giao diện TikTok Creator Center.")
 
         # Use CDP to set file directly, bypassing Playwright 50MB transfer limit
-        file_el = await file_input.first.element_handle()
         cdp = await page.context.new_cdp_session(page)
         try:
-            js_handle = await file_el.evaluate_handle("el => el")
-            remote_object_id = js_handle._impl_obj._remote_object.get("objectId")
-            if not remote_object_id:
-                raise RuntimeError("Không lấy được remoteObjectId của file input TikTok.")
-            node_info = await cdp.send("DOM.describeNode", {"objectId": remote_object_id})
-            backend_node_id = node_info["node"]["backendNodeId"]
+            doc = await cdp.send("DOM.getDocument")
+            node = await cdp.send("DOM.querySelector", {
+                "nodeId": doc["root"]["nodeId"],
+                "selector": 'input[type="file"]',
+            })
+            node_id = node.get("nodeId", 0)
+            if not node_id:
+                raise RuntimeError("CDP không tìm thấy input[type='file'] trên TikTok.")
             await cdp.send("DOM.setFileInputFiles", {
                 "files": [str(Path(video_path).resolve())],
-                "backendNodeId": backend_node_id,
+                "nodeId": node_id,
             })
         finally:
             await cdp.detach()

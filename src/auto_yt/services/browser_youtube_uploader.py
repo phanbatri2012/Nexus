@@ -72,32 +72,31 @@ async def _cdp_set_input_files(
     When Playwright connects via connect_over_cdp(), it marks the browser as remote
     and refuses to transfer files >50MB. Since our GPM browser runs locally,
     we use DOM.setFileInputFiles to pass the local path directly to Chromium.
+
+    Uses pure CDP calls (no Playwright internals) for version compatibility.
     """
     resolved = str(Path(file_path).resolve())
 
+    # Wait for element to exist in DOM first (via Playwright, just for timing)
     el = await page.wait_for_selector(selector, state="attached", timeout=timeout_ms)
     if not el:
         raise BrowserUploadError(f"Không tìm thấy element: {selector}")
 
     cdp = await page.context.new_cdp_session(page)
     try:
-        # Get the remote object ID from element handle
-        js_handle = await el.evaluate_handle("el => el")
-        remote_object_id = js_handle._impl_obj._remote_object.get("objectId")
-
-        if not remote_object_id:
-            raise BrowserUploadError("Không lấy được remoteObjectId của file input element.")
-
-        # Resolve to DOM backend node
-        node_info = await cdp.send("DOM.describeNode", {
-            "objectId": remote_object_id,
+        # Use pure CDP to find the element — no Playwright internals needed
+        doc = await cdp.send("DOM.getDocument")
+        node = await cdp.send("DOM.querySelector", {
+            "nodeId": doc["root"]["nodeId"],
+            "selector": selector,
         })
-        backend_node_id = node_info["node"]["backendNodeId"]
+        node_id = node.get("nodeId", 0)
+        if not node_id:
+            raise BrowserUploadError(f"CDP không tìm thấy element: {selector}")
 
-        # Set files directly via CDP — no size limit
         await cdp.send("DOM.setFileInputFiles", {
             "files": [resolved],
-            "backendNodeId": backend_node_id,
+            "nodeId": node_id,
         })
         logger.info("CDP set_input_files OK: %s (%s)", resolved, selector)
     finally:
