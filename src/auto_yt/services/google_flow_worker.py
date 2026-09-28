@@ -5,6 +5,7 @@ import io
 import logging
 import re
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -34,6 +35,7 @@ GENERATION_POLL_SECONDS = 1.0
 SUBMISSION_ACK_TIMEOUT_SECONDS = 10.0
 SUBMISSION_ACK_POLL_SECONDS = 0.5
 PROMPT_SUBMIT_READY_TIMEOUT_SECONDS = 5.0
+AGENT_SESSION_RESET_TIMEOUT_SECONDS = 10.0
 MAX_CONSECUTIVE_UI_ERRORS = 3
 IMAGE_BASELINE_STABILIZE_SECONDS = 2.0
 IMAGE_BASELINE_POLL_SECONDS = 0.25
@@ -94,6 +96,10 @@ class FlowModeError(RuntimeError):
 
 class FlowAgentSettingsError(RuntimeError):
     """Raised when required Google Flow Agent settings cannot be saved."""
+
+
+class FlowAgentInteractionError(RuntimeError):
+    """Raised when an interactive Agent response cannot be bypassed safely."""
 
 
 class FlowFrameAttachmentError(RuntimeError):
@@ -482,6 +488,133 @@ class GoogleFlowWorker:
             active = False
         self._agent_interface_detected = bool(active)
         return bool(active)
+
+    async def _latest_unanswered_agent_choice(self) -> dict:
+        """Return an unanswered choice only when it belongs to the latest Agent turn."""
+        try:
+            result = await self.page.evaluate(r'''() => {
+                const visible = (element) => {
+                    if (!element) return false;
+                    const style = getComputedStyle(element);
+                    const rect = element.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' &&
+                        rect.width > 0 && rect.height > 0;
+                };
+                const bubbles = Array.from(document.querySelectorAll('flow-chat-bubble'))
+                    .filter(visible);
+                const latest = bubbles.length ? bubbles[bubbles.length - 1] : null;
+                if (!latest || !latest.querySelector('.agent-bubble')) {
+                    return {present: false, choices: []};
+                }
+                const groups = Array.from(latest.querySelectorAll(
+                    "flow-a2ui-multiple-choice [role='radiogroup'], " +
+                    "[role='radiogroup'].choice-container, .choice-container[role='radiogroup']"
+                )).filter(visible);
+                const group = groups.length ? groups[groups.length - 1] : null;
+                if (!group) return {present: false, choices: []};
+                const radios = Array.from(group.querySelectorAll("[role='radio']"))
+                    .filter(visible);
+                if (!radios.length || radios.some((radio) =>
+                    String(radio.getAttribute('aria-checked') || '').toLowerCase() === 'true'
+                )) {
+                    return {present: false, choices: []};
+                }
+                return {
+                    present: true,
+                    choices: radios.map((radio) =>
+                        String(radio.textContent || '').replace(/\s+/g, ' ').trim()
+                    ).filter(Boolean),
+                };
+            }''')
+        except Exception as exc:
+            raise FlowUiStateError(
+                "Không thể đọc trạng thái lựa chọn của Google Flow Agent."
+            ) from exc
+        if not isinstance(result, dict):
+            return {"present": False, "choices": []}
+        return {
+            "present": bool(result.get("present")),
+            "choices": [
+                str(choice or "").strip()
+                for choice in (result.get("choices") or [])
+                if str(choice or "").strip()
+            ],
+        }
+
+    async def _start_new_agent_session(self) -> None:
+        """Bypass a blocking Agent choice without selecting any offered action."""
+        project_id = self._project_id()
+        project_url = self._project_root_url or self._project_root_from_url(
+            str(self.page.url or "")
+        )
+        selector = (
+            "button[aria-label='Bắt đầu phiên mới' i], "
+            "button[aria-label='Start new session' i]"
+        )
+        try:
+            button = self.page.locator(selector).first
+            if not await button.is_visible(timeout=1000) or not await button.is_enabled(
+                timeout=1000
+            ):
+                raise FlowAgentInteractionError(
+                    "Không tìm thấy nút Bắt đầu phiên mới của Google Flow Agent."
+                )
+            await button.click(timeout=3000)
+            deadline = time.monotonic() + AGENT_SESSION_RESET_TIMEOUT_SECONDS
+            prompt_root = self.page.locator("flow-creative-agent-prompt-box").first
+            while time.monotonic() < deadline:
+                current_project_id = self._project_id()
+                if current_project_id != project_id:
+                    raise FlowAgentInteractionError(
+                        "Google Flow đã đổi project khi mở phiên Agent mới."
+                    )
+                choice = await self._latest_unanswered_agent_choice()
+                if not choice["present"] and await prompt_root.is_visible(timeout=200):
+                    self._agent_interface_detected = True
+                    self._remember_project_root()
+                    logger.info(
+                        "flow_generation state=agent_session_reset project=%s",
+                        project_id,
+                    )
+                    return
+                await asyncio.sleep(0.25)
+        except FlowAgentInteractionError:
+            raise
+        except Exception as exc:
+            raise FlowAgentInteractionError(
+                "Không thể mở phiên Google Flow Agent mới."
+            ) from exc
+
+        if project_url and str(self.page.url or "") != project_url:
+            try:
+                await self.page.goto(project_url, wait_until="domcontentloaded")
+            except Exception:
+                pass
+        raise FlowAgentInteractionError(
+            "Google Flow Agent vẫn chờ lựa chọn sau khi mở phiên mới."
+        )
+
+    async def _ensure_agent_session_ready(self) -> bool:
+        if not await self._is_agent_interface_active():
+            return False
+        choice = await self._latest_unanswered_agent_choice()
+        if not choice["present"]:
+            return False
+        logger.info(
+            "flow_generation state=agent_choice_detected project=%s choices=%d",
+            self._project_id(),
+            len(choice["choices"]),
+        )
+        try:
+            await self._start_new_agent_session()
+        except Exception:
+            await self._save_debug_screenshot("agent_session_reset_failed")
+            logger.error(
+                "flow_generation state=agent_session_reset_failed project=%s",
+                self._project_id(),
+            )
+            raise
+        return True
 
     async def _click_agent_setting_text(
         self,
@@ -1361,62 +1494,37 @@ class GoogleFlowWorker:
                 if (visible(el)) return true;
             }
 
+            // 6. Agent responses stream inside a bubble before their action bar exists.
+            const bubbles = Array.from(document.querySelectorAll('flow-chat-bubble'))
+                .filter(visible);
+            const latestBubble = bubbles.length ? bubbles[bubbles.length - 1] : null;
+            if (latestBubble && latestBubble.querySelector('.agent-bubble') &&
+                !latestBubble.querySelector('flow-chat-message-action-bar')) {
+                return true;
+            }
+
             return false;
         }''')
         return result is True
 
     async def _capture_submission_marker(self) -> str:
-        """Return a stable signature for the visible conversation/result panel."""
+        """Return a signature containing only submitted user turns."""
         result = await self.page.evaluate(r'''() => {
-            const selectors = [
-                'flow-prompt-history',
-                'flow-chat-panel',
-                'flow-chat-view',
-                'flow-chat-scroller',
-                'flow-chat-bubble',
-                '.messages-list',
-                '.message-row.user-row',
-                '.message-row.agent-row',
-                'flow-session-panel',
-                "[data-testid*='prompt-history' i]",
-                "[data-testid*='conversation' i]",
-                "[data-testid*='result-panel' i]",
-                '.sidebar',
-                '.mat-drawer'
-            ];
-            const roots = [];
-            const seen = new Set();
-            for (const selector of selectors) {
-                for (const root of document.querySelectorAll(selector)) {
-                    if (seen.has(root)) continue;
-                    seen.add(root);
-                    const style = getComputedStyle(root);
-                    const rect = root.getBoundingClientRect();
-                    if (style.display === 'none' || style.visibility === 'hidden' ||
-                        rect.width <= 0 || rect.height <= 0) continue;
-                    roots.push(root);
-                }
-            }
             const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-            const parts = [];
-            for (const root of roots) {
-                const clone = root.cloneNode(true);
-                for (const node of clone.querySelectorAll(
-                    'flow-creative-agent-prompt-box, flow-base-prompt-box, flow-prompt-box, ' +
-                    'textarea, input, [contenteditable="true"], script, style'
-                )) node.remove();
-                const text = normalize(clone.textContent).slice(-6000);
-                const ids = Array.from(root.querySelectorAll(
-                    '[data-message-id], [data-turn-id], [data-response-id], ' +
-                    '[data-media-id], [data-asset-id]'
-                )).map((node) =>
-                    node.getAttribute('data-message-id') || node.getAttribute('data-turn-id') ||
-                    node.getAttribute('data-response-id') || node.getAttribute('data-media-id') ||
-                    node.getAttribute('data-asset-id') || ''
-                ).filter(Boolean).slice(-50);
-                parts.push(`${ids.join(',')}|${text}`);
-            }
-            return parts.join('||');
+            const turns = Array.from(document.querySelectorAll(
+                'flow-chat-bubble, .message-row.user-row, [data-message-role="user"]'
+            ));
+            return turns.flatMap((turn) => {
+                const user = turn.matches('.message-row.user-row, [data-message-role="user"]')
+                    ? turn : turn.querySelector('.user-bubble');
+                if (!user) return [];
+                const prompt = user.querySelector('.prompt-text') || user;
+                const text = normalize(prompt.textContent);
+                if (!text) return [];
+                const id = turn.getAttribute('data-message-id') ||
+                    turn.getAttribute('data-turn-id') || user.getAttribute('data-message-id') || '';
+                return [`${id}|${text}`];
+            }).slice(-50).join('||');
         }''')
         return str(result or "")
 
@@ -1424,12 +1532,114 @@ class GoogleFlowWorker:
     def _normalize_prompt_text(value: str) -> str:
         return re.sub(r"\s+", " ", str(value or "")).strip()
 
+    async def _find_completed_image_for_prompt(self, *prompts: str) -> str:
+        """Reuse a late Agent result only when it follows the exact submitted prompt."""
+        expected_prompts = [
+            self._normalize_prompt_text(prompt).casefold()
+            for prompt in prompts
+            if self._normalize_prompt_text(prompt)
+        ]
+        if not expected_prompts:
+            return ""
+        try:
+            candidates = await self.page.evaluate(
+                r'''(expectedPrompts) => {
+                    const normalize = (value) => String(value || '')
+                        .replace(/\s+/g, ' ').trim().toLowerCase();
+                    const bubbles = Array.from(document.querySelectorAll('flow-chat-bubble'));
+                    let promptIndex = -1;
+                    for (let index = bubbles.length - 1; index >= 0; index -= 1) {
+                        const user = bubbles[index].querySelector('.user-bubble');
+                        if (!user) continue;
+                        const prompt = user.querySelector('.prompt-text') || user;
+                        const text = normalize(prompt.textContent);
+                        if (expectedPrompts.some((expected) => text.includes(expected))) {
+                            promptIndex = index;
+                            break;
+                        }
+                    }
+                    if (promptIndex < 0) return [];
+
+                    const found = [];
+                    const seen = new Set();
+                    for (let index = promptIndex + 1; index < bubbles.length; index += 1) {
+                        const bubble = bubbles[index];
+                        if (bubble.querySelector('.user-bubble')) break;
+                        if (!bubble.querySelector('.agent-bubble')) continue;
+                        const nodes = bubble.querySelectorAll(
+                            'img[src], img[srcset], [data-image-url], [data-media-url], ' +
+                            '[data-download-url], a[download][href]'
+                        );
+                        for (const node of nodes) {
+                            const urls = [
+                                node.currentSrc || '', node.src || '', node.href || '',
+                                node.getAttribute('data-image-url') || '',
+                                node.getAttribute('data-media-url') || '',
+                                node.getAttribute('data-download-url') || ''
+                            ];
+                            const srcset = node.getAttribute('srcset') || '';
+                            for (const part of srcset.split(',')) {
+                                urls.push(part.trim().split(/\s+/)[0]);
+                            }
+                            const validUrls = Array.from(new Set(urls.filter((value) => {
+                                const url = String(value || '').trim();
+                                const lower = url.toLowerCase();
+                                return url && !url.startsWith('data:') &&
+                                    (lower.startsWith('blob:') ||
+                                     lower.includes('flow-content.google/image') ||
+                                     lower.includes('googleusercontent.com') ||
+                                     /\.(?:png|jpe?g|webp)(?:\?|$)/i.test(url));
+                            })));
+                            if (!validUrls.length) continue;
+                            const card = node.closest('[data-media-id], [data-asset-id]');
+                            const assetId = card ? (
+                                card.getAttribute('data-media-id') ||
+                                card.getAttribute('data-asset-id') || ''
+                            ) : '';
+                            const key = `${assetId}|${validUrls[0]}`;
+                            if (seen.has(key)) continue;
+                            seen.add(key);
+                            found.push({
+                                src: validUrls[0],
+                                urls: validUrls,
+                                assetId,
+                                labelText: '',
+                                turnRole: 'agent'
+                            });
+                        }
+                    }
+                    return found;
+                }''',
+                expected_prompts,
+            )
+        except Exception as exc:
+            logger.warning(
+                "flow_generation media=image state=late_output_scan_failed project=%s detail=%s",
+                self._project_id(),
+                exc,
+            )
+            return ""
+        if not isinstance(candidates, list):
+            return ""
+        for candidate in reversed(candidates):
+            if not isinstance(candidate, dict) or self._candidate_matches_active_reference(candidate):
+                continue
+            source = await self._validate_image_candidate(candidate)
+            if source:
+                self._remember_generated_image_identity(candidate, source)
+                logger.info(
+                    "flow_generation media=image state=late_output_reused project=%s",
+                    self._project_id(),
+                )
+                return source
+        return ""
+
     async def _read_editor_text(self, editor: Locator) -> str:
         value = await editor.evaluate("el => el.innerText || el.value || ''")
         return str(value or "")
 
     async def _find_prompt_submit_button(self, editor: Locator) -> Locator | None:
-        semantic_selectors = [
+        agent_selectors = [
             "flow-creative-agent-prompt-box flow-generate-icon-button button",
             "flow-creative-agent-prompt-box button[type='submit']",
             "flow-creative-agent-prompt-box button.generate-icon-button",
@@ -1439,6 +1649,8 @@ class GoogleFlowWorker:
             "flow-creative-agent-prompt-box button[aria-label*='gửi' i]",
             "flow-creative-agent-prompt-box button[aria-label*='Bắt đầu tạo' i]",
             "flow-creative-agent-prompt-box button:has-text('arrow_forward')",
+        ]
+        legacy_selectors = [
             "flow-base-prompt-box flow-generate-icon-button button",
             "flow-base-prompt-box button[type='submit']",
             "flow-base-prompt-box button.generate-icon-button",
@@ -1459,6 +1671,10 @@ class GoogleFlowWorker:
             "flow-prompt-box button:has-text('arrow_forward')",
             "flow-prompt-box button:has-text('send')",
         ]
+        semantic_selectors = (
+            agent_selectors if self._agent_interface_detected
+            else [*agent_selectors, *legacy_selectors]
+        )
         ready_deadline = time.monotonic() + PROMPT_SUBMIT_READY_TIMEOUT_SECONDS
         while True:
             for selector in semantic_selectors:
@@ -1524,54 +1740,73 @@ class GoogleFlowWorker:
         media_type: str,
         baseline_keys: set[str],
         baseline_marker: str,
+        prompt: str,
+        baseline_activity: bool = False,
     ) -> tuple[str, str]:
         deadline = time.monotonic() + SUBMISSION_ACK_TIMEOUT_SECONDS
+        consecutive_activity_reads = 0
         while True:
             source = await self._resolve_new_media_source(media_type, baseline_keys)
             if source:
                 return source, "output"
-            if await self._read_generation_activity():
-                return "", "activity"
-            current_marker = await self._capture_submission_marker()
-            if current_marker and current_marker != baseline_marker:
-                return "", "conversation"
+            if await self._read_generation_activity() and not baseline_activity:
+                consecutive_activity_reads += 1
+                if consecutive_activity_reads >= 2:
+                    return "", "activity"
+            else:
+                consecutive_activity_reads = 0
+            if await self._has_prompt_in_conversation(prompt, baseline_marker):
+                return "", "user_turn"
             if time.monotonic() >= deadline:
                 return "", ""
             await asyncio.sleep(SUBMISSION_ACK_POLL_SECONDS)
 
     async def _has_prompt_in_conversation(self, prompt: str, baseline_marker: str) -> bool:
         current_marker = await self._capture_submission_marker()
-        if current_marker and current_marker != baseline_marker:
-            return True
+        if not current_marker or current_marker == baseline_marker:
+            return False
         norm_prompt = self._normalize_prompt_text(prompt)
         if not norm_prompt:
             return False
-        clean_prefix = re.sub(r"(?i)\. avoid:.*", "", norm_prompt).strip()[:50].casefold()
-        if not clean_prefix:
-            clean_prefix = norm_prompt[:50].casefold()
         try:
             return bool(await self.page.evaluate(
-                r'''(sample) => {
-                    const selectors = [
-                        'flow-prompt-history', 'flow-chat-panel', 'flow-session-panel',
-                        'flow-chat-view', 'flow-chat-scroller', 'flow-chat-bubble',
-                        '.messages-list', '.message-row.user-row',
-                        "[data-testid*='prompt-history' i]", "[data-testid*='conversation' i]",
-                        "[data-testid*='result-panel' i]", '.sidebar', '.mat-drawer',
-                        'flow-message-turn', '.chat-message', '[data-message-id]', '[data-turn-id]'
-                    ];
-                    for (const sel of selectors) {
-                        for (const el of document.querySelectorAll(sel)) {
-                            const text = (el.textContent || '').toLowerCase();
-                            if (text.includes(sample)) return true;
-                        }
+                r'''(expectedPrompt) => {
+                    const normalize = (value) => String(value || '')
+                        .replace(/\s+/g, ' ').trim().toLowerCase();
+                    const expected = normalize(expectedPrompt);
+                    const turns = Array.from(document.querySelectorAll(
+                        'flow-chat-bubble, .message-row.user-row, [data-message-role="user"]'
+                    ));
+                    const userTurns = turns.filter((turn) =>
+                        turn.matches('.message-row.user-row, [data-message-role="user"]') ||
+                        Boolean(turn.querySelector('.user-bubble'))
+                    );
+                    const turn = userTurns.length ? userTurns[userTurns.length - 1] : null;
+                    if (!turn) return false;
+                    {
+                        const user = turn.matches('.message-row.user-row, [data-message-role="user"]')
+                            ? turn : turn.querySelector('.user-bubble');
+                        const prompt = user.querySelector('.prompt-text') || user;
+                        return normalize(prompt.textContent).includes(expected);
                     }
-                    return false;
                 }''',
-                clean_prefix,
+                norm_prompt.casefold(),
             ))
         except Exception:
             return False
+
+    async def _fill_prompt_editor(self, editor: Locator, full_prompt: str) -> Locator:
+        try:
+            await editor.click(timeout=2000)
+        except Exception:
+            pass
+        try:
+            await editor.fill(full_prompt)
+        except Exception:
+            await self.page.keyboard.press("Control+A")
+            await self.page.keyboard.press("Backspace")
+            await self.page.keyboard.insert_text(full_prompt)
+        return editor
 
     async def _submit_prompt_and_wait_for_ack(
         self,
@@ -1580,15 +1815,24 @@ class GoogleFlowWorker:
         full_prompt: str,
         media_type: str,
         baseline_keys: set[str],
+        on_agent_session_reset: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[float, str]:
         baseline_marker = await self._capture_submission_marker()
-        attempted_methods: set[str] = set()
+        baseline_activity = await self._read_generation_activity()
+        agent_interface = await self._is_agent_interface_active()
+        attempted_methods: list[str] = []
 
         for attempt in range(1, 3):
+            if await self._ensure_agent_session_ready():
+                if on_agent_session_reset is not None:
+                    await on_agent_session_reset()
+                editor = await self.wait_for_editor(timeout=10.0)
+                await self._fill_prompt_editor(editor, full_prompt)
+
             button = await self._find_prompt_submit_button(editor)
-            if button is not None and "button" not in attempted_methods:
+            if button is not None and (agent_interface or attempt == 1):
                 method = "button"
-                attempted_methods.add(method)
+                attempted_methods.append(method)
                 await self.dismiss_blocking_dialogs()
                 try:
                     await button.click(timeout=3000)
@@ -1617,9 +1861,9 @@ class GoogleFlowWorker:
                         await self.page.keyboard.press("Control+A")
                         await self.page.keyboard.insert_text(full_prompt)
                     continue
-            elif "enter" not in attempted_methods:
+            elif not agent_interface and "enter" not in attempted_methods:
                 method = "enter"
-                attempted_methods.add(method)
+                attempted_methods.append(method)
                 try:
                     focus_result = editor.focus()
                     if asyncio.iscoroutine(focus_result):
@@ -1642,11 +1886,13 @@ class GoogleFlowWorker:
                 media_type=media_type,
                 baseline_keys=baseline_keys,
                 baseline_marker=baseline_marker,
+                prompt=full_prompt,
+                baseline_activity=baseline_activity,
             )
             if reason:
                 self._log_generation_event(
                     media_type,
-                    "submit_acknowledged",
+                    "submission_ack_strong",
                     attempted_at,
                     detail=f"attempt={attempt} method={method} reason={reason}",
                 )
@@ -1661,7 +1907,7 @@ class GoogleFlowWorker:
             if await self._has_prompt_in_conversation(full_prompt, baseline_marker):
                 self._log_generation_event(
                     media_type,
-                    "submit_acknowledged",
+                    "submission_ack_strong",
                     attempted_at,
                     detail=f"attempt={attempt} method={method} reason=conversation_verified",
                 )
@@ -1683,46 +1929,30 @@ class GoogleFlowWorker:
                     attempt,
                     method,
                 )
-                if attempt < 2:
-                    await self.dismiss_blocking_dialogs()
-                    try:
-                        await editor.click(timeout=2000)
-                    except Exception:
-                        pass
-                    await self.page.keyboard.press("Control+A")
-                    await self.page.keyboard.press("Backspace")
-                    try:
-                        await editor.fill(full_prompt)
-                    except Exception:
-                        await self.page.keyboard.insert_text(full_prompt)
-                    await asyncio.sleep(0.5)
-                    continue
-                else:
-                    break
-
-            if editor_text != self._normalize_prompt_text(full_prompt):
-                try:
-                    await editor.fill(full_prompt)
-                except Exception:
-                    await editor.click(timeout=2000)
-                    await self.page.keyboard.press("Control+A")
-                    await self.page.keyboard.insert_text(full_prompt)
             if attempt < 2:
                 logger.info(
-                    "flow_generation media=%s state=submit_fallback project=%s "
-                    "attempt=%d previous_method=%s",
+                    "flow_generation media=%s state=submit_retry project=%s "
+                    "attempt=%d previous_method=%s editor_empty=%s",
                     media_type,
                     self._project_id(),
                     attempt + 1,
                     method,
+                    not bool(editor_text),
                 )
+                if await self._ensure_agent_session_ready():
+                    if on_agent_session_reset is not None:
+                        await on_agent_session_reset()
+                    editor = await self.wait_for_editor(timeout=10.0)
+                await self.dismiss_blocking_dialogs()
+                await self._fill_prompt_editor(editor, full_prompt)
+                await asyncio.sleep(0.5)
 
         await self._save_debug_screenshot(f"{media_type}_submit_failed")
         logger.error(
-            "flow_generation media=%s state=submit_failed project=%s methods=%s",
+            "flow_generation media=%s state=submission_failed project=%s methods=%s",
             media_type,
             self._project_id(),
-            ",".join(sorted(attempted_methods)),
+            ",".join(attempted_methods),
         )
         raise FlowSubmissionError(
             f"Google Flow không tiếp nhận prompt tạo {media_type} sau "
@@ -3287,6 +3517,11 @@ class GoogleFlowWorker:
             try:
                 source = await self._resolve_new_media_source(media_type, baseline_keys)
                 is_generating = await self._read_generation_activity()
+                agent_choice = (
+                    await self._latest_unanswered_agent_choice()
+                    if self._agent_interface_detected
+                    else {"present": False, "choices": []}
+                )
                 consecutive_ui_errors = 0
             except Exception as exc:
                 consecutive_ui_errors += 1
@@ -3308,6 +3543,19 @@ class GoogleFlowWorker:
             if source:
                 self._log_generation_event(media_type, "completed", submitted_at)
                 return source
+
+            if agent_choice["present"]:
+                await self._save_debug_screenshot(f"{media_type}_agent_choice")
+                self._log_generation_event(
+                    media_type,
+                    "agent_choice_detected",
+                    submitted_at,
+                    detail=f"choices={len(agent_choice['choices'])}",
+                )
+                raise FlowAgentInteractionError(
+                    "Google Flow Agent đã dừng để hỏi lựa chọn thay vì tạo "
+                    f"{media_type}. Hãy chạy tiếp để tool mở phiên mới tại checkpoint này."
+                )
 
             current_errors = await self._get_existing_error_texts()
             new_errors = [
@@ -3402,6 +3650,9 @@ class GoogleFlowWorker:
         avoid_prompt: str,
         reference_ids: list[str],
         reference_paths: dict[str, str] | None = None,
+        *,
+        scene_index: int | None = None,
+        scene_count: int | None = None,
     ) -> str:
         self._set_active_reference_filenames(reference_ids, reference_paths)
         self._reset_image_candidate_state()
@@ -3412,6 +3663,8 @@ class GoogleFlowWorker:
                 avoid_prompt,
                 reference_ids,
                 reference_paths,
+                scene_index=scene_index,
+                scene_count=scene_count,
             )
         finally:
             if self._is_asset_edit_url(str(self.page.url or "")):
@@ -3423,17 +3676,14 @@ class GoogleFlowWorker:
         avoid_prompt: str,
         reference_ids: list[str],
         reference_paths: dict[str, str] | None = None,
+        *,
+        scene_index: int | None = None,
+        scene_count: int | None = None,
     ) -> str:
         # Clean any URL / bracket tags from prompt
         clean_prompt = re.sub(r"\[IMAGE_URL:[^\]]*\]", "", prompt)
         clean_prompt = re.sub(r"https?://\S+", "", clean_prompt)
         clean_prompt = re.sub(r"/api/thumbnails/\S+", "", clean_prompt).strip()
-
-        # References must be visible before the baseline is captured so they can
-        # never be mistaken for the result of the next prompt.
-        await self.sync_reference_ingredients(reference_ids, reference_paths)
-        baseline_keys = await self._capture_stable_image_baseline()
-        initial_error_texts = await self._get_existing_error_texts()
 
         strict_avoid = "text, letters, words, typography, watermark, logo, headline, caption, subtitle, poster text, overlay, title banner"
         if avoid_prompt and avoid_prompt.strip():
@@ -3441,7 +3691,32 @@ class GoogleFlowWorker:
         else:
             combined_avoid = strict_avoid
 
-        full_prompt = f"{clean_prompt}. Avoid: {combined_avoid}"
+        legacy_full_prompt = f"{clean_prompt}. Avoid: {combined_avoid}"
+        scene_instruction = ""
+        if scene_index is not None and scene_count is not None and scene_count > 0:
+            scene_number = max(0, int(scene_index)) + 1
+            scene_instruction = (
+                f"Generate exactly one 16:9 still image for Scene {scene_number}/{int(scene_count)}. "
+                "Do not summarize the sequence, do not ask follow-up questions, do not present "
+                "choices, do not organize assets, do not write a script, and do not animate. "
+                "Return only the requested image. "
+            )
+        full_prompt = f"{scene_instruction}{legacy_full_prompt}"
+
+        late_source = await self._find_completed_image_for_prompt(
+            full_prompt,
+            legacy_full_prompt,
+        )
+        if late_source:
+            return late_source
+
+        await self._ensure_agent_session_ready()
+
+        # References must be visible before the baseline is captured so they can
+        # never be mistaken for the result of the next prompt.
+        await self.sync_reference_ingredients(reference_ids, reference_paths)
+        baseline_keys = await self._capture_stable_image_baseline()
+        initial_error_texts = await self._get_existing_error_texts()
 
         # Locate prompt editor
         editor = await self.wait_for_editor(timeout=25.0)
@@ -3491,11 +3766,15 @@ class GoogleFlowWorker:
 
         await asyncio.sleep(0.5)
 
+        async def restore_references_after_session_reset() -> None:
+            await self.sync_reference_ingredients(reference_ids, reference_paths)
+
         submitted_at, immediate_source = await self._submit_prompt_and_wait_for_ack(
             editor=editor,
             full_prompt=full_prompt,
             media_type="image",
             baseline_keys=baseline_keys,
+            on_agent_session_reset=restore_references_after_session_reset,
         )
         if immediate_source:
             self._log_generation_event("image", "completed", submitted_at)
@@ -3786,8 +4065,10 @@ class GoogleFlowWorker:
         if not end_frame_path or not Path(end_frame_path).is_file():
             raise FlowFrameAttachmentError("Video end frame không tồn tại.")
 
+        await self._ensure_agent_session_ready()
         editor = await self.wait_for_editor(timeout=25.0)
         agent_interface = await self._is_agent_interface_active()
+        restore_agent_video_frames = None
         if agent_interface:
             await self.ensure_agent_video_settings(video_settings)
             await self.sync_agent_video_frames(
@@ -3795,6 +4076,16 @@ class GoogleFlowWorker:
                 Path(end_frame_path),
                 scene_index=scene_index,
             )
+
+            async def restore_agent_video_frames_after_session_reset() -> None:
+                await self.ensure_agent_video_settings(video_settings)
+                await self.sync_agent_video_frames(
+                    Path(start_frame_path),
+                    Path(end_frame_path),
+                    scene_index=scene_index,
+                )
+
+            restore_agent_video_frames = restore_agent_video_frames_after_session_reset
             editor = await self.wait_for_editor(timeout=25.0)
         else:
             # Legacy Flow keeps character ingredients separate from dedicated
@@ -3852,6 +4143,7 @@ class GoogleFlowWorker:
             full_prompt=full_prompt,
             media_type="video",
             baseline_keys=baseline_keys,
+            on_agent_session_reset=restore_agent_video_frames,
         )
         logger.info(
             "flow_generation media=video state=video_submitted project=%s scene=%s",

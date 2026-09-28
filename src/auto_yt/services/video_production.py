@@ -822,6 +822,8 @@ async def _generate_scene_image_async(
                     negative_prompt,
                     refs,
                     reference_paths,
+                    scene_index=int(scene.get("index", 0)),
+                    scene_count=scene_count,
                 )
             except FlowGenerationError as first_error:
                 logger.warning(
@@ -856,6 +858,8 @@ async def _generate_scene_image_async(
                     negative_prompt,
                     refs,
                     reference_paths,
+                    scene_index=int(scene.get("index", 0)),
+                    scene_count=scene_count,
                 )
 
             await worker.download_image(asset_url, str(target))
@@ -890,6 +894,21 @@ async def _generate_scene_image_async(
                 "Tạo ảnh trùng hệt cảnh trước; dừng để tránh video lặp ảnh."
             )
     except Exception as exc:
+        failure_stage_by_error = {
+            "FlowAgentInteractionError": "agent_interaction",
+            "FlowSubmissionError": "submit",
+            "FlowGenerationStartError": "generation_start",
+            "FlowGenerationTimeout": "generation_timeout",
+            "FlowAgentStalledError": "generation_timeout",
+            "FlowResultMissingError": "result_missing",
+            "FlowInvalidOutputError": "invalid_output",
+            "ReferenceAttachmentError": "reference",
+            "FlowUiStateError": "ui_state",
+        }
+        failure_stage = failure_stage_by_error.get(
+            type(exc).__name__,
+            "image_generation",
+        )
         try:
             target.unlink(missing_ok=True)
         except Exception:
@@ -904,6 +923,7 @@ async def _generate_scene_image_async(
             metadata={
                 **scene,
                 "error": str(exc),
+                "failure_stage": failure_stage,
                 "generation_attempt": generation_attempt,
                 "reference_id": reference_id,
                 "reference_hash": reference_hash,
@@ -1206,6 +1226,7 @@ async def _generate_scene_video_async(
             raise RuntimeError(f"Video tạo từ Google Flow Veo không hợp lệ hoặc quá nhỏ: {target}")
     except Exception as exc:
         failure_stage_by_error = {
+            "FlowAgentInteractionError": "agent_interaction",
             "FlowAgentSettingsError": "agent_settings",
             "FlowFrameAttachmentError": "frame_sync",
             "FlowModeError": "legacy_video_mode",

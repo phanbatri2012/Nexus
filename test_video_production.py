@@ -1113,6 +1113,9 @@ class VideoProductionServiceTests(unittest.TestCase):
 
         self.assertTrue(result.is_file())
         self.assertEqual(worker.generate_scene.await_count, 2)
+        for call in worker.generate_scene.await_args_list:
+            self.assertEqual(call.kwargs["scene_index"], 0)
+            self.assertEqual(call.kwargs["scene_count"], 1)
 
     def test_scene_image_timeout_is_not_retried(self):
         from auto_yt.services.google_flow_worker import FlowGenerationTimeout
@@ -1193,6 +1196,47 @@ class VideoProductionServiceTests(unittest.TestCase):
         artifact = database.get_latest_video_artifact(video_id, "scene:0")
         self.assertEqual(artifact["status"], "failed")
         self.assertIn("not acknowledged", artifact["metadata"]["error"])
+        self.assertEqual(artifact["metadata"]["failure_stage"], "submit")
+
+    def test_scene_image_agent_interaction_failure_has_distinct_checkpoint_stage(self):
+        from auto_yt.services.google_flow_worker import FlowAgentInteractionError
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-agent-choice-failed",
+            "Agent choice failed",
+            "Transcript",
+            "Script",
+        )
+        worker = MagicMock()
+        worker.generate_scene = AsyncMock(
+            side_effect=FlowAgentInteractionError("new session unavailable")
+        )
+        worker.download_image = AsyncMock()
+        scene = {"index": 36, "prompt": "scene 37", "action": "action"}
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            with self.assertRaises(FlowAgentInteractionError):
+                asyncio.run(
+                    video_production._generate_scene_image_async(
+                        video_id=video_id,
+                        scene=scene,
+                        scene_count=37,
+                        profile={},
+                        settings={},
+                        reference_path=None,
+                        reference_id="",
+                        progress=lambda message, stage: None,
+                        cancel_check=lambda: None,
+                        worker=worker,
+                        existing_hashes=set(),
+                    )
+                )
+
+        artifact = database.get_latest_video_artifact(video_id, "scene:36")
+        self.assertEqual(artifact["status"], "failed")
+        self.assertEqual(artifact["metadata"]["failure_stage"], "agent_interaction")
 
     def test_scene_image_invalid_output_is_not_retried(self):
         from auto_yt.services.google_flow_worker import FlowInvalidOutputError
@@ -1360,5 +1404,4 @@ class VideoProductionServiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
 

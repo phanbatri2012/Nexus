@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from PIL import Image
 
 from auto_yt.services.google_flow_worker import (
+    FlowAgentInteractionError,
     FlowAgentSettingsError,
     FlowAgentStalledError,
     FlowFrameAttachmentError,
@@ -845,6 +846,11 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(worker, "_resolve_new_media_source", AsyncMock(return_value="")),
             patch.object(worker, "_read_generation_activity", AsyncMock(return_value=True)),
+            patch.object(
+                worker,
+                "_latest_unanswered_agent_choice",
+                AsyncMock(return_value={"present": False, "choices": []}),
+            ),
             patch.object(worker, "_get_existing_error_texts", AsyncMock(return_value=set())),
             patch.object(worker, "_get_snackbar_error", AsyncMock(return_value="")),
             patch.object(worker, "handle_confirmation_prompts", AsyncMock()),
@@ -864,6 +870,35 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         invalid_output.assert_not_awaited()
+
+    async def test_agent_choice_after_ack_fails_fast_at_interaction_checkpoint(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        worker._agent_interface_detected = True
+
+        with (
+            patch.object(worker, "_resolve_new_media_source", AsyncMock(return_value="")),
+            patch.object(worker, "_read_generation_activity", AsyncMock(return_value=False)),
+            patch.object(
+                worker,
+                "_latest_unanswered_agent_choice",
+                AsyncMock(return_value={"present": True, "choices": ["Add more scenes"]}),
+            ),
+            patch.object(worker, "handle_confirmation_prompts", AsyncMock()),
+            patch.object(worker, "_save_debug_screenshot", AsyncMock()) as screenshot,
+            patch("auto_yt.services.google_flow_worker.asyncio.sleep", AsyncMock()),
+        ):
+            with self.assertRaises(FlowAgentInteractionError):
+                await worker._wait_for_new_media(
+                    media_type="image",
+                    baseline_keys=set(),
+                    initial_error_texts=set(),
+                    submitted_at=0.0,
+                    timeout_seconds=240.0,
+                )
+
+        screenshot.assert_awaited_once_with("image_agent_choice")
 
     async def test_collect_image_candidates_keeps_result_panel_assets(self):
         page = MagicMock()
@@ -998,6 +1033,7 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(worker, "_capture_submission_marker", AsyncMock(return_value="baseline")),
+            patch.object(worker, "_read_generation_activity", AsyncMock(return_value=False)),
             patch.object(worker, "_find_prompt_submit_button", AsyncMock(return_value=button)),
             patch.object(
                 worker,
@@ -1087,19 +1123,67 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(closed)
         done.click.assert_awaited_once_with(timeout=2000)
 
-    async def test_submit_falls_back_to_enter_only_when_prompt_remains(self):
+    async def test_unanswered_latest_agent_choice_resets_session_without_selecting_radio(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+
+        with (
+            patch.object(worker, "_is_agent_interface_active", AsyncMock(return_value=True)),
+            patch.object(
+                worker,
+                "_latest_unanswered_agent_choice",
+                AsyncMock(return_value={"present": True, "choices": ["Animate key scenes"]}),
+            ),
+            patch.object(worker, "_start_new_agent_session", AsyncMock()) as start_session,
+        ):
+            reset = await worker._ensure_agent_session_ready()
+
+        self.assertTrue(reset)
+        start_session.assert_awaited_once()
+        page.locator.assert_not_called()
+
+    async def test_agent_session_reset_failure_is_reported_distinctly(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+
+        with (
+            patch.object(worker, "_is_agent_interface_active", AsyncMock(return_value=True)),
+            patch.object(
+                worker,
+                "_latest_unanswered_agent_choice",
+                AsyncMock(return_value={"present": True, "choices": ["Add more scenes"]}),
+            ),
+            patch.object(
+                worker,
+                "_start_new_agent_session",
+                AsyncMock(side_effect=FlowAgentInteractionError("reset failed")),
+            ),
+            patch.object(worker, "_save_debug_screenshot", AsyncMock()) as screenshot,
+        ):
+            with self.assertRaises(FlowAgentInteractionError):
+                await worker._ensure_agent_session_ready()
+
+        screenshot.assert_awaited_once_with("agent_session_reset_failed")
+
+    async def test_legacy_submit_falls_back_to_enter_only_when_prompt_remains(self):
         page = MagicMock()
         page.url = "https://flow.google.com/project/project-one"
         page.keyboard = MagicMock()
         page.keyboard.press = AsyncMock()
+        page.keyboard.insert_text = AsyncMock()
         editor = MagicMock()
         editor.focus = AsyncMock()
+        editor.click = AsyncMock()
+        editor.fill = AsyncMock()
         button = MagicMock()
         button.click = AsyncMock()
         worker = GoogleFlowWorker(page)
 
         with (
             patch.object(worker, "_capture_submission_marker", AsyncMock(return_value="baseline")),
+            patch.object(worker, "_read_generation_activity", AsyncMock(return_value=False)),
             patch.object(worker, "_find_prompt_submit_button", AsyncMock(return_value=button)),
             patch.object(
                 worker,
@@ -1107,6 +1191,8 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(side_effect=[("", ""), ("", "activity")]),
             ),
             patch.object(worker, "_read_editor_text", AsyncMock(return_value="prompt")),
+            patch.object(worker, "_is_agent_interface_active", AsyncMock(return_value=False)),
+            patch.object(worker, "_ensure_agent_session_ready", AsyncMock(return_value=False)),
             patch.object(worker, "dismiss_blocking_dialogs", AsyncMock()),
         ):
             await worker._submit_prompt_and_wait_for_ack(
@@ -1135,10 +1221,13 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(worker, "_capture_submission_marker", AsyncMock(return_value="baseline")),
+            patch.object(worker, "_read_generation_activity", AsyncMock(return_value=False)),
             patch.object(worker, "_find_prompt_submit_button", AsyncMock(return_value=button)) as find_button,
-            patch.object(worker, "_wait_for_submission_ack", AsyncMock(side_effect=[("", ""), ("", "conversation")])),
+            patch.object(worker, "_wait_for_submission_ack", AsyncMock(side_effect=[("", ""), ("", "user_turn")])),
             patch.object(worker, "_has_prompt_in_conversation", AsyncMock(side_effect=[False, True])),
             patch.object(worker, "_read_editor_text", AsyncMock(return_value="")),
+            patch.object(worker, "_is_agent_interface_active", AsyncMock(return_value=True)),
+            patch.object(worker, "_ensure_agent_session_ready", AsyncMock(return_value=False)),
             patch.object(worker, "dismiss_blocking_dialogs", AsyncMock()),
             patch("auto_yt.services.google_flow_worker.asyncio.sleep", AsyncMock()),
         ):
@@ -1150,25 +1239,78 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(source, "")
-        button.click.assert_awaited_once()
-        page.keyboard.press.assert_awaited_with("Enter")
+        self.assertEqual(button.click.await_count, 2)
+        page.keyboard.press.assert_not_awaited()
+
+    async def test_choice_after_silent_drop_resets_session_and_restores_attachments(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        page.keyboard = MagicMock()
+        page.keyboard.press = AsyncMock()
+        page.keyboard.insert_text = AsyncMock()
+        editor = MagicMock()
+        editor.click = AsyncMock()
+        editor.fill = AsyncMock()
+        button = MagicMock()
+        button.click = AsyncMock()
+        restore_attachments = AsyncMock()
+        worker = GoogleFlowWorker(page)
+
+        with (
+            patch.object(worker, "_capture_submission_marker", AsyncMock(return_value="baseline")),
+            patch.object(worker, "_read_generation_activity", AsyncMock(return_value=False)),
+            patch.object(worker, "_find_prompt_submit_button", AsyncMock(return_value=button)),
+            patch.object(
+                worker,
+                "_wait_for_submission_ack",
+                AsyncMock(side_effect=[("", ""), ("", "activity")]),
+            ),
+            patch.object(worker, "_has_prompt_in_conversation", AsyncMock(return_value=False)),
+            patch.object(worker, "_read_editor_text", AsyncMock(return_value="")),
+            patch.object(worker, "_is_agent_interface_active", AsyncMock(return_value=True)),
+            patch.object(
+                worker,
+                "_ensure_agent_session_ready",
+                AsyncMock(side_effect=[False, True, False]),
+            ),
+            patch.object(worker, "wait_for_editor", AsyncMock(return_value=editor)),
+            patch.object(worker, "dismiss_blocking_dialogs", AsyncMock()),
+            patch("auto_yt.services.google_flow_worker.asyncio.sleep", AsyncMock()),
+        ):
+            await worker._submit_prompt_and_wait_for_ack(
+                editor=editor,
+                full_prompt="Scene 37 prompt",
+                media_type="image",
+                baseline_keys=set(),
+                on_agent_session_reset=restore_attachments,
+            )
+
+        self.assertEqual(button.click.await_count, 2)
+        restore_attachments.assert_awaited_once()
+        page.keyboard.press.assert_not_awaited()
 
     async def test_submit_failure_raises_without_starting_generation_wait(self):
         page = MagicMock()
         page.url = "https://flow.google.com/project/project-one"
         page.keyboard = MagicMock()
         page.keyboard.press = AsyncMock()
+        page.keyboard.insert_text = AsyncMock()
         editor = MagicMock()
         editor.focus = AsyncMock()
+        editor.click = AsyncMock()
+        editor.fill = AsyncMock()
         button = MagicMock()
         button.click = AsyncMock()
         worker = GoogleFlowWorker(page)
 
         with (
             patch.object(worker, "_capture_submission_marker", AsyncMock(return_value="baseline")),
+            patch.object(worker, "_read_generation_activity", AsyncMock(return_value=False)),
             patch.object(worker, "_find_prompt_submit_button", AsyncMock(return_value=button)),
             patch.object(worker, "_wait_for_submission_ack", AsyncMock(return_value=("", ""))),
             patch.object(worker, "_read_editor_text", AsyncMock(return_value="prompt")),
+            patch.object(worker, "_is_agent_interface_active", AsyncMock(return_value=False)),
+            patch.object(worker, "_ensure_agent_session_ready", AsyncMock(return_value=False)),
             patch.object(worker, "dismiss_blocking_dialogs", AsyncMock()),
             patch.object(worker, "_save_debug_screenshot", AsyncMock()) as screenshot,
         ):
@@ -1193,15 +1335,63 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(worker, "_resolve_new_media_source", AsyncMock(return_value="")),
             patch.object(worker, "_read_generation_activity", AsyncMock(return_value=False)),
             patch.object(worker, "_capture_submission_marker", AsyncMock(return_value="new-turn")),
+            patch.object(worker, "_has_prompt_in_conversation", AsyncMock(return_value=True)),
         ):
             source, reason = await worker._wait_for_submission_ack(
                 media_type="image",
                 baseline_keys={"old-image"},
                 baseline_marker="old-turn",
+                prompt="Scene 37 unique prompt",
             )
 
         self.assertEqual(source, "")
-        self.assertEqual(reason, "conversation")
+        self.assertEqual(reason, "user_turn")
+
+    async def test_sidebar_change_without_matching_user_turn_is_not_submission_ack(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+
+        with (
+            patch.object(worker, "_resolve_new_media_source", AsyncMock(return_value="")),
+            patch.object(worker, "_read_generation_activity", AsyncMock(return_value=False)),
+            patch.object(worker, "_capture_submission_marker", AsyncMock(return_value="new-sidebar-state")),
+            patch.object(worker, "_has_prompt_in_conversation", AsyncMock(return_value=False)),
+            patch("auto_yt.services.google_flow_worker.SUBMISSION_ACK_TIMEOUT_SECONDS", 0.0),
+        ):
+            source, reason = await worker._wait_for_submission_ack(
+                media_type="image",
+                baseline_keys=set(),
+                baseline_marker="old-state",
+                prompt="Scene 37 unique prompt",
+            )
+
+        self.assertEqual((source, reason), ("", ""))
+
+    async def test_submission_ack_requires_two_consecutive_activity_reads(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+
+        with (
+            patch.object(worker, "_resolve_new_media_source", AsyncMock(return_value="")),
+            patch.object(
+                worker,
+                "_read_generation_activity",
+                AsyncMock(side_effect=[True, True]),
+            ) as activity,
+            patch.object(worker, "_has_prompt_in_conversation", AsyncMock(return_value=False)),
+            patch("auto_yt.services.google_flow_worker.asyncio.sleep", AsyncMock()),
+        ):
+            source, reason = await worker._wait_for_submission_ack(
+                media_type="image",
+                baseline_keys=set(),
+                baseline_marker="old-state",
+                prompt="Scene 37 unique prompt",
+            )
+
+        self.assertEqual((source, reason), ("", "activity"))
+        self.assertEqual(activity.await_count, 2)
 
     async def test_previous_scene_state_does_not_acknowledge_new_submission(self):
         page = MagicMock()
@@ -1212,12 +1402,14 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(worker, "_resolve_new_media_source", AsyncMock(return_value="")),
             patch.object(worker, "_read_generation_activity", AsyncMock(return_value=False)),
             patch.object(worker, "_capture_submission_marker", AsyncMock(return_value="old-turn")),
+            patch.object(worker, "_has_prompt_in_conversation", AsyncMock(return_value=False)),
             patch("auto_yt.services.google_flow_worker.SUBMISSION_ACK_TIMEOUT_SECONDS", 0.0),
         ):
             source, reason = await worker._wait_for_submission_ack(
                 media_type="image",
                 baseline_keys={"old-image"},
                 baseline_marker="old-turn",
+                prompt="Scene 37 unique prompt",
             )
 
         self.assertEqual(source, "")
@@ -1395,6 +1587,7 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
             end_frame.write_bytes(b"end")
             with (
                 patch.object(worker, "wait_for_editor", AsyncMock(return_value=editor)),
+                patch.object(worker, "_ensure_agent_session_ready", AsyncMock(return_value=False)),
                 patch.object(worker, "_is_agent_interface_active", AsyncMock(return_value=True)),
                 patch.object(worker, "ensure_agent_video_settings", AsyncMock()) as settings,
                 patch.object(worker, "sync_agent_video_frames", AsyncMock()) as sync_frames,
@@ -1890,6 +2083,8 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
             return set()
 
         with (
+            patch.object(worker, "_find_completed_image_for_prompt", AsyncMock(return_value="")),
+            patch.object(worker, "_ensure_agent_session_ready", AsyncMock(return_value=False)),
             patch.object(worker, "sync_reference_ingredients", AsyncMock(side_effect=sync)),
             patch.object(worker, "_capture_stable_image_baseline", AsyncMock(side_effect=baseline)),
             patch.object(worker, "_get_existing_error_texts", AsyncMock(return_value=set())),
@@ -1899,6 +2094,74 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
                 await worker._generate_scene_on_canvas("prompt", "avoid", [], {})
 
         self.assertEqual(events, ["reference", "baseline"])
+
+    async def test_scene_prompt_prevents_agent_follow_up_and_identifies_position(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        page.keyboard = MagicMock()
+        page.keyboard.press = AsyncMock()
+        editor = MagicMock()
+        editor.click = AsyncMock()
+        editor.fill = AsyncMock()
+        editor.evaluate = AsyncMock(return_value="filled")
+        worker = GoogleFlowWorker(page)
+
+        with (
+            patch.object(worker, "_find_completed_image_for_prompt", AsyncMock(return_value="")),
+            patch.object(worker, "_ensure_agent_session_ready", AsyncMock(return_value=False)),
+            patch.object(worker, "sync_reference_ingredients", AsyncMock()),
+            patch.object(worker, "_capture_stable_image_baseline", AsyncMock(return_value=set())),
+            patch.object(worker, "_get_existing_error_texts", AsyncMock(return_value=set())),
+            patch.object(worker, "wait_for_editor", AsyncMock(return_value=editor)),
+            patch.object(
+                worker,
+                "_submit_prompt_and_wait_for_ack",
+                AsyncMock(return_value=(0.0, "https://flow-content.google/image/scene-37")),
+            ) as submit,
+        ):
+            result = await worker.generate_scene(
+                "A final landscape",
+                "text",
+                [],
+                scene_index=36,
+                scene_count=37,
+            )
+
+        self.assertEqual(result, "https://flow-content.google/image/scene-37")
+        submitted_prompt = submit.await_args.kwargs["full_prompt"]
+        self.assertIn("Scene 37/37", submitted_prompt)
+        self.assertIn("Do not summarize", submitted_prompt)
+        self.assertIn("do not ask", submitted_prompt.casefold())
+        self.assertIn("exactly one 16:9 still image", submitted_prompt)
+
+    async def test_completed_late_output_is_reused_before_reset_or_resubmit(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        late_source = "https://flow-content.google/image/late-scene-37"
+
+        with (
+            patch.object(
+                worker,
+                "_find_completed_image_for_prompt",
+                AsyncMock(return_value=late_source),
+            ),
+            patch.object(worker, "_ensure_agent_session_ready", AsyncMock()) as ensure_session,
+            patch.object(worker, "sync_reference_ingredients", AsyncMock()) as sync_refs,
+            patch.object(worker, "_submit_prompt_and_wait_for_ack", AsyncMock()) as submit,
+        ):
+            result = await worker.generate_scene(
+                "Scene 37 exact prompt",
+                "text",
+                [],
+                scene_index=36,
+                scene_count=37,
+            )
+
+        self.assertEqual(result, late_source)
+        ensure_session.assert_not_awaited()
+        sync_refs.assert_not_awaited()
+        submit.assert_not_awaited()
 
     async def test_validated_payload_is_reused_by_download_image(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2185,8 +2448,11 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(worker, "dismiss_blocking_dialogs", AsyncMock()),
             patch.object(worker, "_find_prompt_submit_button", AsyncMock(return_value=btn_loc.first)),
             patch.object(worker, "_capture_submission_marker", AsyncMock(return_value="marker1")),
+            patch.object(worker, "_read_generation_activity", AsyncMock(return_value=False)),
             patch.object(worker, "_wait_for_submission_ack", AsyncMock(side_effect=[("", ""), ("", "conversation")])),
             patch.object(worker, "_has_prompt_in_conversation", AsyncMock(side_effect=[False, True])),
+            patch.object(worker, "_is_agent_interface_active", AsyncMock(return_value=False)),
+            patch.object(worker, "_ensure_agent_session_ready", AsyncMock(return_value=False)),
             patch("auto_yt.services.google_flow_worker.asyncio.sleep", AsyncMock()),
         ):
             attempted_at, source = await worker._submit_prompt_and_wait_for_ack(
