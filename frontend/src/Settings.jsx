@@ -1896,24 +1896,22 @@ export default function Settings({
               </select>
             </label>
             <label>
-              YouTube Category ID
-              <input
+              Thể loại video (Category)
+              <select
                 className="version-select"
-                list="youtube-category-options"
-                value={currentPublishing.category_id}
+                value={currentPublishing.category_id || ''}
                 onChange={event => handlePromptSettingChange(
                   'publishing_settings', 'category_id', event.target.value
                 )}
-                placeholder="Mặc định: 22 (People & Blogs)"
                 disabled={activeVersionLocked}
-              />
-              <datalist id="youtube-category-options">
+              >
+                <option value="">Mặc định theo kênh (Không can thiệp)</option>
                 {YOUTUBE_CATEGORIES.map(cat => (
                   <option key={cat.id} value={cat.id}>
                     {cat.name}
                   </option>
                 ))}
-              </datalist>
+              </select>
             </label>
             <label>
               Ngôn ngữ
@@ -1946,10 +1944,10 @@ export default function Settings({
             </label>
           </div>
           <div className="help-text" style={{ marginTop: 8, fontSize: '0.84rem', color: '#94a3b8', lineHeight: 1.5 }}>
-            💡 <strong>Phương thức Upload:</strong> <em>Giao diện Web Trình duyệt</em> (Playwright CDP qua profile GPM-Login) giữ nguyên toàn bộ cài đặt mặc định của kênh (ngôn ngữ, phụ đề, phân loại...), tự động thích ứng với kênh bật kiếm tiền và không tốn Quota YouTube API. <em>YouTube Data API</em> sử dụng HTTP API ngầm bằng OAuth token.
+            💡 <strong>Phương thức Upload:</strong> <em>Giao diện Web Trình duyệt</em> (Playwright CDP qua profile GPM-Login) tự động điền thông tin và áp dụng cài đặt, tự động thích ứng với kênh bật kiếm tiền và không tốn Quota YouTube API. <em>YouTube Data API</em> sử dụng HTTP API ngầm bằng OAuth token.
           </div>
           <div className="help-text" style={{ marginTop: 4, fontSize: '0.84rem', color: '#94a3b8', lineHeight: 1.5 }}>
-            💡 <strong>YouTube Category ID:</strong> Nếu để trống, hệ thống sẽ tự động dùng mặc định là <strong>22 (People & Blogs / Mọi người & Blog)</strong>. Bạn có thể chọn nhanh từ danh sách gợi ý hoặc nhập ID tùy chỉnh (VD: <code>22</code>: Blogs, <code>24</code>: Giải trí, <code>27</code>: Giáo dục, <code>28</code>: Khoa học & CN, <code>10</code>: Âm nhạc, <code>20</code>: Trò chơi, <code>1</code>: Phim).
+            💡 <strong>Thể loại video:</strong> Tự động chọn đúng thể loại trên YouTube Studio khi upload. Nếu chọn <em>Mặc định theo kênh</em>, hệ thống sẽ giữ nguyên thể loại mặc định của kênh bạn đã cài đặt trên YouTube Studio.
           </div>
           <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginTop: 12, alignItems: 'center' }}>
             <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>

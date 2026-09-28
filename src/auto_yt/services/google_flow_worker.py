@@ -1973,9 +1973,7 @@ class GoogleFlowWorker:
 
             await self._remember_reference_locator_keys(asset_item)
             await asset_item.click()
-            if await self._wait_for_ingredient_chip():
-                await self._close_reference_ui()
-                return REFERENCE_RESULT_ATTACHED
+            await asyncio.sleep(0.3)
 
             add_to_prompt_btn = self.page.locator(
                 ".cdk-overlay-container button.detail-add-to-prompt-btn, "
@@ -1984,12 +1982,13 @@ class GoogleFlowWorker:
                 ".cdk-overlay-container button:has-text('Add to prompt'), "
                 ".cdk-overlay-container [role='menuitem']:has-text('Add to prompt')"
             ).first
-            if not await add_to_prompt_btn.is_visible(timeout=3000):
+            if await add_to_prompt_btn.is_visible(timeout=1000):
+                await add_to_prompt_btn.click()
                 await self._close_reference_ui()
-                return REFERENCE_RESULT_UI_ERROR
-            await add_to_prompt_btn.click()
+            else:
+                # Older Flow versions attach immediately when the asset is clicked.
+                await self._close_reference_ui()
             attached = await self._wait_for_ingredient_chip()
-            await self._close_reference_ui()
             return REFERENCE_RESULT_ATTACHED if attached else REFERENCE_RESULT_UI_ERROR
         except Exception as exc:
             logger.warning("Reference picker failed for '%s': %s", filename, exc)
@@ -2035,8 +2034,8 @@ class GoogleFlowWorker:
                 await self._close_reference_ui()
                 return REFERENCE_RESULT_UI_ERROR
             await add_to_prompt.click()
-            attached = await self._wait_for_ingredient_chip()
             await self._close_reference_ui()
+            attached = await self._wait_for_ingredient_chip()
             return REFERENCE_RESULT_ATTACHED if attached else REFERENCE_RESULT_UI_ERROR
         except Exception as exc:
             logger.warning("Reference gallery fallback failed for '%s': %s", filename, exc)
@@ -2095,8 +2094,16 @@ class GoogleFlowWorker:
         known_in_project = filename_key in cache
         confirmed_missing = False
 
-        for _ in range(REFERENCE_ATTACH_RETRY_COUNT):
+        for attempt in range(1, REFERENCE_ATTACH_RETRY_COUNT + 1):
             result, source = await self._try_attach_existing_reference(filename)
+            logger.info(
+                "flow_reference status=lookup_result project=%s filename=%s attempt=%d result=%s source=%s",
+                self._project_id(),
+                filename,
+                attempt,
+                result,
+                source or "none",
+            )
             if result == REFERENCE_RESULT_ATTACHED:
                 await self._remember_attached_reference_keys()
                 cache.add(filename_key)
@@ -2106,6 +2113,20 @@ class GoogleFlowWorker:
                 confirmed_missing = True
                 break
             await asyncio.sleep(0.5)
+
+        # The new Flow picker commits the selected asset only after its overlay
+        # has closed. Reconcile the actual composer state before declaring that
+        # a known asset could not be attached or attempting another upload.
+        await self._close_reference_ui()
+        if await self._wait_for_ingredient_chip():
+            await self._remember_attached_reference_keys()
+            cache.add(filename_key)
+            self._log_reference_event(
+                "reused_picker",
+                filename,
+                detail="attached_after_overlay_close",
+            )
+            return
 
         if known_in_project:
             self._log_reference_event(

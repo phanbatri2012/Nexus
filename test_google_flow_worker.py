@@ -477,6 +477,112 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
         wait_for_chip.assert_awaited_once_with(timeout=2.0)
         gallery.assert_not_awaited()
 
+    async def test_picker_closes_overlay_before_confirming_reference_chip(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        page.keyboard = MagicMock()
+        page.keyboard.press = AsyncMock()
+
+        add_button = MagicMock()
+        add_button.is_visible = AsyncMock(return_value=True)
+        add_button.click = AsyncMock()
+        add_locator = MagicMock()
+        add_locator.first = add_button
+
+        uploads_tab = MagicMock()
+        uploads_tab.is_visible = AsyncMock(return_value=True)
+        uploads_tab.click = AsyncMock()
+        uploads_locator = MagicMock()
+        uploads_locator.first = uploads_tab
+
+        search_input = MagicMock()
+        search_input.is_visible = AsyncMock(return_value=True)
+        search_input.fill = AsyncMock()
+        search_locator = MagicMock()
+        search_locator.first = search_input
+
+        add_to_prompt = MagicMock()
+        add_to_prompt.is_visible = AsyncMock(return_value=True)
+        add_to_prompt.click = AsyncMock()
+        add_to_prompt_locator = MagicMock()
+        add_to_prompt_locator.first = add_to_prompt
+
+        def locate(selector):
+            if "detail-add-to-prompt-btn" in selector:
+                return add_to_prompt_locator
+            if "input[placeholder" in selector:
+                return search_locator
+            if "mat-list-item:has-text('Uploads')" in selector:
+                return uploads_locator
+            return add_locator
+
+        page.locator.side_effect = locate
+        worker = GoogleFlowWorker(page)
+        asset_item = MagicMock()
+        asset_item.click = AsyncMock()
+        events = []
+
+        async def close_overlay():
+            events.append("close")
+
+        async def confirm_chip(*, timeout=5.0):
+            events.append("confirm")
+            return True
+
+        with (
+            patch.object(worker, "dismiss_blocking_dialogs", AsyncMock()),
+            patch.object(
+                worker,
+                "_find_exact_picker_asset",
+                AsyncMock(return_value=asset_item),
+            ),
+            patch.object(worker, "_remember_reference_locator_keys", AsyncMock()),
+            patch.object(worker, "_close_reference_ui", side_effect=close_overlay),
+            patch.object(worker, "_wait_for_ingredient_chip", side_effect=confirm_chip),
+            patch("auto_yt.services.google_flow_worker.asyncio.sleep", AsyncMock()),
+        ):
+            result = await worker._attach_reference_from_picker("le_trong_tan.jpg")
+
+        self.assertEqual(result, REFERENCE_RESULT_ATTACHED)
+        self.assertEqual(events, ["close", "confirm"])
+        add_to_prompt.click.assert_awaited_once()
+
+    async def test_known_asset_reconciles_chip_after_picker_overlay_closes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reference_path = Path(temp_dir) / "le_trong_tan.jpg"
+            reference_path.write_bytes(b"portrait")
+            page = MagicMock()
+            page.url = "https://flow.google.com/project/project-one"
+            worker = GoogleFlowWorker(page)
+            worker._project_reference_cache().add("le_trong_tan.jpg")
+
+            with (
+                patch.object(
+                    worker,
+                    "_try_attach_existing_reference",
+                    AsyncMock(return_value=(REFERENCE_RESULT_UI_ERROR, "")),
+                ) as attach_existing,
+                patch.object(worker, "_close_reference_ui", AsyncMock()) as close_ui,
+                patch.object(
+                    worker,
+                    "_wait_for_ingredient_chip",
+                    AsyncMock(return_value=True),
+                ) as wait_for_chip,
+                patch.object(worker, "_remember_attached_reference_keys", AsyncMock()),
+                patch.object(worker, "_upload_reference_file", AsyncMock()) as upload,
+                patch("auto_yt.services.google_flow_worker.asyncio.sleep", AsyncMock()),
+            ):
+                await worker._sync_required_scene_reference(
+                    "le_trong_tan",
+                    str(reference_path),
+                )
+
+            self.assertEqual(attach_existing.await_count, 2)
+            close_ui.assert_awaited_once()
+            wait_for_chip.assert_awaited_once()
+            upload.assert_not_awaited()
+            self.assertIn("le_trong_tan.jpg", worker._project_reference_cache())
+
     async def test_reference_chip_confirmation_polls_until_visible(self):
         page = MagicMock()
         worker = GoogleFlowWorker(page)

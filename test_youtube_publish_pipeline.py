@@ -1075,8 +1075,45 @@ class YouTubePublishPipelineTests(unittest.TestCase):
         self.assertEqual(result["stage"], "scheduled")
         self.assertTrue(bool(result["scheduled_at"]))
 
+    def test_browser_upload_passes_category_id(self):
+        job, channel = self._create_publish_job(schedule=False, upload_method="browser")
+        # Set category_id in snapshot publishing settings
+        job["payload"]["snapshot"]["publishing_settings"]["category_id"] = "25"
+        captured_kwargs = {}
+
+        async def fake_browser_upload(**kwargs):
+            captured_kwargs.update(kwargs)
+            kwargs["persist_video_id"]("browser-yt-cat-25")
+            return {
+                "youtube_video_id": "browser-yt-cat-25",
+                "published_url": "https://www.youtube.com/watch?v=browser-yt-cat-25",
+                "status": "uploaded_private",
+                "scheduled_at": "",
+                "title": "Publish title",
+            }
+
+        with patch.object(
+            youtube_publish_workflow.browser_youtube_uploader,
+            "upload_video_via_browser",
+            side_effect=fake_browser_upload,
+        ), patch.object(
+            youtube_publish_workflow.youtube_comments,
+            "access_token_for_channel",
+            return_value="access-token",
+        ):
+            youtube_publish_workflow.execute_publish_job(
+                job,
+                progress=lambda *args: None,
+                cancel_check=lambda: None,
+                resolve_default_channel_id=lambda _ver: "",
+                thumbnails_dir=self.thumbnails_dir,
+            )
+
+        self.assertEqual(captured_kwargs.get("category_id"), "25")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

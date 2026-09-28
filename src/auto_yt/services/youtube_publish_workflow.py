@@ -582,6 +582,7 @@ def execute_publish_job(
         title = str(context["metadata"].get("snippet", {}).get("title") or "")
         description = str(context["metadata"].get("snippet", {}).get("description") or "")
         tags = context["metadata"].get("snippet", {}).get("tags", [])
+        category_id = str(context["publishing_settings"].get("category_id") or "").strip()
         made_for_kids = bool(context["publishing_settings"].get("made_for_kids", False))
         contains_synthetic_media = bool(
             context["publishing_settings"].get("contains_synthetic_media", True)
@@ -598,6 +599,7 @@ def execute_publish_job(
                 title=title,
                 description=description,
                 tags=tags,
+                category_id=category_id,
                 made_for_kids=made_for_kids,
                 contains_synthetic_media=contains_synthetic_media,
                 notify_subscribers=notify_subscribers,

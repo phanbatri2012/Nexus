@@ -103,6 +103,87 @@ async def _cdp_set_input_files(
         await cdp.detach()
 
 
+
+YOUTUBE_CATEGORY_LABELS: dict[str, list[str]] = {
+    "1": ["Phim và hoạt hình", "Phim & Hoạt hình", "Film & Animation", "Film and Animation"],
+    "2": ["Ô tô và xe cộ", "Ô tô & Xe cộ", "Autos & Vehicles", "Autos and Vehicles"],
+    "10": ["Âm nhạc", "Music"],
+    "15": ["Thú cưng và động vật", "Thú cưng & Động vật", "Pets & Animals", "Pets and Animals"],
+    "17": ["Thể thao", "Sports"],
+    "19": ["Du lịch và sự kiện", "Du lịch & Sự kiện", "Travel & Events", "Travel and Events"],
+    "20": ["Trò chơi", "Gaming"],
+    "22": ["Mọi người và blog", "Mọi người & Blog", "People & Blogs", "People and Blogs"],
+    "23": ["Hài kịch", "Comedy"],
+    "24": ["Giải trí", "Entertainment"],
+    "25": ["Tin tức và chính trị", "Tin tức & Chính trị", "News & Politics", "News and Politics"],
+    "26": ["Hướng dẫn và phong cách", "Hướng dẫn & Phong cách", "Howto & Style", "How-to & Style", "Howto and Style"],
+    "27": ["Giáo dục", "Education"],
+    "28": ["Khoa học và Công nghệ", "Khoa học & Công nghệ", "Khoa học & công nghệ", "Science & Technology", "Science and Technology"],
+    "29": ["Hoạt động phi lợi nhuận và hoạt động xã hội", "Hoạt động xã hội & Phi lợi nhuận", "Hoạt động phi lợi nhuận", "Nonprofits & Activism", "Nonprofits and Activism"],
+}
+
+
+async def _select_youtube_category(page, category_id: str) -> bool:
+    """Select video Category in YouTube Studio Upload Details tab."""
+    target_labels = YOUTUBE_CATEGORY_LABELS.get(str(category_id).strip())
+    if not target_labels:
+        logger.debug("Không có cấu hình nhãn Thể loại cho category_id=%s", category_id)
+        return False
+
+    try:
+        # 1. Scroll Category section into view if present
+        try:
+            cat_el = await page.query_selector(
+                "ytcp-form-select#category, #category, #category-container, [aria-label*='Thể loại' i], [aria-label*='Category' i]"
+            )
+            if cat_el:
+                await cat_el.scroll_into_view_if_needed()
+                await asyncio.sleep(0.5)
+        except Exception:
+            pass
+
+        # 2. Click Category dropdown trigger
+        dropdown_selectors = [
+            "ytcp-form-select#category ytcp-dropdown-trigger",
+            "#category ytcp-dropdown-trigger",
+            "ytcp-form-select#category #dropdown-trigger",
+            "#category-container ytcp-dropdown-trigger",
+            "ytcp-form-select#category",
+            "[aria-label*='Thể loại' i]",
+            "[aria-label*='Category' i]",
+        ]
+        opened = await _safe_click(page, dropdown_selectors, timeout_ms=3000)
+        if not opened:
+            logger.debug("Không mở được dropdown Thể loại (Category)")
+            return False
+
+        await asyncio.sleep(0.8)
+
+        # 3. Click matching option from listbox / menu
+        for label in target_labels:
+            option_selectors = [
+                f"tp-yt-paper-listbox tp-yt-paper-item:has-text('{label}')",
+                f"ytcp-text-menu tp-yt-paper-item:has-text('{label}')",
+                f"[role='option']:has-text('{label}')",
+                f"tp-yt-paper-item:has-text('{label}')",
+                f".ytcp-form-select-menu tp-yt-paper-item:has-text('{label}')",
+            ]
+            if await _safe_click(page, option_selectors, timeout_ms=1500):
+                logger.info("Đã chọn Thể loại YouTube: %s (ID: %s)", label, category_id)
+                await asyncio.sleep(0.5)
+                return True
+
+        logger.warning("Không tìm thấy mục Thể loại khớp với các nhãn %s", target_labels)
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return False
+    except Exception as exc:
+        logger.warning("Lỗi khi chọn Thể loại YouTube (ID: %s): %s", category_id, exc)
+        return False
+
+
 async def upload_video_via_browser(
     *,
     profile_id: str,
@@ -111,6 +192,7 @@ async def upload_video_via_browser(
     title: str,
     description: str,
     tags: list[str] | None = None,
+    category_id: str = "",
     made_for_kids: bool = False,
     contains_synthetic_media: bool = True,
     notify_subscribers: bool = True,
@@ -360,6 +442,13 @@ async def upload_video_via_browser(
                         await asyncio.sleep(0.5)
                 except Exception:
                     pass
+
+            # Category Selection (if configured)
+            clean_category_id = str(category_id or "").strip()
+            if clean_category_id:
+                progress("Đang chọn Thể loại video...", "selecting_category", 52)
+                await _select_youtube_category(page, clean_category_id)
+                await asyncio.sleep(1.0)
 
             # Click Next Button from Details tab
             progress("Hoàn tất tab Chi tiết -> Chuyển bước...", "next_step", 55)
