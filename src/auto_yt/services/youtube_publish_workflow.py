@@ -623,8 +623,23 @@ def execute_publish_job(
                     db.complete_youtube_schedule(
                         workflow_id, publication_id, target_schedule_at
                     )
-                except Exception:
-                    pass
+                except Exception as s_exc:
+                    logger.warning("Không thể cập nhật reservation slot qua complete_youtube_schedule: %s; cập nhật trực tiếp publication...", s_exc)
+                    try:
+                        db.update_video_publication(
+                            publication_id,
+                            privacy_status="private",
+                            processing_status="succeeded",
+                            scheduled_at=target_schedule_at,
+                        )
+                        db.update_youtube_publish_workflow(
+                            workflow_id,
+                            status="scheduled",
+                            stage="scheduled",
+                            scheduled_at=target_schedule_at,
+                        )
+                    except Exception as upd_exc:
+                        logger.warning("Lỗi cập nhật publication fallback: %s", upd_exc)
             final_status = "scheduled"
             final_stage = "scheduled"
             scheduled_at = target_schedule_at

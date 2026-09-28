@@ -476,16 +476,23 @@ async def upload_video_via_browser(
                     )
                     await asyncio.sleep(2.0)
 
-            # 8. Traverse Remaining Tabs (Video Elements & Checks)
-            for _ in range(3):
+            # 8. Traverse Remaining Tabs (Video Elements & Checks -> Visibility)
+            progress("Đang duyệt qua các bước trung gian đến tab Chế độ hiển thị...", "navigating_tabs", 75)
+            for step_idx in range(6):
                 cancel_check()
-                # Check if Visibility tab is reached
-                visibility_reached = await page.query_selector(
-                    "#visibility-step, ytcp-video-visibility-select, [test-id='visibility-step'], h2:has-text('Chế độ hiển thị'), h2:has-text('Visibility')"
+                # Check if Visibility tab content is VISIBLE on screen
+                visibility_active = await page.query_selector(
+                    "tp-yt-paper-radio-button[name='SCHEDULE']:not([hidden]), "
+                    "tp-yt-paper-radio-button#schedule-radio-button:not([hidden]), "
+                    "tp-yt-paper-radio-button[name='PRIVATE']:not([hidden]), "
+                    "ytcp-video-visibility-select"
                 )
-                if visibility_reached:
+                if visibility_active and await visibility_active.is_visible():
+                    logger.info("Đã đến tab Chế độ hiển thị (Visibility) tại bước %d.", step_idx + 1)
                     break
-                await _safe_click(
+
+                logger.info("Chưa đến tab Chế độ hiển thị; đang bấm 'Tiếp' (lần %d)...", step_idx + 1)
+                clicked = await _safe_click(
                     page,
                     [
                         "ytcp-button#next-button",
@@ -493,8 +500,10 @@ async def upload_video_via_browser(
                         "ytcp-button:has-text('Tiếp')",
                         "ytcp-button:has-text('Next')",
                     ],
-                    timeout_ms=4000,
+                    timeout_ms=5000,
                 )
+                if not clicked:
+                    logger.warning("Không thể bấm nút 'Tiếp' ở lần duyệt %d", step_idx + 1)
                 await asyncio.sleep(1.5)
 
             # 9. Tab Visibility (Private vs Schedule)
@@ -502,54 +511,129 @@ async def upload_video_via_browser(
             cancel_check()
 
             if schedule_at:
-                logger.info("Đặt lịch công chiếu YouTube qua browser tại: %s", schedule_at)
-                # Parse date and time
-                parsed_dt = dt.datetime.fromisoformat(str(schedule_at).replace("Z", "+00:00"))
-                target_date_str = _format_date_for_picker(parsed_dt.date())
-                target_time_str = _format_time_for_picker(parsed_dt.time())
+                # Convert UTC to local system timezone (ICT / UTC+7 in VN)
+                try:
+                    parsed_dt = dt.datetime.fromisoformat(str(schedule_at).replace("Z", "+00:00"))
+                    local_dt = parsed_dt.astimezone()
+                    target_date_str = _format_date_for_picker(local_dt.date())
+                    target_time_str = _format_time_for_picker(local_dt.time())
+                except Exception as tz_err:
+                    logger.warning("Không thể chuyển đổi timezone cho schedule_at '%s': %s", schedule_at, tz_err)
+                    parsed_dt = dt.datetime.now()
+                    target_date_str = _format_date_for_picker(parsed_dt.date())
+                    target_time_str = _format_time_for_picker(parsed_dt.time())
 
-                # Click Schedule accordion/radio
-                await _safe_click(
+                logger.info(
+                    "Đặt lịch YouTube qua browser: %s (Local: %s %s)",
+                    schedule_at,
+                    target_date_str,
+                    target_time_str,
+                )
+
+                # 1. Click Schedule accordion / radio button
+                schedule_radio_clicked = await _safe_click(
                     page,
                     [
                         "tp-yt-paper-radio-button#schedule-radio-button",
-                        "[name='SCHEDULE']",
+                        "tp-yt-paper-radio-button[name='SCHEDULE']",
                         "tp-yt-paper-radio-button:has-text('Lên lịch')",
                         "tp-yt-paper-radio-button:has-text('Schedule')",
                         "#second-container-expand-button",
                     ],
-                    timeout_ms=5000,
+                    timeout_ms=8000,
                 )
-                await asyncio.sleep(1.0)
+                if not schedule_radio_clicked:
+                    raise BrowserUploadError("Không thể chọn radio 'Lên lịch' (Schedule) trên YouTube Studio.")
 
-                # Set Date
-                try:
-                    date_input = await page.query_selector("#datepicker-trigger input, input#datepicker-trigger, #datepicker-trigger")
-                    if date_input:
-                        await date_input.click()
-                        await page.keyboard.press("Control+A")
-                        await page.keyboard.press("Backspace")
-                        await date_input.fill(target_date_str)
-                        await page.keyboard.press("Enter")
-                        await asyncio.sleep(0.5)
-                except Exception as d_exc:
-                    logger.debug("Không điền được datepicker trực tiếp: %s", d_exc)
+                await asyncio.sleep(1.5)
 
-                # Set Time
-                try:
-                    time_input = await page.query_selector("#time-of-day-trigger input, input#time-input, ytcp-dropdown-trigger[aria-label*='giờ' i]")
-                    if time_input:
-                        await time_input.click()
-                        await page.keyboard.press("Control+A")
-                        await page.keyboard.press("Backspace")
-                        await time_input.fill(target_time_str)
-                        await page.keyboard.press("Enter")
-                        await asyncio.sleep(0.5)
-                except Exception as t_exc:
-                    logger.debug("Không điền được time picker trực tiếp: %s", t_exc)
+                # 2. Set Date
+                date_filled = False
+                date_selectors = [
+                    "#datepicker-trigger input",
+                    "input#datepicker-trigger",
+                    "ytcp-date-picker input",
+                    "#datepicker-trigger",
+                    "input[aria-label*='ngày' i]",
+                    "input[aria-label*='date' i]",
+                    "input[placeholder*='ngày' i]",
+                    "input[placeholder*='date' i]",
+                ]
+                for sel in date_selectors:
+                    try:
+                        date_input = await page.wait_for_selector(sel, state="visible", timeout=3000)
+                        if date_input:
+                            await date_input.click()
+                            await page.keyboard.press("Control+A")
+                            await page.keyboard.press("Backspace")
+                            await date_input.fill(target_date_str)
+                            await page.keyboard.press("Enter")
+                            await asyncio.sleep(0.5)
+                            date_filled = True
+                            logger.info("Đã điền ngày đặt lịch: %s (selector: %s)", target_date_str, sel)
+                            break
+                    except Exception:
+                        continue
 
-                # Click Schedule Done Button
-                await _safe_click(
+                if not date_filled:
+                    logger.warning("Không tìm thấy input datepicker tiêu chuẩn; thử click trực tiếp #datepicker-trigger...")
+                    try:
+                        dp_trigger = await page.query_selector("#datepicker-trigger")
+                        if dp_trigger:
+                            await dp_trigger.click()
+                            await asyncio.sleep(0.5)
+                            await page.keyboard.press("Control+A")
+                            await page.keyboard.press("Backspace")
+                            await page.keyboard.type(target_date_str, delay=20)
+                            await page.keyboard.press("Enter")
+                            date_filled = True
+                    except Exception as dp_exc:
+                        logger.warning("Không điền được datepicker trigger: %s", dp_exc)
+
+                # 3. Set Time
+                time_filled = False
+                time_selectors = [
+                    "#time-of-day-trigger input",
+                    "input#time-input",
+                    "ytcp-time-of-day-picker input",
+                    "#time-of-day-trigger",
+                    "ytcp-dropdown-trigger[aria-label*='giờ' i]",
+                    "input[aria-label*='giờ' i]",
+                    "input[aria-label*='time' i]",
+                ]
+                for sel in time_selectors:
+                    try:
+                        time_input = await page.wait_for_selector(sel, state="visible", timeout=3000)
+                        if time_input:
+                            await time_input.click()
+                            await page.keyboard.press("Control+A")
+                            await page.keyboard.press("Backspace")
+                            await time_input.fill(target_time_str)
+                            await page.keyboard.press("Enter")
+                            await asyncio.sleep(0.5)
+                            time_filled = True
+                            logger.info("Đã điền giờ đặt lịch: %s (selector: %s)", target_time_str, sel)
+                            break
+                    except Exception:
+                        continue
+
+                if not time_filled:
+                    logger.warning("Không tìm thấy input timepicker tiêu chuẩn; thử click trực tiếp #time-of-day-trigger...")
+                    try:
+                        tp_trigger = await page.query_selector("#time-of-day-trigger")
+                        if tp_trigger:
+                            await tp_trigger.click()
+                            await asyncio.sleep(0.5)
+                            await page.keyboard.press("Control+A")
+                            await page.keyboard.press("Backspace")
+                            await page.keyboard.type(target_time_str, delay=20)
+                            await page.keyboard.press("Enter")
+                            time_filled = True
+                    except Exception as tp_exc:
+                        logger.warning("Không điền được timepicker trigger: %s", tp_exc)
+
+                # 4. Click Schedule Done Button
+                done_clicked = await _safe_click(
                     page,
                     [
                         "ytcp-button#done-button:has-text('Lên lịch')",
@@ -557,14 +641,17 @@ async def upload_video_via_browser(
                         "ytcp-button#done-button",
                         "#done-button button",
                     ],
-                    timeout_ms=5000,
+                    timeout_ms=8000,
                 )
-                await asyncio.sleep(2.0)
+                if not done_clicked:
+                    raise BrowserUploadError("Không thể click nút 'Lên lịch' (Done/Schedule) trên YouTube Studio.")
+
+                await asyncio.sleep(3.0)
 
                 # Handle Copyright Check Warning Modal if it appears (Edge Case)
                 try:
                     warning_modal = await page.wait_for_selector(
-                        "ytcp-button:has-text('Đã hiểu'), ytcp-button:has-text('Got it'), ytcp-confirmation-dialog",
+                        "ytcp-button:has-text('Đã hiểu'), ytcp-button:has-text('Got it'), ytcp-confirmation-dialog #confirm-button",
                         state="visible",
                         timeout=4000,
                     )
@@ -575,27 +662,31 @@ async def upload_video_via_browser(
                             [
                                 "ytcp-button:has-text('Đã hiểu')",
                                 "ytcp-button:has-text('Got it')",
+                                "ytcp-confirmation-dialog #confirm-button",
                             ],
                             timeout_ms=3000,
                         )
-                        await asyncio.sleep(1.5)
+                        await asyncio.sleep(2.0)
                 except Exception:
                     pass
 
             else:
                 # Private mode
                 logger.info("Lưu video ở chế độ Riêng tư (Private)...")
-                await _safe_click(
+                private_clicked = await _safe_click(
                     page,
                     [
                         "tp-yt-paper-radio-button[name='PRIVATE']",
                         "tp-yt-paper-radio-button:has-text('Riêng tư')",
                         "tp-yt-paper-radio-button:has-text('Private')",
                     ],
-                    timeout_ms=5000,
+                    timeout_ms=8000,
                 )
+                if not private_clicked:
+                    raise BrowserUploadError("Không thể chọn radio 'Riêng tư' (Private) trên YouTube Studio.")
+
                 await asyncio.sleep(1.0)
-                await _safe_click(
+                done_clicked = await _safe_click(
                     page,
                     [
                         "ytcp-button#done-button:has-text('Lưu')",
@@ -603,26 +694,34 @@ async def upload_video_via_browser(
                         "ytcp-button#done-button",
                         "#done-button button",
                     ],
-                    timeout_ms=5000,
+                    timeout_ms=8000,
                 )
-                await asyncio.sleep(2.0)
+                if not done_clicked:
+                    raise BrowserUploadError("Không thể click nút 'Lưu' (Save/Done) trên YouTube Studio.")
+
+                await asyncio.sleep(3.0)
 
             # 10. Close Post-Publish Dialog & Extract Final Video ID if missed earlier
             progress("Đang hoàn tất và đóng hộp thoại...", "finishing_upload", 95)
             try:
+                # Try finding confirmation or share dialog
+                share_dialog = await page.wait_for_selector(
+                    "ytcp-video-share-dialog, ytcp-publish-dialog",
+                    state="visible",
+                    timeout=10000,
+                )
+                if share_dialog and not youtube_video_id:
+                    dialog_text = await share_dialog.inner_text()
+                    match = re.search(r"youtu\.be/([a-zA-Z0-9_-]+)", dialog_text)
+                    if match:
+                        youtube_video_id = match.group(1).strip()
+                        logger.info("Đã trích xuất Video ID từ dialog xác nhận: %s", youtube_video_id)
+
                 close_btn = await page.wait_for_selector(
                     "ytcp-button#close-button, ytcp-button:has-text('Đóng'), ytcp-button:has-text('Close'), ytcp-video-share-dialog #close-button",
                     state="visible",
-                    timeout=15000,
+                    timeout=8000,
                 )
-                if not youtube_video_id:
-                    # Final attempt to extract Video ID from confirmation dialog
-                    dialog_el = await page.query_selector("ytcp-video-share-dialog, ytcp-publish-dialog")
-                    if dialog_el:
-                        dialog_text = await dialog_el.inner_text()
-                        match = re.search(r"youtu\.be/([a-zA-Z0-9_-]+)", dialog_text)
-                        if match:
-                            youtube_video_id = match.group(1).strip()
                 if close_btn:
                     await close_btn.click()
                     await asyncio.sleep(2.0)
@@ -657,6 +756,15 @@ async def upload_video_via_browser(
 
         except Exception as exc:
             logger.error("Lỗi trong quá trình upload YouTube qua browser: %s", exc, exc_info=True)
+            try:
+                logs_dir = Path("data/logs")
+                logs_dir.mkdir(parents=True, exist_ok=True)
+                timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+                screenshot_path = logs_dir / f"yt_upload_error_{timestamp}.png"
+                await page.screenshot(path=str(screenshot_path), full_page=True)
+                logger.error("Đã chụp ảnh màn hình chẩn đoán lỗi tại: %s", screenshot_path)
+            except Exception as s_exc:
+                logger.warning("Không thể chụp ảnh màn hình chẩn đoán: %s", s_exc)
             raise BrowserUploadError(f"Upload qua trình duyệt thất bại: {exc}") from exc
         finally:
             try:
