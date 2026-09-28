@@ -1834,6 +1834,31 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
             )
         page.locator.assert_not_called()
 
+    async def test_agent_settings_button_skips_hidden_match_before_visible_button(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+
+        empty_matches = MagicMock()
+        empty_matches.count = AsyncMock(return_value=0)
+
+        hidden_button = MagicMock()
+        hidden_button.is_visible = AsyncMock(return_value=False)
+        visible_button = MagicMock()
+        visible_button.is_visible = AsyncMock(return_value=True)
+        visible_button.is_enabled = AsyncMock(return_value=True)
+        fallback_matches = MagicMock()
+        fallback_matches.count = AsyncMock(return_value=2)
+        fallback_matches.nth.side_effect = [hidden_button, visible_button]
+
+        page.locator.side_effect = [empty_matches, fallback_matches]
+
+        found = await worker._find_agent_settings_button(timeout=0.1)
+
+        self.assertIs(found, visible_button)
+        hidden_button.is_visible.assert_awaited_once()
+        visible_button.is_visible.assert_awaited_once()
+
     async def test_agent_video_settings_are_saved_once_per_project(self):
         page = MagicMock()
         page.url = "https://flow.google.com/project/project-one"
@@ -1886,6 +1911,11 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
         page.locator.side_effect = locate
         worker = GoogleFlowWorker(page)
         with (
+            patch.object(
+                worker,
+                "_find_agent_settings_button",
+                AsyncMock(return_value=settings_button),
+            ),
             patch.object(worker, "_save_debug_screenshot", AsyncMock()),
             patch("auto_yt.services.google_flow_worker.asyncio.sleep", AsyncMock()),
         ):

@@ -36,6 +36,7 @@ SUBMISSION_ACK_TIMEOUT_SECONDS = 10.0
 SUBMISSION_ACK_POLL_SECONDS = 0.5
 PROMPT_SUBMIT_READY_TIMEOUT_SECONDS = 5.0
 AGENT_SESSION_RESET_TIMEOUT_SECONDS = 10.0
+AGENT_SETTINGS_BUTTON_TIMEOUT_SECONDS = 10.0
 MAX_CONSECUTIVE_UI_ERRORS = 3
 IMAGE_BASELINE_STABILIZE_SECONDS = 2.0
 IMAGE_BASELINE_POLL_SECONDS = 0.25
@@ -635,6 +636,45 @@ class GoogleFlowWorker:
                 continue
         return False
 
+    async def _find_agent_settings_button(
+        self,
+        *,
+        timeout: float = AGENT_SETTINGS_BUTTON_TIMEOUT_SECONDS,
+    ) -> Locator | None:
+        """Return the visible Agent settings button, ignoring hidden trigger clones."""
+        exact_selector = (
+            "flow-creative-agent-prompt-box button[aria-label='Cài đặt' i], "
+            "flow-creative-agent-prompt-box button[aria-label='Settings' i], "
+            "flow-creative-agent-prompt-box button[aria-label='Agent settings' i]"
+        )
+        fallback_selector = (
+            "flow-creative-agent-prompt-box button[aria-label*='settings' i], "
+            "flow-creative-agent-prompt-box button[aria-label*='cài đặt' i], "
+            "flow-creative-agent-prompt-box button:has(mat-icon:text-is('tune')), "
+            "flow-creative-agent-prompt-box button:has(mat-icon:text-is('settings')), "
+            "flow-creative-agent-prompt-box button.settings-button"
+        )
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            for selector in (exact_selector, fallback_selector):
+                matches = self.page.locator(selector)
+                try:
+                    count = await matches.count()
+                except Exception:
+                    continue
+                for index in range(count):
+                    candidate = matches.nth(index)
+                    try:
+                        if await candidate.is_visible(timeout=100) and await candidate.is_enabled(
+                            timeout=100
+                        ):
+                            return candidate
+                    except Exception:
+                        continue
+            if time.monotonic() >= deadline:
+                return None
+            await asyncio.sleep(0.2)
+
     async def ensure_agent_video_settings(self, video_settings: dict | None = None) -> None:
         """Persist deterministic Agent defaults once for the active Flow project."""
         project_id = self._project_id()
@@ -651,15 +691,9 @@ class GoogleFlowWorker:
                 f"Model video '{model_id}' chưa có ánh xạ giao diện Google Flow Agent."
             )
 
-        settings_button = self.page.locator(
-            "flow-creative-agent-prompt-box button[aria-label*='settings' i], "
-            "flow-creative-agent-prompt-box button[aria-label*='cài đặt' i], "
-            "flow-creative-agent-prompt-box button:has(mat-icon:text-is('tune')), "
-            "flow-creative-agent-prompt-box button:has(mat-icon:text-is('settings')), "
-            "flow-creative-agent-prompt-box button.settings-button"
-        ).first
         try:
-            if not await settings_button.is_visible(timeout=3000):
+            settings_button = await self._find_agent_settings_button()
+            if settings_button is None:
                 raise FlowAgentSettingsError("Không tìm thấy nút Cài đặt tác nhân.")
             await settings_button.click(timeout=2000)
             await asyncio.sleep(0.4)
