@@ -762,5 +762,25 @@ class PromptSettingsTests(unittest.TestCase):
         self.assertEqual(result["version"]["image_generation_settings"]["scene_0_source"], "from_intro_transcript")
 
 
+    def test_image_generation_saves_custom_prompt_templates(self):
+        custom_motion = "Motion: slow cinematic zoom in, 4k 24fps."
+        custom_scene_0 = "Custom Scene 0: {style} with {reference}. Core: {thumbnail_concept}."
+        custom_scene_body = "Custom Scene {scene_index}: {style}. Action: {action}."
+        result = main.save_prompt_image_generation(
+            "default",
+            main.PromptImageGenerationData(
+                video_motion_prompt=custom_motion,
+                scene_0_prompt_template=custom_scene_0,
+                scene_body_prompt_template=custom_scene_body,
+            ),
+        )
+        saved = self.read_saved_data()
+        saved_img = saved["versions"]["default"]["image_generation_settings"]
+        self.assertEqual(saved_img["video_motion_prompt"], custom_motion)
+        self.assertEqual(saved_img["scene_0_prompt_template"], custom_scene_0)
+        self.assertEqual(saved_img["scene_body_prompt_template"], custom_scene_body)
+        self.assertEqual(result["version"]["image_generation_settings"]["video_motion_prompt"], custom_motion)
+
+
 if __name__ == "__main__":
     unittest.main()

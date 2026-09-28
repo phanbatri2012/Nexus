@@ -556,6 +556,7 @@ def _format_scene_video_prompt(
     *,
     scene_action: str = "",
     style_prompt: str = "",
+    video_motion_prompt: str = "",
     video_title: str = "",
     has_start_frame: bool = True,
     has_end_frame: bool = False,
@@ -592,10 +593,20 @@ def _format_scene_video_prompt(
     style_directive = f"Visual style: {style_clean}." if style_clean else "Visual style: cinematic documentary film, atmospheric natural lighting."
 
     # 4. Cinematic motion and technical specs (generic 100%)
-    motion_directive = "Motion: smooth cinematic camera movement, natural realistic motion, 4k 24fps high-fidelity video."
+
 
     # 5. Anti-text instruction
-    anti_text_directive = "Clean video without any text, letters, watermark, or subtitles."
+    if video_motion_prompt and video_motion_prompt.strip():
+        motion_clean = video_motion_prompt.strip()
+        motion_clean = motion_clean.replace("{style}", style_clean).replace("{action}", action_clean)
+        motion_directive = motion_clean
+    else:
+        motion_directive = "Motion: smooth cinematic camera movement, natural realistic motion, 4k 24fps high-fidelity video."
+
+    if "without text" in motion_directive.lower() or "without any text" in motion_directive.lower():
+        anti_text_directive = ""
+    else:
+        anti_text_directive = "Clean video without any text, letters, watermark, or subtitles."
 
     full_video_prompt = f"{frame_directive} {action_directive} {style_directive} {motion_directive} {anti_text_directive}"
     full_video_prompt = re.sub(r"\s+", " ", full_video_prompt).strip()
@@ -1149,6 +1160,7 @@ async def _generate_scene_video_async(
                 scene.get("prompt", ""),
                 scene_action=scene_action,
                 style_prompt=style_str,
+                video_motion_prompt=str(settings.get("video_motion_prompt") or ""),
                 video_title=video_title,
                 has_start_frame=bool(start_frame_path and start_frame_path.is_file()),
                 has_end_frame=bool(end_frame_path and end_frame_path.is_file()),
@@ -2233,6 +2245,8 @@ def build_default_visual_scene_plan(
     prompt_version: str = "",
     generated_script: str = "",
     scene_0_source: str = "from_thumbnail_without_text",
+    scene_0_prompt_template: str = "",
+    scene_body_prompt_template: str = "",
 ) -> dict:
     from auto_yt.services import prompt_assets
     assets = []
@@ -2324,7 +2338,18 @@ def build_default_visual_scene_plan(
                 ref_note = "Visual anchor from story thumbnail. "
 
             # Scene 0: Use Clean Thumbnail concept text if available and not focusing on a specific character, otherwise story hook
-            if not matched and clean_thumb_concept and len(clean_thumb_concept) >= 20:
+            if scene_0_prompt_template and scene_0_prompt_template.strip():
+                custom_p = scene_0_prompt_template.strip()
+                custom_p = (
+                    custom_p
+                    .replace("{style}", style)
+                    .replace("{reference}", ref_note.strip())
+                    .replace("{thumbnail_concept}", clean_thumb_concept or clean_context)
+                    .replace("{action}", clean_context)
+                    .replace("{scene_index}", "1")
+                )
+                prompt = re.sub(r"\s+", " ", custom_p).strip()
+            elif not matched and clean_thumb_concept and len(clean_thumb_concept) >= 20:
                 prompt = (
                     f"A cinematic movie still: {style}, opening scene hook. "
                     f"{ref_note}"
@@ -2340,7 +2365,18 @@ def build_default_visual_scene_plan(
                 ).replace("  ", " ").strip()
         elif is_video:
             # Subsequent intro video scenes: Story-aware dramatic continuation
-            prompt = (
+            if scene_body_prompt_template and scene_body_prompt_template.strip():
+                custom_p = scene_body_prompt_template.strip()
+                custom_p = (
+                    custom_p
+                    .replace("{style}", style)
+                    .replace("{reference}", ref_note.strip())
+                    .replace("{action}", clean_context)
+                    .replace("{scene_index}", str(w["index"] + 1))
+                )
+                prompt = re.sub(r"\s+", " ", custom_p).strip()
+            else:
+                prompt = (
                 f"A cinematic documentary photograph: {style}, scene {w['index'] + 1} dramatic storytelling. "
                 f"{ref_note}"
                 f"{context_part}"
@@ -2348,7 +2384,18 @@ def build_default_visual_scene_plan(
             ).replace("  ", " ").strip()
         else:
             # Standard body/outro scene
-            prompt = (
+            if scene_body_prompt_template and scene_body_prompt_template.strip():
+                custom_p = scene_body_prompt_template.strip()
+                custom_p = (
+                    custom_p
+                    .replace("{style}", style)
+                    .replace("{reference}", ref_note.strip())
+                    .replace("{action}", clean_context)
+                    .replace("{scene_index}", str(w["index"] + 1))
+                )
+                prompt = re.sub(r"\s+", " ", custom_p).strip()
+            else:
+                prompt = (
                 f"A still photograph: {style}, scene {w['index'] + 1}. "
                 f"{ref_note}"
                 f"{context_part}"
@@ -2422,6 +2469,8 @@ def produce_video(
             prompt_version=prompt_version,
             generated_script=generated_script,
             scene_0_source=scene_0_source,
+            scene_0_prompt_template=str(img_settings.get("scene_0_prompt_template") or ""),
+            scene_body_prompt_template=str(img_settings.get("scene_body_prompt_template") or ""),
         )
         save_visual_scene_plan(video_id, prepared["plan_hash"], plan_payload)
 

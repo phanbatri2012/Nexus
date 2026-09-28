@@ -1321,6 +1321,41 @@ class VideoProductionServiceTests(unittest.TestCase):
         self.assertEqual(artifact["status"], "failed")
         self.assertEqual(artifact["metadata"]["failure_stage"], "frame_sync")
 
+    def test_custom_video_motion_prompt_formatting(self):
+        prompt = video_production._format_scene_video_prompt(
+            "scene",
+            scene_action="nhân vật bước vào phòng",
+            style_prompt="Cinematic dark noir",
+            video_motion_prompt="Motion: slow dramatic dolly in, 4k 24fps.",
+            has_start_frame=True,
+            has_end_frame=False,
+        )
+        self.assertIn("Motion: slow dramatic dolly in, 4k 24fps.", prompt)
+        self.assertIn("Visual style: Cinematic dark noir.", prompt)
+        self.assertIn("Clean video without any text", prompt)
+
+    def test_build_default_visual_scene_plan_with_custom_templates(self):
+        windows = [
+            {"index": 0, "start": 0.0, "end": 8.0, "duration": 8.0, "transcript": "Mở đầu câu chuyện", "is_video": True},
+            {"index": 1, "start": 8.0, "end": 35.0, "duration": 27.0, "transcript": "Thân bài phân đoạn một", "is_video": False},
+        ]
+        custom_scene_0 = "TEMPLATE 0: {style} | Action: {action} | Ref: {reference}"
+        custom_body = "TEMPLATE BODY {scene_index}: {style} | Action: {action}"
+        plan = video_production.build_default_visual_scene_plan(
+            windows,
+            "Tiêu đề Test",
+            style_prompt="8k documentary",
+            scene_0_prompt_template=custom_scene_0,
+            scene_body_prompt_template=custom_body,
+        )
+        scene0 = plan["scenes"][0]
+        scene1 = plan["scenes"][1]
+        self.assertIn("TEMPLATE 0: 8k documentary", scene0["prompt"])
+        self.assertIn("Action: Mở đầu câu chuyện", scene0["prompt"])
+        self.assertIn("TEMPLATE BODY 2: 8k documentary", scene1["prompt"])
+        self.assertIn("Action: Thân bài phân đoạn một", scene1["prompt"])
+
+
 if __name__ == "__main__":
     unittest.main()
 

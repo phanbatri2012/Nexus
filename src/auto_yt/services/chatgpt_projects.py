@@ -165,6 +165,9 @@ DEFAULT_IMAGE_GENERATION_SETTINGS = {
     "enable_intro_video": True,
     "intro_scene_target_seconds": 8.0,
     "intro_crop_watermark": True,
+    "video_motion_prompt": "Motion: smooth cinematic camera movement, natural realistic motion, 4k 24fps high-fidelity video.",
+    "scene_0_prompt_template": "A cinematic movie still: {style}, opening scene hook. {reference} Story visual core: {thumbnail_concept}. 16:9 widescreen, photorealistic 8k, authentic documentary realism, clean framing without text.",
+    "scene_body_prompt_template": "A still photograph: {style}, scene {scene_index}. {reference} Narrative scene: {action}. 16:9 widescreen still photograph, authentic documentary realism, natural lighting, clean visual without text.",
     "scene_duration_min_seconds": 25,
     "scene_duration_target_seconds": 30,
     "scene_duration_max_seconds": 35,
@@ -397,6 +400,18 @@ def normalize_image_generation_settings(value: object) -> dict:
     except (TypeError, ValueError):
         normalized["intro_scene_target_seconds"] = 8.0
     normalized["intro_crop_watermark"] = bool(settings.get("intro_crop_watermark", True))
+    normalized["video_motion_prompt"] = str(
+        settings.get("video_motion_prompt") if settings.get("video_motion_prompt") is not None
+        else DEFAULT_IMAGE_GENERATION_SETTINGS["video_motion_prompt"]
+    ).strip()
+    normalized["scene_0_prompt_template"] = str(
+        settings.get("scene_0_prompt_template") if settings.get("scene_0_prompt_template") is not None
+        else DEFAULT_IMAGE_GENERATION_SETTINGS["scene_0_prompt_template"]
+    ).strip()
+    normalized["scene_body_prompt_template"] = str(
+        settings.get("scene_body_prompt_template") if settings.get("scene_body_prompt_template") is not None
+        else DEFAULT_IMAGE_GENERATION_SETTINGS["scene_body_prompt_template"]
+    ).strip()
     return normalized
 
 
