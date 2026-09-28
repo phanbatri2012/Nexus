@@ -1011,6 +1011,7 @@ class YouTubePublishPipelineTests(unittest.TestCase):
             "status": "uploaded_private",
             "scheduled_at": "",
             "title": "Publish title",
+            "caption_locator": "browser:vi:captions.srt",
         }
         async def fake_browser_upload(**kwargs):
             kwargs["progress"]("Test progress", "uploading", 50)
@@ -1049,6 +1050,8 @@ class YouTubePublishPipelineTests(unittest.TestCase):
             "status": "scheduled",
             "scheduled_at": "2026-09-27T23:55:00+07:00",
             "title": "Publish title",
+            "caption_locator": "browser:vi:captions.srt",
+            "schedule_verified": True,
         }
         async def fake_browser_upload(**kwargs):
             kwargs["persist_video_id"]("browser-yt-sched-456")
@@ -1084,12 +1087,24 @@ class YouTubePublishPipelineTests(unittest.TestCase):
         async def fake_browser_upload(**kwargs):
             captured_kwargs.update(kwargs)
             kwargs["persist_video_id"]("browser-yt-cat-25")
+            kwargs["persist_checkpoint"](
+                "monetization_detected",
+                {
+                    "monetization": {
+                        "capability": "unavailable",
+                        "evidence": ["complete_non_monetized_topology"],
+                    },
+                    "video_monetization_state": "not_applicable",
+                    "ad_suitability_state": "not_applicable",
+                },
+            )
             return {
                 "youtube_video_id": "browser-yt-cat-25",
                 "published_url": "https://www.youtube.com/watch?v=browser-yt-cat-25",
                 "status": "uploaded_private",
                 "scheduled_at": "",
                 "title": "Publish title",
+                "caption_locator": "browser:vi:captions.srt",
             }
 
         with patch.object(
@@ -1110,10 +1125,111 @@ class YouTubePublishPipelineTests(unittest.TestCase):
             )
 
         self.assertEqual(captured_kwargs.get("category_id"), "25")
+        self.assertEqual(captured_kwargs.get("publication_timezone"), "Asia/Ho_Chi_Minh")
+        self.assertEqual(captured_kwargs.get("expected_channel_id"), channel["channel_id"])
+        self.assertEqual(
+            captured_kwargs.get("publishing_settings", {}).get("monetization_mode"),
+            "auto_enable_if_available",
+        )
+        workflow = database.get_youtube_publish_workflow_by_job(job["id"])
+        snapshot = workflow["snapshot"]
+        self.assertEqual(snapshot["monetization_capability"], "unavailable")
+        self.assertEqual(
+            snapshot["monetization_detection_evidence"],
+            ["complete_non_monetized_topology"],
+        )
+        self.assertEqual(snapshot["video_monetization_state"], "not_applicable")
+
+    def test_browser_resume_passes_existing_video_id_without_new_identity(self):
+        job, channel = self._create_publish_job(schedule=True, upload_method="browser")
+        workflow, _ = database.reserve_youtube_publish_workflow(
+            video_id=job["video_id"],
+            youtube_channel_id=channel["id"],
+            artifact_id=(job.get("payload") or {})["artifact_id"],
+            snapshot=(job.get("payload") or {})["snapshot"],
+            system_job_id=job["id"],
+        )
+        database.update_youtube_publish_workflow(
+            workflow["id"],
+            youtube_video_id="existing-browser-video",
+            stage="draft_created",
+            status="error",
+        )
+        payload = dict(job["payload"])
+        payload["workflow_id"] = workflow["id"]
+        database.update_system_job(job["id"], payload_json=payload)
+        captured_kwargs = {}
+
+        async def fake_browser_upload(**kwargs):
+            captured_kwargs.update(kwargs)
+            return {
+                "youtube_video_id": "existing-browser-video",
+                "published_url": "https://www.youtube.com/watch?v=existing-browser-video",
+                "status": "scheduled",
+                "scheduled_at": kwargs["schedule_at"],
+                "title": "Publish title",
+                "caption_locator": "browser:vi:captions.srt",
+                "schedule_verified": True,
+                "resumed": True,
+            }
+
+        with patch.object(
+            youtube_publish_workflow.browser_youtube_uploader,
+            "upload_video_via_browser",
+            side_effect=fake_browser_upload,
+        ):
+            youtube_publish_workflow.execute_publish_job(
+                database.get_system_job(job["id"]),
+                progress=lambda *args: None,
+                cancel_check=lambda: None,
+                resolve_default_channel_id=lambda _ver: "",
+                thumbnails_dir=self.thumbnails_dir,
+            )
+
+        self.assertEqual(
+            captured_kwargs.get("existing_video_id"), "existing-browser-video"
+        )
+
+    def test_browser_resume_blocks_duplicate_when_remote_identity_is_unknown(self):
+        job, channel = self._create_publish_job(schedule=False, upload_method="browser")
+        snapshot = dict((job.get("payload") or {})["snapshot"])
+        snapshot["browser_upload_state"] = {
+            "checkpoint": "needs_review",
+            "remote_identity_unknown": True,
+            "file_selected": True,
+        }
+        workflow, _ = database.reserve_youtube_publish_workflow(
+            video_id=job["video_id"],
+            youtube_channel_id=channel["id"],
+            artifact_id=(job.get("payload") or {})["artifact_id"],
+            snapshot=snapshot,
+            system_job_id=job["id"],
+        )
+        database.update_youtube_publish_workflow(
+            workflow["id"],
+            stage="needs_review",
+            status="needs_review",
+        )
+        payload = dict(job["payload"])
+        payload["workflow_id"] = workflow["id"]
+        database.update_system_job(job["id"], payload_json=payload)
+
+        with patch.object(
+            youtube_publish_workflow.browser_youtube_uploader,
+            "upload_video_via_browser",
+        ) as browser_upload:
+            with self.assertRaises(
+                youtube_publish_workflow.browser_youtube_uploader.BrowserUploadNeedsReview
+            ):
+                youtube_publish_workflow.execute_publish_job(
+                    database.get_system_job(job["id"]),
+                    progress=lambda *_values: None,
+                    cancel_check=lambda: None,
+                    resolve_default_channel_id=lambda _version: "",
+                    thumbnails_dir=self.thumbnails_dir,
+                )
+        browser_upload.assert_not_called()
 
 
 if __name__ == "__main__":
     unittest.main()
-
-
-

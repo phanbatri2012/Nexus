@@ -130,6 +130,29 @@ const DEFAULT_PUBLISHING_SETTINGS = {
   include_tags: true,
   default_tags: '',
   contains_synthetic_media: true,
+  monetization_mode: 'auto_enable_if_available',
+  midroll_ads: true,
+  ad_suitability_mode: 'none_of_the_above',
+  playlist_name: '',
+  age_restriction: false,
+  paid_promotion: false,
+  automatic_chapters: true,
+  automatic_places: true,
+  automatic_concepts: true,
+  title_description_language: 'vi',
+  caption_certification: 'none',
+  license: 'youtube',
+  allow_embedding: true,
+  remix_policy: 'video_and_audio',
+  comments_enabled: true,
+  comment_moderation: 'basic',
+  comment_access: 'anyone',
+  comment_sort: 'top',
+  show_ratings: true,
+  upload_captions: true,
+  end_screen_source_video_id: '',
+  premiere: false,
+  checks_policy: 'schedule_immediately',
   description_template: ''
 };
 
@@ -1943,6 +1966,176 @@ export default function Settings({
               </select>
             </label>
           </div>
+          {(currentPublishing.upload_method || 'browser') === 'browser' && (
+            <details style={{ marginTop: 14 }}>
+              <summary style={{ cursor: 'pointer', fontWeight: 700, color: '#c4b5fd' }}>
+                ⚙️ Thiết lập nâng cao YouTube Studio
+              </summary>
+              <div className="production-settings-grid" style={{ marginTop: 12 }}>
+                <label>
+                  Chính sách kiếm tiền
+                  <select
+                    className="version-select"
+                    value={currentPublishing.monetization_mode}
+                    onChange={event => handlePromptSettingChange('publishing_settings', 'monetization_mode', event.target.value)}
+                    disabled={activeVersionLocked}
+                  >
+                    <option value="auto_enable_if_available">Tự bật nếu kênh hỗ trợ; nếu không thì bỏ qua</option>
+                    <option value="keep_off">Luôn giữ tắt</option>
+                    <option value="require_on">Bắt buộc bật; không hỗ trợ thì dừng</option>
+                  </select>
+                </label>
+                <label>
+                  Tự đánh giá quảng cáo
+                  <select
+                    className="version-select"
+                    value={currentPublishing.ad_suitability_mode}
+                    onChange={event => handlePromptSettingChange('publishing_settings', 'ad_suitability_mode', event.target.value)}
+                    disabled={activeVersionLocked}
+                  >
+                    <option value="none_of_the_above">Không chứa nội dung nào ở trên</option>
+                  </select>
+                </label>
+                <label>
+                  Playlist chính xác
+                  <input
+                    className="version-select"
+                    value={currentPublishing.playlist_name}
+                    onChange={event => handlePromptSettingChange('publishing_settings', 'playlist_name', event.target.value)}
+                    placeholder="Để trống để giữ mặc định theo kênh"
+                    disabled={activeVersionLocked}
+                  />
+                </label>
+                <label>
+                  Ngôn ngữ tiêu đề và mô tả
+                  <input
+                    className="version-select"
+                    value={currentPublishing.title_description_language}
+                    onChange={event => handlePromptSettingChange('publishing_settings', 'title_description_language', event.target.value)}
+                    placeholder="vi"
+                    disabled={activeVersionLocked}
+                  />
+                </label>
+                <label>
+                  Giấy phép
+                  <select
+                    className="version-select"
+                    value={currentPublishing.license}
+                    onChange={event => handlePromptSettingChange('publishing_settings', 'license', event.target.value)}
+                    disabled={activeVersionLocked}
+                  >
+                    <option value="youtube">Giấy phép chuẩn của YouTube</option>
+                    <option value="creative_common">Creative Commons</option>
+                  </select>
+                </label>
+                <label>
+                  Chứng nhận phụ đề (FCC)
+                  <select
+                    className="version-select"
+                    value={currentPublishing.caption_certification}
+                    onChange={event => handlePromptSettingChange('publishing_settings', 'caption_certification', event.target.value)}
+                    disabled={activeVersionLocked}
+                  >
+                    <option value="none">Không áp dụng</option>
+                    <option value="never_aired_us">Chưa từng phát sóng trên TV tại Hoa Kỳ</option>
+                    <option value="aired_us_without_captions">Đã phát sóng tại Hoa Kỳ nhưng không có phụ đề</option>
+                    <option value="not_aired_us_with_captions_since_2012">Không phát sóng có phụ đề tại Hoa Kỳ từ 30/09/2012</option>
+                    <option value="fcc_not_required">Không thuộc diện FCC yêu cầu phụ đề</option>
+                    <option value="fcc_exempt">Được FCC/Quốc hội Hoa Kỳ miễn trừ</option>
+                  </select>
+                </label>
+                <label>
+                  Chính sách remix
+                  <select
+                    className="version-select"
+                    value={currentPublishing.remix_policy}
+                    onChange={event => handlePromptSettingChange('publishing_settings', 'remix_policy', event.target.value)}
+                    disabled={activeVersionLocked}
+                  >
+                    <option value="video_and_audio">Cho phép remix video và âm thanh</option>
+                    <option value="audio_only">Chỉ cho phép remix âm thanh</option>
+                    <option value="disabled">Không cho phép remix</option>
+                  </select>
+                </label>
+                <label>
+                  Kiểm duyệt bình luận
+                  <select
+                    className="version-select"
+                    value={currentPublishing.comment_moderation}
+                    onChange={event => handlePromptSettingChange('publishing_settings', 'comment_moderation', event.target.value)}
+                    disabled={activeVersionLocked || !currentPublishing.comments_enabled}
+                  >
+                    <option value="none">Không kiểm duyệt</option>
+                    <option value="basic">Cơ bản</option>
+                    <option value="strict">Nghiêm ngặt</option>
+                    <option value="hold_all">Giữ tất cả để xem xét</option>
+                  </select>
+                </label>
+                <label>
+                  Người được bình luận
+                  <select
+                    className="version-select"
+                    value={currentPublishing.comment_access}
+                    onChange={event => handlePromptSettingChange('publishing_settings', 'comment_access', event.target.value)}
+                    disabled={activeVersionLocked || !currentPublishing.comments_enabled}
+                  >
+                    <option value="anyone">Mọi người</option>
+                    <option value="subscribers">Người đăng ký</option>
+                    <option value="members">Hội viên</option>
+                  </select>
+                </label>
+                <label>
+                  Thứ tự bình luận
+                  <select
+                    className="version-select"
+                    value={currentPublishing.comment_sort}
+                    onChange={event => handlePromptSettingChange('publishing_settings', 'comment_sort', event.target.value)}
+                    disabled={activeVersionLocked || !currentPublishing.comments_enabled}
+                  >
+                    <option value="top">Hàng đầu</option>
+                    <option value="newest">Mới nhất</option>
+                  </select>
+                </label>
+                <label>
+                  Video mẫu cho màn hình kết thúc
+                  <input
+                    className="version-select"
+                    value={currentPublishing.end_screen_source_video_id}
+                    onChange={event => handlePromptSettingChange('publishing_settings', 'end_screen_source_video_id', event.target.value)}
+                    placeholder="YouTube Video ID (không bắt buộc)"
+                    disabled={activeVersionLocked}
+                  />
+                </label>
+              </div>
+              <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginTop: 12 }}>
+                {[
+                  ['midroll_ads', 'Quảng cáo giữa video'],
+                  ['age_restriction', 'Giới hạn độ tuổi'],
+                  ['paid_promotion', 'Có nội dung trả phí'],
+                  ['automatic_chapters', 'Chapter tự động'],
+                  ['automatic_places', 'Địa điểm tự động'],
+                  ['automatic_concepts', 'Khái niệm tự động'],
+                  ['allow_embedding', 'Cho phép nhúng'],
+                  ['comments_enabled', 'Bật bình luận'],
+                  ['show_ratings', 'Hiển thị lượt thích'],
+                  ['upload_captions', 'Upload SRT tự động'],
+                  ['premiere', 'Đặt làm video Công chiếu']
+                ].map(([key, label]) => (
+                  <label key={key} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
+                      checked={Boolean(currentPublishing[key])}
+                      onChange={event => handlePromptSettingChange('publishing_settings', key, event.target.checked)}
+                      disabled={activeVersionLocked}
+                    /> {label}
+                  </label>
+                ))}
+              </div>
+              <div className="help-text" style={{ marginTop: 8 }}>
+                Tool nhận diện ba trạng thái kiếm tiền: khả dụng, không khả dụng và không xác định. Kênh chưa kiếm tiền vẫn được đặt lịch; trạng thái không xác định sẽ dừng để tránh thao tác sai.
+              </div>
+            </details>
+          )}
           {(currentPublishing.upload_method || 'browser') === 'browser' ? (
             <div
               style={{

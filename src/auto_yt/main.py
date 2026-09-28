@@ -61,6 +61,7 @@ from auto_yt.services.audio_review import (
 )
 from auto_yt.services import voice_config
 from auto_yt.services import (
+    browser_youtube_uploader,
     chatgpt_projects,
     prompt_assets,
     publication_scheduler,
@@ -374,6 +375,29 @@ class PromptPublishingData(BaseModel):
     made_for_kids: Optional[bool] = None
     notify_subscribers: bool = True
     contains_synthetic_media: bool = True
+    monetization_mode: str = "auto_enable_if_available"
+    midroll_ads: bool = True
+    ad_suitability_mode: str = "none_of_the_above"
+    playlist_name: str = Field(default="", max_length=150)
+    age_restriction: bool = False
+    paid_promotion: bool = False
+    automatic_chapters: bool = True
+    automatic_places: bool = True
+    automatic_concepts: bool = True
+    title_description_language: str = Field(default="vi", min_length=2, max_length=35)
+    caption_certification: str = Field(default="none", max_length=80)
+    license: str = "youtube"
+    allow_embedding: bool = True
+    remix_policy: str = "video_and_audio"
+    comments_enabled: bool = True
+    comment_moderation: str = "basic"
+    comment_access: str = "anyone"
+    comment_sort: str = "top"
+    show_ratings: bool = True
+    upload_captions: bool = True
+    end_screen_source_video_id: str = Field(default="", max_length=32)
+    premiere: bool = False
+    checks_policy: str = "schedule_immediately"
     description_template: str = Field(
         default="{description}\n\n{chapters}\n\n{tags}", max_length=5000
     )
@@ -5003,6 +5027,24 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
             message=safe_error,
             attention_required="youtube_publish_config",
             missing_configuration=exc.missing_configuration,
+        )
+        return
+    if isinstance(exc, browser_youtube_uploader.BrowserUploadNeedsReview):
+        _pause_youtube_publish_job(
+            job,
+            message=safe_error,
+            attention_required="youtube_browser_review",
+            missing_configuration=[],
+            workflow_status="needs_review",
+        )
+        return
+    if isinstance(exc, browser_youtube_uploader.BrowserUploadError):
+        _pause_youtube_publish_job(
+            job,
+            message=safe_error,
+            attention_required="youtube_browser_retry",
+            missing_configuration=[],
+            workflow_status="error",
         )
         return
     if isinstance(exc, publication_scheduler.PublicationScheduleError):

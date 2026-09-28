@@ -495,6 +495,40 @@ class PromptSettingsTests(unittest.TestCase):
         self.assertFalse(saved_pub["made_for_kids"])
         self.assertEqual(result["version"]["publishing_settings"]["category_id"], "22")
 
+    def test_publishing_defaults_auto_detect_monetization(self):
+        normalized = chatgpt_projects.normalize_publishing_settings({})
+        self.assertEqual(
+            normalized["monetization_mode"], "auto_enable_if_available"
+        )
+        self.assertEqual(
+            normalized["ad_suitability_mode"], "none_of_the_above"
+        )
+        self.assertTrue(normalized["upload_captions"])
+        self.assertEqual(normalized["checks_policy"], "schedule_immediately")
+
+    def test_publishing_rejects_unknown_monetization_mode(self):
+        with self.assertRaises(ValueError):
+            chatgpt_projects.validate_publishing_settings(
+                {"monetization_mode": "assume_disabled"}
+            )
+
+    def test_publishing_validates_caption_certification_and_end_screen_id(self):
+        valid = chatgpt_projects.validate_publishing_settings(
+            {
+                "caption_certification": "never_aired_us",
+                "end_screen_source_video_id": "abcDEF_12345",
+            }
+        )
+        self.assertEqual(valid["caption_certification"], "never_aired_us")
+        with self.assertRaises(ValueError):
+            chatgpt_projects.validate_publishing_settings(
+                {"caption_certification": "invented"}
+            )
+        with self.assertRaises(ValueError):
+            chatgpt_projects.validate_publishing_settings(
+                {"end_screen_source_video_id": "not a youtube id"}
+            )
+
     def test_pipeline_dependencies_enable_every_required_step(self):
         resolved, auto_enabled = chatgpt_projects.resolve_prompt_pipeline_dependencies(
             {

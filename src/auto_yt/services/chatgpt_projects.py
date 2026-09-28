@@ -171,6 +171,25 @@ DEFAULT_IMAGE_GENERATION_SETTINGS = {
 }
 UPLOAD_METHODS = ("browser", "api")
 DEFAULT_UPLOAD_METHOD = "browser"
+MONETIZATION_MODES = {
+    "auto_enable_if_available",
+    "keep_off",
+    "require_on",
+}
+AD_SUITABILITY_MODES = {"none_of_the_above"}
+REMIX_POLICIES = {"video_and_audio", "audio_only", "disabled"}
+COMMENT_MODERATION_LEVELS = {"none", "basic", "strict", "hold_all"}
+COMMENT_ACCESS_LEVELS = {"anyone", "subscribers", "members"}
+COMMENT_SORT_ORDERS = {"top", "newest"}
+CHECKS_POLICIES = {"schedule_immediately"}
+CAPTION_CERTIFICATIONS = {
+    "none",
+    "never_aired_us",
+    "aired_us_without_captions",
+    "not_aired_us_with_captions_since_2012",
+    "fcc_not_required",
+    "fcc_exempt",
+}
 
 DEFAULT_PUBLISHING_SETTINGS = {
     "upload_method": DEFAULT_UPLOAD_METHOD,
@@ -181,6 +200,29 @@ DEFAULT_PUBLISHING_SETTINGS = {
     "include_tags": True,
     "default_tags": "",
     "contains_synthetic_media": True,
+    "monetization_mode": "auto_enable_if_available",
+    "midroll_ads": True,
+    "ad_suitability_mode": "none_of_the_above",
+    "playlist_name": "",
+    "age_restriction": False,
+    "paid_promotion": False,
+    "automatic_chapters": True,
+    "automatic_places": True,
+    "automatic_concepts": True,
+    "title_description_language": "vi",
+    "caption_certification": "none",
+    "license": "youtube",
+    "allow_embedding": True,
+    "remix_policy": "video_and_audio",
+    "comments_enabled": True,
+    "comment_moderation": "basic",
+    "comment_access": "anyone",
+    "comment_sort": "top",
+    "show_ratings": True,
+    "upload_captions": True,
+    "end_screen_source_video_id": "",
+    "premiere": False,
+    "checks_policy": "schedule_immediately",
     "description_template": "{description}\n\n{chapters}\n\n{hashtags}",
 }
 
@@ -413,6 +455,79 @@ def normalize_publishing_settings(value: object) -> dict:
     normalized["default_tags"] = str(settings.get("default_tags") or "").strip()
     # All videos produced by this pipeline use synthetic scene images.
     normalized["contains_synthetic_media"] = True
+    monetization_mode = str(
+        settings.get("monetization_mode") or "auto_enable_if_available"
+    ).strip()
+    normalized["monetization_mode"] = (
+        monetization_mode
+        if monetization_mode in MONETIZATION_MODES
+        else "auto_enable_if_available"
+    )
+    normalized["midroll_ads"] = bool(settings.get("midroll_ads", True))
+    ad_suitability_mode = str(
+        settings.get("ad_suitability_mode") or "none_of_the_above"
+    ).strip()
+    normalized["ad_suitability_mode"] = (
+        ad_suitability_mode
+        if ad_suitability_mode in AD_SUITABILITY_MODES
+        else "none_of_the_above"
+    )
+    normalized["playlist_name"] = str(settings.get("playlist_name") or "").strip()
+    normalized["age_restriction"] = bool(settings.get("age_restriction", False))
+    normalized["paid_promotion"] = bool(settings.get("paid_promotion", False))
+    for key in ("automatic_chapters", "automatic_places", "automatic_concepts"):
+        normalized[key] = bool(settings.get(key, True))
+    normalized["title_description_language"] = str(
+        settings.get("title_description_language")
+        or normalized["language"]
+    ).strip() or normalized["language"]
+    caption_certification = str(
+        settings.get("caption_certification") or "none"
+    ).strip()
+    normalized["caption_certification"] = (
+        caption_certification
+        if caption_certification in CAPTION_CERTIFICATIONS
+        else "none"
+    )
+    normalized["license"] = (
+        "creative_common"
+        if str(settings.get("license") or "youtube").strip() == "creative_common"
+        else "youtube"
+    )
+    normalized["allow_embedding"] = bool(settings.get("allow_embedding", True))
+    remix_policy = str(settings.get("remix_policy") or "video_and_audio").strip()
+    normalized["remix_policy"] = (
+        remix_policy if remix_policy in REMIX_POLICIES else "video_and_audio"
+    )
+    normalized["comments_enabled"] = bool(settings.get("comments_enabled", True))
+    comment_moderation = str(settings.get("comment_moderation") or "basic").strip()
+    normalized["comment_moderation"] = (
+        comment_moderation
+        if comment_moderation in COMMENT_MODERATION_LEVELS
+        else "basic"
+    )
+    comment_access = str(settings.get("comment_access") or "anyone").strip()
+    normalized["comment_access"] = (
+        comment_access if comment_access in COMMENT_ACCESS_LEVELS else "anyone"
+    )
+    comment_sort = str(settings.get("comment_sort") or "top").strip()
+    normalized["comment_sort"] = (
+        comment_sort if comment_sort in COMMENT_SORT_ORDERS else "top"
+    )
+    normalized["show_ratings"] = bool(settings.get("show_ratings", True))
+    normalized["upload_captions"] = bool(settings.get("upload_captions", True))
+    normalized["end_screen_source_video_id"] = str(
+        settings.get("end_screen_source_video_id") or ""
+    ).strip()
+    normalized["premiere"] = bool(settings.get("premiere", False))
+    checks_policy = str(
+        settings.get("checks_policy") or "schedule_immediately"
+    ).strip()
+    normalized["checks_policy"] = (
+        checks_policy
+        if checks_policy in CHECKS_POLICIES
+        else "schedule_immediately"
+    )
     template_val = settings.get("description_template")
     if isinstance(template_val, str):
         normalized["description_template"] = template_val
@@ -454,6 +569,59 @@ def validate_publishing_settings(value: object) -> dict:
         raise ValueError("Thẻ từ khóa mặc định phải là chuỗi ký tự.")
     if isinstance(default_tags, str) and len(default_tags) > 500:
         raise ValueError("Thẻ từ khóa mặc định không được vượt quá 500 ký tự.")
+    enum_fields = {
+        "monetization_mode": MONETIZATION_MODES,
+        "ad_suitability_mode": AD_SUITABILITY_MODES,
+        "remix_policy": REMIX_POLICIES,
+        "comment_moderation": COMMENT_MODERATION_LEVELS,
+        "comment_access": COMMENT_ACCESS_LEVELS,
+        "comment_sort": COMMENT_SORT_ORDERS,
+        "checks_policy": CHECKS_POLICIES,
+        "license": {"youtube", "creative_common"},
+        "caption_certification": CAPTION_CERTIFICATIONS,
+    }
+    for field, choices in enum_fields.items():
+        if field in settings and str(settings.get(field) or "") not in choices:
+            raise ValueError(f"Thiết lập {field} không hợp lệ.")
+    boolean_fields = {
+        "midroll_ads",
+        "age_restriction",
+        "paid_promotion",
+        "automatic_chapters",
+        "automatic_places",
+        "automatic_concepts",
+        "allow_embedding",
+        "comments_enabled",
+        "show_ratings",
+        "upload_captions",
+        "premiere",
+    }
+    invalid_boolean_fields = [
+        field
+        for field in boolean_fields
+        if field in settings and not isinstance(settings.get(field), bool)
+    ]
+    if invalid_boolean_fields:
+        raise ValueError(
+            "Thiết lập upload phải là Có hoặc Không: "
+            + ", ".join(sorted(invalid_boolean_fields))
+        )
+    for language_field in ("title_description_language",):
+        language_value = str(settings.get(language_field) or language).strip()
+        if not re.fullmatch(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", language_value):
+            raise ValueError(f"Mã ngôn ngữ {language_field} không hợp lệ.")
+    for text_field, max_length in {
+        "playlist_name": 150,
+        "end_screen_source_video_id": 32,
+    }.items():
+        text_value = settings.get(text_field, "")
+        if text_value is not None and not isinstance(text_value, str):
+            raise ValueError(f"Thiết lập {text_field} phải là chuỗi ký tự.")
+        if isinstance(text_value, str) and len(text_value) > max_length:
+            raise ValueError(f"Thiết lập {text_field} vượt quá {max_length} ký tự.")
+    end_screen_video_id = str(settings.get("end_screen_source_video_id") or "").strip()
+    if end_screen_video_id and not re.fullmatch(r"[A-Za-z0-9_-]{6,32}", end_screen_video_id):
+        raise ValueError("YouTube Video ID dùng cho màn hình kết thúc không hợp lệ.")
     desc_template = settings.get("description_template")
     if desc_template is not None and not isinstance(desc_template, str):
         raise ValueError("Mẫu mô tả YouTube phải là chuỗi ký tự.")

@@ -12,6 +12,7 @@ from urllib.parse import unquote, urlsplit
 from auto_yt.services import database as db
 from auto_yt.services import (
     browser_youtube_uploader,
+    chatgpt_projects,
     publication_scheduler,
     secret_store,
     youtube_comments,
@@ -423,6 +424,10 @@ def _build_preflight_context(
             ["made_for_kids"],
             "Bộ prompt chưa chọn video có dành cho trẻ em hay không.",
         )
+    publishing_settings = chatgpt_projects.normalize_publishing_settings(
+        publishing_settings
+    )
+    snapshot["publishing_settings"] = publishing_settings
     metadata = snapshot.get("youtube_metadata")
     if not isinstance(metadata, dict) or not metadata.get("snippet"):
         try:
@@ -553,6 +558,20 @@ def execute_browser_publish_workflow(
             ["gpm_profile_id"],
             "Kênh chưa được gán GPM Profile để upload qua trình duyệt.",
         )
+    browser_state = dict(
+        (workflow.get("snapshot") or context["snapshot"]).get(
+            "browser_upload_state"
+        )
+        or {}
+    )
+    if (
+        bool(browser_state.get("remote_identity_unknown"))
+        and not str(workflow.get("youtube_video_id") or "").strip()
+    ):
+        raise browser_youtube_uploader.BrowserUploadNeedsReview(
+            "YouTube đã nhận file ở lần chạy trước nhưng chưa lấy được Video ID; "
+            "cần đối chiếu draft thủ công trước khi retry để tránh upload trùng."
+        )
 
     target_schedule_at = ""
     if context["schedule_enabled"]:
@@ -561,6 +580,14 @@ def execute_browser_publish_workflow(
     def persist_browser_video_id(vid_id: str) -> None:
         if not vid_id:
             return
+        current_workflow = db.get_youtube_publish_workflow(workflow_id) or workflow
+        current_stage = str(current_workflow.get("stage") or "")
+        checkpoint_stage = (
+            current_stage
+            if str(current_workflow.get("youtube_video_id") or "") == vid_id
+            and current_stage not in {"", "upload", "uploaded", "draft_created"}
+            else "draft_created"
+        )
         publication = db.save_video_publication(
             video_id=video_id,
             youtube_channel_id=int(workflow["youtube_channel_id"]),
@@ -583,8 +610,41 @@ def execute_browser_publish_workflow(
             workflow_id,
             youtube_video_id=vid_id,
             publication_id=int(publication["id"]),
-            stage="uploaded",
+            stage=checkpoint_stage,
             status="running",
+        )
+
+    def persist_browser_checkpoint(stage: str, details: dict) -> None:
+        latest = db.get_youtube_publish_workflow(workflow_id) or workflow
+        latest_snapshot = dict(latest.get("snapshot") or context["snapshot"])
+        browser_state = dict(latest_snapshot.get("browser_upload_state") or {})
+        browser_state.update(dict(details or {}))
+        browser_state["checkpoint"] = stage
+        latest_snapshot["browser_upload_state"] = browser_state
+        monetization = dict(details.get("monetization") or {})
+        if monetization:
+            latest_snapshot["monetization_capability"] = str(
+                monetization.get("capability") or ""
+            )
+            latest_snapshot["monetization_detection_evidence"] = list(
+                monetization.get("evidence") or []
+            )
+        for state_key in ("video_monetization_state", "ad_suitability_state"):
+            if state_key in details:
+                latest_snapshot[state_key] = details[state_key]
+        checkpoint_status = (
+            "needs_review"
+            if stage == "needs_review"
+            else "error"
+            if stage == "failed"
+            else "running"
+        )
+        db.update_youtube_publish_workflow(
+            workflow_id,
+            snapshot_json=latest_snapshot,
+            stage=stage,
+            status=checkpoint_status,
+            error=str(details.get("error") or "") if checkpoint_status != "running" else "",
         )
 
     title = str(context["metadata"].get("snippet", {}).get("title") or "")
@@ -599,27 +659,87 @@ def execute_browser_publish_workflow(
         context["publishing_settings"].get("notify_subscribers", True)
     )
 
-    browser_result = asyncio.run(
-        browser_youtube_uploader.upload_video_via_browser(
-            profile_id=gpm_profile_id,
-            video_path=context["video_path"],
-            thumbnail_path=context["thumbnail_path"],
-            title=title,
-            description=description,
-            tags=tags,
-            category_id=category_id,
-            made_for_kids=made_for_kids,
-            contains_synthetic_media=contains_synthetic_media,
-            notify_subscribers=notify_subscribers,
-            schedule_at=target_schedule_at if context["schedule_enabled"] else None,
-            progress=progress,
-            cancel_check=cancel_check,
-            persist_video_id=persist_browser_video_id,
+    try:
+        browser_result = asyncio.run(
+            browser_youtube_uploader.upload_video_via_browser(
+                profile_id=gpm_profile_id,
+                video_path=context["video_path"],
+                thumbnail_path=context["thumbnail_path"],
+                title=title,
+                description=description,
+                tags=tags,
+                category_id=category_id,
+                made_for_kids=made_for_kids,
+                contains_synthetic_media=contains_synthetic_media,
+                notify_subscribers=notify_subscribers,
+                schedule_at=target_schedule_at if context["schedule_enabled"] else None,
+                caption_path=context["caption_path"],
+                language=str(context["publishing_settings"].get("language") or "vi"),
+                publication_timezone=str(
+                    context["channel"].get("publication_timezone")
+                    or "Asia/Ho_Chi_Minh"
+                ),
+                expected_channel_id=str(context["channel"].get("channel_id") or ""),
+                existing_video_id=str(workflow.get("youtube_video_id") or ""),
+                publishing_settings=context["publishing_settings"],
+                progress=progress,
+                cancel_check=cancel_check,
+                persist_video_id=persist_browser_video_id,
+                persist_checkpoint=persist_browser_checkpoint,
+            )
         )
-    )
+    except browser_youtube_uploader.BrowserUploadNeedsReview as exc:
+        db.update_video_production_state(
+            video_id,
+            publish_status="needs_review",
+            current_stage="needs_review",
+            production_progress="Upload YouTube cần kiểm tra thủ công",
+            blocking_reason=str(exc),
+        )
+        raise
+    except browser_youtube_uploader.BrowserUploadError as exc:
+        latest = db.get_youtube_publish_workflow(workflow_id) or {}
+        if str(latest.get("status") or "") not in {"needs_review", "error"}:
+            db.update_youtube_publish_workflow(
+                workflow_id,
+                status="error",
+                error=str(exc),
+            )
+        db.update_video_production_state(
+            video_id,
+            publish_status="error",
+            current_stage=str(latest.get("stage") or "browser_upload"),
+            production_progress="Upload YouTube qua trình duyệt thất bại",
+            blocking_reason=str(exc),
+        )
+        raise
 
     youtube_video_id = str(browser_result.get("youtube_video_id") or "").strip()
     persist_browser_video_id(youtube_video_id)
+    if context["schedule_enabled"] and not bool(browser_result.get("schedule_verified")):
+        raise browser_youtube_uploader.BrowserUploadNeedsReview(
+            "YouTube Studio chưa xác minh lịch đăng; không cập nhật local thành scheduled."
+        )
+    latest_workflow = db.get_youtube_publish_workflow(workflow_id) or {}
+    latest_browser_state = dict(
+        (latest_workflow.get("snapshot") or {}).get("browser_upload_state") or {}
+    )
+    caption_locator = str(
+        browser_result.get("caption_locator")
+        or latest_browser_state.get("caption_locator")
+        or latest_workflow.get("caption_id")
+        or ""
+    ).strip()
+    if bool(context["publishing_settings"].get("upload_captions", True)) and not caption_locator:
+        raise browser_youtube_uploader.BrowserUploadNeedsReview(
+            "Chưa xác minh được phụ đề SRT trên YouTube Studio."
+        )
+    if caption_locator:
+        db.update_youtube_publish_workflow(
+            workflow_id,
+            caption_id=caption_locator,
+            stage="caption_verified",
+        )
 
     workflow = db.get_youtube_publish_workflow(workflow_id)
     publication_id = int(workflow.get("publication_id") or 0)

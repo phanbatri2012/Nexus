@@ -5325,6 +5325,7 @@ PUBLISH_WORKFLOW_REUSABLE_STATUSES = {
     "running",
     "retry_wait",
     "waiting",
+    "needs_review",
     "processing",
     "ready_to_schedule",
     "uploaded_private",
