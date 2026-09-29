@@ -34,6 +34,12 @@ class BrowserYouTubeUploaderTests(unittest.IsolatedAsyncioTestCase):
             uploader.UPLOAD_PLAYLIST_TRIGGER_SELECTORS,
         )
 
+    def test_completion_dialog_supports_current_scheduled_title(self):
+        self.assertIn(
+            "ytcp-dialog:has-text('Đã lên lịch cho video')",
+            uploader.UPLOAD_COMPLETION_DIALOG_SELECTOR,
+        )
+
     async def test_existing_youtube_category_is_not_selected_again(self):
         category = MagicMock()
         category.scroll_into_view_if_needed = AsyncMock()
@@ -539,6 +545,19 @@ class BrowserYouTubeUploaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(uploader._schedule_time_matches("19:00", target_time))
         self.assertTrue(uploader._schedule_time_matches("7:00 PM", target_time))
         self.assertFalse(uploader._schedule_time_matches("18:00", target_time))
+
+    def test_schedule_timestamp_matcher_accepts_studio_prefetch_data(self):
+        target = dt.datetime(
+            2026, 9, 30, 19, 0, tzinfo=dt.timezone(dt.timedelta(hours=7))
+        )
+        markup = '"scheduledTimeSeconds":"1790769600"'
+
+        self.assertTrue(uploader._schedule_timestamp_matches(markup, target))
+        self.assertFalse(
+            uploader._schedule_timestamp_matches(
+                '"scheduledTimeSeconds":"1790773200"', target
+            )
+        )
 
 
 if __name__ == "__main__":

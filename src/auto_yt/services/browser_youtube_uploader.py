@@ -93,6 +93,11 @@ UPLOAD_THUMBNAIL_PREVIEW_SELECTOR = (
     "ytcp-video-upload-dialog ytcp-video-custom-still-editor img[src], "
     "ytcp-video-upload-dialog #custom-thumbnail img[src]"
 )
+UPLOAD_COMPLETION_DIALOG_SELECTOR = (
+    "ytcp-video-share-dialog, ytcp-publish-dialog, "
+    "ytcp-dialog:has-text('Đã lên lịch cho video'), "
+    "ytcp-dialog:has-text('Video scheduled')"
+)
 MONETIZATION_MODE_AUTO = "auto_enable_if_available"
 MONETIZATION_MODE_KEEP_OFF = "keep_off"
 MONETIZATION_MODE_REQUIRE = "require_on"
@@ -597,6 +602,18 @@ def _schedule_time_matches(value: str, expected: dt.time) -> bool:
     hour_12 = expected.hour % 12 or 12
     meridiem = "pm" if expected.hour >= 12 else "am"
     return f"{hour_12}:{expected.minute:02d}{meridiem}" in normalized
+
+
+def _schedule_timestamp_matches(page_markup: str, expected: dt.datetime) -> bool:
+    expected_seconds = int(expected.timestamp())
+    scheduled_seconds = {
+        int(value)
+        for value in re.findall(
+            r'"scheduledTimeSeconds"\s*:\s*"?(\d+)"?',
+            str(page_markup or ""),
+        )
+    }
+    return any(abs(value - expected_seconds) <= 60 for value in scheduled_seconds)
 
 
 def _find_blocking_restriction(text: str) -> str:
@@ -1667,10 +1684,15 @@ async def upload_video_via_browser(
                         schedule_at,
                         publication_timezone,
                     )
-                    if (
-                        not _schedule_date_matches(body_text, resumed_local_dt.date())
-                        or not _schedule_time_matches(body_text, resumed_local_dt.time())
-                    ):
+                    schedule_matches = (
+                        _schedule_date_matches(body_text, resumed_local_dt.date())
+                        and _schedule_time_matches(body_text, resumed_local_dt.time())
+                    )
+                    if not schedule_matches:
+                        schedule_matches = _schedule_timestamp_matches(
+                            await page.content(), resumed_local_dt
+                        )
+                    if not schedule_matches:
                         raise BrowserUploadNeedsReview(
                             "Bản nháp đã lên lịch nhưng ngày/giờ trên YouTube không khớp timezone kênh."
                         )
@@ -2334,10 +2356,10 @@ async def upload_video_via_browser(
                 # 2. Set Date
                 date_filled = False
                 date_selectors = [
+                    "#datepicker-trigger",
                     "#datepicker-trigger input",
                     "input#datepicker-trigger",
                     "ytcp-date-picker input",
-                    "#datepicker-trigger",
                     "input[aria-label*='ngày' i]",
                     "input[aria-label*='date' i]",
                     "input[placeholder*='ngày' i]",
@@ -2346,8 +2368,28 @@ async def upload_video_via_browser(
                 date_value = ""
                 for sel in date_selectors:
                     try:
-                        date_input = await page.wait_for_selector(sel, state="visible", timeout=3000)
+                        dialog_elements = await _visible_upload_dialog_elements(
+                            page, sel
+                        )
+                        date_input = (
+                            dialog_elements[0]
+                            if dialog_elements
+                            else await page.wait_for_selector(
+                                sel, state="visible", timeout=3000
+                            )
+                        )
                         if date_input:
+                            date_value = await _read_control_value(date_input)
+                            if _schedule_date_matches(
+                                date_value, local_dt.date()
+                            ):
+                                date_filled = True
+                                logger.info(
+                                    "Ngày đặt lịch đã đúng: %s (selector: %s)",
+                                    date_value,
+                                    sel,
+                                )
+                                break
                             await date_input.click()
                             await page.keyboard.press("Control+A")
                             await page.keyboard.press("Backspace")
@@ -2392,6 +2434,8 @@ async def upload_video_via_browser(
                 # 3. Set Time
                 time_filled = False
                 time_selectors = [
+                    "#time-of-day-container input",
+                    "ytcp-datetime-picker #time-of-day-container input",
                     "#time-of-day-trigger input",
                     "input#time-input",
                     "ytcp-time-of-day-picker input",
@@ -2403,8 +2447,28 @@ async def upload_video_via_browser(
                 time_value = ""
                 for sel in time_selectors:
                     try:
-                        time_input = await page.wait_for_selector(sel, state="visible", timeout=3000)
+                        dialog_elements = await _visible_upload_dialog_elements(
+                            page, sel
+                        )
+                        time_input = (
+                            dialog_elements[0]
+                            if dialog_elements
+                            else await page.wait_for_selector(
+                                sel, state="visible", timeout=3000
+                            )
+                        )
                         if time_input:
+                            time_value = await _read_control_value(time_input)
+                            if _schedule_time_matches(
+                                time_value, local_dt.time()
+                            ):
+                                time_filled = True
+                                logger.info(
+                                    "Giờ đặt lịch đã đúng: %s (selector: %s)",
+                                    time_value,
+                                    sel,
+                                )
+                                break
                             await time_input.click()
                             await page.keyboard.press("Control+A")
                             await page.keyboard.press("Backspace")
@@ -2569,9 +2633,9 @@ async def upload_video_via_browser(
             try:
                 # Try finding confirmation or share dialog
                 share_dialog = await page.wait_for_selector(
-                    "ytcp-video-share-dialog, ytcp-publish-dialog",
+                    UPLOAD_COMPLETION_DIALOG_SELECTOR,
                     state="visible",
-                    timeout=10000,
+                    timeout=30000,
                 )
                 if share_dialog and not youtube_video_id:
                     dialog_text = await share_dialog.inner_text()
@@ -2627,10 +2691,13 @@ async def upload_video_via_browser(
                 raise BrowserUploadNeedsReview(
                     "Đã bấm đặt lịch nhưng trang video chưa hiển thị trạng thái Đã lên lịch."
                 )
-            if schedule_at and (
-                not _schedule_date_matches(editor_text, local_dt.date())
-                or not _schedule_time_matches(editor_text, local_dt.time())
-            ):
+            schedule_matches = True
+            if schedule_at:
+                schedule_matches = (
+                    _schedule_date_matches(editor_text, local_dt.date())
+                    and _schedule_time_matches(editor_text, local_dt.time())
+                ) or _schedule_timestamp_matches(await page.content(), local_dt)
+            if schedule_at and not schedule_matches:
                 raise BrowserUploadNeedsReview(
                     "Video đã lên lịch nhưng trang chỉnh sửa chưa hiển thị đúng ngày/giờ theo timezone kênh."
                 )
