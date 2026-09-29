@@ -1,11 +1,70 @@
 import datetime as dt
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from auto_yt.services import browser_youtube_uploader as uploader
 
 
 class BrowserYouTubeUploaderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_control_value_prefers_contenteditable_text_over_aria_label(self):
+        element = MagicMock()
+        element.input_value = AsyncMock(side_effect=RuntimeError("not an input"))
+        element.get_attribute = AsyncMock(
+            side_effect=lambda name: {
+                "value": None,
+                "aria-valuetext": None,
+                "aria-label": "Tiêu đề (bắt buộc)",
+            }.get(name)
+        )
+        element.inner_text = AsyncMock(return_value="Tiêu đề video đã điền")
+
+        value = await uploader._read_control_value(element)
+
+        self.assertEqual(value, "Tiêu đề video đã điền")
+
+    async def test_blank_new_upload_dialog_is_not_treated_as_saved_draft(self):
+        dialog = MagicMock()
+        dialog.query_selector = AsyncMock(return_value=None)
+        page = MagicMock()
+        page.query_selector_all = AsyncMock(return_value=[dialog])
+
+        result = await uploader._find_visible_upload_details_dialog(page)
+
+        self.assertIsNone(result)
+
+    async def test_details_dialog_uses_visible_editor_when_custom_root_has_no_box(self):
+        editor = MagicMock()
+        editor.is_visible = AsyncMock(return_value=True)
+        dialog = MagicMock()
+        dialog.is_visible = AsyncMock(return_value=False)
+        dialog.query_selector = AsyncMock(return_value=editor)
+        page = MagicMock()
+        page.query_selector_all = AsyncMock(return_value=[dialog])
+
+        result = await uploader._find_visible_upload_details_dialog(page)
+
+        self.assertIs(result, dialog)
+        dialog.is_visible.assert_not_awaited()
+
+    async def test_existing_draft_uses_edit_draft_button_without_upload_url(self):
+        page = MagicMock()
+        page.goto = AsyncMock()
+        details_dialog = MagicMock()
+
+        with (
+            patch.object(
+                uploader,
+                "_find_visible_upload_details_dialog",
+                AsyncMock(side_effect=[None, details_dialog]),
+            ),
+            patch.object(uploader, "_safe_click", AsyncMock(return_value=True)) as click,
+        ):
+            await uploader._open_existing_draft_upload_dialog(page)
+
+        page.goto.assert_not_awaited()
+        click.assert_awaited_once()
+        self.assertIn("Chỉnh sửa bản nháp", " ".join(click.await_args.args[1]))
+
     async def test_monetized_wizard_requires_stable_reads(self):
         snapshot = {
             "stepText": [

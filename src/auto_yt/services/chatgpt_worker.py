@@ -414,31 +414,33 @@ def get_visible_conversation_turns(page: Page) -> list[tuple[int, str]]:
             visible_turns.append((turn_number, role))
         if visible_turns:
             return visible_turns
-
     # Modern ChatGPT DOM (or when no numbered conversation-turn elements exist):
     try:
         raw_turns = page.evaluate("""() => {
-            const units = [...document.querySelectorAll(
-                '[data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"]'
-            )];
+            const units = Array.from(document.querySelectorAll(
+                '[data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"], .group\\/user-message, .bg-user-message, div.MarkdownRoot-rZKhxa, [data-message-author-role], img[alt*="Generated image"], img[alt*="DALL"]'
+            ));
             const results = [];
             let currentTurn = 0;
+            let lastRole = null;
             for (const unit of units) {
-                const isUser = unit.getAttribute('data-user-message-bubble') === 'true'
+                const isUser = unit.matches('[data-user-message-bubble="true"], .group\\/user-message, .group\\/user-message *, .bg-user-message, .bg-user-message *')
+                    || unit.getAttribute('data-message-author-role') === 'user'
                     || (unit.getAttribute('data-conversation-role') || '') === 'user';
-                const isAssistant = unit.getAttribute('data-markdown-text-style') === 'assistant-message'
-                    || (unit.getAttribute('data-conversation-role') || '') === 'assistant';
-                if (isUser) {
-                    results.push([currentTurn++, 'user']);
-                } else if (isAssistant) {
-                    results.push([currentTurn++, 'assistant']);
+                const role = isUser ? 'user' : 'assistant';
+                if (role !== lastRole) {
+                    results.push([currentTurn++, role]);
+                    lastRole = role;
                 }
             }
             return results;
         }""")
-        return [(int(t[0]), str(t[1])) for t in raw_turns]
+        if raw_turns:
+            return [(int(t[0]), str(t[1])) for t in raw_turns]
     except Exception:
-        return []
+        pass
+
+    return []
 
 
 def get_latest_conversation_turn(page: Page, role: str) -> int:

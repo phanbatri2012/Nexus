@@ -44,7 +44,30 @@ class MonetizationDetection:
     evidence: tuple[str, ...]
 
 
-UPLOAD_DIALOG_SELECTOR = "ytcp-uploads-dialog, ytcp-video-upload-dialog"
+UPLOAD_DIALOG_ROOT_SELECTORS = ("ytcp-uploads-dialog", "ytcp-video-upload-dialog")
+UPLOAD_DIALOG_SELECTOR = ", ".join(UPLOAD_DIALOG_ROOT_SELECTORS)
+TITLE_EDITOR_SELECTORS = (
+    "#title-textarea #textbox",
+    "#textbox[aria-label*='tiêu đề' i]",
+    "#textbox[aria-label*='title' i]",
+    "input#title",
+)
+DESCRIPTION_EDITOR_SELECTORS = (
+    "#description-textarea #textbox",
+    "#description-textarea [contenteditable='true']",
+    "#textbox[aria-label*='mô tả' i]",
+    "#textbox[aria-label*='description' i]",
+)
+UPLOAD_TITLE_EDITOR_SELECTORS = [
+    f"{root} {selector}"
+    for root in UPLOAD_DIALOG_ROOT_SELECTORS
+    for selector in TITLE_EDITOR_SELECTORS
+]
+UPLOAD_DESCRIPTION_EDITOR_SELECTORS = [
+    f"{root} {selector}"
+    for root in UPLOAD_DIALOG_ROOT_SELECTORS
+    for selector in DESCRIPTION_EDITOR_SELECTORS
+]
 MONETIZATION_MODE_AUTO = "auto_enable_if_available"
 MONETIZATION_MODE_KEEP_OFF = "keep_off"
 MONETIZATION_MODE_REQUIRE = "require_on"
@@ -95,6 +118,54 @@ async def _safe_fill(page, selectors: list[str], text: str, timeout_ms: int = 50
         except Exception:
             continue
     return False
+
+
+async def _find_visible_upload_details_dialog(page):
+    """Return only a visible upload dialog that is editing video details."""
+    try:
+        dialogs = await page.query_selector_all(UPLOAD_DIALOG_SELECTOR)
+    except Exception:
+        return None
+    for dialog in dialogs:
+        try:
+            for selector in TITLE_EDITOR_SELECTORS:
+                editor = await dialog.query_selector(selector)
+                if editor is not None and await editor.is_visible():
+                    return dialog
+        except Exception:
+            continue
+    return None
+
+
+async def _open_existing_draft_upload_dialog(page, timeout_ms: int = 10000) -> None:
+    """Open the saved draft wizard without triggering a new video upload."""
+    if await _find_visible_upload_details_dialog(page) is not None:
+        return
+    edit_draft_clicked = await _safe_click(
+        page,
+        [
+            "ytcp-button:has-text('Chỉnh sửa bản nháp')",
+            "ytcp-button:has-text('Edit draft')",
+            "button:has-text('Chỉnh sửa bản nháp')",
+            "button:has-text('Edit draft')",
+        ],
+        timeout_ms=3000,
+    )
+    if not edit_draft_clicked:
+        raise BrowserUploadNeedsReview(
+            "Đã mở đúng bản nháp nhưng không tìm thấy nút Chỉnh sửa bản nháp; "
+            "giữ draft để kiểm tra, không upload lại MP4."
+        )
+
+    deadline = time.monotonic() + max(0.1, timeout_ms / 1000)
+    while time.monotonic() < deadline:
+        if await _find_visible_upload_details_dialog(page) is not None:
+            return
+        await asyncio.sleep(0.25)
+    raise BrowserUploadNeedsReview(
+        "YouTube Studio không mở được wizard của bản nháp đã lưu; "
+        "giữ draft để kiểm tra, không upload lại MP4."
+    )
 
 
 async def _require_click(
@@ -312,17 +383,26 @@ async def _read_control_value(element) -> str:
             return str(value).strip()
     except Exception:
         pass
-    for attribute in ("value", "aria-label"):
+    try:
+        value = await element.get_attribute("value")
+        if str(value or "").strip():
+            return str(value).strip()
+    except Exception:
+        pass
+    try:
+        value = await element.inner_text()
+        if str(value or "").strip():
+            return str(value).strip()
+    except Exception:
+        pass
+    for attribute in ("aria-valuetext", "aria-label"):
         try:
             value = await element.get_attribute(attribute)
             if str(value or "").strip():
                 return str(value).strip()
         except Exception:
             continue
-    try:
-        return str(await element.inner_text() or "").strip()
-    except Exception:
-        return ""
+    return ""
 
 
 def _schedule_date_matches(value: str, expected: dt.date) -> bool:
@@ -1371,18 +1451,7 @@ async def upload_video_via_browser(
                         "schedule_verified": True,
                         "resumed": True,
                     }
-                await page.goto(
-                    f"https://studio.youtube.com/video/{clean_existing_video_id}/edit?d=ud",
-                    wait_until="domcontentloaded",
-                    timeout=60000,
-                )
-                await asyncio.sleep(2.0)
-                upload_dialog = await page.query_selector(UPLOAD_DIALOG_SELECTOR)
-                if upload_dialog is None:
-                    raise BrowserUploadNeedsReview(
-                        "Đã mở đúng bản nháp nhưng YouTube Studio không cho tiếp tục upload wizard; "
-                        "giữ draft để kiểm tra, không upload lại MP4."
-                    )
+                await _open_existing_draft_upload_dialog(page)
                 resuming_existing_draft = True
                 youtube_video_id = clean_existing_video_id
                 _emit_checkpoint(
@@ -1493,24 +1562,14 @@ async def upload_video_via_browser(
             # Title
             await _require_fill(
                 page,
-                [
-                    "#title-textarea #textbox",
-                    "#textbox[aria-label*='tiêu đề' i]",
-                    "#textbox[aria-label*='title' i]",
-                    "input#title",
-                ],
+                UPLOAD_TITLE_EDITOR_SELECTORS,
                 title,
                 "Không thể điền tiêu đề video trên YouTube Studio.",
                 timeout_ms=10000,
             )
             await _require_text_value(
                 page,
-                [
-                    "#title-textarea #textbox",
-                    "#textbox[aria-label*='tiêu đề' i]",
-                    "#textbox[aria-label*='title' i]",
-                    "input#title",
-                ],
+                UPLOAD_TITLE_EDITOR_SELECTORS,
                 title,
                 "YouTube Studio không xác nhận tiêu đề vừa điền.",
             )
@@ -1520,24 +1579,14 @@ async def upload_video_via_browser(
             if description:
                 await _require_fill(
                     page,
-                    [
-                        "#description-textarea #textbox",
-                        "#description-textarea [contenteditable='true']",
-                        "#textbox[aria-label*='mô tả' i]",
-                        "#textbox[aria-label*='description' i]",
-                    ],
+                    UPLOAD_DESCRIPTION_EDITOR_SELECTORS,
                     description,
                     "Không thể điền mô tả video trên YouTube Studio.",
                     timeout_ms=10000,
                 )
                 await _require_text_value(
                     page,
-                    [
-                        "#description-textarea #textbox",
-                        "#description-textarea [contenteditable='true']",
-                        "#textbox[aria-label*='mô tả' i]",
-                        "#textbox[aria-label*='description' i]",
-                    ],
+                    UPLOAD_DESCRIPTION_EDITOR_SELECTORS,
                     description,
                     "YouTube Studio không xác nhận mô tả vừa điền.",
                 )

@@ -32,7 +32,10 @@ from auto_yt.paths import (
     VISUAL_PLANS_DIR,
 )
 from auto_yt.services import database as db
-from auto_yt.services.visual_action_translator import translate_transcript_to_visual_action
+from auto_yt.services.visual_action_translator import (
+    remove_vietnamese_accents,
+    translate_transcript_to_visual_action,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -160,52 +163,127 @@ def parse_srt_segments(srt_path: Path) -> list[dict]:
     return segments
 
 
+def _extract_normalized_words(text: str) -> list[str]:
+    """Extract lowercase words with Vietnamese diacritics stripped."""
+    clean = remove_vietnamese_accents(str(text or "").lower())
+    return [w for w in re.findall(r"\w+", clean) if len(w) > 1]
+
+
 def extract_intro_boundary(
     generated_script: str,
     captions: list[dict],
     duration_seconds: float,
 ) -> float:
-    """Extract the ending timestamp (in seconds) of the intro/hook section from script and captions."""
-    if not generated_script:
+    """Extract the ending timestamp (in seconds) of the intro/hook section from script and captions.
+    
+    Uses a robust 3-tier matching engine:
+    1. Tail N-gram phrase matching on ### [INTRO].
+    2. Head N-gram phrase matching on ### [BODY] (cross-verification).
+    3. Word-density ratio anchor and chapter fallbacks.
+    """
+    if not generated_script or not captions:
         return 0.0
 
-    # 1. Try finding ### [INTRO] section text
     intro_match = re.search(
         r"### \[(?:INTRO|MỞ ĐẦU|PHẦN 1: MỞ ĐẦU|MO DAU)\]\s*\n(.*?)(?=\n### \[|\Z)",
         generated_script,
         flags=re.DOTALL | re.IGNORECASE,
     )
-    if intro_match:
-        intro_text = re.sub(r"\s+", " ", intro_match.group(1)).strip().lower()
-        if len(intro_text) >= 20 and captions:
-            intro_words = [w for w in re.findall(r"\w+", intro_text) if len(w) > 1]
-            last_matching_words = intro_words[-6:] if len(intro_words) >= 6 else intro_words
-            best_time = 0.0
-            
-            for cap in captions:
-                cap_text = cap.get("text", "").lower()
-                if any(w in cap_text for w in last_matching_words):
-                    best_time = float(cap.get("end") or 0.0)
-                if float(cap.get("end") or 0.0) > min(180.0, duration_seconds * 0.5):
-                    break
-            if 6.0 <= best_time <= min(180.0, duration_seconds * 0.5):
-                return best_time
+    body_match = re.search(
+        r"### \[(?:BODY|THÂN BÀI|PHẦN 2|NOI DUNG)\]\s*\n(.*?)(?=\n### \[|\Z)",
+        generated_script,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
 
-    # 2. Try finding chapter 1 timestamp from ### [CHAPTERS]
+    if not intro_match:
+        return min(24.0, max(8.0, duration_seconds * 0.15))
+
+    intro_words = _extract_normalized_words(intro_match.group(1))
+    if len(intro_words) < 5:
+        return min(24.0, max(8.0, duration_seconds * 0.15))
+
+    all_script_words = _extract_normalized_words(generated_script)
+    intro_ratio = len(intro_words) / max(1, len(all_script_words))
+    expected_time = max(8.0, intro_ratio * duration_seconds)
+    max_search_time = min(
+        duration_seconds * 0.8,
+        max(expected_time * 2.0, expected_time + 40.0, 180.0),
+    )
+
+    # 1. Match tail of Intro (last 6-10 words)
+    tail_words = intro_words[-10:] if len(intro_words) >= 10 else intro_words
+    tail_candidates: list[tuple[float, float]] = []
+
+    for i, cap in enumerate(captions):
+        start_time = float(cap.get("start") or 0.0)
+        end_time = float(cap.get("end") or 0.0)
+        if start_time > max_search_time:
+            break
+
+        single_words = set(_extract_normalized_words(cap.get("text", "")))
+        match_count = sum(1 for w in tail_words if w in single_words)
+        score = match_count / len(tail_words)
+
+        if score < 0.5 and i + 1 < len(captions):
+            combined_words = single_words | set(
+                _extract_normalized_words(captions[i + 1].get("text", ""))
+            )
+            comb_count = sum(1 for w in tail_words if w in combined_words)
+            comb_score = comb_count / len(tail_words)
+            if comb_score >= 0.5:
+                score = comb_score
+                end_time = float(captions[i + 1].get("end") or end_time)
+
+        if score >= 0.4:
+            prox_penalty = abs(end_time - expected_time) / max(1.0, duration_seconds)
+            adj_score = score - (prox_penalty * 0.2)
+            tail_candidates.append((adj_score, end_time))
+
+    # 2. Match head of Body (first 6-10 words) as dual verification
+    body_head_time = 0.0
+    if body_match:
+        body_words = _extract_normalized_words(body_match.group(1))
+        if len(body_words) >= 5:
+            head_words = body_words[:10]
+            best_head_score = 0.0
+            for i, cap in enumerate(captions):
+                start_time = float(cap.get("start") or 0.0)
+                if start_time > max_search_time:
+                    break
+                single_words = set(_extract_normalized_words(cap.get("text", "")))
+                head_score = sum(1 for w in head_words if w in single_words) / len(head_words)
+                if head_score < 0.5 and i + 1 < len(captions):
+                    comb_words = single_words | set(
+                        _extract_normalized_words(captions[i + 1].get("text", ""))
+                    )
+                    head_score = sum(1 for w in head_words if w in comb_words) / len(head_words)
+                if head_score >= 0.4 and head_score > best_head_score:
+                    best_head_score = head_score
+                    body_head_time = start_time
+
+    # Best decision
+    if tail_candidates:
+        tail_candidates.sort(key=lambda x: x[0], reverse=True)
+        best_tail_score, best_tail_time = tail_candidates[0]
+        if body_head_time > 0 and abs(best_tail_time - body_head_time) <= 5.0:
+            return max(best_tail_time, body_head_time)
+        if best_tail_score >= 0.4:
+            return best_tail_time
+
+    if body_head_time > 0:
+        return body_head_time
+
+    # 3. Chapter fallback
     try:
         chapters = extract_chapters(generated_script, duration_seconds)
         if len(chapters) >= 2:
             ch1_start = float(chapters[1]["start"])
-            if 6.0 <= ch1_start <= min(180.0, duration_seconds * 0.5):
-                for cap in captions:
-                    if float(cap.get("end") or 0.0) >= ch1_start - 2.0:
-                        return float(cap.get("end") or ch1_start)
+            if 6.0 <= ch1_start <= max_search_time:
                 return ch1_start
     except Exception:
         pass
 
-    # 3. Default fallback if intro couldn't be definitively matched
-    return min(24.0, max(8.0, duration_seconds * 0.15))
+    return min(max_search_time, max(8.0, expected_time))
 
 
 def build_scene_windows(
@@ -230,7 +308,10 @@ def build_scene_windows(
 
     while cursor < len(captions):
         start = max(0.0, float(captions[cursor]["start"]))
-        in_intro = use_intro and start < (intro_end_seconds - 2.0)
+        in_intro = use_intro and (
+            start < (intro_end_seconds - 0.5)
+            or (start + max(4.0, intro_target_seconds * 0.75) * 0.5) < intro_end_seconds
+        )
         
         cur_target = intro_target_seconds if in_intro else target_seconds
         cur_min = max(4.0, intro_target_seconds * 0.75) if in_intro else minimum_seconds

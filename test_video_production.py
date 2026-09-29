@@ -50,6 +50,36 @@ class VideoProductionServiceTests(unittest.TestCase):
         self.assertTrue(len(windows) > 0)
         self.assertTrue(all(w["duration"] >= 20.0 for w in windows))
 
+    def test_extract_intro_boundary_multi_tier_matching(self):
+        # Test long intro matching with slight transcription differences
+        script = (
+            "### [INTRO]\n"
+            "Một câu hỏi đã ám ảnh lịch sử suốt hơn bốn thập kỷ: tháng 3 năm 1979 khi quân Trung Quốc tiến vào Lạng Sơn vì sao không tiến xuống Hà Nội?\n"
+            "Và nếu quân Trung Quốc thực sự vượt khỏi Lạng Sơn để tiến về Hà Nội, cục diện năm 1979 có thể đã diễn biến ra sao?\n\n"
+            "### [BODY]\n"
+            "Ngày 17 tháng 2 năm 1979 quân Trung Quốc đồng loạt tiến công trên toàn tuyến biên giới phía Bắc Việt Nam."
+        )
+        captions = [
+            {"start": 0.0, "end": 10.3, "text": "Một câu hỏi đã ám ảnh lịch sử suốt hơn bốn thập kỷ."},
+            {"start": 10.3, "end": 29.6, "text": "tháng 3 năm 1979 khi quân Trung Quốc tiến vào Lạng Sơn vì sao không tiến xuống Hà Nội?"},
+            {"start": 29.6, "end": 55.0, "text": "Và nếu quân Trung Quốc thực sự vượt khỏi lạng sơn để tiến về Hà Nội, cuộc diện năm 1979 có thể đã diễn biến ra sao?"},
+            {"start": 55.0, "end": 75.0, "text": "Ngày 17 tháng 2 năm 1979 quân Trung Quốc đồng loạt tiến công trên toàn tuyến biên giới phía Bắc."},
+        ]
+        boundary = video_production.extract_intro_boundary(script, captions, 200.0)
+        self.assertAlmostEqual(boundary, 55.0, delta=0.1)
+
+        windows = video_production.build_scene_windows(
+            captions,
+            duration_seconds=200.0,
+            intro_end_seconds=boundary,
+            intro_target_seconds=8.0,
+            enable_intro_video=True,
+        )
+        video_windows = [w for w in windows if w["is_video"]]
+        self.assertEqual(len(video_windows), 3)
+        self.assertTrue(all(w["is_video"] for w in video_windows))
+        self.assertFalse(windows[3]["is_video"])
+
     def test_media_validation_uses_pyav_when_ffprobe_is_missing(self):
         probe_result = {
             "duration_seconds": 4.0,
