@@ -1325,6 +1325,62 @@ class VideoProductionServiceTests(unittest.TestCase):
         self.assertIn("video mode unavailable", artifact["metadata"]["fallback_reason"])
         self.assertEqual(artifact["metadata"]["failure_stage"], "legacy_video_mode")
 
+    def test_completed_veo_persists_flow_detection_timing(self):
+        from PIL import Image
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-veo-timing",
+            "Veo timing",
+            "Transcript",
+            "Script",
+        )
+        start_frame = Path(self.temporary_directory.name) / "start-frame.png"
+        end_frame = Path(self.temporary_directory.name) / "end-frame.png"
+        Image.new("RGB", (1376, 768), color=(30, 40, 50)).save(start_frame)
+        Image.new("RGB", (1376, 768), color=(50, 40, 30)).save(end_frame)
+        worker = MagicMock()
+        worker.generate_scene_video = AsyncMock(
+            return_value="https://flow-content.google/video/generated.mp4"
+        )
+
+        async def save_video(_url, save_path):
+            Path(save_path).write_bytes(b"v" * 2048)
+
+        worker.download_video = AsyncMock(side_effect=save_video)
+        worker.get_last_video_timing.return_value = {
+            "video_card_seen_elapsed_seconds": 45.25,
+            "playable_url_seen_elapsed_seconds": 45.5,
+            "download_completed_elapsed_seconds": 46.0,
+        }
+        scene = {"index": 0, "prompt": "scene", "is_video": True}
+
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            result = asyncio.run(
+                video_production._generate_scene_video_async(
+                    video_id=video_id,
+                    scene=scene,
+                    scene_count=1,
+                    start_frame_path=start_frame,
+                    end_frame_path=end_frame,
+                    profile={},
+                    settings={},
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                    worker=worker,
+                )
+            )
+
+        self.assertTrue(result.is_file())
+        artifact = database.get_latest_video_artifact(video_id, "scene_video:0")
+        self.assertEqual(artifact["status"], "completed")
+        self.assertEqual(
+            artifact["metadata"]["flow_timing"]["playable_url_seen_elapsed_seconds"],
+            45.5,
+        )
+
     def test_missing_end_frame_marks_checkpoint_failed_before_submit(self):
         from PIL import Image
         from auto_yt.services.google_flow_worker import FlowFrameAttachmentError
@@ -1404,4 +1460,3 @@ class VideoProductionServiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -28,6 +28,7 @@ REFERENCE_ASSET_SCAN_LIMIT = 100
 IMAGE_GENERATION_TIMEOUT_SECONDS = 240.0
 AGENT_IMAGE_GENERATION_TIMEOUT_SECONDS = 600.0
 VIDEO_GENERATION_TIMEOUT_SECONDS = 180.0
+VIDEO_QUEUE_TIMEOUT_SECONDS = 900.0
 GENERATION_START_TIMEOUT_SECONDS = 45.0
 GENERATION_IDLE_GRACE_SECONDS = 10.0
 VIDEO_MODE_TIMEOUT_SECONDS = 10.0
@@ -37,6 +38,7 @@ SUBMISSION_ACK_POLL_SECONDS = 0.5
 PROMPT_SUBMIT_READY_TIMEOUT_SECONDS = 5.0
 AGENT_SESSION_RESET_TIMEOUT_SECONDS = 10.0
 AGENT_SETTINGS_BUTTON_TIMEOUT_SECONDS = 10.0
+AGENT_SETTINGS_SAVE_TIMEOUT_SECONDS = 5.0
 MAX_CONSECUTIVE_UI_ERRORS = 3
 IMAGE_BASELINE_STABILIZE_SECONDS = 2.0
 IMAGE_BASELINE_POLL_SECONDS = 0.25
@@ -44,6 +46,10 @@ MIN_GENERATED_IMAGE_WIDTH = 800
 MIN_GENERATED_IMAGE_HEIGHT = 400
 MIN_GENERATED_IMAGE_ASPECT_RATIO = 1.15
 VIDEO_FRAME_ATTACH_TIMEOUT_SECONDS = 8.0
+VIDEO_FRAME_UPLOAD_ATTACH_TIMEOUT_SECONDS = 30.0
+VIDEO_COMPLETION_SOURCE_GRACE_SECONDS = 5.0
+VIDEO_COMPLETION_FAST_POLL_SECONDS = 0.25
+VIDEO_DETAIL_SCAN_TIMEOUT_SECONDS = 5.0
 FLOW_VIDEO_MODEL_LABELS = {
     "omni_1_1_flash": ("Omni 1.1 Flash",),
     "veo_3_1_lite": ("Veo 3.1 Lite", "Veo 3.1 – Lite", "Veo 3.1 - Lite"),
@@ -192,6 +198,35 @@ class GoogleFlowWorker:
         self._validated_image_payload: tuple[str, bytes] | None = None
         self._last_generated_image_identity: dict[str, str] = {}
         self._agent_interface_detected = False
+        self._generation_queue_active = False
+        self._video_completion_pending = False
+        self._video_completed_candidate_seen_at: dict[str, float] = {}
+        self._inspected_video_detail_keys: set[str] = set()
+        self._last_video_timing: dict[str, object] = {}
+        self._active_video_submitted_at: float | None = None
+
+    @staticmethod
+    def _utc_timestamp() -> str:
+        return dt.datetime.now(dt.timezone.utc).isoformat()
+
+    def _record_video_timing(self, state: str) -> None:
+        key = f"{state}_at"
+        if key in self._last_video_timing:
+            return
+        self._last_video_timing[key] = self._utc_timestamp()
+        elapsed = 0.0
+        if self._active_video_submitted_at is not None:
+            elapsed = max(0.0, time.monotonic() - self._active_video_submitted_at)
+            self._last_video_timing[f"{state}_elapsed_seconds"] = round(elapsed, 3)
+        logger.info(
+            "flow_generation media=video state=%s project=%s elapsed=%.2f",
+            state,
+            self._project_id(),
+            elapsed,
+        )
+
+    def get_last_video_timing(self) -> dict[str, object]:
+        return dict(self._last_video_timing)
 
     @staticmethod
     def _project_root_from_url(url: str) -> str:
@@ -675,6 +710,44 @@ class GoogleFlowWorker:
                 return None
             await asyncio.sleep(0.2)
 
+    async def _find_agent_settings_save_button(
+        self,
+        panel: Locator,
+        *,
+        timeout: float = AGENT_SETTINGS_SAVE_TIMEOUT_SECONDS,
+    ) -> Locator | None:
+        """Return the visible save button from the active Agent settings panel."""
+        locator_specs = (
+            ("button.settings-save-button", False),
+            ("button[type='submit']", True),
+            ("button", True),
+        )
+        save_labels = {"lưu", "save"}
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            for selector, require_save_label in locator_specs:
+                matches = panel.locator(selector)
+                try:
+                    count = await matches.count()
+                except Exception:
+                    continue
+                for index in range(count):
+                    candidate = matches.nth(index)
+                    try:
+                        if require_save_label:
+                            label = " ".join((await candidate.inner_text()).split()).casefold()
+                            if label not in save_labels:
+                                continue
+                        if await candidate.is_visible(timeout=100) and await candidate.is_enabled(
+                            timeout=100
+                        ):
+                            return candidate
+                    except Exception:
+                        continue
+            if time.monotonic() >= deadline:
+                return None
+            await asyncio.sleep(0.2)
+
     async def ensure_agent_video_settings(self, video_settings: dict | None = None) -> None:
         """Persist deterministic Agent defaults once for the active Flow project."""
         project_id = self._project_id()
@@ -746,8 +819,8 @@ class GoogleFlowWorker:
             await model_option.click(force=True, timeout=2000)
             await asyncio.sleep(0.2)
 
-            save_button = panel.get_by_text(re.compile(r"^(Lưu|Save)$", re.IGNORECASE)).first
-            if not await save_button.is_visible(timeout=1000):
+            save_button = await self._find_agent_settings_save_button(panel)
+            if save_button is None:
                 raise FlowAgentSettingsError("Không tìm thấy nút Lưu cài đặt Agent.")
             await save_button.click(timeout=2000)
             deadline = time.monotonic() + 5.0
@@ -1324,36 +1397,145 @@ class GoogleFlowWorker:
         return [item for item in result if isinstance(item, dict)]
 
     async def _collect_video_candidates(self) -> list[dict]:
-        """Collect video URLs from players, media cards, and the result panel."""
+        """Collect playable URLs and completion markers from Flow video cards."""
         result = await self.page.evaluate(r'''() => {
+            const excludedSelector =
+                "flow-ingredient-chip, flow-prompt-box, [role='menu'], flow-upload-card, " +
+                "[data-testid*='asset-picker' i], .asset-picker, .uploads-picker";
+            const cardSelector =
+                "flow-media-tile, flow-canvas-tile, flow-canvas-item, " +
+                "[data-media-id], [data-asset-id], [data-testid*='media' i], " +
+                ".media-card, .canvas-tile";
+            const roots = Array.from(document.querySelectorAll(cardSelector));
+            for (const video of document.querySelectorAll('video')) {
+                if (!video.closest(cardSelector)) roots.push(video);
+            }
+
             const candidates = [];
             const seen = new Set();
-            const nodes = document.querySelectorAll(
-                "video, flow-video-player video, a[href], [data-video-url], [data-media-url]"
-            );
-            for (const node of nodes) {
-                if (node.closest(
-                    "flow-ingredient-chip, flow-prompt-box, [role='menu'], flow-upload-card, " +
-                    "[data-testid*='asset-picker' i], .asset-picker, .uploads-picker"
-                )) continue;
-                const src = node.currentSrc || node.src || node.href ||
-                    node.getAttribute('data-video-url') || node.getAttribute('data-media-url') || '';
-                if (!src || src.startsWith('data:')) continue;
-                const lowerSrc = src.toLowerCase();
-                const looksLikeVideo = node.tagName === 'VIDEO' || lowerSrc.startsWith('blob:') ||
-                    /\.(?:mp4|webm)(?:\?|$)/i.test(src) || node.hasAttribute('data-video-url');
-                if (!looksLikeVideo) continue;
-                const card = node.closest(
-                    "flow-media-tile, [data-media-id], [data-asset-id], [data-testid*='media' i], .media-card"
+            const visible = (element) => {
+                if (!element) return false;
+                const style = getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' &&
+                    rect.width > 0 && rect.height > 0;
+            };
+            const cleanUrl = (value) => {
+                const url = String(value || '').trim();
+                return !url || url.startsWith('data:') ? '' : url;
+            };
+
+            for (let rootIndex = 0; rootIndex < roots.length; rootIndex += 1) {
+                const root = roots[rootIndex];
+                if (root.closest(excludedSelector)) continue;
+                const card = root.matches(cardSelector) ? root : root.closest(cardSelector) || root;
+                const mediaNodes = [card, ...card.querySelectorAll(
+                    "video, source[src], a[href], a[download][href], [data-video-url], " +
+                    "[data-media-url], [data-download-url]"
+                )];
+                const videoNodes = mediaNodes.filter((node) =>
+                    node.tagName === 'VIDEO' || node.tagName === 'SOURCE'
                 );
-                const assetId = card ? (
-                    card.getAttribute('data-media-id') || card.getAttribute('data-asset-id') ||
-                    card.getAttribute('data-id') || ''
-                ) : '';
-                const key = assetId ? `asset:${assetId}` : src;
-                if (seen.has(key)) continue;
-                seen.add(key);
-                candidates.push({src, assetId});
+                const controlText = Array.from(card.querySelectorAll(
+                    "button, [role='button'], mat-icon, .material-icons, .material-symbols-outlined"
+                )).map((node) => `${node.textContent || ''} ${node.getAttribute('aria-label') || ''}`)
+                    .join(' ').toLowerCase();
+                const cardText = `${card.textContent || ''} ${card.getAttribute('aria-label') || ''}`
+                    .toLowerCase();
+                const state = (
+                    `${card.getAttribute('data-state') || ''} ` +
+                    `${card.getAttribute('data-tile-state') || ''}`
+                ).toLowerCase();
+                const hasPlayControl = /(^|\s)(play|phát|play_arrow|play_circle)(\s|$)/i.test(controlText);
+                const hasVideoMarker = videoNodes.length > 0 || hasPlayControl ||
+                    card.matches('[data-video-url]') || Boolean(card.querySelector('[data-video-url]')) ||
+                    /(^|\s)video(\s|$)/i.test(cardText);
+                if (!hasVideoMarker) continue;
+
+                const urls = [];
+                const matchUrls = [];
+                const addMatchUrl = (value) => {
+                    const url = cleanUrl(value);
+                    if (url && !matchUrls.includes(url)) matchUrls.push(url);
+                };
+                const addPlayableUrl = (value, node, attributeName = '') => {
+                    const url = cleanUrl(value);
+                    if (!url) return;
+                    addMatchUrl(url);
+                    const lower = url.toLowerCase();
+                    const fromPlayer = node.tagName === 'VIDEO' || node.tagName === 'SOURCE';
+                    const fromVideoAttribute = attributeName === 'data-video-url';
+                    const fromMediaAttribute = attributeName === 'data-media-url' && hasVideoMarker;
+                    const fromDownload = attributeName === 'data-download-url' ||
+                        (node.tagName === 'A' && node.hasAttribute('download'));
+                    const knownVideoUrl = lower.startsWith('blob:') ||
+                        /\.(?:mp4|webm|mov)(?:\?|$)/i.test(url) ||
+                        lower.includes('/videoplayback') || lower.includes('/video/');
+                    const knownImageUrl = /\.(?:png|jpe?g|webp|gif)(?:\?|$)/i.test(url) ||
+                        lower.includes('/image/');
+                    if ((fromPlayer || fromVideoAttribute || fromMediaAttribute ||
+                        fromDownload || knownVideoUrl) && !knownImageUrl && !urls.includes(url)) {
+                        urls.push(url);
+                    }
+                };
+
+                for (const node of mediaNodes) {
+                    addPlayableUrl(node.currentSrc, node);
+                    addPlayableUrl(node.src, node);
+                    addPlayableUrl(node.href, node, node.hasAttribute('download') ? 'data-download-url' : '');
+                    for (const name of ['data-video-url', 'data-media-url', 'data-download-url']) {
+                        addPlayableUrl(node.getAttribute(name), node, name);
+                    }
+                }
+                for (const image of card.querySelectorAll('img[src], img[srcset]')) {
+                    addMatchUrl(image.currentSrc || image.src);
+                    const srcset = image.getAttribute('srcset') || '';
+                    for (const part of srcset.split(',')) addMatchUrl(part.trim().split(/\s+/)[0]);
+                }
+
+                const assetId = card.getAttribute('data-media-id') ||
+                    card.getAttribute('data-asset-id') || card.getAttribute('data-id') || '';
+                const active = /generating|processing|queued|pending/.test(state) ||
+                    Boolean(card.querySelector(
+                        "[role='progressbar'], [aria-busy='true'], mat-progress-spinner, " +
+                        "[data-state='generating'], [data-state='processing']"
+                    ));
+                const progressComplete = /(^|\s)100%(\s|$)/.test(cardText);
+                const stateComplete = /completed|complete|ready|succeeded|success/.test(state);
+                const playable = videoNodes.some((node) =>
+                    node.tagName === 'SOURCE' || Number(node.readyState || 0) >= 1 ||
+                    Boolean(node.currentSrc || node.src)
+                );
+                const completed = !active && (hasPlayControl || progressComplete || stateComplete || playable);
+                const identityKeys = [];
+                if (assetId) identityKeys.push(`asset:${assetId}`);
+                const posterUrl = matchUrls.find((url) =>
+                    /\.(?:png|jpe?g|webp|gif)(?:\?|$)/i.test(url) ||
+                    url.toLowerCase().includes('/image')
+                );
+                if (posterUrl) identityKeys.push(`poster:${posterUrl}`);
+                const stableLabel = `${card.getAttribute('id') || ''}|` +
+                    `${card.getAttribute('data-testid') || ''}|${card.getAttribute('aria-label') || ''}`;
+                if (!identityKeys.length && stableLabel !== '||') {
+                    identityKeys.push(`card:${stableLabel}`);
+                }
+                if (!identityKeys.length && urls.length) identityKeys.push(`url:${urls[0]}`);
+                if (!identityKeys.length) continue;
+
+                const dedupeKey = assetId || identityKeys[0] || urls[0];
+                if (seen.has(dedupeKey)) continue;
+                seen.add(dedupeKey);
+                candidates.push({
+                    src: urls[0] || '',
+                    urls,
+                    matchUrls,
+                    assetId,
+                    identityKeys,
+                    completed,
+                    source: card.closest(
+                        '.sidebar, .mat-drawer, flow-chat-panel, flow-chat-view, flow-chat-scroller'
+                    ) ? 'result_panel' : 'gallery',
+                });
             }
             return candidates;
         }''')
@@ -1374,6 +1556,15 @@ class GoogleFlowWorker:
         asset_id = str(candidate.get("assetId") or "").strip().casefold()
         if asset_id:
             keys.add(f"asset:{asset_id}")
+        for identity in candidate.get("identityKeys") or []:
+            normalized = str(identity or "").strip().casefold()
+            if not normalized:
+                continue
+            prefix, separator, value = normalized.partition(":")
+            if separator and prefix in {"poster", "url"}:
+                keys.add(f"{prefix}:{self._media_key(value)}")
+            else:
+                keys.add(normalized)
         return keys
 
     def _candidate_matches_active_reference(self, candidate: dict) -> bool:
@@ -1453,6 +1644,36 @@ class GoogleFlowWorker:
                     rect.width > 0 && rect.height > 0;
             };
 
+            // Agent may accept a video request but place it in a server queue.
+            // Only inspect the latest turn so an old queue message cannot keep a
+            // later request alive indefinitely.
+            const queueBubbles = Array.from(document.querySelectorAll(
+                'flow-chat-bubble, [data-message-role="assistant"], .agent-bubble'
+            )).filter(visible);
+            const latestQueueBubble = queueBubbles.length
+                ? queueBubbles[queueBubbles.length - 1] : null;
+            if (latestQueueBubble) {
+                const isAgentBubble = latestQueueBubble.matches(
+                    '[data-message-role="assistant"], .agent-bubble'
+                ) || Boolean(latestQueueBubble.querySelector(
+                    '[data-message-role="assistant"], .agent-bubble'
+                ));
+                const queueText = (latestQueueBubble.textContent || '').toLowerCase();
+                if (isAgentBubble && (
+                    queueText.includes('currently in the queue') ||
+                    queueText.includes('queued') ||
+                    queueText.includes('high demand') ||
+                    queueText.includes('processed as soon as possible') ||
+                    queueText.includes('check back in a few minutes') ||
+                    queueText.includes('hàng đợi') ||
+                    queueText.includes('xếp hàng') ||
+                    queueText.includes('nhu cầu cao') ||
+                    queueText.includes('đang chờ xử lý')
+                )) {
+                    return 'queued';
+                }
+            }
+
             // 1. Explicit Stop / Dừng buttons
             const stopButtons = Array.from(document.querySelectorAll(
                 "button.stop-button, button[aria-label='Stop' i], button[aria-label='Dừng' i], " +
@@ -1517,6 +1738,18 @@ class GoogleFlowWorker:
                 if (/(^|\s)\d{1,3}%($|\s)/.test(text)) return true;
             }
 
+            // New Agent video tiles render the percentage in a plain element
+            // rather than the former .progress/status classes.
+            const tilePercentTexts = Array.from(document.querySelectorAll(
+                'flow-media-tile *, flow-canvas-tile *, flow-placeholder-tile *, ' +
+                '[data-media-id] *, [data-asset-id] *, .media-card *, .canvas-tile *'
+            ));
+            for (const el of tilePercentTexts) {
+                if (!visible(el)) continue;
+                const text = (el.textContent || '').trim();
+                if (/^\d{1,3}%$/.test(text)) return true;
+            }
+
             // 5. Active Thinking / Streaming Indicators (in-progress only)
             const activeThinking = Array.from(document.querySelectorAll(
                 "flow-thinking.active, flow-thinking.in-progress, flow-thinking[data-state='thinking'], " +
@@ -1539,7 +1772,8 @@ class GoogleFlowWorker:
 
             return false;
         }''')
-        return result is True
+        self._generation_queue_active = result == "queued"
+        return result is True or self._generation_queue_active
 
     async def _capture_submission_marker(self) -> str:
         """Return a signature containing only submitted user turns."""
@@ -2435,11 +2669,15 @@ class GoogleFlowWorker:
             const unique = [];
             const seen = new Set();
             for (const node of nodes) {
-                const chip = node.closest(
-                    'flow-image-ingredient-chip, flow-ingredient-chip, flow-prompt-attachment, ' +
-                    'flow-attachment, flow-reference-chip, [data-testid*="attachment" i], ' +
-                    '[data-testid*="ingredient" i], [data-testid*="reference" i]'
-                ) || node;
+                const chip = node.closest('flow-ingredient-chip') ||
+                    node.closest(
+                        'flow-prompt-attachment, flow-attachment, flow-reference-chip'
+                    ) ||
+                    node.closest(
+                        '[data-testid*="attachment" i], [data-testid*="ingredient" i], ' +
+                        '[data-testid*="reference" i]'
+                    ) ||
+                    node.closest('flow-image-ingredient-chip') || node;
                 if (seen.has(chip)) continue;
                 seen.add(chip);
                 const urls = Array.from(chip.querySelectorAll(
@@ -2461,6 +2699,7 @@ class GoogleFlowWorker:
                     urls.push(chip.currentSrc || chip.src || '');
                 }
                 unique.push({
+                    attachmentKey: String(unique.length),
                     assetId: chip.getAttribute('data-media-id') ||
                         chip.getAttribute('data-asset-id') || chip.getAttribute('data-id') || '',
                     urls: Array.from(new Set(urls.filter(Boolean)))
@@ -2470,7 +2709,31 @@ class GoogleFlowWorker:
         }''')
         if not isinstance(result, list):
             raise FlowUiStateError("Không thể đọc attachment trong prompt Google Flow.")
-        return [item for item in result if isinstance(item, dict)]
+        identities: list[dict[str, object]] = []
+        seen_keys: set[tuple[str, object]] = set()
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            asset_id = str(item.get("assetId") or "").strip()
+            urls = list(dict.fromkeys(
+                str(url).strip()
+                for url in item.get("urls") or []
+                if str(url or "").strip()
+            ))
+            attachment_key = str(item.get("attachmentKey") or "").strip()
+            identity_key: tuple[str, object] | None = None
+            if attachment_key:
+                identity_key = ("attachment", attachment_key)
+            elif asset_id:
+                identity_key = ("asset", asset_id.casefold())
+            elif urls:
+                identity_key = ("urls", tuple(sorted(urls)))
+            if identity_key is not None:
+                if identity_key in seen_keys:
+                    continue
+                seen_keys.add(identity_key)
+            identities.append({"assetId": asset_id, "urls": urls})
+        return identities
 
     async def _wait_for_prompt_attachment_count(
         self,
@@ -2641,8 +2904,10 @@ class GoogleFlowWorker:
             chooser = await chooser_info.value
             await chooser.set_files(str(frame_path))
             await self.wait_for_load()
-            await self._close_reference_ui()
-            return await self._wait_for_prompt_attachment_count(expected_count)
+            return await self._wait_for_prompt_attachment_count(
+                expected_count,
+                timeout=VIDEO_FRAME_UPLOAD_ATTACH_TIMEOUT_SECONDS,
+            )
         finally:
             await self._close_reference_ui()
 
@@ -2828,6 +3093,11 @@ class GoogleFlowWorker:
                 record=cache[frame_key],
             )
             attached = retry == REFERENCE_RESULT_ATTACHED
+        if not attached:
+            attached = await self._wait_for_prompt_attachment_count(
+                expected_count,
+                timeout=REFERENCE_CHIP_CONFIRM_TIMEOUT_SECONDS,
+            )
         if not attached:
             self._log_video_frame_event(
                 "frame_attach_failed",
@@ -3462,6 +3732,179 @@ class GoogleFlowWorker:
         finally:
             await self._close_media_detail()
 
+    @staticmethod
+    def _video_candidate_detail_key(candidate: dict) -> str:
+        asset_id = str(candidate.get("assetId") or "").strip().casefold()
+        if asset_id:
+            return f"asset:{asset_id}"
+        identities = [
+            str(value or "").strip().casefold()
+            for value in candidate.get("identityKeys") or []
+            if str(value or "").strip()
+        ]
+        return identities[0] if identities else ""
+
+    def _find_new_completed_video_candidate(
+        self,
+        candidates: list[dict],
+        baseline_keys: set[str],
+    ) -> dict | None:
+        for candidate in reversed(candidates):
+            if not candidate.get("completed"):
+                continue
+            keys = self._candidate_keys(candidate)
+            if keys and not (keys & baseline_keys):
+                return candidate
+        return None
+
+    def _find_new_video_source(
+        self,
+        candidates: list[dict],
+        baseline_keys: set[str],
+    ) -> str:
+        for candidate in reversed(candidates):
+            keys = self._candidate_keys(candidate)
+            if not keys or keys & baseline_keys:
+                continue
+            for value in [
+                candidate.get("src"),
+                candidate.get("url"),
+                *(candidate.get("urls") or []),
+            ]:
+                source = str(value or "").strip()
+                if source:
+                    return source
+        return ""
+
+    async def _inspect_video_candidate_detail(
+        self,
+        candidate: dict,
+        baseline_keys: set[str],
+    ) -> str:
+        detail_key = self._video_candidate_detail_key(candidate)
+        if not detail_key or detail_key in self._inspected_video_detail_keys:
+            return ""
+        self._inspected_video_detail_keys.add(detail_key)
+        payload = {
+            "assetId": str(candidate.get("assetId") or ""),
+            "matchUrls": [
+                str(url or "").strip()
+                for url in candidate.get("matchUrls") or []
+                if str(url or "").strip()
+            ],
+        }
+        clicked = await self.page.evaluate(
+            r'''({assetId, matchUrls}) => {
+                const normalizeUrl = (value) => String(value || '').split('?', 1)[0].toLowerCase();
+                const normalizedMatchUrls = matchUrls.map(normalizeUrl);
+                const cards = Array.from(document.querySelectorAll(
+                    "flow-media-tile, flow-canvas-tile, flow-canvas-item, " +
+                    "[data-media-id], [data-asset-id], [data-testid*='media' i], " +
+                    ".media-card, .canvas-tile"
+                ));
+                for (const card of cards) {
+                    if (card.closest(
+                        "flow-upload-card, flow-prompt-box, [data-testid*='upload' i], " +
+                        "[data-testid*='asset-picker' i], .asset-picker, .uploads-picker"
+                    )) continue;
+                    const cardId = card.getAttribute('data-media-id') ||
+                        card.getAttribute('data-asset-id') || card.getAttribute('data-id') || '';
+                    const cardUrls = Array.from(card.querySelectorAll(
+                        "video, source[src], img[src], img[srcset], a[href], " +
+                        "[data-video-url], [data-media-url], [data-download-url]"
+                    )).flatMap((node) => [
+                        node.currentSrc || '', node.src || '', node.href || '',
+                        node.getAttribute('data-video-url') || '',
+                        node.getAttribute('data-media-url') || '',
+                        node.getAttribute('data-download-url') || ''
+                    ]).filter(Boolean);
+                    if ((assetId && cardId === assetId) ||
+                        cardUrls.some((url) => normalizedMatchUrls.includes(normalizeUrl(url)))) {
+                        card.click();
+                        return true;
+                    }
+                }
+                return false;
+            }''',
+            payload,
+        )
+        if not clicked:
+            return ""
+
+        logger.info(
+            "flow_generation media=video state=detail_opened project=%s asset=%s",
+            self._project_id(),
+            str(candidate.get("assetId") or "")[:80],
+        )
+        self._record_video_timing("detail_opened")
+        deadline = time.monotonic() + VIDEO_DETAIL_SCAN_TIMEOUT_SECONDS
+        try:
+            while True:
+                candidates = await self._collect_video_candidates()
+                source = self._find_new_video_source(candidates, baseline_keys)
+                if source:
+                    return source
+                if time.monotonic() >= deadline:
+                    return ""
+                await asyncio.sleep(VIDEO_COMPLETION_FAST_POLL_SECONDS)
+        finally:
+            await self._close_media_detail()
+
+    async def _wait_for_generation_poll(self, media_type: str) -> None:
+        delay = (
+            VIDEO_COMPLETION_FAST_POLL_SECONDS
+            if media_type == "video" and self._video_completion_pending
+            else GENERATION_POLL_SECONDS
+        )
+        if media_type != "video":
+            await asyncio.sleep(delay)
+            return
+        try:
+            await self.page.evaluate(
+                r'''(timeoutMs) => new Promise((resolve) => {
+                    let settled = false;
+                    const finish = (changed) => {
+                        if (settled) return;
+                        settled = true;
+                        observer.disconnect();
+                        clearTimeout(timer);
+                        resolve(changed);
+                    };
+                    const relevant = (node) => {
+                        if (!node || node.nodeType !== Node.ELEMENT_NODE) return false;
+                        const selector =
+                            "video, source, flow-media-tile, flow-canvas-tile, flow-canvas-item, " +
+                            "[data-media-id], [data-asset-id], [data-video-url], [data-media-url], " +
+                            "[data-download-url], a[download]";
+                        return node.matches(selector) || Boolean(node.closest(selector)) ||
+                            Boolean(node.querySelector(selector));
+                    };
+                    const observer = new MutationObserver((mutations) => {
+                        for (const mutation of mutations) {
+                            if (relevant(mutation.target) ||
+                                Array.from(mutation.addedNodes).some(relevant)) {
+                                finish(true);
+                                return;
+                            }
+                        }
+                    });
+                    observer.observe(document.body, {
+                        childList: true,
+                        subtree: true,
+                        attributes: true,
+                        attributeFilter: [
+                            'src', 'href', 'data-video-url', 'data-media-url',
+                            'data-download-url', 'data-state', 'data-tile-state',
+                            'aria-busy', 'aria-valuenow'
+                        ]
+                    });
+                    const timer = setTimeout(() => finish(false), timeoutMs);
+                })''',
+                max(1, int(delay * 1000)),
+            )
+        except Exception:
+            await asyncio.sleep(delay)
+
     async def _resolve_new_media_source(
         self,
         media_type: str,
@@ -3496,8 +3939,27 @@ class GoogleFlowWorker:
             return ""
 
         candidates = await self._collect_video_candidates()
-        source = self._find_new_media_source(candidates, baseline_keys)
-        return source
+        source = self._find_new_video_source(candidates, baseline_keys)
+        if source:
+            self._record_video_timing("playable_url_seen")
+            return source
+
+        completed = self._find_new_completed_video_candidate(candidates, baseline_keys)
+        self._video_completion_pending = completed is not None
+        if completed is None:
+            return ""
+        self._record_video_timing("video_card_seen")
+        detail_key = self._video_candidate_detail_key(completed)
+        first_seen = self._video_completed_candidate_seen_at.setdefault(
+            detail_key,
+            time.monotonic(),
+        )
+        if recover or time.monotonic() - first_seen >= VIDEO_COMPLETION_SOURCE_GRACE_SECONDS:
+            source = await self._inspect_video_candidate_detail(completed, baseline_keys)
+            if source:
+                self._record_video_timing("playable_url_seen")
+                return source
+        return ""
 
     async def _raise_invalid_image_output(
         self,
@@ -3542,9 +4004,11 @@ class GoogleFlowWorker:
         idle_since: float | None = None
         consecutive_ui_errors = 0
         start_logged = False
+        queue_logged = False
+        self._generation_queue_active = False
 
         while True:
-            await asyncio.sleep(GENERATION_POLL_SECONDS)
+            await self._wait_for_generation_poll(media_type)
             await self.handle_confirmation_prompts()
             now = time.monotonic()
 
@@ -3573,6 +4037,15 @@ class GoogleFlowWorker:
                         f"Không thể đọc trạng thái giao diện Google Flow cho {media_type}."
                     ) from exc
                 continue
+
+            if media_type == "video" and self._generation_queue_active:
+                hard_deadline = max(
+                    hard_deadline,
+                    submitted_at + VIDEO_QUEUE_TIMEOUT_SECONDS,
+                )
+                if not queue_logged:
+                    self._log_generation_event(media_type, "queued", submitted_at)
+                    queue_logged = True
 
             if source:
                 self._log_generation_event(media_type, "completed", submitted_at)
@@ -3675,7 +4148,8 @@ class GoogleFlowWorker:
                         f"{media_type} mới sau {effective_timeout:.0f} giây."
                     )
                 raise FlowGenerationTimeout(
-                    f"Google Flow không trả về {media_type} mới sau {effective_timeout:.0f} giây."
+                    f"Google Flow không trả về {media_type} mới sau "
+                    f"{hard_deadline - submitted_at:.0f} giây."
                 )
 
     async def generate_scene(
@@ -3881,6 +4355,15 @@ class GoogleFlowWorker:
             if strict:
                 raise FlowUiStateError("Không thể chụp baseline video của Google Flow.") from exc
             return set()
+
+    async def _capture_video_baseline(self) -> set[str]:
+        try:
+            candidates = await self._collect_video_candidates()
+        except Exception as exc:
+            raise FlowUiStateError("Không thể chụp baseline video của Google Flow.") from exc
+        if not candidates:
+            return set()
+        return set().union(*(self._candidate_keys(candidate) for candidate in candidates))
 
     async def _is_video_mode_active(self) -> bool:
         result = await self.page.evaluate('''() => {
@@ -4099,6 +4582,13 @@ class GoogleFlowWorker:
         if not end_frame_path or not Path(end_frame_path).is_file():
             raise FlowFrameAttachmentError("Video end frame không tồn tại.")
 
+        self._last_video_timing = {}
+        self._active_video_submitted_at = None
+        self._video_completion_pending = False
+        self._video_completed_candidate_seen_at.clear()
+        self._inspected_video_detail_keys.clear()
+        self._record_video_timing("prepare_started")
+
         await self._ensure_agent_session_ready()
         editor = await self.wait_for_editor(timeout=25.0)
         agent_interface = await self._is_agent_interface_active()
@@ -4131,10 +4621,8 @@ class GoogleFlowWorker:
             if not await self._attach_video_frame(Path(end_frame_path), "end"):
                 raise FlowModeError("Không thể gắn end frame vào chế độ Video của Google Flow.")
 
-        baseline_keys = {
-            self._media_key(source)
-            for source in await self._get_existing_videos(strict=True)
-        }
+        baseline_keys = await self._capture_video_baseline()
+        self._record_video_timing("baseline_captured")
         initial_error_texts = await self._get_existing_error_texts()
 
         # 2. Add strict negative prompt for text/watermarks and static still frames
@@ -4179,12 +4667,15 @@ class GoogleFlowWorker:
             baseline_keys=baseline_keys,
             on_agent_session_reset=restore_agent_video_frames,
         )
+        self._active_video_submitted_at = submitted_at
+        self._record_video_timing("submitted")
         logger.info(
             "flow_generation media=video state=video_submitted project=%s scene=%s",
             self._project_id(),
             scene_index if scene_index is not None else "unknown",
         )
         if immediate_source:
+            self._record_video_timing("playable_url_seen")
             self._log_generation_event("video", "video_completed", submitted_at)
             return immediate_source
 
@@ -4202,6 +4693,7 @@ class GoogleFlowWorker:
         """Download generated video file from URL/Blob to local path."""
         target = Path(save_path)
         target.parent.mkdir(parents=True, exist_ok=True)
+        self._record_video_timing("download_started")
 
         last_error = None
         for attempt in range(3):
@@ -4227,6 +4719,7 @@ class GoogleFlowWorker:
                         target.write_bytes(raw_bytes)
                         if target.stat().st_size > 1000:
                             logger.info("Downloaded video from blob successfully (%d bytes) to %s", len(raw_bytes), target)
+                            self._record_video_timing("download_completed")
                             return
                 else:
                     response = await self.page.request.get(asset_url, timeout=60000)
@@ -4235,6 +4728,7 @@ class GoogleFlowWorker:
                         if body and len(body) > 1000:
                             target.write_bytes(body)
                             logger.info("Downloaded video successfully (%d bytes) to %s", len(body), target)
+                            self._record_video_timing("download_completed")
                             return
                         raise RuntimeError(f"Tải video từ Google Flow rỗng hoặc quá nhỏ ({len(body) if body else 0} bytes).")
                     raise RuntimeError(f"HTTP {response.status} khi tải video từ Google Flow: {asset_url}")

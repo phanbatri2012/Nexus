@@ -1151,6 +1151,7 @@ async def _generate_scene_video_async(
         },
     )
 
+    flow_timing: dict[str, object] = {}
     try:
         from auto_yt.services.google_flow_worker import FlowFrameAttachmentError
 
@@ -1221,10 +1222,15 @@ async def _generate_scene_video_async(
                 scene_index=int(scene.get("index", 0)),
             )
             await worker.download_video(video_url, str(target))
+            timing_snapshot = worker.get_last_video_timing()
+            flow_timing = timing_snapshot if isinstance(timing_snapshot, dict) else {}
 
         if not target.exists() or target.stat().st_size < 1000:
             raise RuntimeError(f"Video tạo từ Google Flow Veo không hợp lệ hoặc quá nhỏ: {target}")
     except Exception as exc:
+        if worker is not None and hasattr(worker, "get_last_video_timing"):
+            timing_snapshot = worker.get_last_video_timing()
+            flow_timing = timing_snapshot if isinstance(timing_snapshot, dict) else {}
         failure_stage_by_error = {
             "FlowAgentInteractionError": "agent_interaction",
             "FlowAgentSettingsError": "agent_settings",
@@ -1259,6 +1265,7 @@ async def _generate_scene_video_async(
                 "error": str(exc),
                 "failure_stage": failure_stage,
                 "fallback_reason": str(exc),
+                "flow_timing": flow_timing,
             },
         )
         _log_scene_generation(
@@ -1287,6 +1294,7 @@ async def _generate_scene_video_async(
             "end_hash": end_hash,
             "start_frame": start_frame_path.name if start_frame_path else "",
             "end_frame": end_frame_path.name if end_frame_path else "",
+            "flow_timing": flow_timing,
         },
     )
     _log_scene_generation(
