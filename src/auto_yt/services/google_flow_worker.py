@@ -13,6 +13,8 @@ from PIL import Image
 from playwright.async_api import Page, Locator
 
 from auto_yt.services.google_flow_login import FLOW_HOME_URL
+from auto_yt.services.browser_diagnostics import capture_browser_diagnostics_async
+
 
 logger = logging.getLogger(__name__)
 
@@ -3063,7 +3065,14 @@ class GoogleFlowWorker:
             )
             return
 
-        if result == REFERENCE_RESULT_UI_ERROR or record is not None:
+        missing_generated_asset = (
+            result == REFERENCE_RESULT_NOT_FOUND
+            and record is not None
+            and record.get("source") == "generated"
+        )
+        if result == REFERENCE_RESULT_UI_ERROR or (
+            record is not None and not missing_generated_asset
+        ):
             self._log_video_frame_event(
                 "frame_attach_failed",
                 path,
@@ -3073,6 +3082,15 @@ class GoogleFlowWorker:
             )
             raise FlowFrameAttachmentError(
                 f"Không thể gắn {role} frame đã có '{path.name}' trong project Flow."
+            )
+
+        if missing_generated_asset:
+            self._log_video_frame_event(
+                "frame_generated_reupload",
+                path,
+                role,
+                scene_index=scene_index,
+                detail="generated_asset_not_selectable",
             )
 
         # Mark the frame as known before opening the file chooser. A later UI
@@ -3744,6 +3762,16 @@ class GoogleFlowWorker:
         ]
         return identities[0] if identities else ""
 
+    def _is_new_video_candidate(
+        self,
+        candidate: dict,
+        baseline_keys: set[str],
+    ) -> bool:
+        keys = self._candidate_keys(candidate)
+        specific_keys = {key for key in keys if not key.startswith("card:")}
+        comparable_keys = specific_keys or keys
+        return bool(comparable_keys - baseline_keys)
+
     def _find_new_completed_video_candidate(
         self,
         candidates: list[dict],
@@ -3752,8 +3780,7 @@ class GoogleFlowWorker:
         for candidate in reversed(candidates):
             if not candidate.get("completed"):
                 continue
-            keys = self._candidate_keys(candidate)
-            if keys and not (keys & baseline_keys):
+            if self._is_new_video_candidate(candidate, baseline_keys):
                 return candidate
         return None
 
@@ -3763,8 +3790,7 @@ class GoogleFlowWorker:
         baseline_keys: set[str],
     ) -> str:
         for candidate in reversed(candidates):
-            keys = self._candidate_keys(candidate)
-            if not keys or keys & baseline_keys:
+            if not self._is_new_video_candidate(candidate, baseline_keys):
                 continue
             for value in [
                 candidate.get("src"),
@@ -4739,14 +4765,19 @@ class GoogleFlowWorker:
 
         raise RuntimeError(f"Không thể tải video sau 3 lần thử: {last_error}")
 
-    async def _save_debug_screenshot(self, prefix: str):
-        """Save a timestamped screenshot to assist in diagnosing UI issues."""
+    async def _save_debug_screenshot(self, prefix: str, error: Exception | str | None = None) -> dict:
+        """Save a timestamped screenshot, sanitized DOM, and blocker diagnostics."""
         try:
-            DEBUG_LOG_DIR.mkdir(parents=True, exist_ok=True)
-            timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = DEBUG_LOG_DIR / f"{prefix}_{timestamp}.png"
-            await self.page.screenshot(path=str(path))
-            logger.info("Saved debug screenshot to %s", path)
+            return await capture_browser_diagnostics_async(
+                page=self.page,
+                service="google_flow",
+                job_id=getattr(self, "job_id", None) or getattr(self, "account_id", None),
+                video_id=getattr(self, "video_id", None),
+                error=error or prefix,
+                action_name=prefix,
+                logs_dir=DEBUG_LOG_DIR,
+            )
         except Exception as e:
-            logger.warning("Failed to save debug screenshot: %s", e)
+            logger.warning("Failed to save debug diagnostics: %s", e)
+            return {}
 

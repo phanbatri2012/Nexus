@@ -26,6 +26,9 @@ SEGMENTS_DIR = VIDEO_ARTIFACTS_DIR / "segments"
 FLOW_ARTIFACTS_DIR = VIDEO_ARTIFACTS_DIR / "flow"
 FLOW_REFERENCE_STAGING_DIR = FLOW_ARTIFACTS_DIR / "staging"
 PROMPT_ASSETS_DIR = DATA_DIR / "prompt_assets"
+LOGS_DIR = DATA_DIR / "logs"
+DIAGNOSTICS_DIR = LOGS_DIR / "diagnostics"
+
 
 
 def gpt_profile_dir(profile_name: str = "PROFILE_GPT_1") -> Path:

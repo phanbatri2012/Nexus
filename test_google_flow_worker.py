@@ -911,6 +911,33 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, "blob:https://flow.google/new-video")
 
+    async def test_video_source_accepts_new_url_with_reused_generic_card_identity(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        old_url = "https://flow-content.google/video/old-video?token=old"
+        new_url = "https://flow-content.google/video/new-video?token=new"
+        shared_identity = "card:||Video được tạo"
+        baseline_keys = {
+            worker._media_key(old_url),
+            shared_identity.casefold(),
+        }
+        candidate = {
+            "src": new_url,
+            "urls": [new_url],
+            "identityKeys": [shared_identity],
+            "completed": True,
+        }
+
+        source = worker._find_new_video_source([candidate], baseline_keys)
+        completed = worker._find_new_completed_video_candidate(
+            [candidate],
+            baseline_keys,
+        )
+
+        self.assertEqual(source, new_url)
+        self.assertIs(completed, candidate)
+
     async def test_completed_baseline_video_card_is_not_opened(self):
         page = MagicMock()
         page.url = "https://flow.google.com/project/project-one"
@@ -2022,6 +2049,109 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
             attach.await_args.kwargs["record"]["source"],
             "generated",
         )
+
+    async def test_missing_generated_frame_is_uploaded_once(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            frame = Path(temp_dir) / "236_1_deadbeef.png"
+            frame.write_bytes(b"frame-one")
+            worker._last_generated_image_identity = {
+                "flow_project_id": "project-one",
+                "flow_asset_id": "generated-one",
+                "flow_media_key": "https://flow-content.google/image/generated-one",
+            }
+            worker.register_generated_video_frame(
+                frame,
+                "https://flow-content.google/image/generated-one?size=original",
+            )
+            with (
+                patch.object(
+                    worker,
+                    "_attach_video_frame_from_picker",
+                    AsyncMock(return_value=REFERENCE_RESULT_NOT_FOUND),
+                ),
+                patch.object(
+                    worker,
+                    "_attach_video_frame_from_gallery_identity",
+                    AsyncMock(return_value=REFERENCE_RESULT_NOT_FOUND),
+                ),
+                patch.object(
+                    worker,
+                    "_upload_video_frame_file",
+                    AsyncMock(return_value=True),
+                ) as upload,
+                patch.object(
+                    worker,
+                    "_prompt_attachment_identities",
+                    AsyncMock(
+                        return_value=[
+                            {
+                                "assetId": "uploaded-one",
+                                "urls": ["https://flow-content.google/image/uploaded-one"],
+                            }
+                        ]
+                    ),
+                ),
+            ):
+                await worker._ensure_agent_video_frame(
+                    frame,
+                    "start",
+                    1,
+                    scene_index=0,
+                )
+
+            frame_key = worker._video_frame_key(frame)
+
+        upload.assert_awaited_once_with(frame, 1)
+        self.assertEqual(
+            worker._project_video_frame_cache()[frame_key]["source"],
+            "upload",
+        )
+        self.assertEqual(
+            worker._project_video_frame_cache()[frame_key]["flow_asset_id"],
+            "uploaded-one",
+        )
+
+    async def test_missing_uploaded_frame_is_not_uploaded_again(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            frame = Path(temp_dir) / "236_1_deadbeef.png"
+            frame.write_bytes(b"frame-one")
+            frame_key = worker._video_frame_key(frame)
+            worker._project_video_frame_cache()[frame_key] = {
+                "filename": frame.name,
+                "frame_sha256": frame_key.rsplit(":", 1)[-1],
+                "flow_project_id": "project-one",
+                "flow_asset_id": "uploaded-one",
+                "flow_media_key": "https://flow-content.google/image/uploaded-one",
+                "source": "upload",
+            }
+            with (
+                patch.object(
+                    worker,
+                    "_attach_video_frame_from_picker",
+                    AsyncMock(return_value=REFERENCE_RESULT_NOT_FOUND),
+                ),
+                patch.object(
+                    worker,
+                    "_attach_video_frame_from_gallery_identity",
+                    AsyncMock(return_value=REFERENCE_RESULT_NOT_FOUND),
+                ),
+                patch.object(worker, "_upload_video_frame_file", AsyncMock()) as upload,
+            ):
+                with self.assertRaises(FlowFrameAttachmentError):
+                    await worker._ensure_agent_video_frame(
+                        frame,
+                        "start",
+                        1,
+                        scene_index=0,
+                    )
+
+        upload.assert_not_awaited()
 
     async def test_video_frame_cache_is_isolated_by_project(self):
         with tempfile.TemporaryDirectory() as temp_dir:

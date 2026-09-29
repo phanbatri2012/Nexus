@@ -20,6 +20,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from auto_yt.services.gpm_service import gpm_browser_session
+from auto_yt.services.browser_diagnostics import capture_browser_diagnostics_async
 
 logger = logging.getLogger(__name__)
 
@@ -2483,39 +2484,18 @@ async def upload_video_via_browser(
             except Exception as checkpoint_exc:
                 logger.warning("Không thể lưu checkpoint lỗi browser upload: %s", checkpoint_exc)
             try:
-                logs_dir = Path("data/logs")
-                logs_dir.mkdir(parents=True, exist_ok=True)
-                timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-                screenshot_path = logs_dir / f"yt_upload_error_{timestamp}.png"
-                await page.screenshot(path=str(screenshot_path), full_page=True)
-                evidence_path = logs_dir / f"yt_upload_error_{timestamp}.json"
-                dialog = await page.query_selector(UPLOAD_DIALOG_SELECTOR)
-                dialog_text = (
-                    str(await dialog.inner_text() or "")[:20000]
-                    if dialog is not None
-                    else ""
+                diag = await capture_browser_diagnostics_async(
+                    page=page,
+                    service="youtube_studio",
+                    video_id=locals().get("existing_video_id") or locals().get("youtube_video_id", ""),
+                    job_id=locals().get("profile_id", ""),
+                    error=exc,
+                    action_name="youtube_browser_upload",
                 )
-                try:
-                    active_step_evidence = await _read_active_upload_step(page)
-                except Exception:
-                    active_step_evidence = "unknown"
-                evidence_path.write_text(
-                    json.dumps(
-                        {
-                            "url": page.url,
-                            "error": str(exc),
-                            "error_type": type(exc).__name__,
-                            "active_step": active_step_evidence,
-                            "dialog_text": dialog_text,
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    encoding="utf-8",
-                )
-                logger.error("Đã chụp ảnh màn hình chẩn đoán lỗi tại: %s", screenshot_path)
+                if diag.get("screenshot_path"):
+                    logger.error("Đã chụp ảnh màn hình chẩn đoán lỗi tại: %s", diag["screenshot_path"])
             except Exception as s_exc:
-                logger.warning("Không thể chụp ảnh màn hình chẩn đoán: %s", s_exc)
+                logger.warning("Không thể chụp chẩn đoán trình duyệt: %s", s_exc)
             if isinstance(exc, BrowserUploadError):
                 raise
             raise BrowserUploadError(f"Upload qua trình duyệt thất bại: {exc}") from exc

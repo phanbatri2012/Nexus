@@ -38,6 +38,14 @@ from auto_yt.services.chatgpt_runtime import (
     ChatGPTAttentionRequiredError,
     encode_attention_error,
 )
+from auto_yt.services.browser_diagnostics import (
+    CATEGORY_CLOUDFLARE,
+    CATEGORY_SESSION_EXPIRED,
+    CATEGORY_VERIFY_2FA,
+    capture_browser_diagnostics_sync,
+    detect_browser_blockers,
+)
+
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -1408,6 +1416,29 @@ def raise_if_chatgpt_attention_required(state: dict) -> None:
 def check_chatgpt_page_attention(page: Page) -> None:
     """Inspect redirects before strict Project/conversation URL validation."""
     raise_if_chatgpt_attention_required(get_chatgpt_load_state(page))
+    try:
+        current_url = str(page.url or "")
+        title = str(page.title() or "")
+        html = str(page.content() or "")
+        blockers = detect_browser_blockers(url=current_url, title=title, html_text=html)
+        for blocker in blockers:
+            if blocker.get("category") in (
+                CATEGORY_CLOUDFLARE,
+                CATEGORY_SESSION_EXPIRED,
+                CATEGORY_VERIFY_2FA,
+            ):
+                capture_browser_diagnostics_sync(
+                    page=page,
+                    service="chatgpt",
+                    error=blocker.get("message"),
+                    action_name="page_attention_check",
+                )
+                raise ChatGPTAttentionRequiredError(blocker.get("message"))
+    except ChatGPTAttentionRequiredError:
+        raise
+    except Exception:
+        pass
+
 
 
 def click_chatgpt_full_page_retry(page: Page) -> bool:
