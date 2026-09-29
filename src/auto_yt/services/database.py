@@ -1071,6 +1071,7 @@ def init_db():
             auto_publish_enabled INTEGER DEFAULT 0,
             convert_to_vertical INTEGER DEFAULT 0,
             default_tags_json TEXT DEFAULT '[]',
+            upload_mode TEXT DEFAULT 'browser',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT ''
         )
@@ -1130,6 +1131,7 @@ def init_db():
     for column_definition in (
         "convert_to_vertical INTEGER DEFAULT 0",
         "default_tags_json TEXT DEFAULT '[]'",
+        "upload_mode TEXT DEFAULT 'browser'",
     ):
         try:
             c.execute(
@@ -4182,6 +4184,7 @@ def _load_fb_crossposter_settings(page_id: str | None = None) -> dict:
         )
         data["convert_to_vertical"] = bool(data.get("convert_to_vertical"))
         data["lead_time_minutes"] = int(data.get("lead_time_minutes") or 60)
+        data["upload_mode"] = str(data.get("upload_mode") or "browser").strip() or "browser"
         return data
     finally:
         conn.close()
@@ -4234,6 +4237,7 @@ def list_all_crossposter_campaigns() -> list[dict]:
                 d.get("default_tags_json", "[]")
             )
             d["convert_to_vertical"] = bool(d.get("convert_to_vertical"))
+            d["upload_mode"] = str(d.get("upload_mode") or "browser").strip() or "browser"
             campaigns.append(d)
         return campaigns
     finally:
@@ -4261,6 +4265,7 @@ def save_fb_crossposter_settings(settings: dict, page_id: str | None = None) -> 
         default_tags_json = json.dumps(default_tags, ensure_ascii=False)
 
         lead_time = int(settings.get("lead_time_minutes") or 60)
+        upload_mode = str(settings.get("upload_mode") or "browser").strip() or "browser"
 
         existing = None
         if target_page_id:
@@ -4314,6 +4319,7 @@ def save_fb_crossposter_settings(settings: dict, page_id: str | None = None) -> 
             1 if settings.get("auto_publish_enabled") else 0,
             1 if settings.get("convert_to_vertical") else 0,
             default_tags_json,
+            upload_mode,
             now_iso,
         )
 
@@ -4341,6 +4347,7 @@ def save_fb_crossposter_settings(settings: dict, page_id: str | None = None) -> 
                     auto_publish_enabled = ?,
                     convert_to_vertical = ?,
                     default_tags_json = ?,
+                    upload_mode = ?,
                     updated_at = ?
                 WHERE id = ?
             """, (*values, existing["id"]))
@@ -4354,8 +4361,8 @@ def save_fb_crossposter_settings(settings: dict, page_id: str | None = None) -> 
                     sort_order_mode, auto_sync_enabled, auto_sync_type,
                     auto_sync_interval_hours, auto_sync_fixed_times_json,
                     last_synced_at, auto_publish_enabled, convert_to_vertical,
-                    default_tags_json, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    default_tags_json, upload_mode, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, values)
         conn.commit()
     finally:

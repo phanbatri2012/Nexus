@@ -69,6 +69,30 @@ UPLOAD_DESCRIPTION_EDITOR_SELECTORS = [
     for root in UPLOAD_DIALOG_ROOT_SELECTORS
     for selector in DESCRIPTION_EDITOR_SELECTORS
 ]
+UPLOAD_ALTERED_CONTENT_SELECTORS = [
+    f"{root} tp-yt-paper-radio-button[name='{name}']"
+    for root in UPLOAD_DIALOG_ROOT_SELECTORS
+    for name in ("VIDEO_HAS_ALTERED_CONTENT_YES", "VIDEO_HAS_ALTERED_CONTENT_NO")
+]
+UPLOAD_ADVANCED_TOGGLE_SELECTORS = [
+    selector
+    for root in UPLOAD_DIALOG_ROOT_SELECTORS
+    for selector in (f"{root} #toggle-button", f"{root} ytcp-button#toggle-button")
+]
+UPLOAD_PLAYLIST_TRIGGER_SELECTORS = [
+    f"{root} ytcp-video-metadata-playlists ytcp-dropdown-trigger"
+    for root in UPLOAD_DIALOG_ROOT_SELECTORS
+] + [
+    "ytcp-uploads-dialog #playlists ytcp-dropdown-trigger",
+    "ytcp-uploads-dialog ytcp-button:has-text('Danh sách phát')",
+    "ytcp-video-upload-dialog #playlists ytcp-dropdown-trigger",
+]
+UPLOAD_THUMBNAIL_PREVIEW_SELECTOR = (
+    "ytcp-uploads-dialog ytcp-video-custom-still-editor img[src], "
+    "ytcp-uploads-dialog #custom-thumbnail img[src], "
+    "ytcp-video-upload-dialog ytcp-video-custom-still-editor img[src], "
+    "ytcp-video-upload-dialog #custom-thumbnail img[src]"
+)
 MONETIZATION_MODE_AUTO = "auto_enable_if_available"
 MONETIZATION_MODE_KEEP_OFF = "keep_off"
 MONETIZATION_MODE_REQUIRE = "require_on"
@@ -96,6 +120,15 @@ async def _safe_click(page, selectors: list[str], timeout_ms: int = 5000) -> boo
     """Try clicking the first matching selector from a list of fallback selectors."""
     for sel in selectors:
         try:
+            dialog_elements = await _visible_upload_dialog_elements(page, sel)
+            if dialog_elements:
+                for element in dialog_elements:
+                    try:
+                        await element.click()
+                        return True
+                    except Exception:
+                        continue
+                continue
             el = await page.wait_for_selector(sel, state="visible", timeout=timeout_ms)
             if el:
                 await el.click()
@@ -105,10 +138,48 @@ async def _safe_click(page, selectors: list[str], timeout_ms: int = 5000) -> boo
     return False
 
 
+async def _has_visible_element(page, selectors: list[str]) -> bool:
+    for selector in selectors:
+        try:
+            elements = await page.query_selector_all(selector)
+            for element in elements:
+                if await element.is_visible():
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+async def _ensure_altered_content_controls_visible(page, timeout_ms: int = 10000) -> None:
+    if await _has_visible_element(page, UPLOAD_ALTERED_CONTENT_SELECTORS):
+        return
+    if not await _safe_click(page, UPLOAD_ADVANCED_TOGGLE_SELECTORS, timeout_ms=3000):
+        raise BrowserUploadError("Không thể mở cài đặt nâng cao trên YouTube Studio.")
+
+    deadline = time.monotonic() + max(0.1, timeout_ms / 1000)
+    while time.monotonic() < deadline:
+        if await _has_visible_element(page, UPLOAD_ALTERED_CONTENT_SELECTORS):
+            return
+        await asyncio.sleep(0.25)
+    raise BrowserUploadError("YouTube Studio không hiển thị khai báo nội dung tổng hợp.")
+
+
 async def _safe_fill(page, selectors: list[str], text: str, timeout_ms: int = 5000) -> bool:
     """Try clicking and filling text into the first matching selector."""
     for sel in selectors:
         try:
+            dialog_elements = await _visible_upload_dialog_elements(page, sel)
+            if dialog_elements:
+                for element in dialog_elements:
+                    try:
+                        await element.click()
+                        await page.keyboard.press("Control+A")
+                        await page.keyboard.press("Backspace")
+                        await element.fill(text)
+                        return True
+                    except Exception:
+                        continue
+                continue
             el = await page.wait_for_selector(sel, state="visible", timeout=timeout_ms)
             if el:
                 await el.click()
@@ -136,6 +207,30 @@ async def _find_visible_upload_details_dialog(page):
         except Exception:
             continue
     return None
+
+
+async def _visible_upload_dialog_elements(page, selector: str) -> list[Any]:
+    dialog = await _find_visible_upload_details_dialog(page)
+    if dialog is None:
+        return []
+    relative_selector = selector
+    for root in UPLOAD_DIALOG_ROOT_SELECTORS:
+        prefix = f"{root} "
+        if relative_selector.startswith(prefix):
+            relative_selector = relative_selector[len(prefix) :]
+            break
+    try:
+        elements = await dialog.query_selector_all(relative_selector)
+    except Exception:
+        return []
+    visible_elements = []
+    for element in elements:
+        try:
+            if await element.is_visible():
+                visible_elements.append(element)
+        except Exception:
+            continue
+    return visible_elements
 
 
 async def _open_existing_draft_upload_dialog(page, timeout_ms: int = 10000) -> None:
@@ -169,6 +264,11 @@ async def _open_existing_draft_upload_dialog(page, timeout_ms: int = 10000) -> N
     )
 
 
+async def _ensure_resumed_draft_dialog(page, resuming_existing_draft: bool) -> None:
+    if resuming_existing_draft:
+        await _open_existing_draft_upload_dialog(page)
+
+
 async def _require_click(
     page,
     selectors: list[str],
@@ -192,24 +292,57 @@ async def _require_fill(
         raise BrowserUploadError(error_message)
 
 
+async def _text_value_matches(
+    page,
+    selectors: list[str],
+    expected: str,
+) -> bool:
+    expected_normalized = str(expected or "").replace("\r\n", "\n").strip()
+    for selector in selectors:
+        try:
+            dialog_elements = await _visible_upload_dialog_elements(page, selector)
+            elements = dialog_elements
+            if not elements:
+                element = await page.query_selector(selector)
+                elements = [element] if element is not None else []
+            for element in elements:
+                actual = (await _read_control_value(element)).replace("\r\n", "\n").strip()
+                if actual == expected_normalized:
+                    return True
+        except Exception:
+            continue
+    return False
+
+
 async def _require_text_value(
     page,
     selectors: list[str],
     expected: str,
     error_message: str,
 ) -> None:
-    expected_normalized = str(expected or "").replace("\r\n", "\n").strip()
-    for selector in selectors:
-        try:
-            element = await page.query_selector(selector)
-            if element is None:
-                continue
-            actual = (await _read_control_value(element)).replace("\r\n", "\n").strip()
-            if actual == expected_normalized:
-                return
-        except Exception:
-            continue
+    if await _text_value_matches(page, selectors, expected):
+        return
     raise BrowserUploadError(error_message)
+
+
+async def _fill_text_if_needed(
+    page,
+    selectors: list[str],
+    text: str,
+    fill_error: str,
+    verify_error: str,
+    *,
+    timeout_ms: int = 5000,
+) -> None:
+    if not await _text_value_matches(page, selectors, text):
+        await _require_fill(
+            page,
+            selectors,
+            text,
+            fill_error,
+            timeout_ms=timeout_ms,
+        )
+    await _require_text_value(page, selectors, text, verify_error)
 
 
 def _emit_checkpoint(
@@ -329,27 +462,58 @@ async def detect_monetization_capability(
 async def _is_selected(element) -> bool:
     if element is None:
         return False
-    for attribute in ("aria-checked", "aria-selected", "checked", "active"):
-        value = str(await element.get_attribute(attribute) or "").lower()
-        if value in {"true", "checked", "active"}:
-            return True
+    candidates = [element]
+    try:
+        nested_control = await element.query_selector(
+            "[role='checkbox'], [role='radio'], input[type='checkbox'], input[type='radio']"
+        )
+        if nested_control is not None:
+            candidates.insert(0, nested_control)
+    except Exception:
+        pass
+    for candidate in candidates:
+        for attribute in ("aria-checked", "aria-selected", "checked", "active"):
+            value = str(await candidate.get_attribute(attribute) or "").lower()
+            if value in {"true", "checked", "active"}:
+                return True
+    return False
+
+
+async def _is_any_selected(page, selectors: list[str]) -> bool:
+    for selector in selectors:
+        try:
+            dialog_elements = await _visible_upload_dialog_elements(page, selector)
+            if dialog_elements:
+                if any([await _is_selected(element) for element in dialog_elements]):
+                    return True
+                continue
+            element = await page.query_selector(selector)
+            if element is not None and await _is_selected(element):
+                return True
+        except Exception:
+            continue
     return False
 
 
 async def _require_selected(page, selectors: list[str], error_message: str) -> None:
-    for selector in selectors:
-        try:
-            element = await page.query_selector(selector)
-            if element is not None and await _is_selected(element):
-                return
-        except Exception:
-            continue
+    if await _is_any_selected(page, selectors):
+        return
     raise BrowserUploadError(error_message)
 
 
 async def _set_checkbox(page, selectors: list[str], desired: bool) -> bool:
     for selector in selectors:
         try:
+            dialog_elements = await _visible_upload_dialog_elements(page, selector)
+            if dialog_elements:
+                for element in dialog_elements:
+                    selected = await _is_selected(element)
+                    if selected != desired:
+                        await element.click()
+                        await asyncio.sleep(0.25)
+                    if await _is_selected(element) == desired:
+                        return True
+                continue
             element = await page.query_selector(selector)
             if element is None or not await element.is_visible():
                 continue
@@ -584,14 +748,33 @@ async def _select_youtube_category(page, category_id: str) -> bool:
         return False
 
     try:
-        category = await page.query_selector(
+        category_selector = (
             "ytcp-form-select#category, #category, #category-container, "
             "ytcp-form-select:has-text('Danh mục'), "
             "ytcp-form-select:has-text('Category')"
         )
+        dialog_categories = await _visible_upload_dialog_elements(
+            page, category_selector
+        )
+        category = (
+            dialog_categories[0]
+            if dialog_categories
+            else await page.query_selector(category_selector)
+        )
         if category:
             await category.scroll_into_view_if_needed()
             await asyncio.sleep(0.5)
+            selected_text = str(await category.inner_text() or "")
+            if any(
+                label.casefold() in selected_text.casefold()
+                for label in target_labels
+            ):
+                logger.info(
+                    "Thể loại YouTube đã được chọn trước đó: %s (ID: %s)",
+                    selected_text.strip(),
+                    category_id,
+                )
+                return True
         opened = await _safe_click(
             page,
             [
@@ -619,10 +802,24 @@ async def _select_youtube_category(page, category_id: str) -> bool:
                 timeout_ms=1500,
             ):
                 await asyncio.sleep(0.25)
-                selected_text = str(await category.inner_text() or "") if category else ""
-                if label.casefold() in selected_text.casefold():
-                    logger.info("Đã chọn Thể loại YouTube: %s (ID: %s)", label, category_id)
-                    return True
+                for _ in range(8):
+                    dialog_categories = await _visible_upload_dialog_elements(
+                        page, category_selector
+                    )
+                    current_category = (
+                        dialog_categories[0]
+                        if dialog_categories
+                        else await page.query_selector(category_selector)
+                    )
+                    selected_text = (
+                        str(await current_category.inner_text() or "")
+                        if current_category
+                        else ""
+                    )
+                    if label.casefold() in selected_text.casefold():
+                        logger.info("Đã chọn Thể loại YouTube: %s (ID: %s)", label, category_id)
+                        return True
+                    await asyncio.sleep(0.25)
                 logger.warning(
                     "YouTube Studio chưa xác nhận thể loại sau khi chọn: %s",
                     label,
@@ -701,6 +898,28 @@ async def _select_exact_checkbox_by_text(
     expected_text: str,
 ) -> None:
     expected = " ".join(str(expected_text or "").split()).casefold()
+    rows = await page.query_selector_all(
+        f"{container_selector} li.row, "
+        f"{container_selector} label.ytcp-checkbox-label"
+    )
+    for row in rows:
+        try:
+            label = " ".join(str(await row.inner_text() or "").split()).casefold()
+            if label != expected:
+                continue
+            control = await row.query_selector(
+                "tp-yt-paper-checkbox, [role='checkbox'], ytcp-checkbox-lit"
+            )
+            if control is None:
+                continue
+            if not await _is_selected(control):
+                await control.click()
+                await asyncio.sleep(0.25)
+            if await _is_selected(control):
+                return
+        except Exception:
+            continue
+
     controls = await page.query_selector_all(
         f"{container_selector} tp-yt-paper-checkbox, "
         f"{container_selector} ytcp-checkbox-lit, "
@@ -762,11 +981,7 @@ async def _apply_advanced_details_settings(
     if playlist_name:
         await _require_click(
             page,
-            [
-                "ytcp-uploads-dialog #playlists ytcp-dropdown-trigger",
-                "ytcp-uploads-dialog ytcp-button:has-text('Danh sách phát')",
-                "ytcp-video-upload-dialog #playlists ytcp-dropdown-trigger",
-            ],
+            UPLOAD_PLAYLIST_TRIGGER_SELECTORS,
             "Không thể mở thiết lập playlist.",
             timeout_ms=4000,
         )
@@ -790,6 +1005,7 @@ async def _apply_advanced_details_settings(
     age_restricted = bool(settings.get("age_restriction", False))
     age_selectors = (
         [
+            "tp-yt-paper-radio-button[name='VIDEO_AGE_RESTRICTION_SELF']",
             "tp-yt-paper-radio-button[name='VIDEO_AGE_RESTRICTION_RESTRICTED']",
             "tp-yt-paper-radio-button[name='VIDEO_AGE_RESTRICTION_AGE_RESTRICTED']",
         ]
@@ -812,18 +1028,20 @@ async def _apply_advanced_details_settings(
         await _safe_click(
             page,
             [
+                "button.expand-button[aria-controls='age-restriction']",
                 "ytcp-video-audience #age-restriction-button",
                 "ytcp-video-audience ytcp-button:has-text('Giới hạn độ tuổi')",
                 "ytcp-video-audience ytcp-button:has-text('Age restriction')",
             ],
             timeout_ms=1200,
         )
-    await _require_click(
-        page,
-        age_selectors,
-        "Không thể đặt giới hạn độ tuổi.",
-        timeout_ms=3000,
-    )
+    if not await _is_any_selected(page, age_selectors):
+        await _require_click(
+            page,
+            age_selectors,
+            "Không thể đặt giới hạn độ tuổi.",
+            timeout_ms=3000,
+        )
     await _require_selected(
         page,
         age_selectors,
@@ -848,12 +1066,13 @@ async def _apply_advanced_details_settings(
             "tp-yt-paper-radio-button[name='VIDEO_CONTAINS_PAID_PROMOTION_NO']",
         ]
     )
-    await _require_click(
-        page,
-        paid_promotion_selectors,
-        "Không thể đặt trạng thái nội dung trả phí.",
-        timeout_ms=3000,
-    )
+    if not await _is_any_selected(page, paid_promotion_selectors):
+        await _require_click(
+            page,
+            paid_promotion_selectors,
+            "Không thể đặt trạng thái nội dung trả phí.",
+            timeout_ms=3000,
+        )
     await _require_selected(
         page,
         paid_promotion_selectors,
@@ -868,7 +1087,9 @@ async def _apply_advanced_details_settings(
                 "ytcp-checkbox-lit#allow-automatic-chapters",
                 "ytcp-video-automatic-chapters tp-yt-paper-checkbox",
                 "ytcp-video-automatic-chapters ytcp-checkbox-lit",
+                "ytcp-uploads-dialog ytcp-checkbox-lit:has-text('Cho phép dùng phân cảnh tự động')",
                 "ytcp-uploads-dialog tp-yt-paper-checkbox:has-text('Cho phép dùng phần cảnh tự động')",
+                "ytcp-uploads-dialog ytcp-checkbox-lit:has-text('Allow automatic chapters')",
             ],
             True,
             "chapter tự động",
@@ -876,10 +1097,12 @@ async def _apply_advanced_details_settings(
         (
             "automatic_places",
             [
+                "ytcp-checkbox-lit#has-autoplaces-mentioned-checkbox",
                 "tp-yt-paper-checkbox#allow-automatic-places",
                 "ytcp-checkbox-lit#allow-automatic-places",
                 "ytcp-video-automatic-places tp-yt-paper-checkbox",
                 "ytcp-video-automatic-places ytcp-checkbox-lit",
+                "ytcp-uploads-dialog ytcp-checkbox-lit:has-text('Cho phép chèn địa điểm tự động')",
                 "ytcp-uploads-dialog tp-yt-paper-checkbox:has-text('Cho phép chèn địa điểm tự động')",
             ],
             True,
@@ -892,6 +1115,7 @@ async def _apply_advanced_details_settings(
                 "ytcp-checkbox-lit#allow-automatic-concepts",
                 "ytcp-video-automatic-concepts tp-yt-paper-checkbox",
                 "ytcp-video-automatic-concepts ytcp-checkbox-lit",
+                "ytcp-uploads-dialog ytcp-checkbox-lit:has-text('tự động thêm khái niệm')",
                 "ytcp-uploads-dialog tp-yt-paper-checkbox:has-text('tự động thêm khái niệm')",
             ],
             True,
@@ -903,6 +1127,7 @@ async def _apply_advanced_details_settings(
                 "tp-yt-paper-checkbox#allow-embedding",
                 "ytcp-checkbox-lit#allow-embedding",
                 "tp-yt-paper-checkbox#allow-embedding-checkbox",
+                "ytcp-uploads-dialog ytcp-checkbox-lit:has-text('Cho phép nhúng')",
                 "ytcp-uploads-dialog tp-yt-paper-checkbox:has-text('Cho phép nhúng')",
             ],
             True,
@@ -987,6 +1212,7 @@ async def _apply_advanced_details_settings(
         await _select_dropdown_option(
             page,
             trigger_selectors=[
+                "ytcp-comment-moderation-settings ytcp-select#enablement-state-select ytcp-dropdown-trigger",
                 "ytcp-form-select#comments ytcp-dropdown-trigger",
                 "#comments ytcp-dropdown-trigger",
                 "ytcp-video-comments ytcp-dropdown-trigger#comments",
@@ -1005,6 +1231,7 @@ async def _apply_advanced_details_settings(
                     "tp-yt-paper-checkbox#show-ratings",
                     "ytcp-checkbox-lit#show-ratings",
                     "tp-yt-paper-checkbox#show-ratings-checkbox",
+                    "ytcp-uploads-dialog ytcp-checkbox-lit:has-text('Hiện số người xem thích')",
                     "ytcp-uploads-dialog tp-yt-paper-checkbox:has-text('Hiện số người xem thích')",
                 ],
                 desired=bool(settings.get("show_ratings", True)),
@@ -1019,6 +1246,7 @@ async def _apply_advanced_details_settings(
             await _select_dropdown_option(
                 page,
                 trigger_selectors=[
+                    "ytcp-comment-moderation-settings ytcp-select#moderation-type-select ytcp-dropdown-trigger",
                     "ytcp-video-comments #moderation ytcp-dropdown-trigger",
                     "ytcp-form-select#moderation ytcp-dropdown-trigger",
                     "ytcp-form-select:has-text('Kiểm duyệt') ytcp-dropdown-trigger",
@@ -1037,6 +1265,7 @@ async def _apply_advanced_details_settings(
             await _select_dropdown_option(
                 page,
                 trigger_selectors=[
+                    "ytcp-comment-moderation-settings ytcp-select#allowed-commenter-mode-select ytcp-dropdown-trigger",
                     "ytcp-video-comments #comment-access ytcp-dropdown-trigger",
                     "ytcp-form-select#comment-access ytcp-dropdown-trigger",
                     "ytcp-form-select:has-text('Người có thể bình luận') ytcp-dropdown-trigger",
@@ -1054,6 +1283,7 @@ async def _apply_advanced_details_settings(
             await _select_dropdown_option(
                 page,
                 trigger_selectors=[
+                    "ytcp-form-select.comment-sort-options ytcp-dropdown-trigger",
                     "ytcp-video-comments #comment-sort ytcp-dropdown-trigger",
                     "ytcp-form-select#comment-sort ytcp-dropdown-trigger",
                     "ytcp-form-select:has-text('Sắp xếp theo') ytcp-dropdown-trigger",
@@ -1069,27 +1299,34 @@ async def _apply_advanced_details_settings(
         remix_policy = str(settings.get("remix_policy") or "video_and_audio")
         remix_selectors = {
             "video_and_audio": [
+                "tp-yt-paper-radio-button[name='REMIX_SOURCE_OPTION_OPT_IN']",
                 "tp-yt-paper-radio-button[name='VIDEO_REMIX_SETTING_ALLOW_VIDEO_AND_AUDIO_REMIXING']",
+                "ytcp-video-metadata-remix-settings tp-yt-paper-radio-button:has-text('video và âm thanh')",
                 "ytcp-video-remix-settings tp-yt-paper-radio-button:has-text('hình ảnh và âm thanh')",
                 "ytcp-video-remix-settings tp-yt-paper-radio-button:has-text('video and audio')",
             ],
             "audio_only": [
+                "tp-yt-paper-radio-button[name='REMIX_SOURCE_OPTION_VISUAL_OPT_OUT_AND_PERFORM_ACTIONS']",
                 "tp-yt-paper-radio-button[name='VIDEO_REMIX_SETTING_ALLOW_AUDIO_ONLY_REMIXING']",
+                "ytcp-video-metadata-remix-settings tp-yt-paper-radio-button:has-text('Chỉ cho phép phối lại âm thanh')",
                 "ytcp-video-remix-settings tp-yt-paper-radio-button:has-text('Chỉ âm thanh')",
                 "ytcp-video-remix-settings tp-yt-paper-radio-button:has-text('Audio only')",
             ],
             "disabled": [
+                "tp-yt-paper-radio-button[name='REMIX_SOURCE_OPTION_OPT_OUT_AND_MUTE_DERIVATIVES']",
                 "tp-yt-paper-radio-button[name='VIDEO_REMIX_SETTING_DISABLE_REMIXING']",
+                "ytcp-video-metadata-remix-settings tp-yt-paper-radio-button:has-text('Không cho phép phối lại')",
                 "ytcp-video-remix-settings tp-yt-paper-radio-button:has-text('Không cho phép')",
                 "ytcp-video-remix-settings tp-yt-paper-radio-button:has-text('Don\'t allow')",
             ],
         }[remix_policy]
-        await _require_click(
-            page,
-            remix_selectors,
-            "Không thể đặt chính sách remix.",
-            timeout_ms=3000,
-        )
+        if not await _is_any_selected(page, remix_selectors):
+            await _require_click(
+                page,
+                remix_selectors,
+                "Không thể đặt chính sách remix.",
+                timeout_ms=3000,
+            )
         await _require_selected(
             page,
             remix_selectors,
@@ -1561,65 +1798,55 @@ async def upload_video_via_browser(
             progress("Đang điền tiêu đề & mô tả video...", "filling_metadata", 35)
 
             # Title
-            await _require_fill(
+            await _ensure_resumed_draft_dialog(page, resuming_existing_draft)
+            await _fill_text_if_needed(
                 page,
                 UPLOAD_TITLE_EDITOR_SELECTORS,
                 title,
                 "Không thể điền tiêu đề video trên YouTube Studio.",
-                timeout_ms=10000,
-            )
-            await _require_text_value(
-                page,
-                UPLOAD_TITLE_EDITOR_SELECTORS,
-                title,
                 "YouTube Studio không xác nhận tiêu đề vừa điền.",
+                timeout_ms=10000,
             )
             await asyncio.sleep(1.0)
 
             # Description
             if description:
-                await _require_fill(
+                await _ensure_resumed_draft_dialog(page, resuming_existing_draft)
+                await _fill_text_if_needed(
                     page,
                     UPLOAD_DESCRIPTION_EDITOR_SELECTORS,
                     description,
                     "Không thể điền mô tả video trên YouTube Studio.",
-                    timeout_ms=10000,
-                )
-                await _require_text_value(
-                    page,
-                    UPLOAD_DESCRIPTION_EDITOR_SELECTORS,
-                    description,
                     "YouTube Studio không xác nhận mô tả vừa điền.",
+                    timeout_ms=10000,
                 )
                 await asyncio.sleep(1.0)
 
             # Upload Thumbnail
             if thumbnail_path and thumbnail_path.exists():
+                await _ensure_resumed_draft_dialog(page, resuming_existing_draft)
                 progress("Đang tải lên thumbnail...", "uploading_thumbnail", 45)
                 try:
-                    thumb_input = await page.query_selector(
-                        "ytcp-uploads-dialog ytcp-video-custom-still-editor input[type='file'], "
-                        "ytcp-uploads-dialog input#file-loader[type='file'][accept*='image'], "
-                        "ytcp-uploads-dialog input[type='file'][accept*='image'], "
-                        "ytcp-video-upload-dialog ytcp-video-custom-still-editor input[type='file'], "
-                        "ytcp-video-upload-dialog input#file-loader[type='file'][accept*='image'], "
-                        "ytcp-video-upload-dialog input[type='file'][accept*='image']"
-                    )
-                    if not thumb_input:
-                        raise BrowserUploadError("Không tìm thấy input thumbnail trong upload dialog.")
-                    await thumb_input.set_input_files(str(thumbnail_path.resolve()))
-                    thumbnail_verified = False
-                    for _ in range(10):
-                        preview = await page.query_selector(
-                            "ytcp-uploads-dialog ytcp-video-custom-still-editor img[src], "
-                            "ytcp-uploads-dialog #custom-thumbnail img[src], "
-                            "ytcp-video-upload-dialog ytcp-video-custom-still-editor img[src], "
-                            "ytcp-video-upload-dialog #custom-thumbnail img[src]"
+                    preview = await page.query_selector(UPLOAD_THUMBNAIL_PREVIEW_SELECTOR)
+                    thumbnail_verified = bool(resuming_existing_draft and preview is not None)
+                    if not thumbnail_verified:
+                        thumb_input = await page.query_selector(
+                            "ytcp-uploads-dialog ytcp-video-custom-still-editor input[type='file'], "
+                            "ytcp-uploads-dialog input#file-loader[type='file'][accept*='image'], "
+                            "ytcp-uploads-dialog input[type='file'][accept*='image'], "
+                            "ytcp-video-upload-dialog ytcp-video-custom-still-editor input[type='file'], "
+                            "ytcp-video-upload-dialog input#file-loader[type='file'][accept*='image'], "
+                            "ytcp-video-upload-dialog input[type='file'][accept*='image']"
                         )
-                        if preview is not None:
-                            thumbnail_verified = True
-                            break
-                        await asyncio.sleep(0.5)
+                        if not thumb_input:
+                            raise BrowserUploadError("Không tìm thấy input thumbnail trong upload dialog.")
+                        await thumb_input.set_input_files(str(thumbnail_path.resolve()))
+                        for _ in range(10):
+                            preview = await page.query_selector(UPLOAD_THUMBNAIL_PREVIEW_SELECTOR)
+                            if preview is not None:
+                                thumbnail_verified = True
+                                break
+                            await asyncio.sleep(0.5)
                     if not thumbnail_verified:
                         raise BrowserUploadError(
                             "Đã chọn file thumbnail nhưng YouTube Studio chưa hiển thị ảnh xem trước."
@@ -1630,33 +1857,31 @@ async def upload_video_via_browser(
 
             # Audience Selection (Not for kids / For kids)
             cancel_check()
-            if made_for_kids:
-                await _require_click(
-                    page,
-                    [
+            await _ensure_resumed_draft_dialog(page, resuming_existing_draft)
+            audience_selectors = (
+                [
                         "tp-yt-paper-radio-button[name='VIDEO_MADE_FOR_KIDS_MFK']",
                         "tp-yt-paper-radio-button:has-text('Có, nội dung này dành cho trẻ em')",
                         "tp-yt-paper-radio-button:has-text('Yes, it\'s made for kids')",
-                    ],
-                    "Không thể chọn video dành cho trẻ em.",
-                    timeout_ms=3000,
-                )
-            else:
+                ]
+                if made_for_kids
+                else [
+                    "tp-yt-paper-radio-button[name='VIDEO_MADE_FOR_KIDS_NOT_MFK']",
+                    "tp-yt-paper-radio-button:has-text('Không, nội dung này không dành cho trẻ em')",
+                    "tp-yt-paper-radio-button:has-text('No, it\'s not made for kids')",
+                ]
+            )
+            if not await _is_any_selected(page, audience_selectors):
                 await _require_click(
                     page,
-                    [
-                        "tp-yt-paper-radio-button[name='VIDEO_MADE_FOR_KIDS_NOT_MFK']",
-                        "tp-yt-paper-radio-button:has-text('Không, nội dung này không dành cho trẻ em')",
-                        "tp-yt-paper-radio-button:has-text('No, it\'s not made for kids')",
-                    ],
-                    "Không thể chọn video không dành cho trẻ em.",
+                    audience_selectors,
+                    (
+                        "Không thể chọn video dành cho trẻ em."
+                        if made_for_kids
+                        else "Không thể chọn video không dành cho trẻ em."
+                    ),
                     timeout_ms=3000,
                 )
-            audience_selectors = (
-                ["tp-yt-paper-radio-button[name='VIDEO_MADE_FOR_KIDS_MFK']"]
-                if made_for_kids
-                else ["tp-yt-paper-radio-button[name='VIDEO_MADE_FOR_KIDS_NOT_MFK']"]
-            )
             await _require_selected(
                 page,
                 audience_selectors,
@@ -1664,55 +1889,37 @@ async def upload_video_via_browser(
             )
             await asyncio.sleep(1.0)
 
-            # Click Show More button
-            await _safe_click(
-                page,
-                [
-                    "ytcp-uploads-dialog #toggle-button",
-                    "ytcp-uploads-dialog ytcp-button#toggle-button",
-                    "ytcp-video-upload-dialog #toggle-button",
-                    "ytcp-video-upload-dialog ytcp-button#toggle-button",
-                ],
-                timeout_ms=3000,
-            )
-            await asyncio.sleep(1.0)
+            # Studio can persist the expanded state. Avoid toggling it closed.
+            await _ensure_resumed_draft_dialog(page, resuming_existing_draft)
+            await _ensure_altered_content_controls_visible(page)
 
             # Synthetic / Altered AI Media (Radio 'Có' / 'Không')
-            if contains_synthetic_media:
-                await _require_click(
-                    page,
-                    [
+            altered_content_selectors = (
+                [
                         "tp-yt-paper-radio-button[name='VIDEO_HAS_ALTERED_CONTENT_YES']",
                         "#altered-content-radio-group tp-yt-paper-radio-button:has-text('Có')",
                         "tp-yt-paper-radio-group[name='altered-content-radios'] tp-yt-paper-radio-button:has-text('Có')",
                         "tp-yt-paper-radio-button[name='ALTERED_CONTENT_YES']",
-                    ],
-                    "Không thể khai báo nội dung tổng hợp bằng AI.",
-                    timeout_ms=3000,
-                )
-            else:
-                await _require_click(
-                    page,
-                    [
-                        "tp-yt-paper-radio-button[name='VIDEO_HAS_ALTERED_CONTENT_NO']",
-                        "#altered-content-radio-group tp-yt-paper-radio-button:has-text('Không')",
-                        "tp-yt-paper-radio-group[name='altered-content-radios'] tp-yt-paper-radio-button:has-text('Không')",
-                        "tp-yt-paper-radio-button[name='ALTERED_CONTENT_NO']",
-                    ],
-                    "Không thể khai báo trạng thái nội dung tổng hợp.",
-                    timeout_ms=3000,
-                )
-            altered_content_selectors = (
-                [
-                    "tp-yt-paper-radio-button[name='VIDEO_HAS_ALTERED_CONTENT_YES']",
-                    "tp-yt-paper-radio-button[name='ALTERED_CONTENT_YES']",
                 ]
                 if contains_synthetic_media
                 else [
                     "tp-yt-paper-radio-button[name='VIDEO_HAS_ALTERED_CONTENT_NO']",
+                    "#altered-content-radio-group tp-yt-paper-radio-button:has-text('Không')",
+                    "tp-yt-paper-radio-group[name='altered-content-radios'] tp-yt-paper-radio-button:has-text('Không')",
                     "tp-yt-paper-radio-button[name='ALTERED_CONTENT_NO']",
                 ]
             )
+            if not await _is_any_selected(page, altered_content_selectors):
+                await _require_click(
+                    page,
+                    altered_content_selectors,
+                    (
+                        "Không thể khai báo nội dung tổng hợp bằng AI."
+                        if contains_synthetic_media
+                        else "Không thể khai báo trạng thái nội dung tổng hợp."
+                    ),
+                    timeout_ms=3000,
+                )
             await _require_selected(
                 page,
                 altered_content_selectors,
@@ -1721,6 +1928,7 @@ async def upload_video_via_browser(
             await asyncio.sleep(1.0)
 
             progress("Đang áp dụng thiết lập upload nâng cao...", "advanced_details", 48)
+            await _ensure_resumed_draft_dialog(page, resuming_existing_draft)
             await _apply_advanced_details_settings(
                 page,
                 settings,
@@ -1785,6 +1993,7 @@ async def upload_video_via_browser(
 
             # Click Next Button from Details tab
             progress("Hoàn tất tab Chi tiết -> Chuyển bước...", "next_step", 55)
+            await _ensure_resumed_draft_dialog(page, resuming_existing_draft)
             await _require_click(
                 page,
                 [

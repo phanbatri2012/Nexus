@@ -2751,8 +2751,14 @@ def process_queue_item_jit(
             "title": v_title,
         }
 
-    if not page_id or not access_token:
-        raise ValueError(f"Chưa cấu hình Fanpage ID hoặc Access Token Facebook trong Settings cho Fanpage {page_name}")
+    upload_mode = str(settings.get("upload_mode") or "browser").strip().lower()
+    if upload_mode == "api":
+        if not page_id or not access_token:
+            raise ValueError(f"Chưa cấu hình Fanpage ID hoặc Access Token Facebook trong Settings cho Fanpage {page_name}")
+    else:
+        gpm_pid = target_gpm_profile_id or source_gpm_profile_id
+        if not gpm_pid:
+            raise ValueError(f"Chưa chọn GPM Profile ID trong Settings cho Fanpage {page_name} để đăng tải qua trình duyệt Playwright")
 
     if not parent_task_id and not sys_job_id:
         sys_job_id = f"fb-pub-{item_id}-{int(time.time() * 1000)}"
@@ -2944,6 +2950,101 @@ def process_queue_item_jit(
         def persist_upload_state(fields: dict[str, Any]) -> None:
             db.update_fb_crossposter_queue_item(item_id, fields)
 
+        if upload_mode == "browser":
+            from auto_yt.services import fb_reels_browser_service
+            import concurrent.futures
+
+            def persist_browser_state(st: dict[str, Any]) -> None:
+                msg = st.get("message", "")
+                if sys_job_id and msg:
+                    try:
+                        db.update_system_job(sys_job_id, status="running", progress=msg)
+                    except Exception:
+                        pass
+                if st.get("phase"):
+                    db.update_fb_crossposter_queue_item(item_id, {"upload_phase": st["phase"]})
+
+            tags = list(default_tags)
+            if title and title not in tags:
+                tags.insert(0, title)
+            if page_name and page_name not in tags:
+                tags.append(page_name)
+
+            gpm_pid = target_gpm_profile_id or source_gpm_profile_id
+
+            # Safe execution across sync/async contexts
+            loop = None
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop and loop.is_running():
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    browser_res = executor.submit(
+                        asyncio.run,
+                        fb_reels_browser_service.schedule_reel_via_gpm(
+                            profile_id=gpm_pid,
+                            video_path=upload_video_file,
+                            caption=caption,
+                            thumb_path=thumb_file,
+                            tags=tags,
+                            schedule_datetime=scheduled_time,
+                            publish_now=publish_now,
+                            page_name=page_name,
+                            target_page_id=page_id,
+                            state_callback=persist_browser_state,
+                        )
+                    ).result()
+            else:
+                browser_res = asyncio.run(
+                    fb_reels_browser_service.schedule_reel_via_gpm(
+                        profile_id=gpm_pid,
+                        video_path=upload_video_file,
+                        caption=caption,
+                        thumb_path=thumb_file,
+                        tags=tags,
+                        schedule_datetime=scheduled_time,
+                        publish_now=publish_now,
+                        page_name=page_name,
+                        target_page_id=page_id,
+                        state_callback=persist_browser_state,
+                    )
+                )
+
+            final_status = "published" if publish_now else "meta_scheduled"
+            db.update_fb_crossposter_queue_item(item_id, {
+                "status": final_status,
+                "meta_state": final_status,
+                "meta_video_status": "ready",
+                "meta_published": 1 if publish_now else 0,
+                "meta_scheduled_publish_time": scheduled_time if not publish_now else 0,
+                "meta_verified_at": db.utc_now(),
+                "error_message": "",
+            })
+
+            if sys_job_id:
+                try:
+                    db.update_system_job(
+                        sys_job_id,
+                        status="completed",
+                        progress=f"Đã lên lịch Reels thành công trên Facebook Meta Business Suite ({browser_res.get('scheduled_time', '')})",
+                        finished_at=db.utc_now(),
+                    )
+                except Exception:
+                    pass
+
+            return {
+                "success": True,
+                "item_id": item_id,
+                "title": v_title,
+                "status": final_status,
+                "scheduled_publish_time": scheduled_time,
+                "upload_mode": "browser",
+                "message": browser_res.get("message", "Thành công"),
+            }
+
+        # Else: API Upload Mode
         upload_result = upload_video_to_facebook(
             page_id=page_id,
             access_token=access_token,

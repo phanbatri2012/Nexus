@@ -38,6 +38,7 @@ function createDefaultSettings() {
     target_gpm_profile_id: '',
     target_access_token: '',
     target_access_token_configured: false,
+    upload_mode: 'browser',
     daily_quota: 2,
     schedule_times: ['11:30', '19:30'],
     lead_time_minutes: 60,
@@ -850,8 +851,17 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
 
   // Create New Campaign
   const handleCreateNewCampaign = async () => {
-    if (!newCampaignForm.page_id || !newCampaignForm.access_token) {
-      alert('Vui lòng nhập Fanpage ID và Access Token')
+    if (!newCampaignForm.page_id) {
+      alert('Vui lòng nhập Fanpage ID')
+      return
+    }
+    const mode = newCampaignForm.upload_mode || 'browser'
+    if (mode === 'api' && !newCampaignForm.access_token) {
+      alert('Vui lòng nhập Page Access Token khi chọn chế độ Meta Graph API')
+      return
+    }
+    if (mode === 'browser' && !newCampaignForm.gpm_profile_id) {
+      alert('Vui lòng chọn GPM Profile khi chọn chế độ Trình duyệt')
       return
     }
     try {
@@ -865,6 +875,7 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
           target_gpm_profile_id: newCampaignForm.gpm_profile_id,
           source_channel_id: newCampaignForm.source_channel_id,
           source_channel_title: newCampaignForm.source_channel_title,
+          upload_mode: mode,
           daily_quota: newCampaignForm.daily_quota || 2,
           lead_time_minutes: 60
         })
@@ -1204,6 +1215,34 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
                   </option>
                 ))}
               </select>
+            </div>
+
+            {/* Upload Method Selector */}
+            <div className="fb-upload-mode-container" style={{ marginTop: '10px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                <span style={{ fontSize: '0.8rem', fontWeight: 600, color: '#e2e8f0' }}>⚡ Phương thức tải lên (Upload Mode):</span>
+                <span style={{ fontSize: '0.75rem', fontWeight: 500, color: settings.upload_mode === 'api' ? '#34d399' : '#38bdf8' }}>
+                  {settings.upload_mode === 'api' ? '⚡ Meta Graph API' : '🌐 GPM-Login Playwright (Reels Đầy đủ)'}
+                </span>
+              </div>
+              <div className="fb-upload-mode-toggle">
+                <button
+                  type="button"
+                  className={`fb-mode-btn ${settings.upload_mode !== 'api' ? 'active' : ''}`}
+                  onClick={() => setSettings(prev => ({ ...prev, upload_mode: 'browser' }))}
+                >
+                  <div className="fb-mode-title">🌐 Trình duyệt (GPM Playwright)</div>
+                  <div className="fb-mode-desc">Reels đầy đủ: Thumbnail, Tags, Playlist, Kiếm tiền</div>
+                </button>
+                <button
+                  type="button"
+                  className={`fb-mode-btn ${settings.upload_mode === 'api' ? 'active' : ''}`}
+                  onClick={() => setSettings(prev => ({ ...prev, upload_mode: 'api' }))}
+                >
+                  <div className="fb-mode-title">⚡ Meta Graph API</div>
+                  <div className="fb-mode-desc">Tải ngầm nhanh qua Token, không mở tab</div>
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -1967,6 +2006,28 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
                     </option>
                   ))}
                 </select>
+              </div>
+
+              <div className="fb-form-group">
+                <label>Phương thức tải lên (Upload Mode)</label>
+                <div className="fb-upload-mode-toggle">
+                  <button
+                    type="button"
+                    className={`fb-mode-btn ${newCampaignForm.upload_mode !== 'api' ? 'active' : ''}`}
+                    onClick={() => setNewCampaignForm(prev => ({ ...prev, upload_mode: 'browser' }))}
+                  >
+                    <div className="fb-mode-title">🌐 Trình duyệt (GPM Playwright)</div>
+                    <div className="fb-mode-desc">Tự động đặt lịch Reels với Thumbnail, Tags</div>
+                  </button>
+                  <button
+                    type="button"
+                    className={`fb-mode-btn ${newCampaignForm.upload_mode === 'api' ? 'active' : ''}`}
+                    onClick={() => setNewCampaignForm(prev => ({ ...prev, upload_mode: 'api' }))}
+                  >
+                    <div className="fb-mode-title">⚡ Meta Graph API</div>
+                    <div className="fb-mode-desc">Tải qua Access Token ngầm</div>
+                  </button>
+                </div>
               </div>
 
               <div className="fb-form-group">

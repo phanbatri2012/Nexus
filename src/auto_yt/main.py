@@ -9394,6 +9394,7 @@ class FBCrossPosterSettingsPayload(BaseModel):
     target_fb_page_name: str = ""
     target_gpm_profile_id: str = ""
     target_access_token: str = ""
+    upload_mode: str = "browser"
     daily_quota: int = 2
     schedule_times: list[str] = Field(default_factory=lambda: ["11:30", "19:30"])
     lead_time_minutes: int = 60
