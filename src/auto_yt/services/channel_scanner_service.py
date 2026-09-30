@@ -361,7 +361,11 @@ async def channel_browser_session(profile_id: str, target_url: str = "") -> Asyn
             yield context, browser, parsed
 
 
-def open_channel_platform_browser(profile_id: str, platform: str) -> dict[str, Any]:
+def open_channel_platform_browser(
+    profile_id: str,
+    platform: str,
+    force_restart: bool = False,
+) -> dict[str, Any]:
     """Launch or focus browser window on the specific platform's studio/creator page."""
     parsed = parse_profile_target(profile_id)
     platform_key = platform.lower().strip()
@@ -378,6 +382,8 @@ def open_channel_platform_browser(profile_id: str, platform: str) -> dict[str, A
             parsed["browser_key"],
             parsed["profile_dir"],
             target_url=url,
+            require_cdp=False,
+            force_restart=force_restart,
         )
         return {
             "success": True,
@@ -387,7 +393,8 @@ def open_channel_platform_browser(profile_id: str, platform: str) -> dict[str, A
             "browser_type": "local",
             "browser_name": parsed["browser_name"],
             "profile_name": parsed["profile_name"],
-            "message": f"Đã mở {parsed['browser_name']} ({parsed['profile_name']}) tại {url}",
+            "already_running_no_cdp": res.get("already_running_no_cdp", False),
+            "message": res.get("message") or f"Đã mở {parsed['browser_name']} ({parsed['profile_name']}) tại {url}",
         }
     else:
         start_gpm_profile(parsed["id"])

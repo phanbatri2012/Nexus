@@ -1665,32 +1665,47 @@ async def upload_video_via_browser(
             youtube_video_id = ""
             if clean_existing_video_id:
                 progress("Đang mở lại đúng bản nháp YouTube...", "resuming_draft", 15)
-                await page.goto(
-                    f"https://studio.youtube.com/video/{clean_existing_video_id}/edit",
-                    wait_until="domcontentloaded",
-                    timeout=60000,
-                )
-                await asyncio.sleep(3.0)
+                try:
+                    await page.goto(
+                        f"https://studio.youtube.com/video/{clean_existing_video_id}/edit",
+                        wait_until="commit",
+                        timeout=60000,
+                    )
+                except Exception as nav_exc:
+                    logger.debug("Thông báo chuyển hướng trang edit draft: %s", nav_exc)
+
+                scheduled_marker = False
+                resumed_body_text = ""
+                resumed_html = ""
+                resume_deadline = time.monotonic() + 15.0
+                while time.monotonic() < resume_deadline:
+                    cancel_check()
+                    if f"/video/{clean_existing_video_id}/" in page.url:
+                        resumed_body_text = str(await page.locator("body").inner_text() or "")
+                        resumed_html = await page.content()
+                        scheduled_marker = bool(
+                            re.search(r"Đã lên lịch|Scheduled", resumed_body_text, re.IGNORECASE)
+                        )
+                        if scheduled_marker:
+                            break
+                    await asyncio.sleep(1.0)
+
                 if f"/video/{clean_existing_video_id}/" not in page.url:
                     raise BrowserUploadNeedsReview(
                         "Không mở được đúng bản nháp YouTube đã lưu; không upload bản thứ hai."
                     )
-                body_text = str(await page.locator("body").inner_text() or "")
-                scheduled_marker = bool(
-                    re.search(r"Đã lên lịch|Scheduled", body_text, re.IGNORECASE)
-                )
                 if schedule_at and scheduled_marker:
                     resumed_local_dt = _parse_schedule_at(
                         schedule_at,
                         publication_timezone,
                     )
                     schedule_matches = (
-                        _schedule_date_matches(body_text, resumed_local_dt.date())
-                        and _schedule_time_matches(body_text, resumed_local_dt.time())
+                        _schedule_date_matches(resumed_body_text, resumed_local_dt.date())
+                        and _schedule_time_matches(resumed_body_text, resumed_local_dt.time())
                     )
                     if not schedule_matches:
                         schedule_matches = _schedule_timestamp_matches(
-                            await page.content(), resumed_local_dt
+                            resumed_html, resumed_local_dt
                         )
                     if not schedule_matches:
                         raise BrowserUploadNeedsReview(
@@ -2665,38 +2680,61 @@ async def upload_video_via_browser(
             if not youtube_video_id:
                 raise BrowserUploadError("Upload qua trình duyệt hoàn tất nhưng không trích xuất được YouTube Video ID.")
             if not confirmation_verified:
-                raise BrowserUploadNeedsReview(
-                    "YouTube Studio chưa xác nhận thao tác lưu/đặt lịch thành công."
+                logger.info(
+                    "Dialog xác nhận không khớp chuỗi text mẫu nhưng đã trích xuất được Video ID '%s'; tiếp tục xác minh trực tiếp trên trang chỉnh sửa YouTube Studio...",
+                    youtube_video_id,
                 )
 
-            await page.goto(
-                f"https://studio.youtube.com/video/{youtube_video_id}/edit",
-                wait_until="domcontentloaded",
-                timeout=60000,
-            )
-            await asyncio.sleep(2.0)
+            try:
+                await page.goto(
+                    f"https://studio.youtube.com/video/{youtube_video_id}/edit",
+                    wait_until="commit",
+                    timeout=60000,
+                )
+            except Exception as nav_exc:
+                logger.debug("Thông báo chuyển hướng trang edit: %s", nav_exc)
+
+            # Poll for video edit page and visibility status to fully load
+            editor_text = ""
+            final_restriction = ""
+            schedule_verified_on_page = False
+            schedule_matches = False
+
+            verify_deadline = time.monotonic() + 30.0
+            while time.monotonic() < verify_deadline:
+                cancel_check()
+                if f"/video/{youtube_video_id}/" in page.url:
+                    editor_text = str(await page.locator("body").inner_text() or "")
+                    page_html = await page.content()
+                    final_restriction = _find_blocking_restriction(editor_text)
+                    if final_restriction:
+                        break
+                    if schedule_at:
+                        if re.search(r"Đã lên lịch|Scheduled", editor_text, re.IGNORECASE):
+                            schedule_verified_on_page = True
+                            schedule_matches = (
+                                _schedule_date_matches(editor_text, local_dt.date())
+                                and _schedule_time_matches(editor_text, local_dt.time())
+                            ) or _schedule_timestamp_matches(page_html, local_dt)
+                            if schedule_matches:
+                                break
+                    else:
+                        if re.search(r"Riêng tư|Private|Không công khai|Unlisted", editor_text, re.IGNORECASE):
+                            break
+                await asyncio.sleep(1.5)
+
             if f"/video/{youtube_video_id}/" not in page.url:
                 raise BrowserUploadNeedsReview(
                     "Không thể mở lại đúng video để xác minh sau upload."
                 )
-            editor_text = str(await page.locator("body").inner_text() or "")
-            final_restriction = _find_blocking_restriction(editor_text)
             if final_restriction:
                 raise BrowserUploadNeedsReview(
                     f"Video có hạn chế cần kiểm tra thủ công: {final_restriction}."
                 )
-            if schedule_at and not re.search(
-                r"Đã lên lịch|Scheduled", editor_text, re.IGNORECASE
-            ):
+            if schedule_at and not schedule_verified_on_page:
                 raise BrowserUploadNeedsReview(
                     "Đã bấm đặt lịch nhưng trang video chưa hiển thị trạng thái Đã lên lịch."
                 )
-            schedule_matches = True
-            if schedule_at:
-                schedule_matches = (
-                    _schedule_date_matches(editor_text, local_dt.date())
-                    and _schedule_time_matches(editor_text, local_dt.time())
-                ) or _schedule_timestamp_matches(await page.content(), local_dt)
             if schedule_at and not schedule_matches:
                 raise BrowserUploadNeedsReview(
                     "Video đã lên lịch nhưng trang chỉnh sửa chưa hiển thị đúng ngày/giờ theo timezone kênh."

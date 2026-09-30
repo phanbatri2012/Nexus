@@ -933,6 +933,53 @@ class YouTubeCommentJobTests(unittest.TestCase):
         self.assertEqual(finished_job["status"], "done")
         self.assertEqual(finished_job["result"]["ignored"], 1)
 
+    def test_sync_drafts_all_eligible_comments_without_daily_reply_limit_restriction(self):
+        database.update_youtube_channel(
+            self.channel["id"],
+            auto_mode="draft_only",
+            daily_reply_limit=1,
+        )
+        sync_job = main._create_comment_system_job(
+            "comment_sync",
+            title="Channel A",
+            payload={"channel_id": self.channel["id"]},
+        )
+        claimed = database.claim_next_system_job("comment_sync")
+        remote_comments = [
+            {
+                "comment_id": f"comment-batch-{i}",
+                "thread_id": f"thread-{i}",
+                "youtube_video_id": "published123",
+                "author_channel_id": f"UC-viewer-{i}",
+                "text": f"Video rất hay và ý nghĩa số {i}?",
+            }
+            for i in range(5)
+        ]
+
+        with (
+            patch.object(
+                main,
+                "_get_youtube_access_token",
+                return_value=(self.channel, "access-token"),
+            ),
+            patch.object(
+                youtube_comments,
+                "list_channel_comment_threads",
+                return_value=remote_comments,
+            ),
+            patch.object(
+                youtube_comments,
+                "find_channel_reply",
+                return_value=None,
+            ),
+        ):
+            main._execute_comment_sync_job(claimed)
+
+        draft_job = database.claim_next_system_job("comment_draft")
+        self.assertIsNotNone(draft_job)
+        payload_comment_ids = (draft_job.get("payload") or {}).get("comment_ids", [])
+        self.assertEqual(len(payload_comment_ids), 5)
+
     def test_scheduler_respects_minimum_interval_for_every_channel(self):
         database.update_youtube_channel(
             self.channel["id"],

@@ -564,6 +564,54 @@ def get_gpm_profile_detail(profile_id: str, api_url: str | None = None) -> dict[
 get_gpm_profile = get_gpm_profile_detail
 
 
+def kill_gpm_profile_processes(profile_id: str, api_url: str | None = None) -> int:
+    """Force terminate all browser processes belonging to a GPM profile."""
+    clean_id = str(profile_id).strip()
+    if not clean_id or sys.platform != "win32":
+        return 0
+    profile_path = ""
+    try:
+        detail = get_gpm_profile_detail(clean_id, api_url=api_url)
+        profile_path = str(detail.get("profile_path") or detail.get("id") or "").strip()
+    except Exception:
+        profile_path = clean_id
+
+    killed = 0
+    try:
+        ps_cmd = (
+            "$ErrorActionPreference='SilentlyContinue'; "
+            "Get-CimInstance Win32_Process | "
+            "Where-Object { $_.Name -like '*chrome*' -or $_.Name -like '*gpm*' } | "
+            "Select-Object ProcessId, CommandLine | ConvertTo-Json -Compress"
+        )
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            capture_output=True,
+            text=True,
+            timeout=6.0,
+        )
+        stdout = res.stdout.strip()
+        if stdout:
+            parsed = json.loads(stdout)
+            proc_list = [parsed] if isinstance(parsed, dict) else parsed
+            for proc in proc_list:
+                cmdline = str(proc.get("CommandLine") or "")
+                pid = proc.get("ProcessId")
+                if pid and ((profile_path and profile_path in cmdline) or (clean_id in cmdline)):
+                    try:
+                        subprocess.run(
+                            ["powershell", "-NoProfile", "-Command", f"Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue"],
+                            capture_output=True,
+                            timeout=3.0,
+                        )
+                        killed += 1
+                    except Exception:
+                        pass
+    except Exception as exc:
+        logger.debug("Lỗi khi quét dọn tiến trình GPM profile %s: %s", clean_id, exc)
+    return killed
+
+
 def start_gpm_profile(
     profile_id: str,
     *,
@@ -589,6 +637,11 @@ def start_gpm_profile(
             running_info["already_running"] = True
             _active_gpm_profiles[clean_id] = running_info
             return running_info
+    else:
+        logger.info("Force restart GPM profile %s requested. Dọn dẹp tiến trình cũ...", clean_id)
+        kill_gpm_profile_processes(clean_id, api_url=api_url)
+        stop_gpm_profile(clean_id, api_url=api_url)
+        time.sleep(1.0)
 
     params: dict[str, Any] = {}
     if remote_debugging_port is not None and remote_debugging_port > 0:
@@ -654,6 +707,32 @@ def start_gpm_profile(
             _active_gpm_profiles[clean_id] = running_info
             return running_info
         if str(resp.get("message") or "") == "ALREADY_OPEN":
+            logger.warning("GPM Profile %s đã mở sẵn nhưng không có CDP port. Đang tự động dọn dẹp và khởi động lại qua API...", clean_id)
+            kill_gpm_profile_processes(clean_id, api_url=api_url)
+            stop_gpm_profile(clean_id, api_url=api_url)
+            time.sleep(1.5)
+            # Retry starting with CDP
+            resp = _request_gpm_api(f"/profiles/start/{clean_id}", api_url=api_url, params=params, timeout=45.0)
+            data = resp.get("data") or {}
+            if isinstance(data, dict):
+                raw_addr = str(data.get("selenium_remote_debug_address") or data.get("remote_debugging_address") or "").strip()
+                raw_port = data.get("remote_debugging_port") or data.get("remote_port") or data.get("port")
+                if not raw_port and ":" in raw_addr:
+                    try:
+                        raw_port = int(raw_addr.split(":")[-1])
+                    except (ValueError, IndexError):
+                        pass
+                if raw_port:
+                    data["remote_debugging_port"] = raw_port
+                if raw_addr:
+                    data["selenium_remote_debug_address"] = raw_addr
+                raw_ws = str(data.get("websocket_debugging_url") or data.get("wsUrl") or "").strip()
+                if raw_ws:
+                    data["websocket_debugging_url"] = raw_ws
+                if data.get("websocket_debugging_url") or data.get("remote_debugging_port") or data.get("selenium_remote_debug_address"):
+                    _active_gpm_profiles[clean_id] = data
+                    return data
+
             logger.info("GPM Profile %s đã mở sẵn (chế độ thường/không có CDP port)", clean_id)
             return {
                 "success": True,
@@ -720,6 +799,20 @@ async def gpm_browser_session(
 
         ws_url = str(launch_info.get("websocket_debugging_url") or "").strip()
         remote_port = launch_info.get("remote_debugging_port")
+        if not remote_port and not ws_url:
+            logger.warning("CDP coordinates không có cho Profile GPM %s, đang thử force_restart...", clean_id)
+            launch_info = await asyncio.to_thread(
+                start_gpm_profile,
+                clean_id,
+                skip_proxy_check=skip_proxy_check,
+                addition_args=addition_args,
+                force_restart=True,
+                api_url=api_url,
+            )
+            was_already_running = False
+            ws_url = str(launch_info.get("websocket_debugging_url") or "").strip()
+            remote_port = launch_info.get("remote_debugging_port")
+
         if not remote_port and not ws_url:
             raise GpmProfileLaunchError(
                 f"Không tìm thấy cổng kết nối CDP cho Profile GPM '{clean_id}'. "

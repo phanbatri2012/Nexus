@@ -19,7 +19,7 @@ import re
 from pathlib import Path
 from typing import Any, Callable
 
-from auto_yt.services.gpm_service import gpm_browser_session
+from auto_yt.services.channel_scanner_service import channel_browser_session
 
 logger = logging.getLogger(__name__)
 
@@ -110,9 +110,9 @@ async def schedule_reel_via_gpm(
             except Exception:
                 pass
 
-    notify("starting", f"Đang kết nối GPM Profile {clean_profile_id} qua Playwright CDP...", 5)
+    notify("starting", f"Đang kết nối Profile {clean_profile_id} qua Playwright CDP...", 5)
 
-    async with gpm_browser_session(clean_profile_id, auto_stop=auto_stop_profile) as (context, _browser):
+    async with channel_browser_session(clean_profile_id) as (context, _browser, _profile_meta):
         page = await context.new_page()
         try:
             # Set default timeout for individual actions

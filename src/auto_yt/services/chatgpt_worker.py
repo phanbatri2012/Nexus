@@ -1012,7 +1012,7 @@ def is_chatgpt_conversation_url(url: str) -> bool:
     return (
         len(path_parts) == 4
         and path_parts[0] == "g"
-        and path_parts[1].startswith("g-p-")
+        and (path_parts[1].startswith("g-p-") or path_parts[1].startswith("g-"))
         and path_parts[2] == "c"
     )
 
@@ -1037,6 +1037,10 @@ def ensure_expected_conversation_page(
 ) -> None:
     actual = urlparse(actual_url)
     expected = urlparse(conversation_url)
+    m_actual = re.search(r"/c/([a-zA-Z0-9_-]+)", actual.path)
+    m_expected = re.search(r"/c/([a-zA-Z0-9_-]+)", expected.path)
+    if m_actual and m_expected and m_actual.group(1).lower() == m_expected.group(1).lower():
+        return
     if (
         actual.scheme != expected.scheme
         or actual.netloc != expected.netloc
@@ -2455,17 +2459,26 @@ def is_chatgpt_generation_active(page: Page) -> bool:
                 });
                 if (hasStopButton) return true;
 
-                // 2. Active thinking / searching state indicators
+                // 2. Active thinking / searching state indicators in main area
                 const isThinkingOrSearching = [...document.querySelectorAll(
-                    '[data-testid*="thinking"], [data-testid*="searching"], [class*="thinking"], [class*="thought-process"], [class*="reasoning-state"], .result-thinking, [data-testid*="search-status"]'
+                    '[data-testid*="thinking"], [data-testid*="searching"], .result-thinking, [data-testid*="search-status"]'
                 )].some(el => {
+                    if (el.closest('nav, [aria-label="Chat history"], [class*="sidebar"], [class*="history"]')) return false;
                     const rect = el.getBoundingClientRect();
                     return rect.width > 0 && rect.height > 0;
                 });
                 if (isThinkingOrSearching) return true;
 
-                // 3. Check for in-progress animation/spinner or reasoning indicators
+                // 3. In-progress spinner strictly inside the active message or composer (NOT history lazy-loading)
                 const hasSpinners = [...document.querySelectorAll('svg.animate-spin, [class*="animate-spin"], [class*="loading-spinner"]')].some(el => {
+                    if (el.closest('nav, [aria-label="Chat history"], [class*="sidebar"], header')) return false;
+                    const containerText = (el.parentElement?.innerText || '').toLowerCase();
+                    if (containerText.includes('loading older') || containerText.includes('đang tải tin nhắn') || containerText.includes('loading chat') || containerText.includes('loading older messages')) {
+                        return false;
+                    }
+                    if (!el.closest('main, form, [data-message-author-role="assistant"], [data-testid="composer"], [data-testid="send-button"]')) {
+                        return false;
+                    }
                     const rect = el.getBoundingClientRect();
                     return rect.width > 0 && rect.height > 0;
                 });
@@ -2520,14 +2533,7 @@ def wait_for_assistant_response(
             previous_assistant_turn,
             previous_assistant_count,
         )
-        new_user_observed = saw_busy_state
-        if not new_user_observed and previous_user_turn is not None:
-            new_user_observed = (
-                get_latest_conversation_turn(page, "user") > previous_user_turn
-            )
-        if not new_user_observed and previous_user_count is not None:
-            new_user_observed = get_user_message_count(page) > previous_user_count
-        if not response_text and new_user_observed:
+        if not response_text:
             response_text = get_assistant_response_after_latest_user(
                 page,
                 expected_user_text=submitted_prompt_text,

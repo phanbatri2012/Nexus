@@ -81,7 +81,7 @@ class ProductionCoordinator:
             ]
         except sqlite3.OperationalError:
             return 0.25
-        return max(0.05, min(delays)) if delays else None
+        return max(0.05, min(delays)) if delays else 3.0
 
     def _claim_next(self) -> dict | None:
         for job_type in self._job_types:

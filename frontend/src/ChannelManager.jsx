@@ -856,16 +856,16 @@ export default function ChannelManager({
     if (!gpmProfileId) return
     setGpmBusy(true)
     try {
-      const res = await fetch(`${API_BASE}/api/gpm/profiles/${encodeURIComponent(gpmProfileId)}/open-url`, {
+      const res = await fetch(`${API_BASE}/api/channels/open-browser`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: 'https://business.facebook.com' })
+        body: JSON.stringify({ profile_id: gpmProfileId, platform: 'facebook' })
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
-      setMessage('🚀 Đã mở Facebook Business Suite trong Profile GPM.')
+      setMessage(`🚀 ${data.message || 'Đã mở Facebook trong trình duyệt.'}`)
     } catch (error) {
-      setMessage(`❌ Lỗi mở Facebook qua GPM: ${error.message}`)
+      setMessage(`❌ Lỗi mở Facebook: ${error.message}`)
     } finally {
       setGpmBusy(false)
     }
@@ -917,17 +917,16 @@ export default function ChannelManager({
     if (!gpmProfileId) return
     setGpmBusy(true)
     try {
-      const url = 'https://www.tiktok.com/creator-center/upload'
-      const res = await fetch(`${API_BASE}/api/gpm/profiles/${encodeURIComponent(gpmProfileId)}/open-url`, {
+      const res = await fetch(`${API_BASE}/api/channels/open-browser`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url })
+        body: JSON.stringify({ profile_id: gpmProfileId, platform: 'tiktok' })
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
-      setMessage(`🚀 Đã mở TikTok Creator Center trong Profile GPM.`)
+      setMessage(`🚀 ${data.message || 'Đã mở TikTok Creator trong trình duyệt.'}`)
     } catch (error) {
-      setMessage(`❌ Lỗi mở TikTok qua GPM: ${error.message}`)
+      setMessage(`❌ Lỗi mở TikTok: ${error.message}`)
     } finally {
       setGpmBusy(false)
     }
@@ -1588,7 +1587,7 @@ export default function ChannelManager({
                   />
                 </div>
                 <div className="help-text" style={{ marginTop: 6 }}>
-                  Ô bên phải là số câu trả lời tối đa mỗi ngày. Mặc định 50.
+                  Ô bên phải là số câu trả lời tối đa mỗi ngày khi đăng lên YouTube (soạn bản nháp tự động diễn ra mọi lúc không bị giới hạn). Mặc định 50.
                 </div>
 
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 10, marginTop: 10 }}>
@@ -2061,9 +2060,9 @@ export default function ChannelManager({
                         type="button"
                         disabled={gpmBusy || !page.gpm_profile_id}
                         onClick={() => openFacebookInGpm(page.gpm_profile_id)}
-                        title="Mở Facebook Business Suite trong Profile GPM"
+                        title="Mở Facebook / Business Suite trong trình duyệt"
                       >
-                        🚀 Mở Facebook GPM
+                        🚀 {page.gpm_profile_id?.startsWith('local_') ? 'Mở Facebook (Local)' : 'Mở Facebook GPM'}
                       </button>
                       <button
                         className="btn-secondary"
@@ -2348,9 +2347,9 @@ export default function ChannelManager({
                         type="button"
                         disabled={gpmBusy || !account.gpm_profile_id}
                         onClick={() => openTiktokInGpm(account.gpm_profile_id, account.handle)}
-                        title="Mở TikTok Creator Studio trong Profile GPM"
+                        title="Mở TikTok Creator Studio trong trình duyệt"
                       >
-                        🚀 Mở TikTok GPM
+                        🚀 {account.gpm_profile_id?.startsWith('local_') ? 'Mở TikTok (Local)' : 'Mở TikTok GPM'}
                       </button>
                       <button
                         className="btn-secondary"

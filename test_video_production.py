@@ -573,6 +573,66 @@ class VideoProductionServiceTests(unittest.TestCase):
         for s in validated["scenes"]:
             self.assertGreaterEqual(len(s["prompt"]), 80)
 
+    def test_default_scene_plan_is_transcript_grounded_for_unrelated_topics(self):
+        transcripts = [
+            "Kính thiên văn ghi lại ánh sáng của một thiên hà cách Trái Đất hàng tỷ năm.",
+            "Người thợ làm bánh nhào bột mì trên bàn gỗ trước khi đưa bánh vào lò.",
+            "Các kỹ sư kiểm tra tua-bin gió ngoài khơi trong điều kiện biển động.",
+            "Bác sĩ giải thích hình ảnh chụp cộng hưởng từ cho bệnh nhân trong phòng khám.",
+            "Nông dân thu hoạch cà phê chín đỏ trên sườn đồi vào sáng sớm.",
+            "Nhà khảo cổ làm sạch một bình gốm vừa được tìm thấy dưới lớp đất cổ.",
+        ]
+        windows = [
+            {
+                "index": index,
+                "start": float(index * 30),
+                "end": float((index + 1) * 30),
+                "duration": 30.0,
+                "transcript": transcript,
+            }
+            for index, transcript in enumerate(transcripts)
+        ]
+
+        plan = video_production.build_default_visual_scene_plan(
+            windows,
+            "Một video tổng hợp nhiều chủ đề",
+            "Photorealistic documentary",
+        )
+        actions = [scene["action"] for scene in plan["scenes"]]
+
+        self.assertEqual(len(actions), len(set(actions)))
+        for transcript, action in zip(transcripts, actions):
+            anchor = " ".join(transcript.split()[:4])
+            self.assertIn(anchor, action)
+        video_production.validate_visual_scene_plan(plan, windows)
+
+    def test_scene_plan_rejects_prompts_that_only_differ_by_scene_number(self):
+        windows = [
+            {"index": 0, "start": 0.0, "end": 30.0, "duration": 30.0, "transcript": "Đoạn một"},
+            {"index": 1, "start": 30.0, "end": 60.0, "duration": 30.0, "transcript": "Đoạn hai"},
+        ]
+        repeated_action = (
+            "A researcher examines the same glass instrument on the same desk "
+            "from the same camera angle"
+        )
+        payload = {
+            "visual_bible": {"style": "Documentary"},
+            "scenes": [
+                {
+                    "index": index,
+                    "action": repeated_action,
+                    "prompt": (
+                        f"A documentary still, scene {index + 1}. {repeated_action}. "
+                        "Natural lighting, realistic detail, clean visual without text."
+                    ),
+                }
+                for index in range(2)
+            ],
+        }
+
+        with self.assertRaises(video_production.VideoProductionError):
+            video_production.validate_visual_scene_plan(payload, windows)
+
     def test_trigger_render_video_api_endpoints(self):
         video_id = database.save_video(
             "https://www.youtube.com/watch?v=render123",
@@ -801,7 +861,7 @@ class VideoProductionServiceTests(unittest.TestCase):
         plan = video_production.build_default_visual_scene_plan(windows, title)
         scene1 = plan["scenes"][1]
         self.assertNotEqual(scene1["subject"], title)
-        self.assertIn("tank", scene1["action"].lower())
+        self.assertIn("xe tăng", scene1["action"].lower())
         self.assertIn("clean visual without text", scene1["prompt"])
 
     def test_purge_scene_artifacts_from_index(self):
@@ -1147,6 +1207,143 @@ class VideoProductionServiceTests(unittest.TestCase):
             self.assertEqual(call.kwargs["scene_index"], 0)
             self.assertEqual(call.kwargs["scene_count"], 1)
 
+    def test_scene_image_does_not_reuse_cache_from_a_different_plan(self):
+        from PIL import Image, ImageDraw
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=stale-image-cache",
+            "Stale image cache",
+            "Transcript",
+            "Script",
+        )
+        stale_path = Path(self.temporary_directory.name) / "stale-scene.png"
+        Image.new("RGB", (1376, 768), color=(20, 20, 20)).save(stale_path)
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene:0",
+            path=str(stale_path),
+            content_hash="hash-from-an-older-plan",
+            status="completed",
+            mime_type="image/png",
+        )
+        worker = MagicMock()
+        worker.generate_scene = AsyncMock(return_value="https://flow/image/fresh")
+
+        async def write_fresh_image(_asset_url, save_path):
+            image = Image.new("RGB", (1376, 768), color=(235, 235, 235))
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((100, 100, 600, 600), fill=(20, 80, 160))
+            image.save(save_path)
+
+        worker.download_image = AsyncMock(side_effect=write_fresh_image)
+        scene = {
+            "index": 0,
+            "prompt": "A new scene plan with a blue machine inside a bright workshop.",
+            "action": "A technician inspects a blue machine inside a bright workshop",
+        }
+
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            result = asyncio.run(
+                video_production._generate_scene_image_async(
+                    video_id=video_id,
+                    scene=scene,
+                    scene_count=1,
+                    profile={},
+                    settings={},
+                    reference_path=None,
+                    reference_id="",
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                    worker=worker,
+                    existing_hashes=set(),
+                )
+            )
+
+        self.assertNotEqual(result, stale_path)
+        worker.generate_scene.assert_awaited_once()
+        expected_hash = video_production._scene_hash(video_id, scene, {}, "", "")
+        self.assertEqual(
+            database.get_latest_video_artifact(video_id, "scene:0")["content_hash"],
+            expected_hash,
+        )
+
+    def test_scene_image_retries_when_output_is_perceptually_duplicate(self):
+        from PIL import Image, ImageDraw
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=perceptual-duplicate",
+            "Perceptual duplicate",
+            "Transcript",
+            "Script",
+        )
+        previous_path = Path(self.temporary_directory.name) / "previous-scene.png"
+        previous = Image.new("RGB", (1376, 768), color=(230, 230, 230))
+        previous_draw = ImageDraw.Draw(previous)
+        previous_draw.rectangle((0, 0, 688, 768), fill=(25, 25, 25))
+        previous.save(previous_path)
+
+        worker = MagicMock()
+        worker.generate_scene = AsyncMock(
+            side_effect=[
+                "https://flow/image/duplicate",
+                "https://flow/image/unique",
+            ]
+        )
+        download_count = 0
+
+        async def write_generated_image(_asset_url, save_path):
+            nonlocal download_count
+            download_count += 1
+            if download_count == 1:
+                Image.open(previous_path).save(save_path)
+                return
+            image = Image.new("RGB", (1376, 768), color=(30, 70, 130))
+            draw = ImageDraw.Draw(image)
+            draw.ellipse((380, 80, 1000, 700), fill=(245, 200, 40))
+            image.save(save_path)
+
+        worker.download_image = AsyncMock(side_effect=write_generated_image)
+        scene = {
+            "index": 1,
+            "prompt": "A distinct documentary scene inside a laboratory.",
+            "action": "A laboratory team examines a circular instrument",
+        }
+        previous_fingerprint = video_production._image_perceptual_fingerprint(
+            previous_path
+        )
+
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            result = asyncio.run(
+                video_production._generate_scene_image_async(
+                    video_id=video_id,
+                    scene=scene,
+                    scene_count=2,
+                    profile={},
+                    settings={},
+                    reference_path=None,
+                    reference_id="",
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                    worker=worker,
+                    existing_hashes={video_production._sha256_file(previous_path)},
+                    existing_perceptual_hashes=[previous_fingerprint],
+                )
+            )
+
+        self.assertEqual(worker.generate_scene.await_count, 2)
+        self.assertFalse(
+            video_production._perceptual_fingerprints_match(
+                previous_fingerprint,
+                video_production._image_perceptual_fingerprint(result),
+            )
+        )
+
     def test_scene_image_timeout_is_not_retried(self):
         from auto_yt.services.google_flow_worker import FlowGenerationTimeout
 
@@ -1409,6 +1606,83 @@ class VideoProductionServiceTests(unittest.TestCase):
         self.assertEqual(
             artifact["metadata"]["flow_timing"]["playable_url_seen_elapsed_seconds"],
             45.5,
+        )
+
+    def test_scene_video_does_not_reuse_cache_from_a_different_plan(self):
+        from PIL import Image
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=stale-video-cache",
+            "Stale video cache",
+            "Transcript",
+            "Script",
+        )
+        start_frame = Path(self.temporary_directory.name) / "fresh-start.png"
+        end_frame = Path(self.temporary_directory.name) / "fresh-end.png"
+        Image.new("RGB", (1376, 768), color=(20, 60, 100)).save(start_frame)
+        Image.new("RGB", (1376, 768), color=(100, 60, 20)).save(end_frame)
+        stale_video = Path(self.temporary_directory.name) / "stale-scene.mp4"
+        stale_video.write_bytes(b"s" * 2048)
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene_video:0",
+            path=str(stale_video),
+            content_hash="hash-from-an-older-video-plan",
+            status="completed",
+            mime_type="video/mp4",
+        )
+        worker = MagicMock()
+        worker.generate_scene_video = AsyncMock(
+            return_value="https://flow/video/fresh"
+        )
+
+        async def save_fresh_video(_url, save_path):
+            Path(save_path).write_bytes(b"n" * 2048)
+
+        worker.download_video = AsyncMock(side_effect=save_fresh_video)
+        worker.get_last_video_timing.return_value = {}
+        scene = {
+            "index": 0,
+            "prompt": "A completely new animated scene inside a workshop.",
+            "action": "A technician walks around a newly assembled machine",
+            "is_video": True,
+        }
+
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            result = asyncio.run(
+                video_production._generate_scene_video_async(
+                    video_id=video_id,
+                    scene=scene,
+                    scene_count=1,
+                    start_frame_path=start_frame,
+                    end_frame_path=end_frame,
+                    profile={},
+                    settings={},
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                    worker=worker,
+                )
+            )
+
+        self.assertNotEqual(result, stale_video)
+        worker.generate_scene_video.assert_awaited_once()
+        start_hash = video_production._sha256_file(start_frame)
+        end_hash = video_production._sha256_file(end_frame)
+        expected_hash = video_production._scene_hash(
+            video_id,
+            scene,
+            {},
+            "",
+            f"{start_hash}:{end_hash}",
+        )
+        self.assertEqual(
+            database.get_latest_video_artifact(video_id, "scene_video:0")[
+                "content_hash"
+            ],
+            expected_hash,
         )
 
     def test_missing_end_frame_marks_checkpoint_failed_before_submit(self):

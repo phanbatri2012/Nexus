@@ -745,6 +745,7 @@ class GpmChannelMappingRequest(BaseModel):
 class ChannelOpenBrowserRequest(BaseModel):
     profile_id: str = Field(min_length=1, max_length=200)
     platform: str = Field(default="youtube", max_length=50)
+    force_restart: bool = False
 
 
 class ChannelScanYouTubeRequest(BaseModel):
@@ -1224,9 +1225,18 @@ def start_gpm_profile_endpoint(
     request: Optional[GpmProfileStartRequest] = None,
     api_url: Optional[str] = Query(None),
 ):
-    """Start a GPM profile browser and return debugging connection info."""
+    """Start a GPM profile browser or local browser and return debugging connection info."""
     req = request or GpmProfileStartRequest()
     try:
+        if profile_id.startswith("local_"):
+            from auto_yt.services import local_browser_service, channel_scanner_service
+            parsed = channel_scanner_service.parse_profile_target(profile_id)
+            return local_browser_service.start_local_browser(
+                browser_key=parsed["browser_key"],
+                profile_dir=parsed["profile_dir"],
+                preferred_port=req.remote_debugging_port,
+                require_cdp=False,
+            )
         return gpm_service.start_gpm_profile(
             profile_id,
             remote_debugging_port=req.remote_debugging_port,
@@ -1249,8 +1259,13 @@ def start_gpm_profile_endpoint(
 
 @app.post("/api/gpm/profiles/{profile_id}/stop")
 def stop_gpm_profile_endpoint(profile_id: str, api_url: Optional[str] = Query(None)):
-    """Close/stop a running GPM profile browser."""
+    """Close/stop a running GPM profile browser or local browser."""
     try:
+        if profile_id.startswith("local_"):
+            from auto_yt.services import local_browser_service, channel_scanner_service
+            parsed = channel_scanner_service.parse_profile_target(profile_id)
+            success = local_browser_service.terminate_local_browser_processes(parsed["browser_key"])
+            return {"success": success, "profile_id": profile_id}
         success = gpm_service.stop_gpm_profile(profile_id, api_url=api_url)
         return {"success": success, "profile_id": profile_id}
     except Exception as exc:
@@ -1259,11 +1274,18 @@ def stop_gpm_profile_endpoint(profile_id: str, api_url: Optional[str] = Query(No
 
 @app.post("/api/gpm/profiles/{profile_id}/open-url")
 async def open_url_in_gpm_endpoint(profile_id: str, request: GpmOpenUrlRequest):
-    """Open a target URL inside the GPM profile browser session."""
+    """Open a target URL inside the GPM profile browser session or local browser."""
     url = request.url.strip()
     if not url:
         raise HTTPException(status_code=400, detail="URL không được để trống.")
     try:
+        if profile_id.startswith("local_"):
+            from auto_yt.services import channel_scanner_service
+            platform = "facebook" if "facebook" in url else ("tiktok" if "tiktok" in url else "youtube")
+            return channel_scanner_service.open_channel_platform_browser(
+                profile_id=profile_id,
+                platform=platform,
+            )
         timeout_seconds = float(request.timeout_seconds or 20.0)
         result = await gpm_youtube_automation.open_url_in_gpm_profile(
             profile_id, url, timeout_seconds=timeout_seconds
@@ -1367,6 +1389,7 @@ def open_channel_browser_endpoint(request: ChannelOpenBrowserRequest):
         return channel_scanner_service.open_channel_platform_browser(
             profile_id=request.profile_id,
             platform=request.platform,
+            force_restart=request.force_restart,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -3336,10 +3359,6 @@ def _execute_comment_sync_job(job: dict) -> None:
                 )
     db.update_youtube_channel(channel_db_id, last_sync_at=db.utc_now(), status="connected")
     mode = channel.get("auto_mode") or "draft_only"
-    auto_draft_limit = min(
-        youtube_comments.MAX_AUTO_DRAFT_COMMENTS_PER_SYNC,
-        int(channel.get("daily_reply_limit") or 50),
-    )
     prioritized_comments = sorted(
         db.get_youtube_comments(matched_ids),
         key=lambda item: int(item.get("auto_reply_priority") or 0),
@@ -3347,7 +3366,7 @@ def _execute_comment_sync_job(job: dict) -> None:
     )
     draft_jobs = (
         _enqueue_comment_draft_jobs(
-            [item["comment_id"] for item in prioritized_comments[:auto_draft_limit]]
+            [item["comment_id"] for item in prioritized_comments]
         )
         if mode != "manual"
         else []
@@ -3452,7 +3471,9 @@ def _execute_comment_draft_job(job: dict) -> bool:
         )
         auto_publish_ids = []
         for comment in comments:
-            reply = replies[comment["comment_id"]]
+            reply = replies.get(comment["comment_id"])
+            if not reply:
+                continue
             requires_review = comment.get("risk_level") == "review_required"
             db.update_youtube_comment(
                 comment["comment_id"],

@@ -993,9 +993,14 @@ def parse_comment_reply_response(response_text: str, expected_ids: set[str]) -> 
         reply = str(item.get("reply") or "").strip() if isinstance(item, dict) else ""
         if comment_id in expected_ids and reply:
             replies[comment_id] = validate_comment_reply(reply)
+    if not replies:
+        raise YouTubeCommentsError("ChatGPT không trả về câu trả lời hợp lệ cho bình luận.")
     missing = expected_ids - replies.keys()
     if missing:
-        raise YouTubeCommentsError(
-            f"ChatGPT còn thiếu câu trả lời cho {len(missing)} bình luận."
+        logger.warning(
+            "ChatGPT trả lời %d/%d bình luận (thiếu: %s)",
+            len(replies),
+            len(expected_ids),
+            list(missing),
         )
     return replies

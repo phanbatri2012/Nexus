@@ -30,14 +30,14 @@ REFERENCE_ASSET_SCAN_LIMIT = 100
 IMAGE_GENERATION_TIMEOUT_SECONDS = 240.0
 AGENT_IMAGE_GENERATION_TIMEOUT_SECONDS = 600.0
 VIDEO_GENERATION_TIMEOUT_SECONDS = 180.0
-VIDEO_QUEUE_TIMEOUT_SECONDS = 900.0
+VIDEO_QUEUE_TIMEOUT_SECONDS = 180.0
 GENERATION_START_TIMEOUT_SECONDS = 45.0
 GENERATION_IDLE_GRACE_SECONDS = 10.0
 VIDEO_MODE_TIMEOUT_SECONDS = 10.0
 GENERATION_POLL_SECONDS = 1.0
 SUBMISSION_ACK_TIMEOUT_SECONDS = 10.0
 SUBMISSION_ACK_POLL_SECONDS = 0.5
-PROMPT_SUBMIT_READY_TIMEOUT_SECONDS = 5.0
+PROMPT_SUBMIT_READY_TIMEOUT_SECONDS = 15.0
 AGENT_SESSION_RESET_TIMEOUT_SECONDS = 10.0
 AGENT_SETTINGS_BUTTON_TIMEOUT_SECONDS = 10.0
 AGENT_SETTINGS_SAVE_TIMEOUT_SECONDS = 5.0
@@ -2092,15 +2092,32 @@ class GoogleFlowWorker:
         agent_interface = await self._is_agent_interface_active()
         attempted_methods: list[str] = []
 
-        for attempt in range(1, 3):
+        for attempt in range(1, 4):
             if await self._ensure_agent_session_ready():
                 if on_agent_session_reset is not None:
                     await on_agent_session_reset()
                 editor = await self.wait_for_editor(timeout=10.0)
                 await self._fill_prompt_editor(editor, full_prompt)
 
+            # Wait briefly if the previous turn's stop button is still active
+            stop_btn = self.page.locator(
+                "flow-creative-agent-prompt-box button:has(mat-icon:text-is('stop')), "
+                "flow-generate-icon-button button:has(mat-icon:text-is('stop')), "
+                "flow-creative-agent-prompt-box button[aria-label*='dừng' i], "
+                "flow-creative-agent-prompt-box button[aria-label*='stop' i]"
+            ).first
+            try:
+                for _ in range(20):
+                    if await stop_btn.is_visible(timeout=200):
+                        await asyncio.sleep(0.5)
+                    else:
+                        break
+            except Exception:
+                pass
+
             button = await self._find_prompt_submit_button(editor)
-            if button is not None and (agent_interface or attempt == 1):
+            method = ""
+            if button is not None:
                 method = "button"
                 attempted_methods.append(method)
                 await self.dismiss_blocking_dialogs()
@@ -2115,23 +2132,25 @@ class GoogleFlowWorker:
                         attempt,
                         exc,
                     )
-                    continue
-                await asyncio.sleep(0.2)
-                if await self.close_agent_instructions_panel():
-                    logger.warning(
-                        "flow_generation media=%s state=wrong_agent_control project=%s attempt=%d",
-                        media_type,
-                        self._project_id(),
-                        attempt,
-                    )
-                    try:
-                        await editor.click(timeout=2000)
-                        await editor.fill(full_prompt)
-                    except Exception:
-                        await self.page.keyboard.press("Control+A")
-                        await self.page.keyboard.insert_text(full_prompt)
-                    continue
-            elif not agent_interface and "enter" not in attempted_methods:
+                    method = ""
+                else:
+                    await asyncio.sleep(0.2)
+                    if await self.close_agent_instructions_panel():
+                        logger.warning(
+                            "flow_generation media=%s state=wrong_agent_control project=%s attempt=%d",
+                            media_type,
+                            self._project_id(),
+                            attempt,
+                        )
+                        try:
+                            await editor.click(timeout=2000)
+                            await editor.fill(full_prompt)
+                        except Exception:
+                            await self.page.keyboard.press("Control+A")
+                            await self.page.keyboard.insert_text(full_prompt)
+                        continue
+
+            if not method:
                 method = "enter"
                 attempted_methods.append(method)
                 try:
@@ -2141,8 +2160,6 @@ class GoogleFlowWorker:
                 except Exception:
                     pass
                 await self.page.keyboard.press("Enter")
-            else:
-                break
 
             attempted_at = time.monotonic()
             logger.info(
@@ -2199,7 +2216,7 @@ class GoogleFlowWorker:
                     attempt,
                     method,
                 )
-            if attempt < 2:
+            if attempt < 3:
                 logger.info(
                     "flow_generation media=%s state=submit_retry project=%s "
                     "attempt=%d previous_method=%s editor_empty=%s",

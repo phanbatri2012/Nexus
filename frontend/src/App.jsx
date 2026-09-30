@@ -9,6 +9,7 @@ import JobCenter from './JobCenter'
 import Settings from './Settings'
 import ChannelManager from './ChannelManager'
 import VideoQueuePanel from './VideoQueuePanel'
+import VideoGenerationProgressCard from './VideoGenerationProgressCard'
 import YouTubeDownloader from './YouTubeDownloader'
 import YouTubeComments from './YouTubeComments'
 import TTSSettings from './TTSSettings'
@@ -2146,6 +2147,12 @@ function App() {
               )}
 
               <VideoQueuePanel
+                refreshKey={queueRefreshKey}
+                onOpenJobCenter={() => setActiveView('jobs')}
+                onOpenVideo={viewSavedVideo}
+              />
+
+              <VideoGenerationProgressCard
                 refreshKey={queueRefreshKey}
                 onOpenJobCenter={() => setActiveView('jobs')}
                 onOpenVideo={viewSavedVideo}

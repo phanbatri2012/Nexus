@@ -368,6 +368,48 @@ function Test-BrowserServicesReady {
     }
 }
 
+function Invoke-BrowserServiceAction {
+    param(
+        [ValidateSet("chatgpt_browser_service", "google_flow_browser_service")]
+        [string]$ModuleName,
+        [ValidateSet("start", "show")]
+        [string]$Action,
+        [string]$DisplayName
+    )
+
+    $methodCall = if ($Action -eq "start") {
+        "service.start_browser_service()"
+    }
+    else {
+        "service.set_browser_service_window_visibility(True)"
+    }
+    $pythonCode = "from auto_yt.services import $ModuleName as service; status = $methodCall; print(status.get('message', '')); raise SystemExit(0 if status.get('connected') else 1)"
+    $previousPythonPath = $env:PYTHONPATH
+    $previousPythonIoEncoding = $env:PYTHONIOENCODING
+    try {
+        $env:PYTHONPATH = Join-Path $projectRoot "src"
+        $env:PYTHONIOENCODING = "utf-8"
+        Invoke-ExternalCommand `
+            $venvPython `
+            @("-c", $pythonCode) `
+            "$DisplayName browser service action '$Action' failed"
+    }
+    finally {
+        if ($null -eq $previousPythonPath) {
+            Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:PYTHONPATH = $previousPythonPath
+        }
+        if ($null -eq $previousPythonIoEncoding) {
+            Remove-Item Env:PYTHONIOENCODING -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:PYTHONIOENCODING = $previousPythonIoEncoding
+        }
+    }
+}
+
 function Test-PortInUse {
     param([int]$Port)
 
@@ -659,6 +701,8 @@ if (-not $createdNew) {
 
 try {
     Set-Location $projectRoot
+    $backendProcess = $null
+    $frontendProcess = $null
 
     $apiKeyPath = Join-Path $dataRoot "genmax_api_key.txt"
     $hasStoredApiKey = Test-Path -LiteralPath $apiKeyPath -PathType Leaf
@@ -699,6 +743,22 @@ try {
         if (-not $omniVoiceReady) {
             if (-not (Test-PortInUse 8011)) {
                 Start-OmniVoiceWorker
+            }
+        }
+
+        if (-not $chatgptReady -or -not $flowReady) {
+            if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
+                Ensure-PythonEnvironment
+            }
+            if (-not (Test-ChatGPTBrowserReady)) {
+                Write-Step "Starting ChatGPT browser service..."
+                Invoke-BrowserServiceAction "chatgpt_browser_service" "start" "ChatGPT"
+                $chatgptReady = Test-ChatGPTBrowserReady
+            }
+            if (-not (Test-GoogleFlowBrowserReady)) {
+                Write-Step "Starting Google Flow browser service..."
+                Invoke-BrowserServiceAction "google_flow_browser_service" "start" "Google Flow"
+                $flowReady = Test-GoogleFlowBrowserReady
             }
         }
 
@@ -777,11 +837,19 @@ try {
             Start-Sleep -Milliseconds 300
         }
 
-        if (-not $backendReady -or -not $frontendReady) {
-            throw "The core Auto_YT system did not become ready within $ReadyTimeoutSeconds seconds."
+        if (-not ($backendReady -and $frontendReady -and $omniVoiceReady -and $chatgptReady -and $flowReady)) {
+            $missingServices = @()
+            if (-not $backendReady) { $missingServices += "Backend" }
+            if (-not $frontendReady) { $missingServices += "Frontend" }
+            if (-not $omniVoiceReady) { $missingServices += "OmniVoice" }
+            if (-not $chatgptReady) { $missingServices += "ChatGPT" }
+            if (-not $flowReady) { $missingServices += "Google Flow" }
+            throw "Auto_YT services did not become ready within $ReadyTimeoutSeconds seconds: $($missingServices -join ', ')."
         }
     }
 
+    Invoke-BrowserServiceAction "chatgpt_browser_service" "show" "ChatGPT"
+    Invoke-BrowserServiceAction "google_flow_browser_service" "show" "Google Flow"
     $finalBrowserState = Test-BrowserServicesReady
     $omniVoiceReady = Test-OmniVoiceReady
 

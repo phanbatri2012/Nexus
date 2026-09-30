@@ -7,10 +7,12 @@ import datetime as dt
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import secrets
 import shutil
+import statistics
 import subprocess
 import threading
 import time
@@ -33,6 +35,7 @@ from auto_yt.paths import (
 )
 from auto_yt.services import database as db
 from auto_yt.services.visual_action_translator import (
+    normalize_visual_identity,
     remove_vietnamese_accents,
     translate_transcript_to_visual_action,
 )
@@ -45,6 +48,16 @@ TARGET_HEIGHT = 1080
 TARGET_FPS = 30
 SCENE_IMAGE_WIDTH = 1024
 SCENE_IMAGE_HEIGHT = 576
+PERCEPTUAL_HASH_IMAGE_SIZE = 32
+PERCEPTUAL_HASH_SIZE = 8
+PERCEPTUAL_DUPLICATE_DISTANCE = 6
+LOW_VARIANCE_IMAGE_THRESHOLD = 2.0
+LOW_VARIANCE_COLOR_DISTANCE = 8.0
+MAX_PERCEPTUAL_DUPLICATE_RETRIES = 2
+PERCEPTUAL_RETRY_DIRECTIONS = (
+    "Use a substantially different camera distance, viewpoint, and subject arrangement",
+    "Change the foreground, background, direction of movement, and visual hierarchy completely",
+)
 _WHISPER_LOCK = threading.Lock()
 _WHISPER_MODEL = None
 _WHISPER_DEVICE = ""
@@ -53,6 +66,10 @@ _ENCODER = ""
 
 
 class VideoProductionError(RuntimeError):
+    pass
+
+
+class SceneVisualDuplicateError(VideoProductionError):
     pass
 
 
@@ -66,6 +83,113 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+ImagePerceptualFingerprint = tuple[int, tuple[float, float, float], float]
+
+
+def _image_perceptual_fingerprint(path: Path) -> ImagePerceptualFingerprint:
+    """Return a structure-sensitive image hash plus low-variance safeguards."""
+    from PIL import Image, ImageStat
+
+    with Image.open(path) as source:
+        rgb = source.convert("RGB")
+        color_sample = rgb.resize((64, 64), Image.Resampling.LANCZOS)
+        color_statistics = ImageStat.Stat(color_sample)
+        mean_rgb = tuple(float(value) for value in color_statistics.mean[:3])
+        grayscale_deviation = float(
+            ImageStat.Stat(color_sample.convert("L")).stddev[0]
+        )
+        grayscale = rgb.convert("L").resize(
+            (PERCEPTUAL_HASH_IMAGE_SIZE, PERCEPTUAL_HASH_IMAGE_SIZE),
+            Image.Resampling.LANCZOS,
+        )
+        pixels = list(grayscale.tobytes())
+
+    cosine_table = [
+        [
+            math.cos(
+                (2 * coordinate + 1)
+                * frequency
+                * math.pi
+                / (2 * PERCEPTUAL_HASH_IMAGE_SIZE)
+            )
+            for coordinate in range(PERCEPTUAL_HASH_IMAGE_SIZE)
+        ]
+        for frequency in range(PERCEPTUAL_HASH_SIZE)
+    ]
+    coefficients: list[float] = []
+    for vertical_frequency in range(PERCEPTUAL_HASH_SIZE):
+        vertical_scale = (
+            1 / math.sqrt(2) if vertical_frequency == 0 else 1.0
+        )
+        for horizontal_frequency in range(PERCEPTUAL_HASH_SIZE):
+            horizontal_scale = (
+                1 / math.sqrt(2) if horizontal_frequency == 0 else 1.0
+            )
+            total = 0.0
+            for y_coordinate in range(PERCEPTUAL_HASH_IMAGE_SIZE):
+                row_offset = y_coordinate * PERCEPTUAL_HASH_IMAGE_SIZE
+                vertical_weight = cosine_table[vertical_frequency][y_coordinate]
+                for x_coordinate in range(PERCEPTUAL_HASH_IMAGE_SIZE):
+                    total += (
+                        pixels[row_offset + x_coordinate]
+                        * cosine_table[horizontal_frequency][x_coordinate]
+                        * vertical_weight
+                    )
+            coefficients.append(
+                0.25 * horizontal_scale * vertical_scale * total
+            )
+
+    median_value = statistics.median(coefficients[1:])
+    perceptual_hash = 0
+    for coefficient in coefficients[1:]:
+        perceptual_hash = (perceptual_hash << 1) | int(
+            coefficient > median_value
+        )
+    return perceptual_hash, mean_rgb, grayscale_deviation
+
+
+def _perceptual_fingerprints_match(
+    first: ImagePerceptualFingerprint,
+    second: ImagePerceptualFingerprint,
+) -> bool:
+    hash_distance = (first[0] ^ second[0]).bit_count()
+    if hash_distance > PERCEPTUAL_DUPLICATE_DISTANCE:
+        return False
+    if (
+        first[2] <= LOW_VARIANCE_IMAGE_THRESHOLD
+        and second[2] <= LOW_VARIANCE_IMAGE_THRESHOLD
+    ):
+        color_distance = math.dist(first[1], second[1])
+        return color_distance <= LOW_VARIANCE_COLOR_DISTANCE
+    return True
+
+
+def _matches_existing_perceptual_fingerprint(
+    candidate: ImagePerceptualFingerprint,
+    existing: list[ImagePerceptualFingerprint] | None,
+) -> bool:
+    return any(
+        _perceptual_fingerprints_match(candidate, fingerprint)
+        for fingerprint in existing or []
+    )
+
+
+def _build_perceptual_retry_prompt(
+    base_prompt: str,
+    scene: dict,
+    retry_index: int,
+) -> str:
+    direction = PERCEPTUAL_RETRY_DIRECTIONS[
+        (retry_index - 1) % len(PERCEPTUAL_RETRY_DIRECTIONS)
+    ]
+    action = re.sub(r"\s+", " ", str(scene.get("action") or "")).strip()
+    action_instruction = f" Keep the narrative event: {action}." if action else ""
+    return (
+        f"{base_prompt} Visual uniqueness requirement: {direction}."
+        f"{action_instruction} Do not reuse any earlier composition or image layout."
+    )
 
 
 def _parse_timestamp(value: str) -> float:
@@ -376,6 +500,7 @@ def validate_visual_scene_plan(payload: dict, windows: list[dict]) -> dict:
         raise VideoProductionError("ChatGPT trả về thiếu hoặc thừa cảnh.")
     normalized = []
     seen_prompts: set[str] = set()
+    seen_actions: set[str] = set()
     for window, scene in zip(windows, supplied):
         if not isinstance(scene, dict) or int(scene.get("index", -1)) != window["index"]:
             raise VideoProductionError("ChatGPT trả về sai thứ tự scene.")
@@ -383,17 +508,25 @@ def validate_visual_scene_plan(payload: dict, windows: list[dict]) -> dict:
         lowered = prompt.casefold()
         if len(prompt) < 80 or "youtube documentary scene about" in lowered:
             raise VideoProductionError("Prompt cảnh còn chung chung, không đủ chi tiết hình ảnh.")
-        prompt_key = lowered
+        prompt_key = normalize_visual_identity(prompt)
         if prompt_key in seen_prompts:
             raise VideoProductionError("Hai cảnh dùng cùng prompt; kế hoạch ảnh bị từ chối.")
         seen_prompts.add(prompt_key)
+        action = re.sub(r"\s+", " ", str(scene.get("action") or "")).strip()
+        action_key = normalize_visual_identity(action)
+        if action_key and action_key in seen_actions:
+            raise VideoProductionError(
+                "Hai cảnh mô tả cùng một hành động hình ảnh; kế hoạch ảnh bị từ chối."
+            )
+        if action_key:
+            seen_actions.add(action_key)
         normalized.append(
             {
                 **window,
                 "is_video": window.get("is_video", False),
                 "media_type": window.get("media_type", "image"),
                 "subject": str(scene.get("subject") or "").strip(),
-                "action": str(scene.get("action") or "").strip(),
+                "action": action,
                 "setting": str(scene.get("setting") or "").strip(),
                 "era": str(scene.get("era") or "").strip(),
                 "composition": str(scene.get("composition") or "").strip(),
@@ -794,6 +927,7 @@ async def _generate_scene_image_async(
     cancel_check,
     worker,
     existing_hashes: set[str] | None = None,
+    existing_perceptual_hashes: list[ImagePerceptualFingerprint] | None = None,
     force_new_project: bool = False,
 ) -> Path:
     negative_prompt = str(settings.get("avoid_prompt") or settings.get("negative_prompt") or "")
@@ -806,16 +940,39 @@ async def _generate_scene_image_async(
     artifact_type = f"scene:{scene['index']}"
     existing = db.get_latest_video_artifact(video_id, artifact_type)
 
-    if not force_new_project and existing and existing.get("status") == "completed":
+    cache_matches_plan = bool(
+        existing and existing.get("content_hash") == content_hash
+    )
+    if existing and not cache_matches_plan:
+        logger.info(
+            "Ignoring stale scene cache for video=%s scene=%s: expected=%s actual=%s",
+            video_id,
+            scene.get("index"),
+            content_hash,
+            existing.get("content_hash"),
+        )
+    if (
+        not force_new_project
+        and cache_matches_plan
+        and existing.get("status") == "completed"
+    ):
         artifact_path = Path(existing["path"])
         if artifact_path.exists():
             art_hash = _sha256_file(artifact_path)
-            if existing_hashes is not None and art_hash in existing_hashes:
+            art_fingerprint = _image_perceptual_fingerprint(artifact_path)
+            is_exact_duplicate = bool(
+                existing_hashes is not None and art_hash in existing_hashes
+            )
+            is_visual_duplicate = _matches_existing_perceptual_fingerprint(
+                art_fingerprint,
+                existing_perceptual_hashes,
+            )
+            if is_exact_duplicate or is_visual_duplicate:
                 logger.warning(
-                    "Cached artifact %s for scene %s has duplicate hash %s matching an earlier scene. Purging corrupted cache and regenerating.",
+                    "Cached artifact %s for scene %s duplicates an earlier scene (%s). Purging cache and regenerating.",
                     existing.get("id"),
                     scene.get("index"),
-                    art_hash,
+                    "exact" if is_exact_duplicate else "perceptual",
                 )
                 if existing.get("id"):
                     db.delete_video_artifact(existing["id"])
@@ -858,6 +1015,7 @@ async def _generate_scene_image_async(
     )
 
     flow_frame_metadata: dict[str, str] = {}
+    perceptual_duplicate_retries = 0
     try:
         if _flow_mock_enabled():
             from PIL import Image
@@ -889,77 +1047,134 @@ async def _generate_scene_image_async(
                 else {}
             )
 
-            _log_scene_generation(
-                video_id=video_id,
-                scene_index=int(scene.get("index", 0)),
-                media_type="image",
-                state="submitted",
-                attempt=1,
-                started_at=started_at,
+            concise_style = (
+                style_str.split("\n")[0][:200].strip()
+                if style_str
+                else "Cinematic documentary visual style, photorealistic, 8k resolution"
             )
-            try:
-                asset_url = await worker.generate_scene(
-                    clean_prompt,
-                    negative_prompt,
-                    refs,
-                    reference_paths,
-                    scene_index=int(scene.get("index", 0)),
-                    scene_count=scene_count,
+            clean_action = _sanitize_scene_prompt_context(scene_action, max_chars=120)
+            context_desc = f"Narrative action: {clean_action}. " if clean_action else ""
+            safe_prompt = (
+                f"A cinematic still photograph: {concise_style}. "
+                f"{context_desc}"
+                "16:9 widescreen still photograph, authentic realism, "
+                "dramatic atmospheric lighting, clean visual without text."
+            ).replace("  ", " ").strip()
+
+            while True:
+                generation_prompt = (
+                    clean_prompt
+                    if perceptual_duplicate_retries == 0
+                    else _build_perceptual_retry_prompt(
+                        clean_prompt,
+                        scene,
+                        perceptual_duplicate_retries,
+                    )
                 )
-            except FlowGenerationError as first_error:
-                logger.warning(
-                    "Flow explicitly rejected scene %d (%s). Retrying once with a safe prompt.",
-                    scene.get("index", 0),
-                    first_error,
-                )
-                concise_style = (
-                    style_str.split("\n")[0][:200].strip()
-                    if style_str
-                    else "Cinematic documentary visual style, photorealistic, 8k resolution"
-                )
-                clean_action = _sanitize_scene_prompt_context(scene_action, max_chars=120)
-                context_desc = f"Narrative action: {clean_action}. " if clean_action else ""
-                safe_prompt = (
-                    f"A cinematic still photograph: {concise_style}. "
-                    f"{context_desc}"
-                    "16:9 widescreen still photograph, authentic realism, "
-                    "dramatic atmospheric lighting, clean visual without text."
-                ).replace("  ", " ").strip()
                 _log_scene_generation(
                     video_id=video_id,
                     scene_index=int(scene.get("index", 0)),
                     media_type="image",
-                    state="retry_explicit_error",
-                    attempt=2,
+                    state=(
+                        "submitted"
+                        if perceptual_duplicate_retries == 0
+                        else "retry_visual_duplicate"
+                    ),
+                    attempt=perceptual_duplicate_retries + 1,
                     started_at=started_at,
-                    detail=str(first_error),
                 )
-                asset_url = await worker.generate_scene(
-                    safe_prompt,
-                    negative_prompt,
-                    refs,
-                    reference_paths,
-                    scene_index=int(scene.get("index", 0)),
-                    scene_count=scene_count,
-                )
-
-            await worker.download_image(asset_url, str(target))
-            if not target.exists() or target.stat().st_size == 0:
-                raise RuntimeError(f"Ảnh tạo từ Google Flow không hợp lệ hoặc rỗng: {target}")
-
-            from PIL import Image
-
-            with Image.open(target) as image_check:
-                image_width, image_height = image_check.size
-                if (
-                    image_width < 800
-                    or image_height < 400
-                    or image_width / max(1, image_height) < 1.15
-                ):
-                    raise RuntimeError(
-                        "Ảnh tải về từ Google Flow không đạt chuẩn 16:9 widescreen "
-                        f"({image_width}x{image_height})."
+                try:
+                    asset_url = await worker.generate_scene(
+                        generation_prompt,
+                        negative_prompt,
+                        refs,
+                        reference_paths,
+                        scene_index=int(scene.get("index", 0)),
+                        scene_count=scene_count,
                     )
+                except FlowGenerationError as first_error:
+                    logger.warning(
+                        "Flow explicitly rejected scene %d (%s). Retrying once with a safe prompt.",
+                        scene.get("index", 0),
+                        first_error,
+                    )
+                    fallback_prompt = (
+                        safe_prompt
+                        if perceptual_duplicate_retries == 0
+                        else _build_perceptual_retry_prompt(
+                            safe_prompt,
+                            scene,
+                            perceptual_duplicate_retries,
+                        )
+                    )
+                    _log_scene_generation(
+                        video_id=video_id,
+                        scene_index=int(scene.get("index", 0)),
+                        media_type="image",
+                        state="retry_explicit_error",
+                        attempt=perceptual_duplicate_retries + 1,
+                        started_at=started_at,
+                        detail=str(first_error),
+                    )
+                    asset_url = await worker.generate_scene(
+                        fallback_prompt,
+                        negative_prompt,
+                        refs,
+                        reference_paths,
+                        scene_index=int(scene.get("index", 0)),
+                        scene_count=scene_count,
+                    )
+
+                await worker.download_image(asset_url, str(target))
+                if not target.exists() or target.stat().st_size == 0:
+                    raise RuntimeError(
+                        f"Ảnh tạo từ Google Flow không hợp lệ hoặc rỗng: {target}"
+                    )
+
+                from PIL import Image
+
+                with Image.open(target) as image_check:
+                    image_width, image_height = image_check.size
+                    if (
+                        image_width < 800
+                        or image_height < 400
+                        or image_width / max(1, image_height) < 1.15
+                    ):
+                        raise RuntimeError(
+                            "Ảnh tải về từ Google Flow không đạt chuẩn 16:9 widescreen "
+                            f"({image_width}x{image_height})."
+                        )
+
+                target_hash = _sha256_file(target)
+                target_fingerprint = _image_perceptual_fingerprint(target)
+                is_exact_duplicate = bool(
+                    existing_hashes is not None and target_hash in existing_hashes
+                )
+                is_visual_duplicate = _matches_existing_perceptual_fingerprint(
+                    target_fingerprint,
+                    existing_perceptual_hashes,
+                )
+                if not is_exact_duplicate and not is_visual_duplicate:
+                    break
+                if perceptual_duplicate_retries >= MAX_PERCEPTUAL_DUPLICATE_RETRIES:
+                    raise SceneVisualDuplicateError(
+                        f"Ảnh cảnh {scene.get('index', 0) + 1} vẫn giống cảnh trước "
+                        f"sau {MAX_PERCEPTUAL_DUPLICATE_RETRIES} lần tạo lại."
+                    )
+
+                perceptual_duplicate_retries += 1
+                target.unlink(missing_ok=True)
+                logger.warning(
+                    "Generated scene %s duplicates an earlier scene (%s); retrying with a different composition (%s/%s).",
+                    scene.get("index", 0),
+                    "exact" if is_exact_duplicate else "perceptual",
+                    perceptual_duplicate_retries,
+                    MAX_PERCEPTUAL_DUPLICATE_RETRIES,
+                )
+                progress(
+                    f"Ảnh cảnh {scene['index'] + 1} giống cảnh trước; đang đổi bố cục và tạo lại",
+                    "retrying_visual_duplicate",
+                )
 
             if hasattr(worker, "register_generated_video_frame"):
                 registered_frame = worker.register_generated_video_frame(
@@ -970,9 +1185,17 @@ async def _generate_scene_image_async(
                     flow_frame_metadata = registered_frame
 
         target_hash = _sha256_file(target)
+        target_fingerprint = _image_perceptual_fingerprint(target)
         if existing_hashes is not None and target_hash in existing_hashes:
-            raise VideoProductionError(
+            raise SceneVisualDuplicateError(
                 "Tạo ảnh trùng hệt cảnh trước; dừng để tránh video lặp ảnh."
+            )
+        if _matches_existing_perceptual_fingerprint(
+            target_fingerprint,
+            existing_perceptual_hashes,
+        ):
+            raise SceneVisualDuplicateError(
+                "Tạo ảnh quá giống cảnh trước; dừng để tránh video lặp ảnh."
             )
     except Exception as exc:
         failure_stage_by_error = {
@@ -985,6 +1208,7 @@ async def _generate_scene_image_async(
             "FlowInvalidOutputError": "invalid_output",
             "ReferenceAttachmentError": "reference",
             "FlowUiStateError": "ui_state",
+            "SceneVisualDuplicateError": "visual_duplicate",
         }
         failure_stage = failure_stage_by_error.get(
             type(exc).__name__,
@@ -1006,6 +1230,7 @@ async def _generate_scene_image_async(
                 "error": str(exc),
                 "failure_stage": failure_stage,
                 "generation_attempt": generation_attempt,
+                "perceptual_duplicate_retries": perceptual_duplicate_retries,
                 "reference_id": reference_id,
                 "reference_hash": reference_hash,
             },
@@ -1032,6 +1257,7 @@ async def _generate_scene_image_async(
         metadata={
             **scene,
             "generation_attempt": generation_attempt,
+            "perceptual_duplicate_retries": perceptual_duplicate_retries,
             "reference_id": reference_id,
             **flow_frame_metadata,
         },
@@ -1059,6 +1285,7 @@ def _generate_scene_image(
     progress,
     cancel_check,
     existing_hashes: set[str] | None = None,
+    existing_perceptual_hashes: list[ImagePerceptualFingerprint] | None = None,
     force_new_project: bool = False,
 ) -> Path:
     async def _run() -> Path:
@@ -1078,6 +1305,7 @@ def _generate_scene_image(
                 cancel_check=cancel_check,
                 worker=worker,
                 existing_hashes=existing_hashes,
+                existing_perceptual_hashes=existing_perceptual_hashes,
                 force_new_project=force_new_project,
             )
 
@@ -1099,6 +1327,7 @@ async def _generate_scene_images_with_worker(
     settings = settings or {}
     references: dict[str, Path] = {}
     image_hashes: set[str] = set()
+    image_perceptual_hashes: list[ImagePerceptualFingerprint] = []
     completed_paths: list[Path] = []
     need_force_new = force_new_project
     for scene in scenes:
@@ -1121,15 +1350,25 @@ async def _generate_scene_images_with_worker(
             cancel_check=cancel_check,
             worker=worker,
             existing_hashes=image_hashes,
+            existing_perceptual_hashes=image_perceptual_hashes,
             force_new_project=need_force_new,
         )
         need_force_new = False
         image_hash = _sha256_file(image_path)
         if image_hash in image_hashes:
-            raise VideoProductionError(
+            raise SceneVisualDuplicateError(
                 "Tạo ảnh trùng hệt cảnh trước; dừng để tránh video lặp ảnh."
             )
+        image_fingerprint = _image_perceptual_fingerprint(image_path)
+        if _matches_existing_perceptual_fingerprint(
+            image_fingerprint,
+            image_perceptual_hashes,
+        ):
+            raise SceneVisualDuplicateError(
+                "Tạo ảnh quá giống cảnh trước; dừng để tránh video lặp ảnh."
+            )
         image_hashes.add(image_hash)
+        image_perceptual_hashes.append(image_fingerprint)
         completed_paths.append(image_path)
         if reference_id and reference_id not in references:
             references[reference_id] = image_path
@@ -1199,10 +1438,23 @@ async def _generate_scene_video_async(
     artifact_type = f"scene_video:{scene['index']}"
     existing = db.get_latest_video_artifact(video_id, artifact_type)
 
-    if not force_new_project and existing and existing.get("status") == "completed":
+    if (
+        not force_new_project
+        and existing
+        and existing.get("content_hash") == content_hash
+        and existing.get("status") == "completed"
+    ):
         artifact_path = Path(existing["path"])
         if artifact_path.exists() and artifact_path.stat().st_size > 1000:
             return artifact_path
+    elif existing and existing.get("content_hash") != content_hash:
+        logger.info(
+            "Ignoring stale scene video cache for video=%s scene=%s: expected=%s actual=%s",
+            video_id,
+            scene.get("index"),
+            content_hash,
+            existing.get("content_hash"),
+        )
 
     target = SCENES_DIR / f"{video_id}_{scene['index']}_video_{content_hash[:8]}.mp4"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1484,10 +1736,13 @@ def generate_scene_media(
             )
 
             media_paths: list[Path] = []
+            flow_video_unsupported = False
             for index, scene in enumerate(scenes):
                 cancel_check()
                 is_video = bool(
-                    scene.get("is_video") or scene.get("media_type") == "video"
+                    enable_intro_video
+                    and not flow_video_unsupported
+                    and (scene.get("is_video") or scene.get("media_type") == "video")
                 )
                 if not is_video:
                     media_paths.append(base_image_paths[index])
@@ -1499,20 +1754,29 @@ def generate_scene_media(
                     if index + 1 < len(base_image_paths)
                     else None
                 )
-                video_path = await _generate_scene_video_async(
-                    video_id=video_id,
-                    scene=scene,
-                    scene_count=len(scenes),
-                    start_frame_path=start_frame,
-                    end_frame_path=end_frame,
-                    profile=profile or {},
-                    settings=settings,
-                    progress=progress,
-                    cancel_check=cancel_check,
-                    worker=worker,
-                    force_new_project=False,
-                )
-                media_paths.append(video_path)
+                try:
+                    video_path = await _generate_scene_video_async(
+                        video_id=video_id,
+                        scene=scene,
+                        scene_count=len(scenes),
+                        start_frame_path=start_frame,
+                        end_frame_path=end_frame,
+                        profile=profile or {},
+                        settings=settings,
+                        progress=progress,
+                        cancel_check=cancel_check,
+                        worker=worker,
+                        force_new_project=False,
+                    )
+                    media_paths.append(video_path)
+                except Exception as exc:
+                    logger.warning(
+                        "flow_video generation for scene %s failed (%s); fast-falling back remaining scenes to base image.",
+                        scene.get("index"),
+                        exc,
+                    )
+                    flow_video_unsupported = True
+                    media_paths.append(base_image_paths[index])
             return media_paths
 
     return asyncio.run(_run_batch())

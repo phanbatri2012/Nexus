@@ -358,6 +358,7 @@ def _set_cdp_window_visibility(endpoint: str, visible: bool) -> None:
             "Browser.setWindowBounds",
             {"windowId": window_id, "bounds": {"windowState": "normal"}},
         )
+        time.sleep(SERVICE_POLL_SECONDS)
         if visible:
             session.send(
                 "Browser.setWindowBounds",

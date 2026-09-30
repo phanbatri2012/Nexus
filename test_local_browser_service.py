@@ -21,15 +21,20 @@ class LocalBrowserServiceTests(unittest.TestCase):
         mock_find_port.return_value = None
         mock_is_running.return_value = True
 
-        # Should raise descriptive error indicating tab opened and NOT call taskkill / terminate
-        with self.assertRaises(RuntimeError) as ctx:
-            local_browser_service.start_local_browser("coccoc", "Default", target_url="https://facebook.com")
-
-        self.assertIn("chưa bật cổng tự động", str(ctx.exception))
-        # Verify subprocess.Popen was called to open the target tab
+        # When require_cdp=False (default for opening browser/tab), should succeed gracefully
+        res = local_browser_service.start_local_browser("coccoc", "Default", target_url="https://facebook.com")
+        self.assertTrue(res["success"])
+        self.assertTrue(res["already_running_no_cdp"])
         mock_popen.assert_called_once()
         args = mock_popen.call_args[0][0]
         self.assertIn("https://facebook.com", args)
+
+        # When require_cdp=True (for automated Playwright tasks), should raise descriptive error
+        with self.assertRaises(RuntimeError) as ctx:
+            local_browser_service.start_local_browser(
+                "coccoc", "Default", target_url="https://facebook.com", require_cdp=True
+            )
+        self.assertIn("chưa bật cổng tự động CDP", str(ctx.exception))
 
     @patch("auto_yt.services.local_browser_service.start_local_browser")
     @patch("playwright.async_api.async_playwright")

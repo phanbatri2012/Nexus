@@ -877,7 +877,7 @@ export default function YouTubeChannelSettings({
             />
           </div>
           <div className="help-text" style={{ marginTop: 6 }}>
-            Ô bên phải là số câu trả lời tối đa mỗi ngày. Mặc định 50.
+            Ô bên phải là số câu trả lời tối đa mỗi ngày khi đăng lên YouTube (soạn bản nháp tự động diễn ra mọi lúc không bị giới hạn). Mặc định 50.
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 10, marginTop: 10 }}>
             <label style={{ color: '#aaa' }}>

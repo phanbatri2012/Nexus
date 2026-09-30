@@ -7,6 +7,7 @@ import ctypes
 import ctypes.wintypes
 import os
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -89,7 +90,14 @@ def write_private_text(path: Path, value: str) -> None:
             handle.write(value)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
+        for attempt in range(10):
+            try:
+                os.replace(temporary_path, path)
+                break
+            except (PermissionError, OSError):
+                if attempt == 9:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
     finally:
         temporary_path.unlink(missing_ok=True)
 

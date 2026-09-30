@@ -282,11 +282,16 @@ def start_local_browser(
     profile_dir: str = "Default",
     target_url: str = "",
     preferred_port: int | None = None,
+    require_cdp: bool = False,
+    force_restart: bool = False,
 ) -> dict[str, Any]:
     """Start local browser (Cốc Cốc, Chrome, Edge) with Remote Debugging Port enabled.
 
+    - If force_restart is True: closes running browser processes and launches fresh with CDP.
     - If already running with CDP: navigates/opens target_url and returns coordinates.
-    - If running without CDP: opens target_url in a new tab of the existing browser WITHOUT terminating or closing it.
+    - If running without CDP:
+        * If require_cdp is True: raises informative error to prompt closing browser or restarting.
+        * If require_cdp is False: opens target_url in a new tab of the existing browser and returns success.
     - If not running: launches with remote debugging port enabled.
     """
     exe_path, user_data_path = resolve_browser_paths(browser_key)
@@ -295,6 +300,11 @@ def start_local_browser(
 
     defn = BROWSER_DEFINITIONS.get(browser_key, {})
     browser_display_name = defn.get("name", browser_key.title())
+
+    # 0. Handle force restart if explicitly requested
+    if force_restart:
+        logger.info("Yêu cầu force_restart=True: Đang đóng %s để kích hoạt CDP...", browser_display_name)
+        terminate_local_browser_processes(browser_key)
 
     # 1. Check if already running with CDP
     running = find_running_local_browser_port(browser_key, profile_dir)
@@ -315,11 +325,13 @@ def start_local_browser(
             "endpoint_url": running["endpoint_url"],
             "ws_url": running["ws_url"],
             "already_running": True,
+            "already_running_no_cdp": False,
             "browser_key": browser_key,
             "profile_dir": profile_dir,
+            "message": f"Đã mở tab tại {target_url} trên {browser_display_name} (chế độ CDP).",
         }
 
-    # 2. If running without CDP, NEVER terminate user's browser. Open a new tab in the running browser.
+    # 2. If running without CDP
     if is_browser_process_running(browser_key):
         logger.info(
             "Trình duyệt %s đang chạy chế độ thông thường. Mở thêm tab mới mà không tắt trình duyệt...",
@@ -336,11 +348,27 @@ def start_local_browser(
             except Exception as e:
                 logger.debug("Không thể mở tab qua process invocation: %s", e)
 
-        raise RuntimeError(
-            f"Trình duyệt {browser_display_name} đang mở sẵn ở chế độ thông thường (chưa bật cổng tự động). "
-            f"Hệ thống đã tự động mở thêm tab '{target_url or 'Meta'}' trên trình duyệt của bạn mà không tắt trình duyệt. "
-            f"Để chạy tự động 100%, bạn có thể bấm nút 'Mở trình duyệt' trên hệ thống."
-        )
+        if require_cdp:
+            raise RuntimeError(
+                f"Trình duyệt {browser_display_name} đang mở sẵn ở chế độ thông thường (chưa bật cổng tự động CDP). "
+                f"Hệ thống đã tự động mở thêm tab '{target_url or 'Meta'}' trên trình duyệt của bạn. "
+                f"Để hệ thống tự động quét/thao tác CDP 100%, vui lòng đóng hoàn toàn {browser_display_name} rồi bấm 'Mở trình duyệt' trên hệ thống."
+            )
+
+        return {
+            "success": True,
+            "port": None,
+            "endpoint_url": None,
+            "ws_url": None,
+            "already_running": True,
+            "already_running_no_cdp": True,
+            "browser_key": browser_key,
+            "profile_dir": profile_dir,
+            "message": (
+                f"Đã mở thêm tab '{target_url or 'Meta'}' trên trình duyệt {browser_display_name} đang chạy. "
+                f"(Lưu ý: Để Quét tự động ở Bước 3, vui lòng tắt hoàn toàn {browser_display_name} rồi bấm lại 'Mở trình duyệt')."
+            ),
+        }
 
     # 3. Not running: pick a free port and launch with remote debugging port
     port = preferred_port or find_free_port()
@@ -388,8 +416,10 @@ def start_local_browser(
         "endpoint_url": f"http://127.0.0.1:{port}",
         "ws_url": ws_url,
         "already_running": False,
+        "already_running_no_cdp": False,
         "browser_key": browser_key,
         "profile_dir": profile_dir,
+        "message": f"Đã mở {browser_display_name} ({profile_dir}) ở chế độ tự động hóa CDP.",
     }
 
 
@@ -411,6 +441,7 @@ async def local_browser_session(
         browser_key,
         profile_dir,
         target_url=target_url,
+        require_cdp=True,
     )
 
     port = launch_info.get("port")
