@@ -589,3 +589,42 @@ def schedule_video(
             "YouTube trả về trạng thái đặt lịch không khớp; cần đối soát từ xa."
         )
     return result
+
+
+def publish_video_now(
+    token: str,
+    youtube_video_id: str,
+    *,
+    preserved_status: dict | None = None,
+    proxy: str | None = None,
+) -> dict:
+    source_status = preserved_status if isinstance(preserved_status, dict) else {}
+    status = {
+        "privacyStatus": "public",
+        "selfDeclaredMadeForKids": bool(
+            source_status.get("selfDeclaredMadeForKids", False)
+        ),
+        "containsSyntheticMedia": bool(
+            source_status.get("containsSyntheticMedia", True)
+        ),
+        "license": str(source_status.get("license") or "youtube"),
+        "embeddable": bool(source_status.get("embeddable", True)),
+        "publicStatsViewable": bool(source_status.get("publicStatsViewable", True)),
+    }
+    query = urllib.parse.urlencode({"part": "status"})
+    result = _api_json(
+        f"{YOUTUBE_API_BASE}/videos?{query}",
+        token,
+        method="PUT",
+        payload={"id": youtube_video_id, "status": status},
+        proxy=proxy,
+    )
+    response_status = result.get("status") if isinstance(result, dict) else None
+    if (
+        str(result.get("id") or "") != youtube_video_id
+        or str((response_status or {}).get("privacyStatus") or "") != "public"
+    ):
+        raise YouTubeUploadReconciliationRequired(
+            "YouTube trả về trạng thái công khai không khớp; cần đối soát từ xa."
+        )
+    return result

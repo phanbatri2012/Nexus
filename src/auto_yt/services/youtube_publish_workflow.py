@@ -141,16 +141,34 @@ def _channel_missing_configuration(
     )
 
 
+def resolve_publish_mode(
+    pipeline: dict,
+    publishing_settings: dict,
+    payload_mode: str = "",
+) -> tuple[str, bool]:
+    clean_payload_mode = str(payload_mode or "").strip().lower()
+    clean_pub_mode = str((publishing_settings or {}).get("publish_mode") or "").strip().lower()
+    if clean_payload_mode == "public" or clean_pub_mode == "public":
+        return "public", False
+    if clean_payload_mode == "private":
+        return "private", False
+    if clean_pub_mode == "private" and not clean_payload_mode:
+        return "private", False
+    if bool(pipeline.get("youtube_schedule")):
+        return "schedule", True
+    return "private", False
+
+
 def evaluate_prompt_publish_readiness(version: dict) -> dict:
     pipeline = version.get("pipeline") if isinstance(version.get("pipeline"), dict) else {}
-    if not pipeline.get("youtube_upload"):
-        return {"ready": True, "missing_configuration": [], "upload_method": "browser"}
-    schedule_enabled = bool(pipeline.get("youtube_schedule"))
     publishing_settings = (
         version.get("publishing_settings")
         if isinstance(version.get("publishing_settings"), dict)
         else {}
     )
+    publish_mode, schedule_enabled = resolve_publish_mode(pipeline, publishing_settings)
+    if not pipeline.get("youtube_upload"):
+        return {"ready": True, "missing_configuration": [], "upload_method": "browser", "publish_mode": publish_mode}
     upload_method = str(publishing_settings.get("upload_method") or "browser").strip().lower()
     stable_channel_id = str(version.get("default_youtube_channel_id") or "").strip()
     channel = (
@@ -361,8 +379,6 @@ def _build_preflight_context(
         resolve_default_channel_id=resolve_default_channel_id,
     )
     pipeline = snapshot.get("pipeline") if isinstance(snapshot.get("pipeline"), dict) else {}
-    schedule_enabled = bool(pipeline.get("youtube_schedule"))
-
     publishing_settings = snapshot.get("publishing_settings")
     if not isinstance(publishing_settings, dict):
         publishing_settings = {}
@@ -379,6 +395,9 @@ def _build_preflight_context(
                 publishing_settings = merged_pub_settings
                 snapshot["publishing_settings"] = publishing_settings
 
+    publish_mode, schedule_enabled = resolve_publish_mode(
+        pipeline, publishing_settings, payload.get("publish_mode")
+    )
     upload_method = str(
         publishing_settings.get("upload_method") or "browser"
     ).strip().lower()
@@ -537,6 +556,7 @@ def _build_preflight_context(
         "channel": channel,
         "proxy": proxy,
         "schedule_enabled": schedule_enabled,
+        "publish_mode": publish_mode,
         "upload_method": upload_method,
     }
 
@@ -673,6 +693,7 @@ def execute_browser_publish_workflow(
                 contains_synthetic_media=contains_synthetic_media,
                 notify_subscribers=notify_subscribers,
                 schedule_at=target_schedule_at if context["schedule_enabled"] else None,
+                publish_mode=context.get("publish_mode") or "schedule",
                 caption_path=context["caption_path"],
                 language=str(context["publishing_settings"].get("language") or "vi"),
                 publication_timezone=str(
@@ -747,7 +768,28 @@ def execute_browser_publish_workflow(
         publication = db.get_video_publication_by_youtube_id(youtube_video_id)
         publication_id = int((publication or {}).get("id") or 0)
 
-    if context["schedule_enabled"]:
+    if context.get("publish_mode") == "public":
+        now_iso = db.utc_now()
+        if publication_id:
+            db.update_video_publication(
+                publication_id,
+                privacy_status="public",
+                processing_status="succeeded",
+                scheduled_at="",
+                published_at=now_iso,
+            )
+        db.update_youtube_publish_workflow(
+            workflow_id,
+            status="published",
+            stage="published",
+            upload_session_encrypted="",
+            error="",
+            scheduled_at="",
+        )
+        final_status = "published"
+        final_stage = "published"
+        scheduled_at = ""
+    elif context["schedule_enabled"]:
         if publication_id:
             try:
                 db.complete_youtube_schedule(
@@ -801,9 +843,13 @@ def execute_browser_publish_workflow(
         publish_status=final_status,
         current_stage=final_stage,
         production_progress=(
-            "Đã đặt lịch đăng YouTube qua Trình duyệt Web"
-            if context["schedule_enabled"]
-            else "Đã upload Private qua Trình duyệt Web"
+            "Đã công khai ngay trên YouTube qua Trình duyệt Web"
+            if context.get("publish_mode") == "public"
+            else (
+                "Đã đặt lịch đăng YouTube qua Trình duyệt Web"
+                if context["schedule_enabled"]
+                else "Đã upload Private qua Trình duyệt Web"
+            )
         ),
         blocking_reason="",
     )
@@ -982,7 +1028,37 @@ def execute_api_publish_workflow(
         publication = db.get_video_publication_by_youtube_id(youtube_video_id)
         publication_id = int((publication or {}).get("id") or 0)
 
-    if context["schedule_enabled"]:
+    if context.get("publish_mode") == "public":
+        cancel_check()
+        preserved_status = dict(context["metadata"].get("status") or {})
+        youtube_publisher.publish_video_now(
+            token_provider(),
+            youtube_video_id,
+            preserved_status=preserved_status,
+            proxy=context["proxy"],
+        )
+        now_iso = db.utc_now()
+        if publication_id:
+            db.update_video_publication(
+                publication_id,
+                privacy_status="public",
+                processing_status="succeeded",
+                scheduled_at="",
+                published_at=now_iso,
+            )
+        db.update_youtube_publish_workflow(
+            workflow_id,
+            status="published",
+            stage="published",
+            upload_session_encrypted="",
+            error="",
+            scheduled_at="",
+        )
+        progress("Đã công khai video trên YouTube", "published", 100)
+        final_status = "published"
+        final_stage = "published"
+        scheduled_at = ""
+    elif context["schedule_enabled"]:
         cancel_check()
         db.update_youtube_publish_workflow(
             workflow_id, stage="processing", status="processing"
@@ -1066,9 +1142,13 @@ def execute_api_publish_workflow(
         publish_status=final_status,
         current_stage=final_stage,
         production_progress=(
-            "Đã đặt lịch đăng YouTube"
-            if context["schedule_enabled"]
-            else "Đã upload Private cùng thumbnail và phụ đề"
+            "Đã công khai video trên YouTube"
+            if context.get("publish_mode") == "public"
+            else (
+                "Đã đặt lịch đăng YouTube"
+                if context["schedule_enabled"]
+                else "Đã upload Private cùng thumbnail và phụ đề"
+            )
         ),
         blocking_reason="",
     )

@@ -223,6 +223,7 @@ function App() {
   const [publicationDialog, setPublicationDialog] = useState(null)
   const [sceneResetDialog, setSceneResetDialog] = useState(null)
   const [currentVideoHasCheckpoint, setCurrentVideoHasCheckpoint] = useState(false)
+  const [isPublishingNow, setIsPublishingNow] = useState(false)
   const [chatGptStatus, setChatGptStatus] = useState({
     busy: false,
     operation: '',
@@ -1423,6 +1424,34 @@ function App() {
     }
   };
 
+  const handlePublishNow = async (videoId) => {
+    const targetId = videoId || currentVideoId;
+    if (!targetId || isPublishingNow) return;
+    if (!confirm(`Xác nhận Public ngay video #${targetId} lên YouTube? Video sẽ được công khai trực tiếp ngay lập tức.`)) {
+      return;
+    }
+    setIsPublishingNow(true);
+    try {
+      const response = await fetch(`http://127.0.0.1:8080/api/videos/${targetId}/publish-now`, {
+        method: 'POST'
+      });
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.detail || data.error || 'Không thể thực hiện Public ngay.');
+      }
+      alert(data.message || '🚀 Đã kích hoạt tác vụ Public ngay!');
+      setQueueRefreshKey(k => k + 1);
+      if (currentVideoId === targetId) {
+        await viewSavedVideo(targetId);
+      }
+      await fetchSavedVideos(currentPage, publishFilter);
+    } catch (error) {
+      alert(`Lỗi Public ngay: ${error.message}`);
+    } finally {
+      setIsPublishingNow(false);
+    }
+  };
+
 
   const parseSections = (text) => {
     if (!text) return [];
@@ -1911,15 +1940,34 @@ function App() {
                         
                          <div style={{ marginTop: 'auto', display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
                            {Boolean(video.final_artifact_id) && (
-                             <a
-                               className="btn-secondary"
-                               style={{ padding: '8px 10px', fontSize: '0.85em', textDecoration: 'none' }}
-                               href={`http://127.0.0.1:8080/api/video-artifacts/${video.final_artifact_id}/download`}
-                               target="_blank"
-                               rel="noreferrer"
-                             >
-                               🎬 Mở / tải MP4
-                             </a>
+                             <>
+                               <a
+                                 className="btn-secondary"
+                                 style={{ padding: '8px 10px', fontSize: '0.85em', textDecoration: 'none' }}
+                                 href={`http://127.0.0.1:8080/api/video-artifacts/${video.final_artifact_id}/download`}
+                                 target="_blank"
+                                 rel="noreferrer"
+                               >
+                                 🎬 Mở / tải MP4
+                               </a>
+                               <button
+                                 className="btn-secondary"
+                                 style={{
+                                   padding: '8px 10px',
+                                   fontSize: '0.85em',
+                                   background: 'rgba(230, 126, 34, 0.15)',
+                                   border: '1px solid #e67e22',
+                                   color: '#f39c12',
+                                   fontWeight: 'bold',
+                                   cursor: isPublishingNow ? 'not-allowed' : 'pointer'
+                                 }}
+                                 onClick={() => handlePublishNow(video.id)}
+                                 disabled={isPublishingNow || isError}
+                                 title="Tải lên và Public ngay lập tức lên YouTube"
+                               >
+                                 ⚡ Public ngay
+                               </button>
+                             </>
                            )}
                            {video.published_youtube_video_id && (
                              <button
@@ -2817,6 +2865,27 @@ function App() {
                                       >
                                         📥 Tải Video MP4
                                       </a>
+                                      <button
+                                        className="btn-primary"
+                                        onClick={() => handlePublishNow(currentVideoId)}
+                                        disabled={isPublishingNow || currentVideoIsError}
+                                        style={{
+                                          padding: '4px 14px',
+                                          fontSize: '0.8em',
+                                          background: 'linear-gradient(135deg, #e67e22, #d35400)',
+                                          border: 'none',
+                                          color: '#fff',
+                                          cursor: isPublishingNow ? 'not-allowed' : 'pointer',
+                                          fontWeight: 'bold',
+                                          borderRadius: '4px',
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          gap: '4px'
+                                        }}
+                                        title="Tải lên và Public ngay lập tức lên YouTube"
+                                      >
+                                        {isPublishingNow ? '⏳ Đang Public...' : '⚡ Public ngay'}
+                                      </button>
                                     </>
                                   )}
                                 </div>

@@ -1584,6 +1584,7 @@ async def upload_video_via_browser(
     contains_synthetic_media: bool = True,
     notify_subscribers: bool = True,
     schedule_at: str | None = None,
+    publish_mode: str = "schedule",
     caption_path: Path | None = None,
     language: str = "vi",
     publication_timezone: str = "Asia/Ho_Chi_Minh",
@@ -1615,6 +1616,9 @@ async def upload_video_via_browser(
     ).strip()
     if monetization_mode not in MONETIZATION_MODES:
         raise BrowserUploadError(f"Chế độ kiếm tiền không hợp lệ: {monetization_mode}")
+    resolved_publish_mode = str(
+        publish_mode or settings.get("publish_mode") or ("schedule" if schedule_at else "private")
+    ).strip().lower()
     clean_channel_id = str(expected_channel_id or "").strip()
     clean_existing_video_id = str(existing_video_id or "").strip()
     progress("Đang mở trình duyệt GPM của kênh...", "browser_launching", 5)
@@ -2599,6 +2603,55 @@ async def upload_video_via_browser(
                     )
                     await asyncio.sleep(2.0)
 
+            elif resolved_publish_mode == "public":
+                # Public immediately mode
+                logger.info("Chọn chế độ Công khai ngay (Public)...")
+                public_clicked = await _safe_click(
+                    page,
+                    [
+                        "ytcp-uploads-dialog tp-yt-paper-radio-button[name='PUBLIC']",
+                        "ytcp-video-upload-dialog tp-yt-paper-radio-button[name='PUBLIC']",
+                        "tp-yt-paper-radio-button[name='PUBLIC']",
+                        "tp-yt-paper-radio-button:has-text('Công khai')",
+                        "tp-yt-paper-radio-button:has-text('Public')",
+                    ],
+                    timeout_ms=8000,
+                )
+                if not public_clicked:
+                    raise BrowserUploadError("Không thể chọn radio 'Công khai' (Public) trên YouTube Studio.")
+
+                await asyncio.sleep(1.0)
+                public_done_selectors = [
+                    "ytcp-uploads-dialog ytcp-button#done-button",
+                    "ytcp-uploads-dialog #done-button button",
+                    "ytcp-video-upload-dialog ytcp-button#done-button",
+                    "ytcp-video-upload-dialog #done-button button",
+                    "ytcp-button#done-button",
+                    "ytcp-button:has-text('Xuất bản')",
+                    "ytcp-button:has-text('Publish')",
+                ]
+                await _wait_for_enabled_action(
+                    page,
+                    public_done_selectors,
+                    timeout_seconds=timeout_seconds,
+                    cancel_check=cancel_check,
+                    action_name="xuất bản công khai",
+                )
+                done_clicked = await _safe_click(
+                    page,
+                    public_done_selectors,
+                    timeout_ms=8000,
+                )
+                if not done_clicked:
+                    raise BrowserUploadError("Không thể click nút 'Xuất bản' (Publish/Done) trên YouTube Studio.")
+
+                await asyncio.sleep(3.0)
+                _emit_checkpoint(
+                    persist_checkpoint,
+                    "visibility_verified",
+                    privacy_status="public",
+                )
+
             else:
                 # Private mode
                 logger.info("Lưu video ở chế độ Riêng tư (Private)...")
@@ -2663,6 +2716,11 @@ async def upload_video_via_browser(
                     confirmation_verified = bool(
                         re.search(r"Đã lên lịch|scheduled", dialog_text, re.IGNORECASE)
                     )
+                elif resolved_publish_mode == "public":
+                    confirmation_verified = bool(
+                        re.search(r"Đã xuất bản|published|video đã được xuất bản|video published", dialog_text, re.IGNORECASE)
+                        or share_dialog
+                    )
                 else:
                     confirmation_verified = bool(share_dialog)
 
@@ -2718,6 +2776,9 @@ async def upload_video_via_browser(
                             ) or _schedule_timestamp_matches(page_html, local_dt)
                             if schedule_matches:
                                 break
+                    elif resolved_publish_mode == "public":
+                        if re.search(r"Công khai|Public", editor_text, re.IGNORECASE):
+                            break
                     else:
                         if re.search(r"Riêng tư|Private|Không công khai|Unlisted", editor_text, re.IGNORECASE):
                             break
@@ -2757,7 +2818,9 @@ async def upload_video_via_browser(
             return {
                 "youtube_video_id": youtube_video_id,
                 "published_url": f"https://www.youtube.com/watch?v={youtube_video_id}",
-                "status": "scheduled" if schedule_at else "uploaded_private",
+                "status": "scheduled" if schedule_at else ("published" if resolved_publish_mode == "public" else "uploaded_private"),
+                "privacy_status": "public" if resolved_publish_mode == "public" else "private",
+                "is_published": bool(resolved_publish_mode == "public"),
                 "scheduled_at": str(schedule_at or ""),
                 "title": title,
                 "schedule_verified": bool(schedule_at),
@@ -2813,6 +2876,97 @@ async def upload_video_via_browser(
             if isinstance(exc, BrowserUploadError):
                 raise
             raise BrowserUploadError(f"Upload qua trình duyệt thất bại: {exc}") from exc
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+
+async def make_video_public_via_browser(
+    *,
+    profile_id: str,
+    youtube_video_id: str,
+    timeout_seconds: float = 60.0,
+    auto_stop_gpm: bool | None = None,
+) -> dict[str, Any]:
+    """Change visibility of an existing YouTube video to Public in GPM Profile via Playwright CDP."""
+    clean_profile = str(profile_id or "").strip()
+    clean_vid_id = str(youtube_video_id or "").strip()
+    if not clean_profile:
+        raise BrowserUploadError("GPM Profile ID của kênh không được để trống.")
+    if not clean_vid_id:
+        raise BrowserUploadError("YouTube Video ID không được để trống.")
+
+    logger.info("Bắt đầu chuyển video %s sang trạng thái Công khai trong GPM profile %s", clean_vid_id, clean_profile)
+    async with gpm_browser_session(clean_profile, auto_stop=auto_stop_gpm) as (context, _browser):
+        page = await context.new_page()
+        try:
+            edit_url = f"https://studio.youtube.com/video/{clean_vid_id}/edit"
+            logger.info("Mở trang chỉnh sửa video YouTube Studio: %s", edit_url)
+            await page.goto(edit_url, wait_until="domcontentloaded", timeout=45000)
+            await asyncio.sleep(2.0)
+
+            # 1. Click Visibility dropdown trigger
+            visibility_trigger_selectors = [
+                "#visibility-container",
+                "ytcp-video-metadata-visibility",
+                "#edit-visibility-button",
+                "ytcp-video-metadata-visibility ytcp-text-dropdown-trigger",
+                "ytcp-video-metadata-visibility #trigger",
+                "[test-id='visibility-dropdown']",
+                "button[aria-label*='chế độ hiển thị']",
+                "button[aria-label*='visibility']",
+            ]
+            trigger_clicked = await _safe_click(page, visibility_trigger_selectors, timeout_ms=10000)
+            if not trigger_clicked:
+                raise BrowserUploadError("Không tìm thấy mục Chế độ hiển thị trên trang chỉnh sửa YouTube Studio.")
+            await asyncio.sleep(1.0)
+
+            # 2. Click Public radio button
+            public_radio_selectors = [
+                "tp-yt-paper-radio-button[name='PUBLIC']",
+                "ytcp-video-metadata-visibility tp-yt-paper-radio-button[name='PUBLIC']",
+                "tp-yt-paper-radio-button:has-text('Công khai')",
+                "tp-yt-paper-radio-button:has-text('Public')",
+            ]
+            radio_clicked = await _safe_click(page, public_radio_selectors, timeout_ms=8000)
+            if not radio_clicked:
+                raise BrowserUploadError("Không thể chọn radio 'Công khai' (Public) trong dropdown hiển thị.")
+            await asyncio.sleep(1.0)
+
+            # 3. Click Done inside visibility dialog if present
+            done_selectors = [
+                "ytcp-video-metadata-visibility #save-button",
+                "ytcp-video-metadata-visibility ytcp-button#done-button",
+                "ytcp-video-metadata-visibility ytcp-button:has-text('Xong')",
+                "ytcp-video-metadata-visibility ytcp-button:has-text('Done')",
+                "ytcp-button#done-button",
+            ]
+            await _safe_click(page, done_selectors, timeout_ms=5000)
+            await asyncio.sleep(1.0)
+
+            # 4. Click Save button on the edit page (top right)
+            save_btn_selectors = [
+                "#save-button",
+                "ytcp-entity-page #save-button",
+                "ytcp-button#save",
+                "ytcp-button:has-text('Lưu')",
+                "ytcp-button:has-text('Save')",
+            ]
+            save_clicked = await _safe_click(page, save_btn_selectors, timeout_ms=8000)
+            if not save_clicked:
+                logger.info("Nút Lưu không cần click hoặc đã tự động lưu.")
+            else:
+                await asyncio.sleep(2.0)
+
+            logger.info("Đã chuyển video %s sang trạng thái Công khai (Public) thành công.", clean_vid_id)
+            return {
+                "success": True,
+                "youtube_video_id": clean_vid_id,
+                "status": "published",
+                "privacy_status": "public",
+            }
         finally:
             try:
                 await page.close()

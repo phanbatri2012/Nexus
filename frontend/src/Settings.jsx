@@ -159,6 +159,7 @@ const DEFAULT_IMAGE_GENERATION_SETTINGS = {
 
 const DEFAULT_PUBLISHING_SETTINGS = {
   upload_method: 'browser',
+  publish_mode: 'schedule',
   category_id: '',
   language: 'vi',
   made_for_kids: null,
@@ -353,9 +354,13 @@ function pipelineDependents(pipeline, stepKey, thumbnailVariant) {
   return dependents;
 }
 
-function pipelineOutcome(pipeline) {
-  if (pipeline.youtube_schedule) return 'Dựng, upload và đặt lịch';
-  if (pipeline.youtube_upload) return 'Upload và giữ Private';
+function pipelineOutcome(pipeline, publishingSettings = {}) {
+  if (pipeline.youtube_upload) {
+    const mode = publishingSettings?.publish_mode || (pipeline.youtube_schedule ? 'schedule' : 'private');
+    if (mode === 'public') return 'Dựng, upload và Public ngay';
+    if (mode === 'schedule' || pipeline.youtube_schedule) return 'Dựng, upload và đặt lịch';
+    return 'Upload và giữ Private';
+  }
   if (pipeline.video_render) return 'Tạo MP4, không upload';
   if (pipeline.audio) return 'Kết thúc ở Audio';
   return 'Kết thúc sau khi tạo nội dung đã chọn';
@@ -1466,7 +1471,7 @@ export default function Settings({
           ))}
         </div>
         <div className="pipeline-outcome" role="status">
-          Kết quả: <strong>{pipelineOutcome(currentPipeline)}</strong>
+          Kết quả: <strong>{pipelineOutcome(currentPipeline, currentPublishing)}</strong>
         </div>
         {pipelineNotice && (
           <div className="help-text" style={{
@@ -2308,7 +2313,7 @@ export default function Settings({
             <div>
               <label>📤 Thiết lập upload YouTube của bộ prompt</label>
               <div className="help-text" style={{ marginTop: 5 }}>
-                Video luôn được upload Private. Không có chế độ tự Public ngay.
+                Tùy chỉnh phương thức upload và chế độ phát hành (Public ngay, Lên lịch tự động, hoặc Giữ Riêng tư).
               </div>
             </div>
             <button
@@ -2320,6 +2325,21 @@ export default function Settings({
             </button>
           </div>
           <div className="production-settings-grid">
+            <label>
+              Chế độ phát hành (Publish Mode)
+              <select
+                className="version-select"
+                value={currentPublishing.publish_mode || 'schedule'}
+                onChange={event => handlePromptSettingChange(
+                  'publishing_settings', 'publish_mode', event.target.value
+                )}
+                disabled={activeVersionLocked}
+              >
+                <option value="schedule">⏰ Lên lịch phát sóng tự động (Theo khung giờ đặt trước)</option>
+                <option value="public">⚡ Public ngay lập tức (Công khai trực tiếp khi upload xong)</option>
+                <option value="private">🔒 Riêng tư (Private - Lưu trong Studio không công khai)</option>
+              </select>
+            </label>
             <label>
               Phương thức Upload YouTube
               <select

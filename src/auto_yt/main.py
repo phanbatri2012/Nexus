@@ -376,6 +376,8 @@ class PromptImageGenerationData(BaseModel):
 
 
 class PromptPublishingData(BaseModel):
+    upload_method: str = "browser"
+    publish_mode: str = "schedule"
     category_id: str = Field(default="", max_length=10)
     language: str = Field(default="vi", min_length=2, max_length=35)
     made_for_kids: Optional[bool] = None
@@ -1574,6 +1576,161 @@ async def open_video_watch_in_gpm(video_id: int):
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Lỗi khi mở video trong GPM: {exc}")
+
+
+@app.post("/api/videos/{video_id}/publish-now")
+async def publish_video_now_endpoint(video_id: int):
+    """Trigger instant public publishing for a video (either already uploaded or newly rendered)."""
+    video = db.get_video(video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Không tìm thấy video.")
+
+    # 1. Check if video is already on YouTube (in video_publications or published_youtube_video_id)
+    pubs = db.list_video_publications(video_id)
+    target_pub = pubs[0] if pubs else None
+    youtube_video_id = str((target_pub or {}).get("youtube_video_id") or video.get("published_youtube_video_id") or "").strip()
+    if not youtube_video_id and target_pub and target_pub.get("published_url"):
+        youtube_video_id = youtube_comments.extract_youtube_video_id(target_pub["published_url"])
+
+    if youtube_video_id:
+        channel_db_id = (target_pub or {}).get("youtube_channel_id")
+        target_channel = db.get_youtube_channel(int(channel_db_id)) if channel_db_id else None
+        if not target_channel:
+            prompt_ver = str(video.get("prompt_version") or "").strip()
+            if prompt_ver:
+                try:
+                    configs = prompt_assets.load_prompt_settings()
+                    prompt_cfg = configs.get("prompts", {}).get(prompt_ver, {})
+                    assigned_id = prompt_cfg.get("youtube_channel_id")
+                    if assigned_id:
+                        target_channel = db.get_youtube_channel(int(assigned_id))
+                except Exception:
+                    pass
+
+        profile_id = str((target_channel or {}).get("gpm_profile_id") or "").strip()
+        upload_method = "browser"
+        if not profile_id and target_channel and target_channel.get("access_token_encrypted"):
+            upload_method = "api"
+
+        try:
+            if upload_method == "api":
+                from auto_yt.services import youtube_publisher
+                token = youtube_comments.access_token_for_channel(
+                    target_channel,
+                    _persist_refreshed_token,
+                    proxy=str(target_channel.get("gpm_proxy_info") or "").strip() or None,
+                )
+                youtube_publisher.publish_video_now(
+                    token,
+                    youtube_video_id,
+                    proxy=str(target_channel.get("gpm_proxy_info") or "").strip() or None,
+                )
+            else:
+                if not profile_id:
+                    channel_name = target_channel.get("title") if target_channel else "liên kết"
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Kênh '{channel_name}' chưa được gán GPM Profile. Vui lòng vào menu 'Kết nối Kênh' để gán profile.",
+                    )
+                from auto_yt.services import browser_youtube_uploader
+                await browser_youtube_uploader.make_video_public_via_browser(
+                    profile_id=profile_id,
+                    youtube_video_id=youtube_video_id,
+                )
+
+            now_iso = db.utc_now()
+            if target_pub:
+                db.update_video_publication(
+                    int(target_pub["id"]),
+                    privacy_status="public",
+                    processing_status="succeeded",
+                    scheduled_at="",
+                    published_at=now_iso,
+                )
+            db.update_video_production_state(
+                video_id,
+                publish_status="published",
+                current_stage="published",
+                production_progress="Đã chuyển sang Công khai (Public) ngay",
+                blocking_reason="",
+            )
+            wf = db.get_youtube_publish_workflow_for_video(video_id)
+            if wf:
+                db.update_youtube_publish_workflow(
+                    wf["id"],
+                    status="published",
+                    stage="published",
+                    scheduled_at="",
+                )
+            return {
+                "success": True,
+                "message": f"Đã chuyển video {youtube_video_id} sang chế độ Công khai (Public) ngay!",
+                "status": "published",
+                "youtube_video_id": youtube_video_id,
+            }
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Không thể công khai video: {exc}")
+
+    # 2. Video is not on YouTube yet -> Check if MP4 is ready and enqueue youtube_publish with publish_mode="public"
+    artifact = db.get_latest_video_artifact(video_id, "final_mp4", status="ready")
+    if not artifact:
+        raise HTTPException(
+            status_code=400,
+            detail="Video chưa được dựng MP4 hoàn tất. Vui lòng dựng video trước khi xuất bản.",
+        )
+
+    prompt_version = str(video.get("prompt_version") or "")
+    snapshot = _get_prompt_production_snapshot(prompt_version)
+    if not isinstance(snapshot.get("publishing_settings"), dict):
+        snapshot["publishing_settings"] = {}
+    snapshot["publishing_settings"]["publish_mode"] = "public"
+    if not isinstance(snapshot.get("pipeline"), dict):
+        snapshot["pipeline"] = {}
+    snapshot["pipeline"]["youtube_upload"] = True
+    snapshot["pipeline"]["youtube_schedule"] = False
+
+    # Cancel previous failed/paused publish jobs if any
+    for old_job in db.list_system_jobs(video_id=video_id, limit=None):
+        if old_job.get("job_type") == "youtube_publish" and old_job.get("status") in {"queued", "paused", "retry_wait", "running"}:
+            db.update_system_job(old_job["id"], status="canceled", cancel_requested=1)
+
+    existing_wf = db.get_youtube_publish_workflow_for_video(video_id)
+    if existing_wf:
+        db.update_youtube_publish_workflow(
+            existing_wf["id"],
+            status="running",
+            stage="preflight",
+            error="",
+            snapshot_json=snapshot,
+        )
+
+    job = db.create_system_job(
+        job_id=f"youtube-publish-{uuid.uuid4().hex}",
+        job_type="youtube_publish",
+        title=f"Đăng ngay YouTube: {video.get('generated_title') or video.get('title') or video_id}",
+        payload={
+            "video_id": video_id,
+            "artifact_id": int(artifact["id"]),
+            "snapshot": snapshot,
+            "publish_mode": "public",
+        },
+        prompt_version=prompt_version,
+    )
+    job = db.update_system_job(job["id"], video_id=video_id)
+    db.update_video_production_state(
+        video_id,
+        publish_status="queued",
+        current_stage="preflight",
+        production_progress="Đang chờ xuất bản công khai ngay",
+        blocking_reason="",
+    )
+    _kick_production_queue()
+    return {
+        "success": True,
+        "message": "Đã đưa video vào hàng đợi xuất bản công khai ngay!",
+        "job_id": job["id"],
+        "status": "queued",
+    }
 
 
 @app.get("/api/videos/{video_id}/publications")

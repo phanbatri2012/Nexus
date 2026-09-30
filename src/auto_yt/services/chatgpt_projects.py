@@ -177,6 +177,8 @@ DEFAULT_IMAGE_GENERATION_SETTINGS = {
 }
 UPLOAD_METHODS = ("browser", "api")
 DEFAULT_UPLOAD_METHOD = "browser"
+PUBLISH_MODES = {"public", "schedule", "private"}
+DEFAULT_PUBLISH_MODE = "schedule"
 MONETIZATION_MODES = {
     "auto_enable_if_available",
     "keep_off",
@@ -199,6 +201,7 @@ CAPTION_CERTIFICATIONS = {
 
 DEFAULT_PUBLISHING_SETTINGS = {
     "upload_method": DEFAULT_UPLOAD_METHOD,
+    "publish_mode": "schedule",
     "category_id": "",
     "language": "vi",
     "made_for_kids": None,
@@ -465,6 +468,10 @@ def normalize_publishing_settings(value: object) -> dict:
     normalized["upload_method"] = (
         upload_method if upload_method in UPLOAD_METHODS else DEFAULT_UPLOAD_METHOD
     )
+    publish_mode = str(settings.get("publish_mode") or DEFAULT_PUBLISH_MODE).strip().lower()
+    normalized["publish_mode"] = (
+        publish_mode if publish_mode in PUBLISH_MODES else DEFAULT_PUBLISH_MODE
+    )
     normalized["category_id"] = str(settings.get("category_id") or "").strip()
     normalized["language"] = str(settings.get("language") or "vi").strip() or "vi"
     normalized["made_for_kids"] = (
@@ -600,6 +607,7 @@ def validate_publishing_settings(value: object) -> dict:
     if isinstance(default_tags, str) and len(default_tags) > 500:
         raise ValueError("Thẻ từ khóa mặc định không được vượt quá 500 ký tự.")
     enum_fields = {
+        "publish_mode": PUBLISH_MODES,
         "monetization_mode": MONETIZATION_MODES,
         "ad_suitability_mode": AD_SUITABILITY_MODES,
         "remix_policy": REMIX_POLICIES,
