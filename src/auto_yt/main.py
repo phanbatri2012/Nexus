@@ -610,6 +610,8 @@ class VideoRequest(BaseModel):
     url: str = Field(min_length=1, max_length=2048)
     prompt_version: Optional[str] = Field(default=None, max_length=120)
     voice_id: Optional[str] = Field(default=None, max_length=200)
+    publish_mode: Optional[Literal["public", "schedule", "private"]] = None
+    publish_immediately: Optional[bool] = None
 
 class VideoResponse(BaseModel):
     success: bool
@@ -5491,6 +5493,18 @@ def process_video(request: VideoRequest):
     pipeline = chatgpt_projects.normalize_prompt_pipeline(
         _production_snapshot.get("pipeline")
     )
+    publish_mode_override = request.publish_mode or ("public" if request.publish_immediately else None)
+    if publish_mode_override:
+        if not isinstance(_production_snapshot.get("publishing_settings"), dict):
+            _production_snapshot["publishing_settings"] = {}
+        _production_snapshot["publishing_settings"]["publish_mode"] = publish_mode_override
+        if publish_mode_override == "public":
+            if not isinstance(_production_snapshot.get("pipeline"), dict):
+                _production_snapshot["pipeline"] = {}
+            _production_snapshot["pipeline"]["youtube_upload"] = True
+            _production_snapshot["pipeline"]["youtube_schedule"] = False
+            pipeline["youtube_upload"] = True
+            pipeline["youtube_schedule"] = False
     requested_voice_id = request.voice_id or _get_prompt_default_voice_id(
         resolved_prompt_version
     )
@@ -5567,6 +5581,7 @@ def process_video(request: VideoRequest):
             "voice_snapshot": voice_snapshot,
             "pipeline": pipeline,
             "production_snapshot": _production_snapshot,
+            "publish_mode": publish_mode_override,
         },
         prompt_version=resolved_prompt_version,
         voice_id=selected_voice["id"],

@@ -224,6 +224,7 @@ function App() {
   const [sceneResetDialog, setSceneResetDialog] = useState(null)
   const [currentVideoHasCheckpoint, setCurrentVideoHasCheckpoint] = useState(false)
   const [isPublishingNow, setIsPublishingNow] = useState(false)
+  const [publishImmediately, setPublishImmediately] = useState(false)
   const [chatGptStatus, setChatGptStatus] = useState({
     busy: false,
     operation: '',
@@ -700,7 +701,9 @@ function App() {
         body: JSON.stringify({
           url: submittedUrl,
           prompt_version: selectedPromptVersion,
-          voice_id: selectedVoiceId || null
+          voice_id: selectedVoiceId || null,
+          publish_mode: publishImmediately ? 'public' : null,
+          publish_immediately: publishImmediately
         })
       })
       const data = await response.json()
@@ -708,6 +711,7 @@ function App() {
         throw new Error(data.detail || 'Backend không trả về mã job.')
       }
       setUrl('')
+      setPublishImmediately(false)
       setProgressMsg(
         data.duplicate
           ? 'Video này đã có trong hàng đợi; hệ thống không tạo job trùng.'
@@ -2160,6 +2164,30 @@ function App() {
                     <VoiceOptions voices={voiceOptions} />
                   </select>
                 </div>
+
+                <label style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                  cursor: 'pointer',
+                  userSelect: 'none',
+                  color: publishImmediately ? '#f39c12' : '#bbb',
+                  fontWeight: '600',
+                  fontSize: '14px',
+                  background: publishImmediately ? 'rgba(243, 156, 18, 0.15)' : 'rgba(255, 255, 255, 0.03)',
+                  border: publishImmediately ? '1px solid #f39c12' : '1px solid rgba(255, 255, 255, 0.1)',
+                  padding: '12px 20px',
+                  borderRadius: '12px',
+                  transition: 'all 0.2s ease'
+                }}>
+                  <input
+                    type="checkbox"
+                    checked={publishImmediately}
+                    onChange={(e) => setPublishImmediately(e.target.checked)}
+                    style={{ accentColor: '#f39c12', cursor: 'pointer', width: '16px', height: '16px' }}
+                  />
+                  <span>⚡ Public ngay khi làm xong</span>
+                </label>
               </div>
 
               <div className="input-group">

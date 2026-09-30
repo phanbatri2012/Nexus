@@ -781,6 +781,31 @@ class PromptSettingsTests(unittest.TestCase):
         self.assertEqual(saved_img["scene_body_prompt_template"], custom_scene_body)
         self.assertEqual(result["version"]["image_generation_settings"]["video_motion_prompt"], custom_motion)
 
+    @patch.object(main, "_kick_video_queue")
+    def test_process_video_with_publish_mode_override(self, mock_kick):
+        req = main.VideoRequest(
+            url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            prompt_version="default",
+            publish_immediately=True,
+        )
+        res = main.process_video(req)
+        try:
+            self.assertIn("job_id", res)
+            job = main.db.get_system_job(res["job_id"])
+            self.assertIsNotNone(job)
+            payload = job.get("payload") or {}
+            self.assertEqual(payload.get("publish_mode"), "public")
+            snapshot = payload.get("production_snapshot") or {}
+            pub_settings = snapshot.get("publishing_settings") or {}
+            self.assertEqual(pub_settings.get("publish_mode"), "public")
+            pipeline = payload.get("pipeline") or {}
+            self.assertTrue(pipeline.get("youtube_upload"))
+            self.assertFalse(pipeline.get("youtube_schedule"))
+        finally:
+            if res.get("job_id"):
+                main.db.update_system_job(res["job_id"], status="canceled")
+                main.db.delete_system_job(res["job_id"])
+
 
 if __name__ == "__main__":
     unittest.main()
