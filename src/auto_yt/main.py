@@ -65,6 +65,8 @@ from auto_yt.dialogue_parser import (
     clean_turn_text_for_tts,
     build_dialogue_tts_segments,
     resolve_turn_voice,
+    group_segments_by_role,
+    build_speaker_streams,
 )
 from auto_yt.services import voice_config
 from auto_yt.services import (
@@ -648,6 +650,14 @@ class RegenerateAudioRequest(BaseModel):
     voice_id: str
     confirm_credit_charge: bool
     cast_voice_overrides: Optional[dict] = None
+
+
+class RegenerateRoleAudioRequest(BaseModel):
+    role: str
+    voice_id: str
+    voice_name: Optional[str] = ""
+    confirm_credit_charge: Optional[bool] = False
+
 
 
 class ApproveAudioReviewRequest(BaseModel):
@@ -2378,11 +2388,61 @@ def _require_audio_review_approval(video_id: int) -> dict:
     return review
 
 
+def _compute_role_streams(segments: list[dict], video_id: int) -> dict[str, dict]:
+    if not segments:
+        return {}
+    role_stats: dict[str, dict] = {}
+    for segment in segments:
+        r = segment.get("role") or "MC"
+        if r not in role_stats:
+            role_stats[r] = {
+                "role": r,
+                "voice_id": segment.get("voice_id", ""),
+                "voice_name": segment.get("voice_name", ""),
+                "total": 0,
+                "completed": 0,
+                "processing": 0,
+                "queued": 0,
+                "failed": 0,
+                "percent": 0.0,
+                "status": "pending",
+                "preview_audio_url": "",
+            }
+        role_stats[r]["total"] += 1
+        s_status = segment.get("status", "pending")
+        if s_status == "completed" and segment.get("audio_url"):
+            role_stats[r]["completed"] += 1
+        elif s_status == "processing":
+            role_stats[r]["processing"] += 1
+        elif s_status == "queued":
+            role_stats[r]["queued"] += 1
+        elif s_status == "failed":
+            role_stats[r]["failed"] += 1
+
+    for r, st in role_stats.items():
+        if st["total"] > 0:
+            st["percent"] = round((st["completed"] / st["total"]) * 100.0, 1)
+        if st["failed"] > 0:
+            st["status"] = "failed"
+        elif st["completed"] == st["total"] and st["total"] > 0:
+            st["status"] = "completed"
+            preview_filename = f"video_{video_id}_preview_{r}.mp3"
+            preview_path = AUDIO_DIR / preview_filename
+            if preview_path.is_file() and preview_path.stat().st_size > 0:
+                st["preview_audio_url"] = f"http://127.0.0.1:8080/api/audio/{preview_filename}"
+        elif st["processing"] > 0 or st["queued"] > 0:
+            st["status"] = "processing"
+        else:
+            st["status"] = "pending"
+    return role_stats
+
+
 def _audio_task_response(task: dict) -> dict:
     segments = _get_audio_segments(task)
     missing_segments = sum(not segment.get("task_id") for segment in segments)
+    video_id = task.get("video_id", 0)
     return {
-        "video_id": task["video_id"],
+        "video_id": video_id,
         "task_id": task["task_id"],
         "status": task["status"],
         "audio_url": task.get("audio_url", ""),
@@ -2397,6 +2457,7 @@ def _audio_task_response(task: dict) -> dict:
             segment.get("status") == "completed" for segment in segments
         ),
         "missing_segments": missing_segments,
+        "role_streams": _compute_role_streams(segments, video_id),
     }
 
 
@@ -2658,6 +2719,27 @@ def _sync_batch_audio_task(stored_task: dict, segments: list[dict]) -> dict:
         else ""
     )
     audio_url = ""
+
+    # Tự động tạo file preview âm thanh riêng cho vai diễn nếu vai đó đã hoàn thành 100%
+    role_grouped: dict[str, list[dict]] = {}
+    for seg in segments:
+        r = seg.get("role") or "MC"
+        if r not in role_grouped:
+            role_grouped[r] = []
+        role_grouped[r].append(seg)
+    for r, r_segs in role_grouped.items():
+        if r_segs and all(s.get("status") == "completed" and s.get("audio_url") for s in r_segs):
+            preview_filename = f"video_{video_id}_preview_{r}.mp3"
+            preview_path = AUDIO_DIR / preview_filename
+            if not preview_path.is_file() or preview_path.stat().st_size == 0:
+                try:
+                    audio_utils.merge_audio_segments_to_mp3(
+                        sources=r_segs,
+                        output_path=preview_path,
+                        pause_between_turns=0.20,
+                    )
+                except Exception as p_exc:
+                    print(f"Failed to generate role preview for {r}: {p_exc}", file=sys.stderr)
 
     if failed_segments:
         status = "failed"
@@ -7911,6 +7993,245 @@ def regenerate_audio_for_video(
         "audio_task": _audio_task_response(task),
         "preserved_previous_audio": "### [AUDIO]" in video["generated_script"],
     }
+
+
+@app.post("/api/videos/{video_id}/regenerate-role-audio")
+def regenerate_role_audio_for_video(
+    video_id: int,
+    request: RegenerateRoleAudioRequest,
+):
+    video = _require_actionable_video(video_id)
+    review = _automatically_approve_audio_review(video_id)
+    if review.get("status") != "approved":
+        raise HTTPException(
+            status_code=409,
+            detail="Kịch bản không đạt kiểm tra tự động; chưa tạo lại audio.",
+        )
+    role_to_regen = request.role.strip()
+    if not role_to_regen:
+        raise HTTPException(status_code=400, detail="Vui lòng chỉ định vai diễn cần tạo lại.")
+
+    try:
+        selected_voice = _normalize_voice_record(
+            voice_config.get_voice(
+                request.voice_id,
+                include_inactive=False,
+            ),
+            fallback_id=request.voice_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    provider_config = voice_config.get_provider(selected_voice["provider_id"])
+    if (
+        (provider_config.get("capabilities") or {}).get("billable")
+        and not request.confirm_credit_charge
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Phải xác nhận nhà cung cấp cloud có thể trừ credit cho audio mới.",
+        )
+
+    # 1. Cập nhật cast_voice_overrides trong production_snapshot_json
+    prod_snapshot = {}
+    try:
+        prod_snapshot = json.loads(video.get("production_snapshot_json") or "{}")
+    except Exception:
+        pass
+    cast_overrides = prod_snapshot.get("cast_voice_overrides") or prod_snapshot.get("cast_settings") or {}
+    role_key = (
+        "mc" if role_to_regen.upper() in ("MC", "HOST", "NGUOI_DAN")
+        else "guest_1" if role_to_regen.upper() in ("KHACH_1", "GUEST_1", "KHACH")
+        else "guest_2" if role_to_regen.upper() in ("KHACH_2", "GUEST_2")
+        else "guest_3" if role_to_regen.upper() in ("KHACH_3", "GUEST_3")
+        else role_to_regen.lower()
+    )
+    cast_overrides[role_key] = selected_voice["id"]
+    cast_overrides[role_to_regen] = selected_voice["id"]
+    prod_snapshot["cast_voice_overrides"] = cast_overrides
+    db.update_video_production(
+        video_id,
+        production_snapshot_json=json.dumps(prod_snapshot, ensure_ascii=False),
+    )
+    video["production_snapshot_json"] = json.dumps(prod_snapshot, ensure_ascii=False)
+
+    raw_script = video.get("generated_script", "")
+    script_for_tts = get_clean_script_for_tts(raw_script)
+    if not script_for_tts:
+        raise HTTPException(status_code=400, detail="Không tìm thấy kịch bản để tạo lại audio.")
+
+    available_voices = voice_config.load_voice_config().get("voices", [])
+    primary_voice_id = cast_overrides.get("mc") or video.get("voice_id") or selected_voice["id"]
+    dialogue_segments = build_dialogue_tts_segments(
+        script_for_tts,
+        cast_settings=cast_overrides,
+        default_voice_id=primary_voice_id,
+        available_voices=available_voices,
+        max_segment_chars=7500,
+    )
+    for seg in dialogue_segments:
+        seg["text"] = apply_tts_filters(seg["text"])
+        seg["characters"] = len(seg["text"])
+    requested_hash = tts.get_dialogue_request_hash(dialogue_segments)
+
+    # 2. Xóa các file preview cũ của vai này và file master
+    preview_path = AUDIO_DIR / f"video_{video_id}_preview_{role_to_regen}.mp3"
+    preview_path.unlink(missing_ok=True)
+    master_path = AUDIO_DIR / f"video_{video_id}_{requested_hash[:16]}.mp3"
+    master_path.unlink(missing_ok=True)
+
+    stored_task = db.get_audio_task(video_id)
+    existing_segments = _get_audio_segments(stored_task) if stored_task else []
+    existing_by_index = {
+        s.get("index"): s for s in existing_segments if s.get("task_id")
+    }
+
+    updated_segments = []
+    for index, d_seg in enumerate(dialogue_segments):
+        seg_role = d_seg.get("role") or "MC"
+        if seg_role == role_to_regen:
+            # Vai mục tiêu: reset để sinh lại với voice mới
+            v_snapshot = (
+                voice_config.build_voice_snapshot(selected_voice)
+                if selected_voice["id"] == d_seg["voice_id"]
+                else None
+            )
+            updated_segments.append({
+                "index": index,
+                "role": seg_role,
+                "voice_id": selected_voice["id"],
+                "voice_name": selected_voice["name"],
+                "tts_provider_id": selected_voice.get("provider_id", "genmax"),
+                "text_hash": tts.get_request_hash(d_seg["text"], selected_voice["id"], v_snapshot),
+                "characters": len(d_seg["text"]),
+                "task_id": "",
+                "status": "not_submitted",
+                "audio_url": "",
+                "error": "",
+            })
+        else:
+            # Các vai khác: giữ nguyên 100% audio clip đã hoàn thành
+            existing_s = existing_by_index.get(index)
+            if existing_s and existing_s.get("voice_id") == d_seg.get("voice_id"):
+                updated_segments.append(existing_s)
+            else:
+                s_voice_id = d_seg.get("voice_id", primary_voice_id)
+                s_voice = voice_config.get_voice(s_voice_id, include_inactive=True)
+                updated_segments.append({
+                    "index": index,
+                    "role": seg_role,
+                    "voice_id": s_voice_id,
+                    "voice_name": s_voice.get("name", ""),
+                    "tts_provider_id": s_voice.get("provider_id", "genmax"),
+                    "text_hash": tts.get_request_hash(d_seg["text"], s_voice_id),
+                    "characters": len(d_seg["text"]),
+                    "task_id": "",
+                    "status": "not_submitted",
+                    "audio_url": "",
+                    "error": "",
+                })
+
+    task = _store_batch_audio_task(
+        video_id,
+        requested_hash,
+        updated_segments,
+        primary_voice_id,
+        selected_voice.get("name", ""),
+        status="processing",
+    )
+
+    for seg in updated_segments:
+        if seg["task_id"]:
+            continue
+        idx = seg["index"]
+        seg_text = dialogue_segments[idx]["text"]
+        seg_v_id = seg["voice_id"]
+        v_snap = voice_config.build_voice_snapshot(voice_config.get_voice(seg_v_id, include_inactive=True))
+        sub_task = tts.submit_tts_task(seg_text, seg_v_id, v_snap)
+        seg["task_id"] = sub_task["id"]
+        seg["status"] = sub_task.get("status", "pending")
+        seg["audio_url"] = (sub_task.get("result") or {}).get("audio_url", "")
+        seg["error"] = str(sub_task.get("error") or "")
+
+    task = _store_batch_audio_task(
+        video_id,
+        requested_hash,
+        updated_segments,
+        primary_voice_id,
+        selected_voice.get("name", ""),
+        status="processing",
+    )
+    _start_audio_watcher(video_id)
+
+    return {
+        "success": True,
+        "message": f"Đã bắt đầu tạo lại audio riêng cho vai {role_to_regen}.",
+        "audio_task": _audio_task_response(task),
+    }
+
+
+@app.post("/api/videos/{video_id}/merge-audio")
+def merge_video_audio(video_id: int):
+    video = _require_actionable_video(video_id)
+    task = db.get_audio_task(video_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Không tìm thấy audio task.")
+    segments = _get_audio_segments(task)
+    if not segments:
+        raise HTTPException(status_code=400, detail="Không có segment audio để ghép.")
+
+    task = _sync_batch_audio_task(task, segments)
+    segments = _get_audio_segments(task)
+    incomplete = [s for s in segments if s.get("status") != "completed" or not s.get("audio_url")]
+    if incomplete:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Còn {len(incomplete)}/{len(segments)} đoạn chưa hoàn thành; chưa thể ghép audio master."
+        )
+    return {"success": True, "audio_task": _audio_task_response(task)}
+
+
+@app.post("/api/videos/{video_id}/cancel-audio")
+def cancel_audio_for_video(video_id: int):
+    video = _require_actionable_video(video_id)
+    with _audio_submit_lock:
+        task = db.get_audio_task(video_id)
+        if not task:
+            return {"success": True, "message": "Không tìm thấy audio task để dừng."}
+
+        provider_id = task.get("tts_provider_id") or ""
+        segments_json = task.get("segments_json") or ""
+        if provider_id == "omnivoice" or "omnivoice" in str(task.get("task_id", "")):
+            try:
+                if segments_json:
+                    segments = json.loads(segments_json)
+                    for seg in segments:
+                        seg_tid = seg.get("task_id", "")
+                        if seg_tid.startswith(tts.OMNIVOICE_TASK_PREFIX):
+                            job_id = seg_tid[len(tts.OMNIVOICE_TASK_PREFIX):]
+                            omnivoice_client.cancel_job(job_id)
+                elif str(task.get("task_id", "")).startswith(tts.OMNIVOICE_TASK_PREFIX):
+                    job_id = task["task_id"][len(tts.OMNIVOICE_TASK_PREFIX):]
+                    omnivoice_client.cancel_job(job_id)
+            except Exception as exc:
+                print(f"Lỗi khi hủy job OmniVoice: {exc}", file=sys.stderr)
+
+        task = db.upsert_audio_task(
+            video_id=video_id,
+            request_hash=task.get("request_hash") or "",
+            task_id=task.get("task_id") or "",
+            status="failed",
+            audio_url=task.get("audio_url") or "",
+            error="Đã dừng tiến trình tạo audio theo yêu cầu người dùng.",
+            segments_json=segments_json,
+            voice_id=task.get("voice_id") or "",
+            voice_name=task.get("voice_name") or "",
+            tts_provider_id=task.get("tts_provider_id") or "genmax",
+        )
+        return {
+            "success": True,
+            "audio_task": _audio_task_response(task),
+        }
 
 
 @app.post("/api/videos/{video_id}/retry-audio")

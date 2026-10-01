@@ -190,8 +190,10 @@ function App() {
   const [showPreviewModal, setShowPreviewModal] = useState(false)
   const [copiedPreview, setCopiedPreview] = useState(false)
   const [isGenAudio, setIsGenAudio] = useState(false)
+  const [isCancelingAudio, setIsCancelingAudio] = useState(false)
   const [audioStatus, setAudioStatus] = useState('not_started')
   const [audioMissingSegments, setAudioMissingSegments] = useState(0)
+  const [audioRoleStreams, setAudioRoleStreams] = useState(null)
   const [renderInfo, setRenderInfo] = useState(null)
   const [isRendering, setIsRendering] = useState(false)
   const [isCancelingRender, setIsCancelingRender] = useState(false)
@@ -565,6 +567,7 @@ function App() {
         const status = data.audio_task?.status || 'not_started';
         setAudioStatus(status);
         setAudioMissingSegments(data.audio_task?.missing_segments || 0);
+        setAudioRoleStreams(data.audio_task?.role_streams || null);
         setAudioTaskVoiceName(data.audio_task?.voice_name || '');
         setAudioTaskProviderId(data.audio_task?.tts_provider_id || 'genmax');
         setIsGenAudio(status === 'pending' || status === 'processing');
@@ -825,6 +828,7 @@ function App() {
       setCurrentVideoHasCheckpoint(Boolean(data.has_checkpoint));
       setAudioStatus('not_started');
       setAudioMissingSegments(0);
+      setAudioRoleStreams(null);
       setRenderInfo(null);
       setIsRendering(false);
       setErrorMsg('');
@@ -1398,6 +1402,90 @@ function App() {
     } catch (error) {
       setIsGenAudio(false);
       alert('Lỗi: ' + error.message);
+    }
+  };
+
+  const handleCancelAudio = async () => {
+    if (!currentVideoId || isCancelingAudio) return;
+    setIsCancelingAudio(true);
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:8080/api/videos/${currentVideoId}/cancel-audio`,
+        { method: 'POST' }
+      );
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.detail || data.error || 'Không thể dừng tiến trình tạo audio.');
+      }
+      setIsGenAudio(false);
+      setAudioStatus('failed');
+    } catch (error) {
+      alert('Lỗi dừng audio: ' + error.message);
+    } finally {
+      setIsCancelingAudio(false);
+    }
+  };
+
+  const handleRegenerateRoleAudio = async (role, targetVoiceId) => {
+    if (!currentVideoId || isGenAudio) return;
+    const vId = targetVoiceId || selectedMcVoiceId || regenerateVoiceId;
+    const vName = getVoiceName(vId);
+    const roleLabel = role === 'MC' ? 'MC' : role === 'KHACH_1' ? 'Khách 1' : role === 'KHACH_2' ? 'Khách 2' : role;
+    const confirmed = window.confirm(
+      `Tạo lại chỉ riêng vai [${roleLabel}] với giọng ${vName}? ` +
+      'Các vai khác đã hoàn thành sẽ được giữ nguyên 100% audio.'
+    );
+    if (!confirmed) return;
+
+    setIsGenAudio(true);
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:8080/api/videos/${currentVideoId}/regenerate-role-audio`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            role: role,
+            voice_id: vId,
+            voice_name: vName,
+            confirm_credit_charge: false
+          })
+        }
+      );
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.detail || data.error || 'Không thể tạo lại vai này.');
+      }
+      const status = data.audio_task?.status || 'pending';
+      setAudioStatus(status);
+      setAudioRoleStreams(data.audio_task?.role_streams || null);
+      setIsGenAudio(status === 'pending' || status === 'processing');
+    } catch (error) {
+      setIsGenAudio(false);
+      alert('Lỗi: ' + error.message);
+    }
+  };
+
+  const handleMergeMasterAudio = async () => {
+    if (!currentVideoId || isGenAudio) return;
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:8080/api/videos/${currentVideoId}/merge-audio`,
+        { method: 'POST' }
+      );
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.detail || data.error || 'Không thể ghép audio.');
+      }
+      alert('Đã ghép Audio Master thành công!');
+      const status = data.audio_task?.status || 'completed';
+      setAudioStatus(status);
+      setAudioRoleStreams(data.audio_task?.role_streams || null);
+      const videoResponse = await fetch(`http://127.0.0.1:8080/api/videos/${currentVideoId}`);
+      const video = await videoResponse.json();
+      setResultText(video.generated_script);
+    } catch (error) {
+      alert('Lỗi ghép audio: ' + error.message);
     }
   };
 
@@ -2743,6 +2831,232 @@ function App() {
                         hasAudio={Boolean(audioUrl)}
                       />
                     )}
+
+                    {/* Persistent Live Pipeline Progress & Process Control Panel */}
+                    {activeTab === 'summary' && currentVideoId && (
+                      <div
+                        className="result-panel"
+                        style={{
+                          padding: '16px 20px',
+                          background: 'linear-gradient(135deg, rgba(20, 24, 35, 0.85) 0%, rgba(15, 18, 28, 0.95) 100%)',
+                          border: '1px solid rgba(77, 208, 225, 0.3)',
+                          borderRadius: '10px',
+                          boxShadow: '0 4px 20px rgba(0, 0, 0, 0.3)',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '12px'
+                        }}
+                      >
+                        {/* Header of Progress Panel */}
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '10px' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                            <span style={{ fontSize: '1.2em' }}>⚡</span>
+                            <div>
+                              <h4 style={{ margin: 0, color: '#4dd0e1', fontSize: '0.95em', fontWeight: '700', letterSpacing: '0.3px' }}>
+                                TIẾN TRÌNH & ĐIỀU KHIỂN TÁC VỤ (PIPELINE CONTROL)
+                              </h4>
+                              <span style={{ fontSize: '0.78em', color: '#888' }}>
+                                Theo dõi trạng thái thời gian thực và quản lý dừng các tiến trình tạo lại / dựng video
+                              </span>
+                            </div>
+                          </div>
+
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <button
+                              onClick={() => setActiveView('jobs')}
+                              className="btn-secondary"
+                              style={{
+                                padding: '4px 12px',
+                                fontSize: '0.78em',
+                                background: 'rgba(77, 208, 225, 0.1)',
+                                borderColor: 'rgba(77, 208, 225, 0.4)',
+                                color: '#4dd0e1',
+                                borderRadius: '6px',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '5px',
+                                cursor: 'pointer'
+                              }}
+                              title="Mở Trung tâm Job để xem logs chi tiết và quản lý toàn bộ tiến trình hệ thống"
+                            >
+                              ⚡ Mở Trung tâm Job
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Live Status Stages Grid */}
+                        <div
+                          style={{
+                            display: 'grid',
+                            gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+                            gap: '10px',
+                            marginTop: '4px'
+                          }}
+                        >
+                          {/* 1. Kịch bản & Metadata */}
+                          <div
+                            style={{
+                              background: 'rgba(255, 255, 255, 0.03)',
+                              border: '1px solid rgba(255, 255, 255, 0.08)',
+                              borderRadius: '8px',
+                              padding: '10px 12px'
+                            }}
+                          >
+                            <div style={{ fontSize: '0.76em', color: '#888', fontWeight: '600', marginBottom: '4px' }}>
+                              📝 1. KỊCH BẢN & METADATA
+                            </div>
+                            <div style={{
+                              fontSize: '0.85em',
+                              fontWeight: '600',
+                              color: (generatingThumbnailType !== null || isGeneratingChapters || isGeneratingMetadata || isGeneratingTitle || isGeneratingSlug || isGeneratingDescription || isGeneratingTags || isGeneratingPinnedComment || isGeneratingQuiz) ? '#f5b041' : resultText ? '#2ecc71' : '#888'
+                            }}>
+                              {(generatingThumbnailType !== null || isGeneratingChapters || isGeneratingMetadata || isGeneratingTitle || isGeneratingSlug || isGeneratingDescription || isGeneratingTags || isGeneratingPinnedComment || isGeneratingQuiz)
+                                ? `⏳ Đang tạo ${generatingThumbnailType !== null ? 'Thumbnail' : isGeneratingChapters ? 'Chapters' : isGeneratingMetadata ? 'Metadata' : isGeneratingTitle ? 'Tiêu đề' : isGeneratingSlug ? 'Slug' : isGeneratingDescription ? 'Mô tả' : isGeneratingTags ? 'Tags' : isGeneratingPinnedComment ? 'Ghim' : 'Quiz'}...`
+                                : resultText
+                                  ? '✅ Kịch bản hoàn tất'
+                                  : '⚪ Chưa có kịch bản'}
+                            </div>
+                          </div>
+
+                          {/* 2. Audio Voice-over */}
+                          <div
+                            style={{
+                              background: isGenAudio ? 'rgba(245, 176, 65, 0.08)' : 'rgba(255, 255, 255, 0.03)',
+                              border: isGenAudio ? '1px solid rgba(245, 176, 65, 0.4)' : '1px solid rgba(255, 255, 255, 0.08)',
+                              borderRadius: '8px',
+                              padding: '10px 12px',
+                              display: 'flex',
+                              flexDirection: 'column',
+                              justifyContent: 'space-between',
+                              gap: '6px'
+                            }}
+                          >
+                            <div>
+                              <div style={{ fontSize: '0.76em', color: '#888', fontWeight: '600', marginBottom: '4px' }}>
+                                🎙️ 2. AUDIO VOICE-OVER
+                              </div>
+                              <div style={{
+                                fontSize: '0.85em',
+                                fontWeight: '600',
+                                color: isGenAudio ? '#f5b041' : (audioUrl || audioStatus === 'completed') ? '#2ecc71' : (audioStatus === 'failed' || audioStatus === 'interrupted') ? '#ff6b6b' : '#888'
+                              }}>
+                                {isGenAudio
+                                  ? `⏳ Đang tạo audio... ${audioMissingSegments > 0 ? `(còn ${audioMissingSegments} đoạn)` : ''}`
+                                  : (audioUrl || audioStatus === 'completed')
+                                    ? '✅ Audio đã hoàn thành'
+                                    : (audioStatus === 'failed' || audioStatus === 'interrupted')
+                                      ? '❌ Lỗi tạo audio'
+                                      : '⚪ Chưa tạo audio'}
+                              </div>
+                            </div>
+                            {isGenAudio && (
+                              <div style={{ marginTop: '4px' }}>
+                                <button
+                                  onClick={handleCancelAudio}
+                                  disabled={isCancelingAudio}
+                                  style={{
+                                    background: '#c0392b',
+                                    color: 'white',
+                                    border: 'none',
+                                    borderRadius: '4px',
+                                    padding: '4px 10px',
+                                    fontSize: '0.78em',
+                                    fontWeight: 'bold',
+                                    cursor: isCancelingAudio ? 'not-allowed' : 'pointer',
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    gap: '4px'
+                                  }}
+                                  title="Dừng tiến trình tạo audio này ngay lập tức"
+                                >
+                                  {isCancelingAudio ? '⏳ Đang dừng...' : '⏹️ Dừng tạo Audio'}
+                                </button>
+                              </div>
+                            )}
+                          </div>
+
+                          {/* 3. Render MP4 */}
+                          <div
+                            style={{
+                              background: isRendering ? 'rgba(183, 148, 246, 0.08)' : 'rgba(255, 255, 255, 0.03)',
+                              border: isRendering ? '1px solid rgba(183, 148, 246, 0.4)' : '1px solid rgba(255, 255, 255, 0.08)',
+                              borderRadius: '8px',
+                              padding: '10px 12px',
+                              display: 'flex',
+                              flexDirection: 'column',
+                              justifyContent: 'space-between',
+                              gap: '6px'
+                            }}
+                          >
+                            <div>
+                              <div style={{ fontSize: '0.76em', color: '#888', fontWeight: '600', marginBottom: '4px' }}>
+                                🎬 3. DỰNG VIDEO MP4
+                              </div>
+                              <div style={{
+                                fontSize: '0.85em',
+                                fontWeight: '600',
+                                color: isRendering ? '#b794f6' : renderInfo?.has_mp4 ? '#2ecc71' : (renderInfo?.job?.status === 'error' || renderInfo?.job?.status === 'failed') ? '#ff6b6b' : (renderInfo?.job?.status === 'canceled') ? '#f39c12' : '#888'
+                              }}>
+                                {isRendering
+                                  ? `⏳ ${renderInfo?.job?.progress || 'Đang dựng MP4 & Flow...'}`
+                                  : renderInfo?.has_mp4
+                                    ? '✅ MP4 đã dựng xong (1080p)'
+                                    : renderInfo?.job?.status === 'canceled'
+                                      ? '⏹️ Đã dừng dựng'
+                                      : (renderInfo?.job?.status === 'error' || renderInfo?.job?.status === 'failed')
+                                        ? '❌ Lỗi dựng MP4'
+                                        : '⚪ Chưa dựng MP4'}
+                              </div>
+                            </div>
+                            {isRendering && (
+                              <div style={{ marginTop: '4px' }}>
+                                <button
+                                  onClick={handleCancelRenderVideo}
+                                  disabled={isCancelingRender}
+                                  style={{
+                                    background: '#c0392b',
+                                    color: 'white',
+                                    border: 'none',
+                                    borderRadius: '4px',
+                                    padding: '4px 10px',
+                                    fontSize: '0.78em',
+                                    fontWeight: 'bold',
+                                    cursor: isCancelingRender ? 'not-allowed' : 'pointer',
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    gap: '4px'
+                                  }}
+                                  title="Dừng tiến trình dựng video này ngay lập tức"
+                                >
+                                  {isCancelingRender ? '⏳ Đang dừng...' : '⏹️ Dừng Render'}
+                                </button>
+                              </div>
+                            )}
+                          </div>
+
+                          {/* 4. Trạng thái Xuất bản */}
+                          <div
+                            style={{
+                              background: 'rgba(255, 255, 255, 0.03)',
+                              border: '1px solid rgba(255, 255, 255, 0.08)',
+                              borderRadius: '8px',
+                              padding: '10px 12px'
+                            }}
+                          >
+                            <div style={{ fontSize: '0.76em', color: '#888', fontWeight: '600', marginBottom: '4px' }}>
+                              🚀 4. TRẠNG THÁI XUẤT BẢN
+                            </div>
+                            <div style={{
+                              fontSize: '0.85em',
+                              fontWeight: '600',
+                              color: isCurrentVideoPublished ? '#2ecc71' : '#4dd0e1'
+                            }}>
+                              {isCurrentVideoPublished ? '✅ Đã xuất bản' : '⏳ Chưa đăng / Sẵn sàng'}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    )}
                     {errorMsg ? (
                       <span style={{color: '#ff4b4b'}}>{errorMsg}</span>
                     ) : (
@@ -2771,26 +3085,56 @@ function App() {
                                   )}
                               </div>
                               <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
-                                {((resultText || '').includes('[MC]:') || (resultText || '').includes('[KHACH_1]:')) ? (
+                                {((resultText || '').includes('[MC]:') || (resultText || '').includes('[KHACH_1]:') || audioRoleStreams) ? (
                                   <div style={{
                                     display: 'flex',
                                     flexDirection: 'column',
-                                    gap: '8px',
-                                    background: 'rgba(255, 255, 255, 0.03)',
-                                    padding: '8px 12px',
-                                    borderRadius: '8px',
-                                    border: '1px solid rgba(56, 189, 248, 0.3)',
+                                    gap: '10px',
+                                    background: 'rgba(15, 23, 42, 0.65)',
+                                    padding: '12px 14px',
+                                    borderRadius: '10px',
+                                    border: '1px solid rgba(56, 189, 248, 0.25)',
                                     width: '100%',
-                                    marginBottom: '4px'
+                                    marginBottom: '6px'
                                   }}>
-                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
-                                      <span style={{ color: '#38bdf8', fontSize: '12px', fontWeight: 'bold' }}>
-                                        👥 Phân Vai Giọng Đọc (Cast Voices):
+                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 6 }}>
+                                      <span style={{ color: '#38bdf8', fontSize: '12px', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                        👥 Quản Lý Luồng Audio Theo Nhân Vật (Dual-Stream Pipeline):
+                                      </span>
+                                      <span style={{ fontSize: '11px', color: '#94a3b8' }}>
+                                        Tách luồng độc lập • Tự động ghép Master
                                       </span>
                                     </div>
-                                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px', alignItems: 'center' }}>
-                                      <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
-                                        <label style={{ color: '#fbbf24', fontSize: '12px', fontWeight: 'bold' }}>🎙️ MC:</label>
+
+                                    {/* Role Cards Grid */}
+                                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '10px' }}>
+                                      {/* MC Stream Card */}
+                                      <div style={{
+                                        background: 'rgba(251, 191, 36, 0.05)',
+                                        border: '1px solid rgba(251, 191, 36, 0.3)',
+                                        borderRadius: '8px',
+                                        padding: '10px',
+                                        display: 'flex',
+                                        flexDirection: 'column',
+                                        gap: '6px'
+                                      }}>
+                                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                                          <span style={{ color: '#fbbf24', fontSize: '12px', fontWeight: 'bold' }}>
+                                            🎙️ MC (Người dẫn)
+                                          </span>
+                                          {audioRoleStreams?.MC && (
+                                            <span style={{
+                                              fontSize: '11px',
+                                              padding: '2px 6px',
+                                              borderRadius: '4px',
+                                              background: audioRoleStreams.MC.status === 'completed' ? 'rgba(16, 185, 129, 0.2)' : 'rgba(56, 189, 248, 0.2)',
+                                              color: audioRoleStreams.MC.status === 'completed' ? '#34d399' : '#38bdf8',
+                                              fontWeight: '600'
+                                            }}>
+                                              {audioRoleStreams.MC.status === 'completed' ? '✅ Hoàn tất' : `⚡ ${audioRoleStreams.MC.percent}%`}
+                                            </span>
+                                          )}
+                                        </div>
                                         <select
                                           value={selectedMcVoiceId || regenerateVoiceId}
                                           onChange={(e) => {
@@ -2800,23 +3144,74 @@ function App() {
                                           disabled={currentVideoIsError || isGenAudio || voiceOptions.length === 0}
                                           style={{
                                             background: '#17131d', color: '#eee',
-                                            border: '1px solid rgba(251, 191, 36, 0.5)',
-                                            padding: '4px 8px', borderRadius: '6px', fontSize: '12px'
+                                            border: '1px solid rgba(251, 191, 36, 0.4)',
+                                            padding: '4px 8px', borderRadius: '6px', fontSize: '12px', width: '100%'
                                           }}
                                         >
                                           <VoiceOptions voices={voiceOptions} />
                                         </select>
+                                        {audioRoleStreams?.MC && (
+                                          <div style={{ fontSize: '11px', color: '#cbd5e1', display: 'flex', justifyContent: 'space-between' }}>
+                                            <span>Đoạn: {audioRoleStreams.MC.completed}/{audioRoleStreams.MC.total}</span>
+                                            <span>{audioRoleStreams.MC.percent}%</span>
+                                          </div>
+                                        )}
+                                        <div style={{ display: 'flex', gap: '6px', alignItems: 'center', marginTop: '2px' }}>
+                                          <button
+                                            className="btn-secondary"
+                                            style={{ padding: '3px 8px', fontSize: '11px', flex: 1 }}
+                                            onClick={() => handleRegenerateRoleAudio('MC', selectedMcVoiceId || regenerateVoiceId)}
+                                            disabled={currentVideoIsError || isGenAudio}
+                                            title="Tạo lại chỉ riêng vai MC, giữ nguyên audio của Khách"
+                                          >
+                                            🔄 Tạo lại vai MC
+                                          </button>
+                                          {audioRoleStreams?.MC?.preview_audio_url && (
+                                            <audio
+                                              controls
+                                              src={audioRoleStreams.MC.preview_audio_url}
+                                              style={{ height: '24px', maxWidth: '130px' }}
+                                              title="Nghe thử riêng giọng MC"
+                                            />
+                                          )}
+                                        </div>
                                       </div>
-                                      <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
-                                        <label style={{ color: '#34d399', fontSize: '12px', fontWeight: 'bold' }}>🎙️ Khách 1:</label>
+
+                                      {/* Guest 1 Stream Card */}
+                                      <div style={{
+                                        background: 'rgba(52, 211, 153, 0.05)',
+                                        border: '1px solid rgba(52, 211, 153, 0.3)',
+                                        borderRadius: '8px',
+                                        padding: '10px',
+                                        display: 'flex',
+                                        flexDirection: 'column',
+                                        gap: '6px'
+                                      }}>
+                                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                                          <span style={{ color: '#34d399', fontSize: '12px', fontWeight: 'bold' }}>
+                                            🎙️ Khách 1 (Khách mời)
+                                          </span>
+                                          {audioRoleStreams?.KHACH_1 && (
+                                            <span style={{
+                                              fontSize: '11px',
+                                              padding: '2px 6px',
+                                              borderRadius: '4px',
+                                              background: audioRoleStreams.KHACH_1.status === 'completed' ? 'rgba(16, 185, 129, 0.2)' : 'rgba(56, 189, 248, 0.2)',
+                                              color: audioRoleStreams.KHACH_1.status === 'completed' ? '#34d399' : '#38bdf8',
+                                              fontWeight: '600'
+                                            }}>
+                                              {audioRoleStreams.KHACH_1.status === 'completed' ? '✅ Hoàn tất' : `⚡ ${audioRoleStreams.KHACH_1.percent}%`}
+                                            </span>
+                                          )}
+                                        </div>
                                         <select
                                           value={selectedGuest1VoiceId}
                                           onChange={(e) => setSelectedGuest1VoiceId(e.target.value)}
                                           disabled={currentVideoIsError || isGenAudio || voiceOptions.length === 0}
                                           style={{
                                             background: '#17131d', color: '#eee',
-                                            border: '1px solid rgba(52, 211, 153, 0.5)',
-                                            padding: '4px 8px', borderRadius: '6px', fontSize: '12px'
+                                            border: '1px solid rgba(52, 211, 153, 0.4)',
+                                            padding: '4px 8px', borderRadius: '6px', fontSize: '12px', width: '100%'
                                           }}
                                         >
                                           <option value="auto" style={{ background: '#1a1a1a', color: '#34d399' }}>
@@ -2824,50 +3219,102 @@ function App() {
                                           </option>
                                           <VoiceOptions voices={voiceOptions} />
                                         </select>
+                                        {audioRoleStreams?.KHACH_1 && (
+                                          <div style={{ fontSize: '11px', color: '#cbd5e1', display: 'flex', justifyContent: 'space-between' }}>
+                                            <span>Đoạn: {audioRoleStreams.KHACH_1.completed}/{audioRoleStreams.KHACH_1.total}</span>
+                                            <span>{audioRoleStreams.KHACH_1.percent}%</span>
+                                          </div>
+                                        )}
+                                        <div style={{ display: 'flex', gap: '6px', alignItems: 'center', marginTop: '2px' }}>
+                                          <button
+                                            className="btn-secondary"
+                                            style={{ padding: '3px 8px', fontSize: '11px', flex: 1 }}
+                                            onClick={() => handleRegenerateRoleAudio('KHACH_1', selectedGuest1VoiceId)}
+                                            disabled={currentVideoIsError || isGenAudio}
+                                            title="Tạo lại chỉ riêng vai Khách 1, giữ nguyên audio của MC"
+                                          >
+                                            🔄 Tạo lại vai Khách 1
+                                          </button>
+                                          {audioRoleStreams?.KHACH_1?.preview_audio_url && (
+                                            <audio
+                                              controls
+                                              src={audioRoleStreams.KHACH_1.preview_audio_url}
+                                              style={{ height: '24px', maxWidth: '130px' }}
+                                              title="Nghe thử riêng giọng Khách 1"
+                                            />
+                                          )}
+                                        </div>
                                       </div>
-                                      <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
-                                        <label style={{ color: '#f472b6', fontSize: '12px', fontWeight: 'bold' }}>🎙️ Khách 2:</label>
-                                        <select
-                                          value={selectedGuest2VoiceId}
-                                          onChange={(e) => setSelectedGuest2VoiceId(e.target.value)}
-                                          disabled={currentVideoIsError || isGenAudio || voiceOptions.length === 0}
-                                          style={{
-                                            background: '#17131d', color: '#eee',
-                                            border: '1px solid rgba(244, 114, 182, 0.5)',
-                                            padding: '4px 8px', borderRadius: '6px', fontSize: '12px'
-                                          }}
-                                        >
-                                          <option value="auto" style={{ background: '#1a1a1a', color: '#f472b6' }}>
-                                            ⚡ Tự động chọn giọng phụ khác biệt
-                                          </option>
-                                          <VoiceOptions voices={voiceOptions} />
-                                        </select>
-                                      </div>
+                                    </div>
+
+                                    {/* Action Buttons Bar */}
+                                    <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center', paddingTop: '6px', borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+                                      <button
+                                        className="btn-secondary"
+                                        style={{ padding: '4px 12px', fontSize: '0.8em' }}
+                                        onClick={handleRegenerateAudio}
+                                        disabled={currentVideoIsError || isGenAudio || !regenerateVoiceId}
+                                      >
+                                        {isGenAudio ? '⏳ Audio đang chạy...' : '🎙️ Tạo lại tất cả các vai'}
+                                      </button>
+                                      <button
+                                        className="btn-secondary"
+                                        style={{ padding: '4px 12px', fontSize: '0.8em', background: 'rgba(56, 189, 248, 0.15)', border: '1px solid rgba(56, 189, 248, 0.4)', color: '#38bdf8' }}
+                                        onClick={handleMergeMasterAudio}
+                                        disabled={currentVideoIsError || isGenAudio}
+                                        title="Ghép các clip của các vai thành audio master hoàn chỉnh"
+                                      >
+                                        🔄 Ghép lại Audio Tổng
+                                      </button>
                                     </div>
                                   </div>
                                 ) : (
-                                  <select
-                                    value={regenerateVoiceId}
-                                    onChange={(event) => setRegenerateVoiceId(event.target.value)}
-                                    disabled={currentVideoIsError || isGenAudio || voiceOptions.length === 0}
-                                    aria-label="Giọng tạo lại audio"
-                                    style={{
-                                      background: '#17131d', color: '#eee',
-                                      border: '1px solid rgba(26,188,156,0.5)',
-                                      borderRadius: '6px', padding: '5px 9px'
-                                    }}
-                                  >
-                                    <VoiceOptions voices={voiceOptions} />
-                                  </select>
+                                  <>
+                                    <select
+                                      value={regenerateVoiceId}
+                                      onChange={(event) => setRegenerateVoiceId(event.target.value)}
+                                      disabled={currentVideoIsError || isGenAudio || voiceOptions.length === 0}
+                                      aria-label="Giọng tạo lại audio"
+                                      style={{
+                                        background: '#17131d', color: '#eee',
+                                        border: '1px solid rgba(26,188,156,0.5)',
+                                        borderRadius: '6px', padding: '5px 9px'
+                                      }}
+                                    >
+                                      <VoiceOptions voices={voiceOptions} />
+                                    </select>
+                                    <button
+                                      className="btn-secondary"
+                                      style={{ padding: '4px 12px', fontSize: '0.8em' }}
+                                      onClick={handleRegenerateAudio}
+                                      disabled={currentVideoIsError || isGenAudio || !regenerateVoiceId}
+                                    >
+                                      {isGenAudio ? '⏳ Audio đang chạy...' : '🎙️ Tạo lại toàn bộ'}
+                                    </button>
+                                  </>
                                 )}
-                                <button
-                                  className="btn-secondary"
-                                  style={{ padding: '4px 12px', fontSize: '0.8em' }}
-                                  onClick={handleRegenerateAudio}
-                                  disabled={currentVideoIsError || isGenAudio || !regenerateVoiceId}
-                                >
-                                  {isGenAudio ? '⏳ Audio đang chạy...' : '🎙️ Tạo lại toàn bộ'}
-                                </button>
+                                {isGenAudio && (
+                                  <button
+                                    onClick={handleCancelAudio}
+                                    disabled={isCancelingAudio}
+                                    style={{
+                                      padding: '4px 12px',
+                                      fontSize: '0.8em',
+                                      background: '#c0392b',
+                                      border: '1px solid #e74c3c',
+                                      color: 'white',
+                                      borderRadius: '6px',
+                                      cursor: isCancelingAudio ? 'not-allowed' : 'pointer',
+                                      fontWeight: 'bold',
+                                      display: 'flex',
+                                      alignItems: 'center',
+                                      gap: '4px'
+                                    }}
+                                    title="Dừng tiến trình tạo audio đang chạy"
+                                  >
+                                    {isCancelingAudio ? '⏳ Đang dừng...' : '⏹️ Dừng tạo Audio'}
+                                  </button>
+                                )}
                                 <button
                                   className="btn-secondary"
                                   style={{ padding: '4px 12px', fontSize: '0.8em', display: 'flex', alignItems: 'center', gap: '5px' }}

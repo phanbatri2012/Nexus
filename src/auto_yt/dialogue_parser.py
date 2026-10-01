@@ -452,3 +452,47 @@ def build_dialogue_tts_segments(
         })
 
     return segments
+
+
+def group_segments_by_role(segments: list[DialogueSegment]) -> dict[str, list[DialogueSegment]]:
+    """Nhóm danh sách các segment theo từng vai diễn nhưng giữ nguyên index toàn cục."""
+    grouped: dict[str, list[DialogueSegment]] = {}
+    for seg in segments:
+        role = seg.get("role", "MC")
+        if role not in grouped:
+            grouped[role] = []
+        grouped[role].append(seg)
+    return grouped
+
+
+def build_speaker_streams(
+    script_text: str,
+    cast_settings: dict | None = None,
+    default_voice_id: str = "",
+    available_voices: list[dict] | None = None,
+    max_segment_chars: int = 7500,
+) -> dict[str, dict]:
+    """Phân tách kịch bản thành các Stream độc lập theo từng vai diễn (MC, KHACH_1...)."""
+    segments = build_dialogue_tts_segments(
+        script_text=script_text,
+        cast_settings=cast_settings,
+        default_voice_id=default_voice_id,
+        available_voices=available_voices,
+        max_segment_chars=max_segment_chars,
+    )
+    grouped = group_segments_by_role(segments)
+    streams: dict[str, dict] = {}
+    for role, role_segs in grouped.items():
+        v_id = role_segs[0].get("voice_id", default_voice_id) if role_segs else default_voice_id
+        v_name = role_segs[0].get("voice_name", "") if role_segs else ""
+        total_chars = sum(s.get("characters", len(s.get("text", ""))) for s in role_segs)
+        streams[role] = {
+            "role": role,
+            "voice_id": v_id,
+            "voice_name": v_name,
+            "segments": role_segs,
+            "total_segments": len(role_segs),
+            "total_characters": total_chars,
+        }
+    return streams
+
