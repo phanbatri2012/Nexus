@@ -4856,7 +4856,8 @@ def recalculate_fb_queue_schedule(
     daily_quota: int,
     times_list: list[str],
     target_page_id: str = "",
-    start_date: datetime.date | None = None
+    start_date: datetime.date | None = None,
+    sort_order_mode: str = "oldest_first"
 ) -> int:
     """Recalculate scheduled_publish_time for pending/scheduled items of a specific Fanpage with smart collision prevention."""
     if daily_quota <= 0 or not times_list:
@@ -4874,10 +4875,23 @@ def recalculate_fb_queue_schedule(
         else:
             where_sql += " AND (target_page_id = '' OR target_page_id IS NULL)"
 
+        if str(sort_order_mode).strip().lower() == "newest_first":
+            order_by_sql = """
+                CASE WHEN youtube_upload_date != '' AND youtube_upload_date IS NOT NULL THEN youtube_upload_date ELSE '' END DESC,
+                sort_order DESC,
+                id DESC
+            """
+        else:
+            order_by_sql = """
+                CASE WHEN youtube_upload_date != '' AND youtube_upload_date IS NOT NULL THEN youtube_upload_date ELSE '99999999' END ASC,
+                sort_order ASC,
+                id ASC
+            """
+
         rows = conn.execute(f"""
             SELECT id FROM fb_crossposter_queue
             {where_sql}
-            ORDER BY sort_order ASC, id ASC
+            ORDER BY {order_by_sql}
         """, params).fetchall()
 
         if not rows:
@@ -5113,7 +5127,10 @@ def fix_fb_queue_schedule_collisions(target_page_id: str = "") -> dict:
         settings = get_fb_crossposter_settings(pid)
         daily_quota = settings.get("daily_quota", 2)
         schedule_times = settings.get("schedule_times", ["11:30", "19:30"])
-        updated = recalculate_fb_queue_schedule(daily_quota, schedule_times, target_page_id=pid)
+        sort_order_mode = settings.get("sort_order_mode", "oldest_first")
+        updated = recalculate_fb_queue_schedule(
+            daily_quota, schedule_times, target_page_id=pid, sort_order_mode=sort_order_mode
+        )
         total_recalculated += updated
 
     return {

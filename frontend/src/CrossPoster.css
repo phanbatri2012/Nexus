@@ -751,3 +751,90 @@
 .fb-mode-btn.active .fb-mode-desc {
   color: #cbd5e1;
 }
+
+/* Dropdown Menu for Recalculate Schedule */
+.fb-dropdown-wrapper {
+  position: relative;
+  display: inline-block;
+}
+
+.fb-dropdown-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  min-width: 290px;
+  background: rgba(15, 23, 42, 0.96);
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(56, 189, 248, 0.28);
+  border-radius: 12px;
+  padding: 6px;
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.6), 0 0 20px rgba(56, 189, 248, 0.12);
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  animation: fbFadeInDown 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes fbFadeInDown {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.fb-dropdown-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  text-align: left;
+  background: transparent;
+  border: none;
+  padding: 10px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  color: #f8fafc;
+  transition: all 0.15s ease;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.fb-dropdown-item:hover {
+  background: rgba(56, 189, 248, 0.12);
+  color: #38bdf8;
+}
+
+.fb-dropdown-item-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  font-size: 0.88rem;
+  font-weight: 600;
+  gap: 8px;
+}
+
+.fb-dropdown-item-desc {
+  font-size: 0.74rem;
+  color: #94a3b8;
+  margin-top: 3px;
+  line-height: 1.35;
+}
+
+.fb-dropdown-active-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background-color: #38bdf8;
+  box-shadow: 0 0 8px #38bdf8;
+  display: inline-block;
+}
+
+.fb-dropdown-divider {
+  height: 1px;
+  background: rgba(255, 255, 255, 0.08);
+  margin: 4px 6px;
+}

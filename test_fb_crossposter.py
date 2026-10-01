@@ -379,6 +379,48 @@ class FBCrossPosterUnitTests(unittest.TestCase):
         self.assertEqual(dt3.date(), day_after)
         self.assertEqual(dt3.strftime("%H:%M"), "11:30")
 
+    def test_recalculate_schedule_oldest_first(self):
+        items = [
+            {"youtube_id": "yt_old", "original_title": "Old Video", "sort_order": 1, "youtube_upload_date": "20230101"},
+            {"youtube_id": "yt_mid", "original_title": "Mid Video", "sort_order": 2, "youtube_upload_date": "20230601"},
+            {"youtube_id": "yt_new", "original_title": "New Video", "sort_order": 3, "youtube_upload_date": "20240101"},
+        ]
+        db.upsert_fb_crossposter_queue_items(items)
+        tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+        updated = db.recalculate_fb_queue_schedule(
+            daily_quota=2,
+            times_list=["11:30", "19:30"],
+            start_date=tomorrow,
+            sort_order_mode="oldest_first"
+        )
+        self.assertEqual(updated, 3)
+        queue = db.get_fb_crossposter_queue(page=1, page_size=10)
+        items_res = queue["items"]
+        self.assertEqual(items_res[0]["youtube_id"], "yt_old")
+        self.assertEqual(items_res[1]["youtube_id"], "yt_mid")
+        self.assertEqual(items_res[2]["youtube_id"], "yt_new")
+
+    def test_recalculate_schedule_newest_first(self):
+        items = [
+            {"youtube_id": "yt_old", "original_title": "Old Video", "sort_order": 1, "youtube_upload_date": "20230101"},
+            {"youtube_id": "yt_mid", "original_title": "Mid Video", "sort_order": 2, "youtube_upload_date": "20230601"},
+            {"youtube_id": "yt_new", "original_title": "New Video", "sort_order": 3, "youtube_upload_date": "20240101"},
+        ]
+        db.upsert_fb_crossposter_queue_items(items)
+        tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+        updated = db.recalculate_fb_queue_schedule(
+            daily_quota=2,
+            times_list=["11:30", "19:30"],
+            start_date=tomorrow,
+            sort_order_mode="newest_first"
+        )
+        self.assertEqual(updated, 3)
+        queue = db.get_fb_crossposter_queue(page=1, page_size=10)
+        items_res = queue["items"]
+        self.assertEqual(items_res[0]["youtube_id"], "yt_new")
+        self.assertEqual(items_res[1]["youtube_id"], "yt_mid")
+        self.assertEqual(items_res[2]["youtube_id"], "yt_old")
+
     def test_recalculate_schedule_collision_prevention(self):
         """Test that already occupied/published slots are skipped when recalculating schedule."""
         tomorrow = datetime.date.today() + datetime.timedelta(days=1)
@@ -839,6 +881,7 @@ class FBCrossPosterUnitTests(unittest.TestCase):
             "target_access_token": "token",
             "convert_to_vertical": True,
             "default_tags": [],
+            "upload_mode": "api",
         }
 
         with tempfile.TemporaryDirectory() as temp_dir:

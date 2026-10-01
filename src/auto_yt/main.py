@@ -9686,6 +9686,7 @@ class FBCrossPosterRecalculatePayload(BaseModel):
     daily_quota: int = 2
     schedule_times: list[str] = Field(default_factory=lambda: ["11:30", "19:30"])
     target_page_id: Optional[str] = ""
+    sort_order_mode: Optional[str] = "oldest_first"
 
 
 class FBCrossPosterItemUpdatePayload(BaseModel):
@@ -9913,18 +9914,30 @@ def recalculate_fb_crossposter_schedule(
     settings = db.get_fb_crossposter_settings(target_page_id)
     daily_quota = (payload and payload.daily_quota) or settings.get("daily_quota", 2)
     schedule_times = (payload and payload.schedule_times) or settings.get("schedule_times", ["11:30", "19:30"])
+    sort_order_mode = (payload and payload.sort_order_mode) or settings.get("sort_order_mode", "oldest_first")
+
+    # Persist the chosen sort_order_mode in settings for this campaign
+    if target_page_id and sort_order_mode != settings.get("sort_order_mode"):
+        db.save_fb_crossposter_settings({
+            **settings,
+            "sort_order_mode": sort_order_mode,
+            "target_fb_page_id": target_page_id,
+        }, page_id=target_page_id)
 
     updated_count = db.recalculate_fb_queue_schedule(
         daily_quota=daily_quota,
         times_list=schedule_times,
         target_page_id=target_page_id,
+        sort_order_mode=sort_order_mode,
     )
     stats = db.get_fb_crossposter_stats(target_page_id)
+    mode_label = "từ cũ đến mới" if sort_order_mode == "oldest_first" else "từ mới đến cũ"
     return {
         "success": True,
         "updated_count": updated_count,
+        "sort_order_mode": sort_order_mode,
         "stats": stats,
-        "message": f"Đã tính toán và phân bổ lịch đăng cho {updated_count} video.",
+        "message": f"Đã tính toán và phân bổ lịch đăng cho {updated_count} video ({mode_label}).",
     }
 
 

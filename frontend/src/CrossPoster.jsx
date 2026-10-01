@@ -182,6 +182,9 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
   const [isPublishingId, setIsPublishingId] = useState(null)
   const [isTestingFb, setIsTestingFb] = useState(false)
   const [isExtractingToken, setIsExtractingToken] = useState(false)
+  const [isRecalcMenuOpen, setIsRecalcMenuOpen] = useState(false)
+  const [isRecalculating, setIsRecalculating] = useState(false)
+  const recalcMenuRef = useRef(null)
   const [message, setMessage] = useState('')
   const [messageType, setMessageType] = useState('info') // 'info' | 'success' | 'error'
 
@@ -369,6 +372,21 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
       if (timer) clearInterval(timer)
     }
   }, [preScheduleTask.status, checkPreScheduleStatus])
+
+  // Close Recalculate Menu on outside click
+  useEffect(() => {
+    function handleClickOutside(event) {
+      if (recalcMenuRef.current && !recalcMenuRef.current.contains(event.target)) {
+        setIsRecalcMenuOpen(false)
+      }
+    }
+    if (isRecalcMenuOpen) {
+      document.addEventListener('mousedown', handleClickOutside)
+    }
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside)
+    }
+  }, [isRecalcMenuOpen])
 
   // Switch Active Fanpage Tab
   const handleSelectTab = (pageId) => {
@@ -585,7 +603,12 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
   }
 
   // Recalculate Schedule
-  const handleRecalculateSchedule = async () => {
+  const handleRecalculateSchedule = async (mode = 'oldest_first') => {
+    setIsRecalcMenuOpen(false)
+    setIsRecalculating(true)
+    const modeText = mode === 'oldest_first' ? 'từ cũ đến mới' : 'từ mới đến cũ'
+    setMessage(`Đang tính toán lại lịch đăng (${modeText})...`)
+    setMessageType('info')
     try {
       const params = new URLSearchParams()
       if (selectedPageId) params.append('page_id', selectedPageId)
@@ -595,17 +618,22 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
         body: JSON.stringify({
           daily_quota: settings.daily_quota,
           schedule_times: settings.schedule_times,
-          target_page_id: selectedPageId
+          target_page_id: selectedPageId,
+          sort_order_mode: mode
         })
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
-      setMessage(data.message)
+      setSettings(prev => ({ ...prev, sort_order_mode: mode }))
+      setMessage(data.message || `Đã phân bổ lịch đăng (${modeText}) thành công!`)
       setMessageType('success')
       loadQueue(selectedPageId)
+      loadSettingsAndHub(selectedPageId)
     } catch (err) {
       setMessage(`Lỗi tính toán lịch: ${err.message}`)
       setMessageType('error')
+    } finally {
+      setIsRecalculating(false)
     }
   }
 
@@ -1053,12 +1081,48 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
             >
               {isSyncing ? '⏳ Đang quét...' : '🔍 Quét Kênh YouTube'}
             </button>
-            <button
-              className="fb-btn fb-btn-secondary"
-              onClick={handleRecalculateSchedule}
-            >
-              ⚡ Tính Lại Lịch Đăng
-            </button>
+            <div className="fb-dropdown-wrapper" ref={recalcMenuRef}>
+              <button
+                type="button"
+                className="fb-btn fb-btn-secondary"
+                onClick={() => setIsRecalcMenuOpen(prev => !prev)}
+                disabled={isRecalculating}
+                title="Tính lại lịch phát sóng cho toàn bộ video trong hàng đợi"
+              >
+                {isRecalculating ? '⏳ Đang tính toán...' : '⚡ Tính Lại Lịch Đăng ▾'}
+              </button>
+              {isRecalcMenuOpen && (
+                <div className="fb-dropdown-menu">
+                  <button
+                    type="button"
+                    className="fb-dropdown-item"
+                    onClick={() => handleRecalculateSchedule('oldest_first')}
+                  >
+                    <div className="fb-dropdown-item-title">
+                      <span>⏳ Từ cũ đến mới (Oldest First)</span>
+                      {settings.sort_order_mode === 'oldest_first' && <span className="fb-dropdown-active-dot" />}
+                    </div>
+                    <div className="fb-dropdown-item-desc">
+                      Phát hành các video cũ nhất trước, video mới nhất sau
+                    </div>
+                  </button>
+                  <div className="fb-dropdown-divider" />
+                  <button
+                    type="button"
+                    className="fb-dropdown-item"
+                    onClick={() => handleRecalculateSchedule('newest_first')}
+                  >
+                    <div className="fb-dropdown-item-title">
+                      <span>⚡ Từ mới đến cũ (Newest First)</span>
+                      {settings.sort_order_mode === 'newest_first' && <span className="fb-dropdown-active-dot" />}
+                    </div>
+                    <div className="fb-dropdown-item-desc">
+                      Phát hành các video mới nhất trước, video cũ hơn sau
+                    </div>
+                  </button>
+                </div>
+              )}
+            </div>
             <button
               className="fb-btn fb-btn-secondary"
               onClick={() => handleReconcileMeta(false)}

@@ -833,7 +833,12 @@ def sync_channel_public_videos(
         # Automatically recalculate schedule for pending items if daily quota is set
         daily_quota = settings.get("daily_quota", 2)
         schedule_times = settings.get("schedule_times", ["11:30", "19:30"])
-        db.recalculate_fb_queue_schedule(daily_quota, schedule_times, target_page_id=target_page_id)
+        db.recalculate_fb_queue_schedule(
+            daily_quota,
+            schedule_times,
+            target_page_id=target_page_id,
+            sort_order_mode=sort_order_mode,
+        )
 
         # Save last synced timestamp
         db.save_fb_crossposter_settings({
