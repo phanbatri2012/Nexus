@@ -2855,6 +2855,22 @@ def produce_video(
     cancel_check,
     force_new_project: bool = False,
 ) -> dict:
+    render_mode = (
+        snapshot.get("render_mode")
+        or (snapshot.get("image_generation_settings") or {}).get("render_mode")
+        or (snapshot.get("pipeline") or {}).get("render_mode")
+        or "google_flow"
+    )
+    if str(render_mode).strip().lower() == "stock_video":
+        from auto_yt.services import stock_video_renderer
+        return stock_video_renderer.produce_stock_video(
+            video_id=video_id,
+            snapshot=snapshot,
+            progress=progress,
+            cancel_check=cancel_check,
+            force_new_project=force_new_project,
+        )
+
     prepared = prepare_visual_plan_inputs(video_id, snapshot, progress)
     video = prepared["video"]
     audio_path = prepared["audio_path"]

@@ -10138,6 +10138,72 @@ def delete_prompt_version_asset(version: str, filename: str):
 
 
 # ==========================================
+# Stock Videos & Animated Icons Management
+# ==========================================
+
+@app.get("/api/stock-videos/status")
+def get_stock_videos_status(custom_path: str = ""):
+    from auto_yt.services import stock_video_renderer
+    from auto_yt.paths import BACKGROUND_VIDEOS_DIR
+    target_dir = Path(custom_path).resolve() if custom_path else BACKGROUND_VIDEOS_DIR
+    videos = stock_video_renderer.get_available_background_videos(target_dir)
+    return {
+        "folder_path": str(target_dir),
+        "video_count": len(videos),
+        "videos": [
+            {
+                "name": v.name,
+                "size_mb": round(v.stat().st_size / (1024 * 1024), 2),
+                "path": str(v),
+            }
+            for v in videos[:50]
+        ],
+    }
+
+
+@app.post("/api/stock-videos/open-folder")
+def open_stock_videos_folder(payload: dict = None):
+    from auto_yt.paths import BACKGROUND_VIDEOS_DIR
+    custom_path = (payload or {}).get("custom_path", "")
+    target_dir = Path(custom_path).resolve() if custom_path else BACKGROUND_VIDEOS_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        if os.name == "nt":
+            os.startfile(str(target_dir))
+        else:
+            subprocess.run(["xdg-open", str(target_dir)], check=False)
+        return {"success": True, "folder_path": str(target_dir), "message": "Đã mở thư mục kho video"}
+    except Exception as exc:
+        return {"success": False, "folder_path": str(target_dir), "message": str(exc)}
+
+
+@app.get("/api/animated-icons/list")
+def get_animated_icons_list():
+    from auto_yt.services import stock_video_renderer
+    from auto_yt.paths import ANIMATED_ICONS_DIR
+    icons = stock_video_renderer.get_available_animated_icons(ANIMATED_ICONS_DIR)
+    return {
+        "folder_path": str(ANIMATED_ICONS_DIR),
+        "icon_count": len(icons),
+        "icons": [i.name for i in icons],
+    }
+
+
+@app.post("/api/animated-icons/open-folder")
+def open_animated_icons_folder():
+    from auto_yt.paths import ANIMATED_ICONS_DIR
+    ANIMATED_ICONS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        if os.name == "nt":
+            os.startfile(str(ANIMATED_ICONS_DIR))
+        else:
+            subprocess.run(["xdg-open", str(ANIMATED_ICONS_DIR)], check=False)
+        return {"success": True, "folder_path": str(ANIMATED_ICONS_DIR), "message": "Đã mở thư mục icon động"}
+    except Exception as exc:
+        return {"success": False, "folder_path": str(ANIMATED_ICONS_DIR), "message": str(exc)}
+
+
+# ==========================================
 # FB Cross-Poster (YouTube to FB Syndication)
 # ==========================================
 

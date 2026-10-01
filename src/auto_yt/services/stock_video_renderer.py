@@ -1,0 +1,680 @@
+"""Stock Video / Radio Story Video Rendering Engine.
+
+Muxes background video footage from a repository with:
+- MP3 main audio (OmniVoice / TTS)
+- Picture-in-picture Thumbnail at 1 of 4 randomized corners
+- Stylized Title Card at the opposite corner across center axis
+- Animated Sticker / Icon adjacent to dynamic Audio Waveform Visualizer
+- Multi-video randomized playlist concat & looping to match exact audio duration.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import random
+import re
+import secrets
+import shutil
+import subprocess
+import time
+from pathlib import Path
+from typing import Callable, Sequence
+
+import imageio_ffmpeg
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+from auto_yt.paths import (
+    ANIMATED_ICONS_DIR,
+    AUDIO_DIR,
+    BACKGROUND_VIDEOS_DIR,
+    RENDERS_DIR,
+    THUMBNAILS_DIR,
+)
+from auto_yt.services import database as db
+
+logger = logging.getLogger(__name__)
+
+TARGET_WIDTH = 1920
+TARGET_HEIGHT = 1080
+TARGET_FPS = 30
+SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
+SUPPORTED_ICON_EXTS = {".gif", ".webp", ".png"}
+
+
+class StockVideoRenderError(RuntimeError):
+    pass
+
+
+def probe_media_duration(file_path: Path) -> float:
+    """Probe audio/video duration in seconds using ffprobe/ffmpeg."""
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    ffprobe_exe = ffmpeg_exe.replace("ffmpeg", "ffprobe")
+    
+    # Try ffprobe if available
+    if os.path.exists(ffprobe_exe):
+        cmd = [
+            ffprobe_exe,
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(file_path),
+        ]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            duration_str = res.stdout.strip()
+            if duration_str:
+                return float(duration_str)
+        except Exception:
+            pass
+
+    # Fallback to ffmpeg -i info parsing
+    cmd = [ffmpeg_exe, "-i", str(file_path)]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", res.stderr)
+    if match:
+        h, m, s = match.groups()
+        return float(h) * 3600 + float(m) * 60 + float(s)
+
+    raise StockVideoRenderError(f"Không thể đo thời lượng của file: {file_path}")
+
+
+def get_available_background_videos(custom_dir: Path | str | None = None) -> list[Path]:
+    """Scan and return list of all valid video files in background videos directory."""
+    target_dir = Path(custom_dir).resolve() if custom_dir else BACKGROUND_VIDEOS_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    videos: list[Path] = []
+    for item in target_dir.rglob("*"):
+        if item.is_file() and item.suffix.lower() in SUPPORTED_VIDEO_EXTS:
+            videos.append(item)
+
+    return sorted(videos)
+
+
+def ensure_default_animated_icons(target_dir: Path) -> list[Path]:
+    """Generate high quality transparent animated icons if directory is empty."""
+    target_dir.mkdir(parents=True, exist_ok=True)
+    num_frames = 24
+    
+    # 1. Cute Smiling Sun
+    sun_file = target_dir / "sun_cute.gif"
+    if not sun_file.exists():
+        frames = []
+        for f in range(num_frames):
+            im = Image.new("RGBA", (140, 140), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(im)
+            t = f / num_frames
+            scale = 1.0 + 0.08 * math.sin(t * 2 * math.pi)
+            rot = t * 2 * math.pi / 8
+            cx, cy = 70, 70
+            for r_idx in range(8):
+                angle = rot + r_idx * (2 * math.pi / 8)
+                ray_len = 48 + 8 * math.sin(t * 2 * math.pi + r_idx)
+                rx = cx + ray_len * math.cos(angle)
+                ry = cy + ray_len * math.sin(angle)
+                draw.line([(cx, cy), (rx, ry)], fill=(255, 170, 0, 255), width=7)
+                draw.ellipse([rx - 4, ry - 4, rx + 4, ry + 4], fill=(255, 150, 0, 255))
+            r = int(28 * scale)
+            draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 215, 0, 255), outline=(255, 140, 0, 255), width=3)
+            eye_offset, eye_y = 10, cy - 4
+            draw.ellipse([cx - eye_offset - 3, eye_y - 4, cx - eye_offset + 3, eye_y + 4], fill=(80, 40, 10, 255))
+            draw.ellipse([cx + eye_offset - 3, eye_y - 4, cx + eye_offset + 3, eye_y + 4], fill=(80, 40, 10, 255))
+            draw.ellipse([cx - eye_offset - 1, eye_y - 3, cx - eye_offset + 1, eye_y - 1], fill=(255, 255, 255, 255))
+            draw.ellipse([cx + eye_offset - 1, eye_y - 3, cx + eye_offset + 1, eye_y - 1], fill=(255, 255, 255, 255))
+            draw.ellipse([cx - eye_offset - 6, eye_y + 6, cx - eye_offset + 2, eye_y + 12], fill=(255, 105, 135, 200))
+            draw.ellipse([cx + eye_offset - 2, eye_y + 6, cx + eye_offset + 6, eye_y + 12], fill=(255, 105, 135, 200))
+            draw.arc([cx - 8, cy - 2, cx + 8, cy + 12], start=10, end=170, fill=(120, 40, 10, 255), width=3)
+            frames.append(im)
+        frames[0].save(sun_file, save_all=True, append_images=frames[1:], duration=45, loop=0, disposal=2)
+
+    # 2. Floating Music Notes
+    notes_file = target_dir / "music_notes.gif"
+    if not notes_file.exists():
+        frames = []
+        for f in range(num_frames):
+            im = Image.new("RGBA", (140, 140), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(im)
+            t = f / num_frames
+            y1 = 90 - 50 * ((t + 0.0) % 1.0)
+            x1 = 50 + 15 * math.sin(t * 2 * math.pi)
+            alpha1 = int(255 * math.sin(((t + 0.0) % 1.0) * math.pi))
+            if alpha1 > 20:
+                draw.ellipse([x1 - 10, y1 + 5, x1 + 4, y1 + 17], fill=(168, 85, 247, alpha1))
+                draw.line([(x1 + 3, y1 + 10), (x1 + 3, y1 - 18)], fill=(168, 85, 247, alpha1), width=4)
+                draw.arc([x1 + 3, y1 - 20, x1 + 22, y1 - 6], start=270, end=90, fill=(168, 85, 247, alpha1), width=4)
+            y2 = 100 - 60 * ((t + 0.5) % 1.0)
+            x2 = 85 + 12 * math.cos(t * 2 * math.pi)
+            alpha2 = int(255 * math.sin(((t + 0.5) % 1.0) * math.pi))
+            if alpha2 > 20:
+                draw.ellipse([x2 - 18, y2 + 5, x2 - 6, y2 + 16], fill=(56, 189, 248, alpha2))
+                draw.ellipse([x2 + 2, y2, x2 + 14, y2 + 11], fill=(56, 189, 248, alpha2))
+                draw.line([(x2 - 7, y2 + 10), (x2 - 7, y2 - 15)], fill=(56, 189, 248, alpha2), width=3)
+                draw.line([(x2 + 13, y2 + 5), (x2 + 13, y2 - 20)], fill=(56, 189, 248, alpha2), width=3)
+                draw.line([(x2 - 7, y2 - 15), (x2 + 13, y2 - 20)], fill=(56, 189, 248, alpha2), width=5)
+            frames.append(im)
+        frames[0].save(notes_file, save_all=True, append_images=frames[1:], duration=45, loop=0, disposal=2)
+
+    # 3. Spinning Vinyl Record
+    vinyl_file = target_dir / "vinyl_record.gif"
+    if not vinyl_file.exists():
+        frames = []
+        for f in range(num_frames):
+            im = Image.new("RGBA", (140, 140), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(im)
+            t = f / num_frames
+            cx, cy = 70, 70
+            draw.ellipse([cx - 50, cy - 50, cx + 50, cy + 50], fill=(24, 24, 27, 255), outline=(63, 63, 70, 255), width=2)
+            for gr in [42, 35, 28]:
+                draw.ellipse([cx - gr, cy - gr, cx + gr, cy + gr], outline=(39, 39, 42, 255), width=1)
+            angle = t * 2 * math.pi
+            shine_x, shine_y = cx + 30 * math.cos(angle), cy + 30 * math.sin(angle)
+            draw.line([(cx, cy), (shine_x, shine_y)], fill=(255, 255, 255, 80), width=8)
+            draw.line([(cx, cy), (cx - 30 * math.cos(angle), cy - 30 * math.sin(angle))], fill=(255, 255, 255, 80), width=8)
+            draw.ellipse([cx - 18, cy - 18, cx + 18, cy + 18], fill=(239, 68, 68, 255), outline=(252, 165, 165, 255), width=2)
+            draw.ellipse([cx - 5, cy - 5, cx + 5, cy + 5], fill=(255, 255, 255, 255))
+            frames.append(im)
+        frames[0].save(vinyl_file, save_all=True, append_images=frames[1:], duration=45, loop=0, disposal=2)
+
+    # 4. Twinkling Sparkle Star
+    star_file = target_dir / "sparkle_star.gif"
+    if not star_file.exists():
+        frames = []
+        for f in range(num_frames):
+            im = Image.new("RGBA", (140, 140), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(im)
+            t = f / num_frames
+            cx, cy = 70, 70
+            scale = 0.8 + 0.4 * (0.5 + 0.5 * math.sin(t * 2 * math.pi))
+            star_points = []
+            outer_r, inner_r = 45 * scale, 10 * scale
+            for p in range(8):
+                ang = p * math.pi / 4
+                rad = outer_r if p % 2 == 0 else inner_r
+                star_points.append((cx + rad * math.cos(ang), cy + rad * math.sin(ang)))
+            draw.polygon(star_points, fill=(250, 204, 21, 255), outline=(234, 88, 12, 255))
+            draw.ellipse([cx - 6, cy - 6, cx + 6, cy + 6], fill=(255, 255, 255, 240))
+            frames.append(im)
+        frames[0].save(star_file, save_all=True, append_images=frames[1:], duration=45, loop=0, disposal=2)
+
+    icons = [p for p in target_dir.glob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_ICON_EXTS]
+    return sorted(icons)
+
+
+def get_available_animated_icons(custom_dir: Path | str | None = None) -> list[Path]:
+    """Scan and return list of animated sticker icons (auto-generating defaults if empty)."""
+    target_dir = Path(custom_dir).resolve() if custom_dir else ANIMATED_ICONS_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    icons = [item for item in target_dir.glob("*") if item.is_file() and item.suffix.lower() in SUPPORTED_ICON_EXTS]
+    if not icons:
+        icons = ensure_default_animated_icons(target_dir)
+
+    return sorted(icons)
+
+
+def _get_system_font(size: int = 34) -> ImageFont.FreeTypeFont:
+    """Load Vietnamese Unicode font from Windows system fonts or default."""
+    candidates = [
+        "C:\\Windows\\Fonts\\arialbd.ttf",
+        "C:\\Windows\\Fonts\\segoeuib.ttf",
+        "C:\\Windows\\Fonts\\tahomabd.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+        "C:\\Windows\\Fonts\\segoeui.ttf",
+    ]
+    for font_path in candidates:
+        if os.path.exists(font_path):
+            try:
+                return ImageFont.truetype(font_path, size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
+
+def generate_thumbnail_overlay(
+    thumbnail_path: Path,
+    output_path: Path,
+    target_w: int = 560,
+    target_h: int = 315,
+) -> Path:
+    """Pre-render thumbnail with rounded corners, clean white border, and soft drop shadow."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    with Image.open(thumbnail_path) as source:
+        rgb = source.convert("RGBA")
+        resized = rgb.resize((target_w, target_h), Image.Resampling.LANCZOS)
+
+    # 1. Rounded rectangle mask
+    mask = Image.new("L", (target_w, target_h), 0)
+    mask_draw = ImageDraw.Draw(mask)
+    mask_draw.rounded_rectangle([0, 0, target_w, target_h], radius=16, fill=255)
+
+    # 2. Border container
+    border_padding = 6
+    border_w = target_w + border_padding * 2
+    border_h = target_h + border_padding * 2
+    border_im = Image.new("RGBA", (border_w, border_h), (0, 0, 0, 0))
+    border_draw = ImageDraw.Draw(border_im)
+    border_draw.rounded_rectangle(
+        [0, 0, border_w, border_h],
+        radius=18,
+        fill=(255, 255, 255, 255),
+        outline=(226, 232, 240, 255),
+        width=2,
+    )
+    border_im.paste(resized, (border_padding, border_padding), mask)
+
+    # 3. Soft Drop Shadow
+    shadow_pad = 20
+    shadow_w = border_w + shadow_pad * 2
+    shadow_h = border_h + shadow_pad * 2
+    final_canvas = Image.new("RGBA", (shadow_w, shadow_h), (0, 0, 0, 0))
+    sh_draw = ImageDraw.Draw(final_canvas)
+    sh_draw.rounded_rectangle(
+        [shadow_pad, shadow_pad + 4, shadow_pad + border_w, shadow_pad + border_h + 4],
+        radius=20,
+        fill=(0, 0, 0, 160),
+    )
+    final_canvas = final_canvas.filter(ImageFilter.GaussianBlur(10))
+    final_canvas.paste(border_im, (shadow_pad, shadow_pad), border_im)
+
+    final_canvas.save(output_path, "PNG")
+    return output_path
+
+
+def generate_title_card_overlay(
+    title: str,
+    output_path: Path,
+    max_card_width: int = 900,
+    text_color: tuple[int, int, int, int] = (91, 33, 182, 255),
+) -> tuple[Path, int, int]:
+    """Pre-render title card with rounded corners, subtle border, shadow, and centered text."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    font = _get_system_font(size=34)
+
+    # Wrap title into lines
+    words = title.strip().split()
+    lines: list[str] = []
+    curr_line: list[str] = []
+    max_text_width = max_card_width - 80
+
+    for word in words:
+        curr_line.append(word)
+        bbox = font.getbbox(" ".join(curr_line))
+        if bbox[2] - bbox[0] > max_text_width:
+            curr_line.pop()
+            if curr_line:
+                lines.append(" ".join(curr_line))
+            curr_line = [word]
+    if curr_line:
+        lines.append(" ".join(curr_line))
+    if not lines:
+        lines = [title]
+
+    line_height = 46
+    card_h = len(lines) * line_height + 36
+    card_w = max_card_width
+
+    # Create inner card
+    card_surface = Image.new("RGBA", (card_w, card_h), (0, 0, 0, 0))
+    cs_draw = ImageDraw.Draw(card_surface)
+    cs_draw.rounded_rectangle(
+        [0, 0, card_w, card_h],
+        radius=14,
+        fill=(255, 255, 255, 245),
+        outline=(226, 232, 240, 255),
+        width=2,
+    )
+
+    y_offset = 20
+    for line in lines:
+        bbox = font.getbbox(line)
+        line_w = bbox[2] - bbox[0]
+        x_pos = (card_w - line_w) // 2
+        cs_draw.text((x_pos, y_offset), line, font=font, fill=text_color)
+        y_offset += line_height
+
+    # Shadow container
+    shadow_pad = 18
+    total_w = card_w + shadow_pad * 2
+    total_h = card_h + shadow_pad * 2
+    final_card = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
+    fc_draw = ImageDraw.Draw(final_card)
+    fc_draw.rounded_rectangle(
+        [shadow_pad, shadow_pad + 3, shadow_pad + card_w, shadow_pad + card_h + 3],
+        radius=16,
+        fill=(0, 0, 0, 140),
+    )
+    final_card = final_card.filter(ImageFilter.GaussianBlur(8))
+    final_card.paste(card_surface, (shadow_pad, shadow_pad), card_surface)
+
+    final_card.save(output_path, "PNG")
+    return output_path, total_w, total_h
+
+
+def calculate_layout_coordinates(
+    corner: str,
+    thumb_w: int,
+    thumb_h: int,
+    card_w: int,
+    card_h: int,
+    icon_w: int = 100,
+    icon_h: int = 100,
+    wave_w: int = 360,
+    wave_h: int = 70,
+    canvas_w: int = TARGET_WIDTH,
+    canvas_h: int = TARGET_HEIGHT,
+    margin: int = 40,
+) -> dict[str, tuple[int, int]]:
+    """Compute (x, y) coordinates for Thumbnail, Title Card, Icon, and Waveform for a given corner."""
+    coords = {}
+
+    if corner == "bottom_right":
+        # Thumbnail bottom-right, Title Card bottom-left
+        coords["thumb"] = (canvas_w - thumb_w - margin, canvas_h - thumb_h - margin)
+        card_x, card_y = margin, canvas_h - card_h - margin
+        coords["card"] = (card_x, card_y)
+        icon_x = card_x + 80
+        icon_y = max(margin, card_y - icon_h - 10)
+        coords["icon"] = (icon_x, icon_y)
+        coords["wave"] = (icon_x + icon_w + 15, icon_y + 15)
+
+    elif corner == "bottom_left":
+        # Thumbnail bottom-left, Title Card bottom-right
+        coords["thumb"] = (margin, canvas_h - thumb_h - margin)
+        card_x, card_y = canvas_w - card_w - margin, canvas_h - card_h - margin
+        coords["card"] = (card_x, card_y)
+        icon_x = card_x + 80
+        icon_y = max(margin, card_y - icon_h - 10)
+        coords["icon"] = (icon_x, icon_y)
+        coords["wave"] = (icon_x + icon_w + 15, icon_y + 15)
+
+    elif corner == "top_right":
+        # Thumbnail top-right, Title Card top-left
+        coords["thumb"] = (canvas_w - thumb_w - margin, margin)
+        card_x, card_y = margin, margin
+        coords["card"] = (card_x, card_y)
+        icon_x = card_x + 80
+        icon_y = card_y + card_h + 10
+        coords["icon"] = (icon_x, icon_y)
+        coords["wave"] = (icon_x + icon_w + 15, icon_y + 15)
+
+    else:  # top_left
+        # Thumbnail top-left, Title Card top-right
+        coords["thumb"] = (margin, margin)
+        card_x, card_y = canvas_w - card_w - margin, margin
+        coords["card"] = (card_x, card_y)
+        icon_x = card_x + 80
+        icon_y = card_y + card_h + 10
+        coords["icon"] = (icon_x, icon_y)
+        coords["wave"] = (icon_x + icon_w + 15, icon_y + 15)
+
+    return coords
+
+
+def build_background_playlist(
+    available_videos: Sequence[Path],
+    target_duration: float,
+) -> list[Path]:
+    """Select and shuffle background videos to cover target duration."""
+    if not available_videos:
+        raise StockVideoRenderError("Danh sách video nền trống.")
+
+    pool = list(available_videos)
+    playlist: list[Path] = []
+    accumulated_duration = 0.0
+
+    # Probe and cache video durations
+    durations = {}
+    for video in pool:
+        try:
+            durations[video] = probe_media_duration(video)
+        except Exception:
+            durations[video] = 10.0  # Fallback default estimate
+
+    while accumulated_duration < target_duration:
+        shuffled = list(pool)
+        random.shuffle(shuffled)
+        for video in shuffled:
+            playlist.append(video)
+            accumulated_duration += durations.get(video, 10.0)
+            if accumulated_duration >= target_duration:
+                break
+
+    return playlist
+
+
+def produce_stock_video(
+    video_id: int,
+    snapshot: dict,
+    progress: Callable[[str, str], None],
+    cancel_check: Callable[[], None],
+    force_new_project: bool = False,
+) -> dict:
+    """Execute complete stock video rendering for video_id."""
+    del force_new_project
+    cancel_check()
+    progress("Đang kiểm tra dữ liệu đầu vào cho Video Nền...", "stock_video_prepare")
+
+    # 1. Fetch Video record from DB
+    video = db.get_video(video_id)
+    if not video:
+        raise StockVideoRenderError(f"Không tìm thấy video ID={video_id}")
+
+    title = str(video.get("generated_title") or video.get("title") or f"Video {video_id}").strip()
+
+    # 2. Locate audio file
+    audio_path = AUDIO_DIR / f"video_{video_id}.mp3"
+    if not audio_path.exists():
+        # Check audio artifact
+        artifact = db.get_latest_video_artifact(video_id, "audio", status="ready")
+        if artifact and artifact.get("file_path"):
+            audio_path = Path(artifact["file_path"]).resolve()
+        if not audio_path.exists():
+            raise StockVideoRenderError(f"Không tìm thấy file audio MP3 cho video {video_id}: {audio_path}")
+
+    audio_duration = probe_media_duration(audio_path)
+    if audio_duration <= 0.1:
+        raise StockVideoRenderError(f"File audio có thời lượng không hợp lệ ({audio_duration}s)")
+
+    logger.info("Stock Video: Video ID %s audio duration is %.2fs", video_id, audio_duration)
+
+    # 3. Locate thumbnail image
+    thumb_path: Path | None = None
+    # Check thumbnails dir
+    thumb_candidates = [
+        THUMBNAILS_DIR / f"thumb_with_text_{video_id}.png",
+        THUMBNAILS_DIR / f"thumb_no_text_{video_id}.png",
+        THUMBNAILS_DIR / f"thumb_{video_id}.png",
+    ]
+    for candidate in thumb_candidates:
+        if candidate.exists():
+            thumb_path = candidate
+            break
+
+    if thumb_path is None:
+        # Check DB artifact
+        art_thumb = db.get_latest_video_artifact(video_id, "thumbnail_with_text", status="ready") or \
+                    db.get_latest_video_artifact(video_id, "thumbnail_without_text", status="ready")
+        if art_thumb and art_thumb.get("file_path") and Path(art_thumb["file_path"]).exists():
+            thumb_path = Path(art_thumb["file_path"]).resolve()
+
+    if thumb_path is None:
+        # Generate a placeholder thumbnail if none found
+        thumb_path = THUMBNAILS_DIR / f"thumb_fallback_{video_id}.png"
+        thumb_path.parent.mkdir(parents=True, exist_ok=True)
+        img = Image.new("RGB", (1280, 720), (30, 41, 59))
+        draw = ImageDraw.Draw(img)
+        draw.text((100, 320), title[:60], fill=(255, 255, 255))
+        img.save(thumb_path)
+
+    # 4. Check Background Videos repository
+    bg_custom_dir = snapshot.get("background_videos_dir") or snapshot.get("custom_stock_videos_path")
+    available_videos = get_available_background_videos(bg_custom_dir)
+    if not available_videos:
+        raise StockVideoRenderError(
+            f"Không tìm thấy video nền nào trong kho video: {bg_custom_dir or BACKGROUND_VIDEOS_DIR}. "
+            f"Vui lòng thêm ít nhất 1 video MP4 vào thư mục."
+        )
+
+    cancel_check()
+    progress("Đang chuẩn bị playlist video nền và bố cục ngẫu nhiên...", "stock_video_layout")
+
+    playlist = build_background_playlist(available_videos, audio_duration)
+
+    # 5. Pick Animated Icon
+    available_icons = get_available_animated_icons()
+    chosen_icon = secrets.choice(available_icons) if available_icons else None
+    if chosen_icon is None:
+        # Fallback default icon
+        chosen_icon = ANIMATED_ICONS_DIR / "sun_cute.gif"
+
+    # 6. Random 1 of 4 corners
+    corner = secrets.choice(["bottom_right", "bottom_left", "top_right", "top_left"])
+    logger.info("Stock Video: Selected corner '%s' for Video ID %s", corner, video_id)
+
+    # 7. Generate Pre-rendered Overlays (Thumbnail & Title Card)
+    scratch_dir = RENDERS_DIR / "temp" / f"video_{video_id}_{int(time.time())}"
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+
+    thumb_styled_path = scratch_dir / "thumb_styled.png"
+    generate_thumbnail_overlay(thumb_path, thumb_styled_path, target_w=560, target_h=315)
+
+    title_styled_path = scratch_dir / "title_styled.png"
+    _, title_total_w, title_total_h = generate_title_card_overlay(
+        title,
+        title_styled_path,
+        max_card_width=900,
+    )
+
+    # 8. Calculate Coordinates
+    # Thumbnail styled total size with padding: 560 + 12 + 40 = 612 x 315 + 12 + 40 = 367
+    with Image.open(thumb_styled_path) as im_t:
+        thumb_total_w, thumb_total_h = im_t.size
+
+    coords = calculate_layout_coordinates(
+        corner=corner,
+        thumb_w=thumb_total_w,
+        thumb_h=thumb_total_h,
+        card_w=title_total_w,
+        card_h=title_total_h,
+        icon_w=100,
+        icon_h=100,
+        wave_w=360,
+        wave_h=70,
+        canvas_w=TARGET_WIDTH,
+        canvas_h=TARGET_HEIGHT,
+    )
+
+    # 9. Write Concat List
+    concat_list_file = scratch_dir / "concat_videos.txt"
+    with open(concat_list_file, "w", encoding="utf-8") as f:
+        for video_item in playlist:
+            escaped_path = video_item.as_posix().replace("'", "'\\''")
+            f.write(f"file '{escaped_path}'\n")
+
+    # 10. Prepare FFmpeg Filter Complex
+    t_x, t_y = coords["thumb"]
+    c_x, c_y = coords["card"]
+    i_x, i_y = coords["icon"]
+    w_x, w_y = coords["wave"]
+
+    filter_complex = (
+        f"[0:v]scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=increase,"
+        f"crop={TARGET_WIDTH}:{TARGET_HEIGHT},setsar=1,format=yuva420p[bg];"
+        f"[1:a]showwaves=s=360x70:mode=p2p:colors=white@0.95:scale=sqrt,format=yuva420p[wave];"
+        f"[bg][2:v]overlay={t_x}:{t_y}[ov1];"
+        f"[ov1][3:v]overlay={c_x}:{c_y}[ov2];"
+        f"[4:v]scale=100:100[icon];"
+        f"[ov2][icon]overlay={i_x}:{i_y}:shortest=1[ov3];"
+        f"[ov3][wave]overlay={w_x}:{w_y}[final_v]"
+    )
+
+    # 11. Target Output Path
+    timestamp_str = time.strftime("%Y%m%d_%H%M%S")
+    output_filename = f"video_{video_id}_stock_{timestamp_str}.mp4"
+    output_path = RENDERS_DIR / output_filename
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    cmd = [
+        ffmpeg_exe, "-y",
+        "-f", "concat", "-safe", "0", "-i", str(concat_list_file),
+        "-i", str(audio_path),
+        "-i", str(thumb_styled_path),
+        "-i", str(title_styled_path),
+        "-ignore_loop", "0", "-i", str(chosen_icon),
+        "-filter_complex", filter_complex,
+        "-map", "[final_v]",
+        "-map", "1:a",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-t", f"{audio_duration:.3f}",
+        str(output_path),
+    ]
+
+    cancel_check()
+    progress("Đang tiến hành encode MP4 (Stock Video Mode)...", "stock_video_encoding")
+
+    logger.info("Running FFmpeg stock render: %s", " ".join(cmd[:10]))
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    try:
+        while proc.poll() is None:
+            cancel_check()
+            time.sleep(1.0)
+        stdout, stderr = proc.communicate()
+        if proc.returncode != 0:
+            raise StockVideoRenderError(f"FFmpeg render lỗi (code {proc.returncode}): {stderr[-600:]}")
+    except Exception:
+        if proc.poll() is None:
+            proc.kill()
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+        raise
+
+    # Clean up scratch temp files
+    shutil.rmtree(scratch_dir, ignore_errors=True)
+
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        raise StockVideoRenderError(f"Không tạo được file MP4 đầu ra: {output_path}")
+
+    logger.info("Stock Video rendered successfully: %s (%.2f MB)", output_path, output_path.stat().st_size / (1024 * 1024))
+
+    # 12. Register Final Artifact in DB
+    artifact_id = db.create_video_artifact(
+        video_id=video_id,
+        artifact_type="final_mp4",
+        file_path=str(output_path.resolve()),
+        content_hash=f"stock_{video_id}_{timestamp_str}",
+        status="ready",
+    )
+
+    artifact = db.get_video_artifact(artifact_id) if artifact_id else {
+        "id": artifact_id,
+        "video_id": video_id,
+        "artifact_type": "final_mp4",
+        "file_path": str(output_path.resolve()),
+        "status": "ready",
+    }
+
+    return {
+        "artifact": artifact,
+        "render_mode": "stock_video",
+        "video_path": str(output_path),
+        "duration": audio_duration,
+        "corner": corner,
+        "icon": str(chosen_icon.name),
+    }

@@ -277,7 +277,22 @@ def download_audio(
     ensure_worker_running(base_url=base_url)
     raw = _request(f"/v1/jobs/{job_id}/audio", timeout=30 * 60, base_url=base_url)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(f"{destination.suffix}.tmp")
+    temporary = destination.with_suffix(f"{destination.suffix}.{uuid.uuid4().hex}.tmp")
     temporary.write_bytes(raw)
-    os.replace(temporary, destination)
+    last_error: Exception | None = None
+    for attempt in range(10):
+        try:
+            os.replace(temporary, destination)
+            return destination
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.05 * (attempt + 1))
+    try:
+        destination.write_bytes(raw)
+        temporary.unlink(missing_ok=True)
+        return destination
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        if last_error:
+            raise last_error
     return destination

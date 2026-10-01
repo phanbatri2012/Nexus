@@ -131,6 +131,14 @@ const VIDEO_PROMPT_TAGS = [
 ];
 
 const DEFAULT_IMAGE_GENERATION_SETTINGS = {
+  render_mode: 'google_flow',
+  stock_video_settings: {
+    background_videos_dir: '',
+    custom_stock_videos_path: '',
+    thumbnail_corner_mode: 'random',
+    show_waveform: true,
+    show_animated_icon: true,
+  },
   provider: 'google_flow',
   model: 'nano_banana_pro',
   aspect_ratio: '16:9',
@@ -1131,6 +1139,36 @@ export default function Settings({
         ...prev,
         versions: { ...prev.versions, [versionId]: result.version }
       }));
+    }
+  };
+
+  const handleOpenStockVideosFolder = async (customPath = '') => {
+    try {
+      const res = await fetch('http://127.0.0.1:8080/api/stock-videos/open-folder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ custom_path: customPath })
+      });
+      const data = await res.json();
+      if (!data.success) {
+        alert('Lỗi mở thư mục: ' + data.message);
+      }
+    } catch (err) {
+      alert('Không thể kết nối server: ' + err.message);
+    }
+  };
+
+  const handleOpenAnimatedIconsFolder = async () => {
+    try {
+      const res = await fetch('http://127.0.0.1:8080/api/animated-icons/open-folder', {
+        method: 'POST'
+      });
+      const data = await res.json();
+      if (!data.success) {
+        alert('Lỗi mở thư mục: ' + data.message);
+      }
+    } catch (err) {
+      alert('Không thể kết nối server: ' + err.message);
     }
   };
 
@@ -2176,6 +2214,126 @@ export default function Settings({
             <div style={{ fontSize: '0.85rem', color: '#e2e8f0', lineHeight: 1.5 }}>
               <strong style={{ color: '#93c5fd' }}>Mẹo tự động hóa mượt mà:</strong> Trên tài khoản Google Flow, bạn hãy vào <em>Cài đặt tác nhân (Agent settings)</em> &rarr; mục <em>Xác nhận trước khi tạo</em> &rarr; chọn <strong>"Không bao giờ"</strong> (Tác nhân sẽ tự động tạo nội dung nghe nhìn và trừ tín dụng). Thao tác này giúp bot sinh ảnh/video liên tục mà không bị dừng chờ duyệt popup.
             </div>
+          </div>
+
+          {/* Render Mode Selection */}
+          <div style={{ marginBottom: 20, background: 'rgba(30, 41, 59, 0.7)', border: '1px solid #334155', borderRadius: 10, padding: 16 }}>
+            <h4 style={{ margin: '0 0 12px 0', fontSize: '1rem', color: '#38bdf8', display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span>🎬</span> Chế độ Dựng Video (Video Render Mode)
+            </h4>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 12 }}>
+              {/* Option 1: Google Flow */}
+              <div
+                onClick={() => handlePromptSettingChange('image_generation_settings', 'render_mode', 'google_flow')}
+                style={{
+                  border: (currentImageGeneration.render_mode || 'google_flow') === 'google_flow' ? '2px solid #10b981' : '1px solid #334155',
+                  background: (currentImageGeneration.render_mode || 'google_flow') === 'google_flow' ? 'rgba(16, 185, 129, 0.12)' : 'rgba(15, 23, 42, 0.6)',
+                  borderRadius: 8,
+                  padding: 14,
+                  cursor: 'pointer',
+                  transition: 'all 0.2s'
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                  <strong style={{ color: '#10b981', fontSize: '0.95rem' }}>🟢 1. Google Flow (AI Scenes)</strong>
+                  {(currentImageGeneration.render_mode || 'google_flow') === 'google_flow' && (
+                    <span style={{ fontSize: '0.75rem', background: '#10b981', color: '#fff', padding: '2px 8px', borderRadius: 12 }}>Đang chọn</span>
+                  )}
+                </div>
+                <div style={{ fontSize: '0.82rem', color: '#94a3b8', lineHeight: 1.4 }}>
+                  Tự động chia câu thoại theo SRT, sinh 30–50 ảnh/video AI qua Google Flow và ghép thành phim tài liệu phân cảnh.
+                </div>
+              </div>
+
+              {/* Option 2: Stock Video */}
+              <div
+                onClick={() => handlePromptSettingChange('image_generation_settings', 'render_mode', 'stock_video')}
+                style={{
+                  border: currentImageGeneration.render_mode === 'stock_video' ? '2px solid #8b5cf6' : '1px solid #334155',
+                  background: currentImageGeneration.render_mode === 'stock_video' ? 'rgba(139, 92, 246, 0.12)' : 'rgba(15, 23, 42, 0.6)',
+                  borderRadius: 8,
+                  padding: 14,
+                  cursor: 'pointer',
+                  transition: 'all 0.2s'
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                  <strong style={{ color: '#a78bfa', fontSize: '0.95rem' }}>🔵 2. Kho Video Nền (Stock / Radio)</strong>
+                  {currentImageGeneration.render_mode === 'stock_video' && (
+                    <span style={{ fontSize: '0.75rem', background: '#8b5cf6', color: '#fff', padding: '2px 8px', borderRadius: 12 }}>Đang chọn</span>
+                  )}
+                </div>
+                <div style={{ fontSize: '0.82rem', color: '#94a3b8', lineHeight: 1.4 }}>
+                  Chọn video nền từ kho có sẵn, random Thumbnail 4 góc, Box Tiêu đề đối xứng, Sóng âm Visualizer & Icon động. Render siêu tốc ~1–2 phút.
+                </div>
+              </div>
+            </div>
+
+            {/* Stock Video Specific Settings Panel */}
+            {currentImageGeneration.render_mode === 'stock_video' && (
+              <div style={{ marginTop: 16, borderTop: '1px dashed #475569', paddingTop: 14 }}>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginBottom: 12 }}>
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    onClick={() => handleOpenStockVideosFolder(currentImageGeneration.stock_video_settings?.custom_stock_videos_path || '')}
+                    style={{ fontSize: '0.85rem', padding: '6px 12px' }}
+                  >
+                    📂 Mở Thư Mục Kho Video Nền
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    onClick={handleOpenAnimatedIconsFolder}
+                    style={{ fontSize: '0.85rem', padding: '6px 12px' }}
+                  >
+                    ✨ Mở Thư Mục Kho Icon Động (Stickers)
+                  </button>
+                </div>
+
+                <div className="production-settings-grid" style={{ marginBottom: 10 }}>
+                  <label>
+                    Đường dẫn Kho Video Tùy Chỉnh (Tùy chọn)
+                    <input
+                      type="text"
+                      className="version-input"
+                      placeholder="Ví dụ: D:\Stock_Videos (để trống dùng data/background_videos)"
+                      value={currentImageGeneration.stock_video_settings?.custom_stock_videos_path || ''}
+                      onChange={e => {
+                        const prevStock = currentImageGeneration.stock_video_settings || {};
+                        handlePromptSettingChange('image_generation_settings', 'stock_video_settings', {
+                          ...prevStock,
+                          custom_stock_videos_path: e.target.value
+                        });
+                      }}
+                      disabled={activeVersionLocked}
+                    />
+                  </label>
+
+                  <label>
+                    Vị trí Thumbnail
+                    <select
+                      className="version-select"
+                      value={currentImageGeneration.stock_video_settings?.thumbnail_corner_mode || 'random'}
+                      onChange={e => {
+                        const prevStock = currentImageGeneration.stock_video_settings || {};
+                        handlePromptSettingChange('image_generation_settings', 'stock_video_settings', {
+                          ...prevStock,
+                          thumbnail_corner_mode: e.target.value
+                        });
+                      }}
+                      disabled={activeVersionLocked}
+                    >
+                      <option value="random">🎲 Ngẫu nhiên 1 trong 4 góc (Khuyên dùng)</option>
+                      <option value="bottom_right">Góc dưới bên phải (Tiêu đề góc trái)</option>
+                      <option value="bottom_left">Góc dưới bên trái (Tiêu đề góc phải)</option>
+                      <option value="top_right">Góc trên bên phải (Tiêu đề góc trái)</option>
+                      <option value="top_left">Góc trên bên trái (Tiêu đề góc phải)</option>
+                    </select>
+                  </label>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Section 1: AI Image Models Configuration */}
