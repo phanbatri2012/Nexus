@@ -28,6 +28,11 @@ else {
     ).TrimEnd("\")
 }
 
+$ffmpegDir = Join-Path $dataRoot "tools\ffmpeg"
+if (Test-Path -LiteralPath $ffmpegDir) {
+    $env:PATH = "$ffmpegDir;$env:PATH"
+}
+
 function Write-Step {
     param([string]$Message)
     Write-Host "[Auto_YT] $Message" -ForegroundColor Cyan
@@ -383,12 +388,14 @@ function Invoke-BrowserServiceAction {
     else {
         "service.set_browser_service_window_visibility(True)"
     }
-    $pythonCode = "from auto_yt.services import $ModuleName as service; status = $methodCall; print(status.get('message', '')); raise SystemExit(0 if status.get('connected') else 1)"
+    $pythonCode = "import sys; from auto_yt.services import $ModuleName as service; status = $methodCall; sys.stdout.reconfigure(encoding='utf-8') if hasattr(sys.stdout, 'reconfigure') else None; print(status.get('message', '')); raise SystemExit(0 if status.get('connected') else 1)"
     $previousPythonPath = $env:PYTHONPATH
     $previousPythonIoEncoding = $env:PYTHONIOENCODING
+    $previousPythonUtf8 = $env:PYTHONUTF8
     try {
         $env:PYTHONPATH = Join-Path $projectRoot "src"
         $env:PYTHONIOENCODING = "utf-8"
+        $env:PYTHONUTF8 = "1"
         Invoke-ExternalCommand `
             $venvPython `
             @("-c", $pythonCode) `
@@ -406,6 +413,12 @@ function Invoke-BrowserServiceAction {
         }
         else {
             $env:PYTHONIOENCODING = $previousPythonIoEncoding
+        }
+        if ($null -eq $previousPythonUtf8) {
+            Remove-Item Env:PYTHONUTF8 -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:PYTHONUTF8 = $previousPythonUtf8
         }
     }
 }

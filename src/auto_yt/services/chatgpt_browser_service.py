@@ -234,18 +234,28 @@ def _service_environment() -> dict[str, str]:
         if existing_pythonpath
         else source_root
     )
+    environment["PYTHONIOENCODING"] = "utf-8"
+    environment["PYTHONUTF8"] = "1"
     return environment
 
 
 def _spawn_service_process() -> None:
     from auto_yt.services.win32_window import spawn_service_on_interactive_desktop
 
+    python_executable = sys.executable
+    venv_pythonw = PROJECT_ROOT / ".venv" / "Scripts" / "pythonw.exe"
+    venv_python = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+    if venv_pythonw.exists():
+        python_executable = str(venv_pythonw)
+    elif venv_python.exists():
+        python_executable = str(venv_python)
+
     SERVICE_LOG_DIR.mkdir(parents=True, exist_ok=True)
     stdout_path = SERVICE_LOG_DIR / "chatgpt-browser-service.stdout.log"
     stderr_path = SERVICE_LOG_DIR / "chatgpt-browser-service.stderr.log"
     spawn_service_on_interactive_desktop(
         [
-            sys.executable,
+            python_executable,
             "-m",
             "auto_yt.services.chatgpt_browser_service",
             "--serve",
@@ -475,6 +485,23 @@ def run_browser_service() -> int:
     from playwright.sync_api import sync_playwright
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    SERVICE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        sys.stdout = open(
+            SERVICE_LOG_DIR / "chatgpt-browser-service.stdout.log",
+            "a",
+            encoding="utf-8",
+            buffering=1,
+        )
+        sys.stderr = open(
+            SERVICE_LOG_DIR / "chatgpt-browser-service.stderr.log",
+            "a",
+            encoding="utf-8",
+            buffering=1,
+        )
+    except Exception:
+        pass
+
     instance_id = uuid.uuid4().hex
     cdp_port = _reserve_loopback_port()
     endpoint = f"http://{CDP_HOST}:{cdp_port}"
@@ -509,6 +536,11 @@ def run_browser_service() -> int:
     try:
         profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
         profile_dir.mkdir(parents=True, exist_ok=True)
+        for lock_file in profile_dir.glob("Singleton*"):
+            try:
+                lock_file.unlink(missing_ok=True)
+            except Exception:
+                pass
         browser_settings = account_store.get_browser_automation_settings()
         launch_options = get_browser_service_launch_options(
             browser_settings,

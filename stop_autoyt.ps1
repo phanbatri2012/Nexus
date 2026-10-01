@@ -75,6 +75,9 @@ function Test-AutoYTProcess {
     if ($omniVoiceRoot -and $identity.IndexOf($omniVoiceRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
         return $true
     }
+    if ($identity -match "auto_yt" -or $identity -match "chatgpt_browser_service" -or $identity -match "google_flow_browser_service") {
+        return $true
+    }
     return $false
 }
 
@@ -236,7 +239,7 @@ try {
             }
             else {
                 $proc = $processes | Where-Object { [int]$_.ProcessId -eq [int]$listenerId } | Select-Object -First 1
-                if ($proc -and (Test-AutoYTProcess $proc -or [string]$proc.CommandLine -match "api_server:app" -or [string]$proc.CommandLine -match "auto_yt")) {
+                if ($proc -and (Test-AutoYTProcess $proc -or [string]$proc.CommandLine -match "api_server:app" -or [string]$proc.CommandLine -match "auto_yt" -or [string]$proc.CommandLine -match "uvicorn" -or $port -eq 8011)) {
                     $null = $rootIds.Add([int]$listenerId)
                 }
                 else {
@@ -323,7 +326,7 @@ try {
         foreach ($port in $servicePorts) {
             foreach ($listenerId in @(Get-ListeningProcessIds $port)) {
                 $proc = $snapshot | Where-Object { [int]$_.ProcessId -eq [int]$listenerId } | Select-Object -First 1
-                if ($proc -and (Test-AutoYTProcess $proc -or [string]$proc.CommandLine -match "api_server:app" -or [string]$proc.CommandLine -match "auto_yt")) {
+                if ($proc -and (Test-AutoYTProcess $proc -or [string]$proc.CommandLine -match "api_server:app" -or [string]$proc.CommandLine -match "auto_yt" -or [string]$proc.CommandLine -match "uvicorn" -or $port -eq 8011)) {
                     Stop-Process -Id $listenerId -Force -ErrorAction SilentlyContinue
                 }
             }

@@ -37,6 +37,14 @@ def _get_token() -> str:
     environment_token = os.environ.get("AUTO_YT_OMNIVOICE_TOKEN", "").strip()
     if environment_token:
         return environment_token
+    worker_token_path = OMNIVOICE_ROOT / "data" / "omnivoice_internal_token.txt"
+    if worker_token_path.exists():
+        try:
+            token = worker_token_path.read_text(encoding="utf-8").strip()
+            if token:
+                return token
+        except Exception:
+            pass
     if TOKEN_PATH.exists():
         token = read_encrypted_secret_file(TOKEN_PATH)
         if token:

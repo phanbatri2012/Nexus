@@ -78,31 +78,17 @@ def spawn_service_on_interactive_desktop(
             ]
             kernel32.CreateProcessW.restype = wintypes.BOOL
 
-            # Open log files in append mode and get inheritable OS handles
-            stdout_fd = os.open(
-                str(stdout_path),
-                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-                0o666,
-            )
-            stderr_fd = os.open(
-                str(stderr_path),
-                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-                0o666,
-            )
-            h_stdout = msvcrt.get_osfhandle(stdout_fd)
-            h_stderr = msvcrt.get_osfhandle(stderr_fd)
-
-            HANDLE_FLAG_INHERIT = 0x00000001
-            kernel32.SetHandleInformation(h_stdout, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
-            kernel32.SetHandleInformation(h_stderr, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
+            STARTF_USESHOWWINDOW = 0x00000001
+            SW_HIDE = 0
 
             si = STARTUPINFOW()
             si.cb = ctypes.sizeof(STARTUPINFOW)
             si.lpDesktop = r"WinSta0\Default"
-            si.dwFlags = 0x00000100  # STARTF_USESTDHANDLES
+            si.dwFlags = STARTF_USESHOWWINDOW
+            si.wShowWindow = SW_HIDE
             si.hStdInput = None
-            si.hStdOutput = h_stdout
-            si.hStdError = h_stderr
+            si.hStdOutput = None
+            si.hStdError = None
 
             pi = PROCESS_INFORMATION()
             cmd_str = subprocess.list2cmdline(command)
@@ -113,20 +99,20 @@ def spawn_service_on_interactive_desktop(
             env_block = "".join(f"{k}={v}\0" for k, v in sorted(env.items())) + "\0"
             env_buf = ctypes.create_unicode_buffer(env_block)
 
+            # bInheritHandles MUST be False to prevent leaking parent pipes (e.g. PowerShell/cmd)
+            # which causes callers like start_autoyt.ps1 to hang indefinitely waiting for EOF.
             success = kernel32.CreateProcessW(
                 None,
                 cmd_str,
                 None,
                 None,
-                True,  # bInheritHandles
+                False,
                 CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
                 ctypes.byref(env_buf),
                 str(cwd),
                 ctypes.byref(si),
                 ctypes.byref(pi),
             )
-            os.close(stdout_fd)
-            os.close(stderr_fd)
 
             if success:
                 kernel32.CloseHandle(pi.hProcess)
