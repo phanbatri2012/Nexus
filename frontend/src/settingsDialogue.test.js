@@ -16,3 +16,12 @@ test('Settings exposes Content Mode and Cast Settings management for dialogue', 
   assert.match(settingsSource, /\/cast-settings`/);
   assert.match(settingsSource, /\/content-mode`/);
 });
+
+test('Settings exposes Variable Chips, Contextual Guides, and Syntax Cheat Sheet', () => {
+  assert.match(settingsSource, /PROMPT_FIELD_METADATA/);
+  assert.match(settingsSource, /showCheatSheet/);
+  assert.match(settingsSource, /handleInsertVariable/);
+  assert.match(settingsSource, /Bảng Tra Cứu Biến Số & Cú Pháp Chuẩn/);
+  assert.match(settingsSource, /Biến có sẵn:/);
+  assert.match(settingsSource, /Prompt đang thiếu biến\/tag bắt buộc:/);
+});

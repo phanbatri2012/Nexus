@@ -385,6 +385,122 @@ function ProviderVoiceOptions({ voices }) {
   ));
 }
 
+const PROMPT_FIELD_METADATA = {
+  outline: {
+    key: 'outline',
+    label: '1. Dàn ý (Outline)',
+    help: 'Chia nội dung video nguồn thành các phần lớn bằng tag [PHAN].',
+    guide: 'Bắt buộc chứa biến {transcript} để nhận toàn bộ phụ đề/nội dung thô từ video nguồn.',
+    variables: [
+      { tag: '{transcript}', label: '+ {transcript}', required: true, description: 'Nội dung phụ đề/văn bản thô video nguồn', color: '#38bdf8' }
+    ]
+  },
+  intro: {
+    key: 'intro',
+    label: '2. Mở đầu (Intro)',
+    help: 'Viết đoạn mở đầu giật gân, cuốn hút giữ chân khán giả từ 5 giây đầu.',
+    guide: 'Trong chế độ Đối thoại, hãy dùng thẻ [MC]: và [KHACH_1]: để phân chia lượt nói mở đầu.',
+    variables: [
+      { tag: '[MC]:', label: '+ [MC]:', required: true, forMode: 'dialogue', description: 'Lượt mở đầu của MC/Host', color: '#fbbf24' },
+      { tag: '[KHACH_1]:', label: '+ [KHACH_1]:', required: true, forMode: 'dialogue', description: 'Lượt chào của Khách Mời Chính', color: '#34d399' },
+      { tag: '[KHACH_2]:', label: '+ [KHACH_2]:', required: false, forMode: 'dialogue', description: 'Lượt lời của Khách Mời 2 (nếu có)', color: '#f472b6' }
+    ]
+  },
+  body: {
+    key: 'body',
+    label: '3. Nội dung chính (Body)',
+    help: 'Viết chi tiết từng phần nội dung câu chuyện trong vòng lặp kịch bản.',
+    guide: 'Bắt buộc chứa {part} để nhận dữ liệu từng phần dàn ý. Trong chế độ Đối thoại, bắt buộc dùng thẻ [MC]: và [KHACH_1]: ở đầu mỗi lượt thoại.',
+    variables: [
+      { tag: '{part}', label: '+ {part}', required: true, description: 'Dữ liệu từng phần [PHAN] trong dàn ý', color: '#38bdf8' },
+      { tag: '[MC]:', label: '+ [MC]:', required: true, forMode: 'dialogue', description: 'Lời dẫn/hỏi/phân tích của MC', color: '#fbbf24' },
+      { tag: '[KHACH_1]:', label: '+ [KHACH_1]:', required: true, forMode: 'dialogue', description: 'Lời kể chuyện/chia sẻ của Khách Mời', color: '#34d399' },
+      { tag: '[KHACH_2]:', label: '+ [KHACH_2]:', required: false, forMode: 'dialogue', description: 'Lời thoại của Khách Mời 2', color: '#f472b6' }
+    ]
+  },
+  outro: {
+    key: 'outro',
+    label: '4. Kết thúc (Outro)',
+    help: 'Đúc kết bài học, cảm ơn người xem và kêu gọi like, share, đăng ký kênh.',
+    guide: 'Trong chế độ Đối thoại, hãy dùng thẻ [MC]: và [KHACH_1]: để phân chia lời kết thúc.',
+    variables: [
+      { tag: '[MC]:', label: '+ [MC]:', required: true, forMode: 'dialogue', description: 'Lời đúc kết & chào kết của MC', color: '#fbbf24' },
+      { tag: '[KHACH_1]:', label: '+ [KHACH_1]:', required: true, forMode: 'dialogue', description: 'Lời cảm ơn của Khách Mời', color: '#34d399' },
+      { tag: '[KHACH_2]:', label: '+ [KHACH_2]:', required: false, forMode: 'dialogue', description: 'Lời chào của Khách Mời 2', color: '#f472b6' }
+    ]
+  },
+  title: {
+    key: 'title',
+    label: '5. Tiêu đề (Title)',
+    help: 'Tiêu đề video YouTube giật gân, chuẩn SEO, từ khóa VIẾT HOA.',
+    guide: 'AI sẽ tự động đọc toàn bộ nội dung kịch bản đã viết để sinh ra tiêu đề tối ưu nhất.',
+    variables: []
+  },
+  slug: {
+    key: 'slug',
+    label: '6. URL Slug (Tên file MP4)',
+    help: 'Chuỗi ký tự không dấu nối bằng dấu gạch ngang dùng làm tên file MP4 khi render.',
+    guide: 'AI sẽ sinh ra chuỗi không dấu ngắn gọn (ví dụ: tam-su-hon-nhan-nguoi-thu-ba).',
+    variables: []
+  },
+  description: {
+    key: 'description',
+    label: '7. Mô tả video (Description)',
+    help: 'Tóm tắt nội dung câu chuyện và phân tích chuẩn SEO YouTube.',
+    guide: 'Nội dung này sẽ được chèn vào biến {description} trong mẫu mô tả video xuất bản.',
+    variables: []
+  },
+  hashtags: {
+    key: 'hashtags',
+    label: '8. Hashtags (cho mô tả)',
+    help: '3–5 thẻ hashtag có dấu # ở đầu trên 1 dòng.',
+    guide: 'Nội dung này sẽ được chèn vào biến {hashtags} trong mẫu mô tả video xuất bản.',
+    variables: []
+  },
+  tags: {
+    key: 'tags',
+    label: '9. Thẻ từ khóa (Tags YouTube)',
+    help: '10–15 từ khóa phân cách bằng dấu phẩy cho SEO YouTube.',
+    guide: 'Các thẻ từ khóa YouTube phân cách bằng dấu phẩy, không chứa dấu #.',
+    variables: []
+  },
+  pinned_comment: {
+    key: 'pinned_comment',
+    label: '10. Bình luận ghim',
+    help: 'Bình luận ghim tương tác của chủ kênh để kích thích khán giả comment.',
+    guide: 'Gợi mở câu hỏi hoặc thông điệp từ MC/Chủ kênh.',
+    variables: []
+  },
+  quiz: {
+    key: 'quiz',
+    label: '11. Quiz tương tác',
+    help: '1 câu hỏi trắc nghiệm kèm 4 đáp án và lời giải thích.',
+    guide: 'Tạo câu hỏi đố vui hoặc suy ngẫm cho cộng đồng khán giả.',
+    variables: []
+  },
+  chapters: {
+    key: 'chapters',
+    label: '12. Phân đoạn (Chapters)',
+    help: 'Các mốc thời gian phân đoạn video (Timestamps) chuẩn định dạng YouTube.',
+    guide: 'Nội dung này sẽ được chèn vào biến {chapters} trong mẫu mô tả video xuất bản.',
+    variables: []
+  },
+  thumb_text: {
+    key: 'thumb_text',
+    label: '13. Thumbnail (Có chữ)',
+    help: 'Ý tưởng thiết kế và prompt sinh ảnh nền thumbnail có kèm chữ clickbait nổi bật.',
+    guide: 'Dùng cho ảnh đại diện video YouTube bản có chữ tiêu đề bắt mắt.',
+    variables: []
+  },
+  thumb_notext: {
+    key: 'thumb_notext',
+    label: '14. Thumbnail (Không chữ)',
+    help: 'Ý tưởng thiết kế và prompt sinh ảnh nền thumbnail nghệ thuật không chữ.',
+    guide: 'Dùng cho ảnh đại diện video sạch hoặc dùng làm ảnh nền mở đầu Scene 0.',
+    variables: []
+  }
+};
+
 export default function Settings({
   lockedPromptVersion = '',
   chatGptOperation = ''
@@ -393,6 +509,7 @@ export default function Settings({
   const [voicesData, setVoicesData] = useState(null);
   const [youtubeChannels, setYoutubeChannels] = useState([]);
   const [pipelineNotice, setPipelineNotice] = useState('');
+  const [showCheatSheet, setShowCheatSheet] = useState(false);
   const [activeVersion, setActiveVersion] = useState('');
   const [loadingMsg, setLoadingMsg] = useState('');
   const [resultMsg, setResultMsg] = useState('');
@@ -532,6 +649,12 @@ export default function Settings({
         }
       }
     }));
+  };
+
+  const handleInsertVariable = (key, tag) => {
+    const currentVal = currentVersion?.prompts?.[key] || '';
+    const nextVal = currentVal ? `${currentVal.trimEnd()}\n${tag}` : tag;
+    handlePromptChange(key, nextVal);
   };
 
   const handleVersionNameChange = (value) => {
@@ -1355,6 +1478,15 @@ export default function Settings({
         
         <div className="version-actions">
           <button
+            type="button"
+            className="btn-secondary"
+            onClick={() => setShowCheatSheet(true)}
+            title="Xem bảng tra cứu đầy đủ biến số và quy chuẩn viết prompt"
+            style={{ background: 'rgba(56, 189, 248, 0.15)', borderColor: 'rgba(56, 189, 248, 0.35)', color: '#38bdf8' }}
+          >
+            📖 Tra Cứu Biến & Cú Pháp
+          </button>
+          <button
             className="btn-save btn-save-all"
             onClick={handleSave}
             disabled={Boolean(savingSection)}
@@ -1377,6 +1509,163 @@ export default function Settings({
           </button>
         </div>
       </div>
+
+      {showCheatSheet && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          backgroundColor: 'rgba(0, 0, 0, 0.75)',
+          backdropFilter: 'blur(5px)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 9999,
+          padding: '20px'
+        }}>
+          <div style={{
+            background: '#0f172a',
+            border: '1px solid rgba(255, 255, 255, 0.15)',
+            borderRadius: '12px',
+            maxWidth: '860px',
+            width: '100%',
+            maxHeight: '90vh',
+            overflowY: 'auto',
+            boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.8)',
+            padding: '24px',
+            color: '#f8fafc'
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, borderBottom: '1px solid rgba(255, 255, 255, 0.1)', paddingBottom: 12 }}>
+              <h3 style={{ margin: 0, fontSize: '1.25rem', color: '#38bdf8', display: 'flex', alignItems: 'center', gap: 8 }}>
+                📖 Bảng Tra Cứu Biến Số & Cú Pháp Chuẩn
+              </h3>
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() => setShowCheatSheet(false)}
+                style={{ padding: '4px 12px', fontSize: '0.85rem' }}
+              >
+                ✕ Đóng
+              </button>
+            </div>
+
+            {/* Section 1: Cast Role Tags */}
+            <div style={{ marginBottom: 20 }}>
+              <h4 style={{ color: '#fbbf24', margin: '0 0 8px 0', fontSize: '1rem' }}>
+                👥 1. Thẻ Định Danh Vai Diễn (Chế độ Đối Thoại - Dùng trong Intro, Body, Outro)
+              </h4>
+              <div style={{ background: 'rgba(255, 255, 255, 0.04)', borderRadius: 8, padding: 12, border: '1px solid rgba(255, 255, 255, 0.08)' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.85rem' }}>
+                  <thead>
+                    <tr style={{ borderBottom: '1px solid rgba(255, 255, 255, 0.1)', textAlign: 'left' }}>
+                      <th style={{ padding: '6px 8px', color: '#94a3b8' }}>Thẻ vai diễn</th>
+                      <th style={{ padding: '6px 8px', color: '#94a3b8' }}>Ý nghĩa & Vai trò</th>
+                      <th style={{ padding: '6px 8px', color: '#94a3b8' }}>Ghi chú bắt buộc</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr style={{ borderBottom: '1px solid rgba(255, 255, 255, 0.05)' }}>
+                      <td style={{ padding: '8px', color: '#fbbf24', fontFamily: 'monospace', fontWeight: 'bold' }}>[MC]:</td>
+                      <td style={{ padding: '8px' }}>Lượt nói của Host / MC (Tiến sĩ Đinh Đoàn)</td>
+                      <td style={{ padding: '8px', color: '#cbd5e1' }}>Đặt ở đầu dòng mỗi lượt thoại của MC</td>
+                    </tr>
+                    <tr style={{ borderBottom: '1px solid rgba(255, 255, 255, 0.05)' }}>
+                      <td style={{ padding: '8px', color: '#34d399', fontFamily: 'monospace', fontWeight: 'bold' }}>[KHACH_1]:</td>
+                      <td style={{ padding: '8px' }}>Lượt nói của Khách Mời Chính (Người kể chuyện)</td>
+                      <td style={{ padding: '8px', color: '#cbd5e1' }}>Cho phép kể liên tục đoạn dài không giới hạn</td>
+                    </tr>
+                    <tr>
+                      <td style={{ padding: '8px', color: '#f472b6', fontFamily: 'monospace', fontWeight: 'bold' }}>[KHACH_2]:</td>
+                      <td style={{ padding: '8px' }}>Lượt nói của Khách Mời 2 (Người thứ ba / Chuyên gia phụ)</td>
+                      <td style={{ padding: '8px', color: '#cbd5e1' }}>Tùy chọn khi kịch bản có 3 nhân vật</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Section 2: Script Dynamic Variables */}
+            <div style={{ marginBottom: 20 }}>
+              <h4 style={{ color: '#38bdf8', margin: '0 0 8px 0', fontSize: '1rem' }}>
+                🔄 2. Biến Dữ Liệu Tự Động (Dùng trong ChatGPT Prompt)
+              </h4>
+              <div style={{ background: 'rgba(255, 255, 255, 0.04)', borderRadius: 8, padding: 12, border: '1px solid rgba(255, 255, 255, 0.08)' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.85rem' }}>
+                  <thead>
+                    <tr style={{ borderBottom: '1px solid rgba(255, 255, 255, 0.1)', textAlign: 'left' }}>
+                      <th style={{ padding: '6px 8px', color: '#94a3b8' }}>Biến số</th>
+                      <th style={{ padding: '6px 8px', color: '#94a3b8' }}>Áp dụng tại Prompt</th>
+                      <th style={{ padding: '6px 8px', color: '#94a3b8' }}>Dữ liệu tự động chèn vào</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr style={{ borderBottom: '1px solid rgba(255, 255, 255, 0.05)' }}>
+                      <td style={{ padding: '8px', color: '#38bdf8', fontFamily: 'monospace', fontWeight: 'bold' }}>{'{transcript}'}</td>
+                      <td style={{ padding: '8px' }}>1. Dàn ý (Outline)</td>
+                      <td style={{ padding: '8px', color: '#cbd5e1' }}>Toàn bộ phụ đề/văn bản thô của video nguồn để lập dàn ý</td>
+                    </tr>
+                    <tr>
+                      <td style={{ padding: '8px', color: '#38bdf8', fontFamily: 'monospace', fontWeight: 'bold' }}>{'{part}'}</td>
+                      <td style={{ padding: '8px' }}>3. Thân bài (Body)</td>
+                      <td style={{ padding: '8px', color: '#cbd5e1' }}>Từng phần [PHAN] trong dàn ý khi hệ thống viết từng đoạn kịch bản</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Section 3: Publishing Template Variables */}
+            <div style={{ marginBottom: 20 }}>
+              <h4 style={{ color: '#a78bfa', margin: '0 0 8px 0', fontSize: '1rem' }}>
+                📤 3. Biến Mẫu Mô Tả YouTube (Description Template)
+              </h4>
+              <div style={{ background: 'rgba(255, 255, 255, 0.04)', borderRadius: 8, padding: 12, border: '1px solid rgba(255, 255, 255, 0.08)' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.85rem' }}>
+                  <thead>
+                    <tr style={{ borderBottom: '1px solid rgba(255, 255, 255, 0.1)', textAlign: 'left' }}>
+                      <th style={{ padding: '6px 8px', color: '#94a3b8' }}>Biến số</th>
+                      <th style={{ padding: '6px 8px', color: '#94a3b8' }}>Ý nghĩa</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr style={{ borderBottom: '1px solid rgba(255, 255, 255, 0.05)' }}>
+                      <td style={{ padding: '8px', color: '#a78bfa', fontFamily: 'monospace', fontWeight: 'bold' }}>{'{description}'}</td>
+                      <td style={{ padding: '8px', color: '#cbd5e1' }}>Đoạn mô tả tóm tắt chuẩn SEO YouTube từ prompt 7</td>
+                    </tr>
+                    <tr style={{ borderBottom: '1px solid rgba(255, 255, 255, 0.05)' }}>
+                      <td style={{ padding: '8px', color: '#a78bfa', fontFamily: 'monospace', fontWeight: 'bold' }}>{'{chapters}'}</td>
+                      <td style={{ padding: '8px', color: '#cbd5e1' }}>Danh sách mốc thời gian (00:00 - Tiêu đề...) từ prompt 12</td>
+                    </tr>
+                    <tr>
+                      <td style={{ padding: '8px', color: '#a78bfa', fontFamily: 'monospace', fontWeight: 'bold' }}>{'{hashtags}'}</td>
+                      <td style={{ padding: '8px', color: '#cbd5e1' }}>Danh sách 3–5 thẻ # từ prompt 8</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Section 4: Scene Image/Video Variables */}
+            <div style={{ marginBottom: 12 }}>
+              <h4 style={{ color: '#ec4899', margin: '0 0 8px 0', fontSize: '1rem' }}>
+                🖼️ 4. Biến Sinh Ảnh & Video Phân Cảnh (Image / Video Templates)
+              </h4>
+              <div style={{ background: 'rgba(255, 255, 255, 0.04)', borderRadius: 8, padding: 12, border: '1px solid rgba(255, 255, 255, 0.08)' }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 10, fontSize: '0.83rem' }}>
+                  <div><code style={{ color: '#ec4899' }}>{'{style}'}</code>: Phong cách ảnh chung</div>
+                  <div><code style={{ color: '#ec4899' }}>{'{reference}'}</code>: Ảnh tham chiếu nhân vật</div>
+                  <div><code style={{ color: '#ec4899' }}>{'{thumbnail_concept}'}</code>: Ý tưởng cốt lõi câu chuyện</div>
+                  <div><code style={{ color: '#ec4899' }}>{'{action}'}</code>: Hành động diễn biến phân cảnh</div>
+                  <div><code style={{ color: '#ec4899' }}>{'{scene_index}'}</code>: Số thứ tự cảnh (1, 2, 3...)</div>
+                  <div><code style={{ color: '#ec4899' }}>{'{motion}'}</code>: Lệnh chuyển động camera</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Content Mode Selector */}
       <div className="prompt-item" style={{ marginBottom: '20px' }}>
@@ -3104,38 +3393,123 @@ export default function Settings({
       )}
 
       <div className="prompts-list">
-        {promptFields.map(field => (
-          <div key={field.key} className="prompt-item">
-            <div className="prompt-header">
-              <label>{field.label}</label>
-              <div className="prompt-header-actions">
-                {field.help && <span className="help-text">{field.help}</span>}
-                <button
-                  className="btn-save section-save-button"
-                  onClick={() => handleSavePrompt(field.key, field.label)}
-                  disabled={Boolean(savingSection) || activeVersionLocked}
-                >
-                  💾 Lưu
-                </button>
+        {promptFields.map(field => {
+          const meta = PROMPT_FIELD_METADATA[field.key] || {};
+          const currentMode = currentVersion.content_mode || 'dialogue';
+          const availableVars = (meta.variables || []).filter(
+            v => !v.forMode || v.forMode === currentMode
+          );
+          const promptValue = currentVersion.prompts[field.key] || '';
+          const missingRequired = availableVars.filter(
+            v => v.required && !promptValue.includes(v.tag)
+          );
+
+          return (
+            <div key={field.key} className="prompt-item">
+              <div className="prompt-header">
+                <div>
+                  <label>{field.label}</label>
+                  {meta.guide && (
+                    <div className="help-text" style={{ marginTop: '3px', color: '#94a3b8' }}>
+                      💡 {meta.guide}
+                    </div>
+                  )}
+                </div>
+                <div className="prompt-header-actions">
+                  {field.help && <span className="help-text">{field.help}</span>}
+                  <button
+                    className="btn-save section-save-button"
+                    onClick={() => handleSavePrompt(field.key, field.label)}
+                    disabled={Boolean(savingSection) || activeVersionLocked}
+                  >
+                    💾 Lưu
+                  </button>
+                </div>
               </div>
-            </div>
-            <div style={{ display: 'flex', gap: '10px' }}>
-              <textarea
-                className="prompt-textarea"
-                style={{ flex: 1 }}
-                value={currentVersion.prompts[field.key] || ''}
-                onChange={(e) => handlePromptChange(field.key, e.target.value)}
-                rows={6}
-                disabled={activeVersionLocked}
-              />
-              {(field.key === 'thumb_text' || field.key === 'thumb_notext') && (
-                <div style={{ width: '150px', border: '1px dashed #666', borderRadius: '4px', padding: '10px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.2)' }}>
-                  {renderImagePreviews(field.key)}
+
+              {/* Variable Chips Bar */}
+              {availableVars.length > 0 && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', margin: '8px 0 6px 0' }}>
+                  <span style={{ fontSize: '0.78rem', color: '#64748b', fontWeight: 600 }}>Biến có sẵn:</span>
+                  {availableVars.map(v => (
+                    <button
+                      key={v.tag}
+                      type="button"
+                      className="btn-secondary"
+                      style={{
+                        padding: '2px 8px',
+                        fontSize: '0.76rem',
+                        borderRadius: 4,
+                        background: `${v.color || '#38bdf8'}18`,
+                        borderColor: `${v.color || '#38bdf8'}40`,
+                        color: v.color || '#38bdf8'
+                      }}
+                      onClick={() => handleInsertVariable(field.key, v.tag)}
+                      disabled={activeVersionLocked}
+                      title={`Chèn biến ${v.tag}: ${v.description}`}
+                    >
+                      {v.label || v.tag}
+                    </button>
+                  ))}
                 </div>
               )}
+
+              {/* Missing Required Variable Warning */}
+              {missingRequired.length > 0 && (
+                <div style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  background: 'rgba(245, 158, 11, 0.12)',
+                  border: '1px solid rgba(245, 158, 11, 0.35)',
+                  borderRadius: 6,
+                  padding: '6px 12px',
+                  marginBottom: 8,
+                  color: '#fbbf24',
+                  fontSize: '0.8rem',
+                  gap: 10
+                }}>
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span>⚠️</span>
+                    <span>
+                      <strong>Lưu ý:</strong> Prompt đang thiếu biến/tag bắt buộc: {missingRequired.map(v => v.tag).join(', ')}. {field.key === 'outline' ? 'AI sẽ không có dữ liệu nguồn để lập dàn ý.' : field.key === 'body' ? 'AI sẽ không nhận được từng phần dàn ý.' : 'OmniVoice sẽ không thể tự động nhận diện và đổi giọng đọc.'}
+                    </span>
+                  </span>
+                  <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+                    {missingRequired.map(v => (
+                      <button
+                        key={v.tag}
+                        type="button"
+                        className="btn-secondary"
+                        style={{ padding: '2px 8px', fontSize: '0.75rem', background: '#f59e0b', color: '#000', fontWeight: 'bold', border: 'none' }}
+                        onClick={() => handleInsertVariable(field.key, v.tag)}
+                        title={`Khôi phục ${v.tag}`}
+                      >
+                        + Khôi phục {v.tag}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div style={{ display: 'flex', gap: '10px' }}>
+                <textarea
+                  className="prompt-textarea"
+                  style={{ flex: 1 }}
+                  value={currentVersion.prompts[field.key] || ''}
+                  onChange={(e) => handlePromptChange(field.key, e.target.value)}
+                  rows={6}
+                  disabled={activeVersionLocked}
+                />
+                {(field.key === 'thumb_text' || field.key === 'thumb_notext') && (
+                  <div style={{ width: '150px', border: '1px dashed #666', borderRadius: '4px', padding: '10px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.2)' }}>
+                    {renderImagePreviews(field.key)}
+                  </div>
+                )}
+              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
