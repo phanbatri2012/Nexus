@@ -795,6 +795,26 @@ function App() {
       setAudioTaskVoiceName('');
       setAudioTaskProviderId(data.tts_provider_id || 'genmax');
       setRegenerateVoiceId(data.voice_id || selectedVoiceId);
+
+      let castOverrides = null;
+      try {
+        if (data.production_snapshot_json) {
+          const snapshot = JSON.parse(data.production_snapshot_json);
+          castOverrides = snapshot.cast_voice_overrides || snapshot.cast_settings || null;
+        }
+      } catch (e) {}
+
+      const promptVer = promptVersions.find(v => v.key === (data.prompt_version || ''));
+      const promptCast = promptVer?.castSettings || {};
+
+      const mcVoice = castOverrides?.mc || data.voice_id || promptCast.mc?.voice_id || promptCast.mc?.default_voice_id || selectedVoiceId || '';
+      const guest1Voice = castOverrides?.guest_1 || promptCast.guest_1?.voice_id || promptCast.guest_1?.default_voice_id || 'auto';
+      const guest2Voice = castOverrides?.guest_2 || promptCast.guest_2?.voice_id || promptCast.guest_2?.default_voice_id || 'auto';
+
+      setSelectedMcVoiceId(mcVoice);
+      setSelectedGuest1VoiceId(guest1Voice);
+      setSelectedGuest2VoiceId(guest2Voice);
+
       setShowResult(true);
       setActiveView('fetcher', String(id));
       setCurrentVideoId(id);  // track which video is loaded
@@ -1320,9 +1340,11 @@ function App() {
       alert('Kịch bản không đạt kiểm tra tự động nên chưa thể tạo lại audio.');
       return;
     }
-    const voiceName = getVoiceName(regenerateVoiceId);
+    const isDialogue = (resultText || '').includes('[MC]:') || (resultText || '').includes('[KHACH_1]:');
+    const primaryVoiceId = isDialogue && selectedMcVoiceId ? selectedMcVoiceId : regenerateVoiceId;
+    const voiceName = getVoiceName(primaryVoiceId);
     const selectedRegenerateVoice = voiceOptions.find(
-      voice => voice.id === regenerateVoiceId
+      voice => voice.id === primaryVoiceId
     );
     const providerId = selectedRegenerateVoice?.provider_id || 'genmax';
     const billable = providerId === 'genmax';
@@ -1333,6 +1355,12 @@ function App() {
     );
     if (!confirmed) return;
 
+    const castOverrides = isDialogue ? {
+      mc: selectedMcVoiceId || primaryVoiceId || '',
+      guest_1: selectedGuest1VoiceId || 'auto',
+      guest_2: selectedGuest2VoiceId || 'auto'
+    } : null;
+
     setIsGenAudio(true);
     try {
       const response = await fetch(
@@ -1341,7 +1369,8 @@ function App() {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            voice_id: regenerateVoiceId,
+            voice_id: primaryVoiceId,
+            cast_voice_overrides: castOverrides,
             confirm_credit_charge: billable
           })
         }
@@ -2741,20 +2770,96 @@ function App() {
                                     </div>
                                   )}
                               </div>
-                              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                                <select
-                                  value={regenerateVoiceId}
-                                  onChange={(event) => setRegenerateVoiceId(event.target.value)}
-                                  disabled={currentVideoIsError || isGenAudio || voiceOptions.length === 0}
-                                  aria-label="Giọng tạo lại audio"
-                                  style={{
-                                    background: '#17131d', color: '#eee',
-                                    border: '1px solid rgba(26,188,156,0.5)',
-                                    borderRadius: '6px', padding: '5px 9px'
-                                  }}
-                                >
-                                  <VoiceOptions voices={voiceOptions} />
-                                </select>
+                              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+                                {((resultText || '').includes('[MC]:') || (resultText || '').includes('[KHACH_1]:')) ? (
+                                  <div style={{
+                                    display: 'flex',
+                                    flexDirection: 'column',
+                                    gap: '8px',
+                                    background: 'rgba(255, 255, 255, 0.03)',
+                                    padding: '8px 12px',
+                                    borderRadius: '8px',
+                                    border: '1px solid rgba(56, 189, 248, 0.3)',
+                                    width: '100%',
+                                    marginBottom: '4px'
+                                  }}>
+                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+                                      <span style={{ color: '#38bdf8', fontSize: '12px', fontWeight: 'bold' }}>
+                                        👥 Phân Vai Giọng Đọc (Cast Voices):
+                                      </span>
+                                    </div>
+                                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px', alignItems: 'center' }}>
+                                      <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+                                        <label style={{ color: '#fbbf24', fontSize: '12px', fontWeight: 'bold' }}>🎙️ MC:</label>
+                                        <select
+                                          value={selectedMcVoiceId || regenerateVoiceId}
+                                          onChange={(e) => {
+                                            setSelectedMcVoiceId(e.target.value);
+                                            setRegenerateVoiceId(e.target.value);
+                                          }}
+                                          disabled={currentVideoIsError || isGenAudio || voiceOptions.length === 0}
+                                          style={{
+                                            background: '#17131d', color: '#eee',
+                                            border: '1px solid rgba(251, 191, 36, 0.5)',
+                                            padding: '4px 8px', borderRadius: '6px', fontSize: '12px'
+                                          }}
+                                        >
+                                          <VoiceOptions voices={voiceOptions} />
+                                        </select>
+                                      </div>
+                                      <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+                                        <label style={{ color: '#34d399', fontSize: '12px', fontWeight: 'bold' }}>🎙️ Khách 1:</label>
+                                        <select
+                                          value={selectedGuest1VoiceId}
+                                          onChange={(e) => setSelectedGuest1VoiceId(e.target.value)}
+                                          disabled={currentVideoIsError || isGenAudio || voiceOptions.length === 0}
+                                          style={{
+                                            background: '#17131d', color: '#eee',
+                                            border: '1px solid rgba(52, 211, 153, 0.5)',
+                                            padding: '4px 8px', borderRadius: '6px', fontSize: '12px'
+                                          }}
+                                        >
+                                          <option value="auto" style={{ background: '#1a1a1a', color: '#34d399' }}>
+                                            ⚡ Tự động chọn giọng khác biệt
+                                          </option>
+                                          <VoiceOptions voices={voiceOptions} />
+                                        </select>
+                                      </div>
+                                      <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+                                        <label style={{ color: '#f472b6', fontSize: '12px', fontWeight: 'bold' }}>🎙️ Khách 2:</label>
+                                        <select
+                                          value={selectedGuest2VoiceId}
+                                          onChange={(e) => setSelectedGuest2VoiceId(e.target.value)}
+                                          disabled={currentVideoIsError || isGenAudio || voiceOptions.length === 0}
+                                          style={{
+                                            background: '#17131d', color: '#eee',
+                                            border: '1px solid rgba(244, 114, 182, 0.5)',
+                                            padding: '4px 8px', borderRadius: '6px', fontSize: '12px'
+                                          }}
+                                        >
+                                          <option value="auto" style={{ background: '#1a1a1a', color: '#f472b6' }}>
+                                            ⚡ Tự động chọn giọng phụ khác biệt
+                                          </option>
+                                          <VoiceOptions voices={voiceOptions} />
+                                        </select>
+                                      </div>
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <select
+                                    value={regenerateVoiceId}
+                                    onChange={(event) => setRegenerateVoiceId(event.target.value)}
+                                    disabled={currentVideoIsError || isGenAudio || voiceOptions.length === 0}
+                                    aria-label="Giọng tạo lại audio"
+                                    style={{
+                                      background: '#17131d', color: '#eee',
+                                      border: '1px solid rgba(26,188,156,0.5)',
+                                      borderRadius: '6px', padding: '5px 9px'
+                                    }}
+                                  >
+                                    <VoiceOptions voices={voiceOptions} />
+                                  </select>
+                                )}
                                 <button
                                   className="btn-secondary"
                                   style={{ padding: '4px 12px', fontSize: '0.8em' }}

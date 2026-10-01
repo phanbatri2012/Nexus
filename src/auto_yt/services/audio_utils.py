@@ -1,9 +1,12 @@
-from __future__ import annotations
-
+import io
 import os
 import tempfile
 import time
+import uuid
 from pathlib import Path
+
+import av
+import numpy as np
 
 from auto_yt.services.network_security import (
     GENMAX_AUDIO_HOSTS,
@@ -211,51 +214,199 @@ def _replace_file_with_retry(source_path: Path, output_path: Path) -> None:
             time.sleep(FILE_REPLACE_RETRY_DELAY_SECONDS)
 
 
-def merge_remote_mp3_files(
-    audio_urls: list[str],
+def decode_audio_stream(
+    source: bytes | Path | str,
+    target_sr: int = 44100,
+) -> tuple[np.ndarray, float]:
+    """Decode audio bytes or a file path into a float32 stereo PCM numpy array (2, N) at target_sr."""
+    if isinstance(source, bytes):
+        container = av.open(io.BytesIO(source))
+    else:
+        container = av.open(str(source))
+
+    if not container.streams.audio:
+        container.close()
+        raise AudioContentError("File âm thanh không chứa audio stream hợp lệ.")
+
+    stream = container.streams.audio[0]
+    resampler = av.AudioResampler(format="fltp", layout="stereo", rate=target_sr)
+
+    chunks = []
+    total_samples = 0
+    for frame in container.decode(stream):
+        for resampled_frame in resampler.resample(frame):
+            arr = resampled_frame.to_ndarray()
+            chunks.append(arr)
+            total_samples += arr.shape[1]
+
+    for resampled_frame in resampler.resample(None):
+        arr = resampled_frame.to_ndarray()
+        chunks.append(arr)
+        total_samples += arr.shape[1]
+
+    container.close()
+
+    if not chunks:
+        return np.zeros((2, 0), dtype=np.float32), 0.0
+
+    full_audio = np.concatenate(chunks, axis=1)
+    duration = total_samples / target_sr
+    return full_audio, duration
+
+
+def _load_and_decode_segment(
+    source: dict | str | bytes | Path,
+    target_sr: int = 44100,
+) -> tuple[np.ndarray, float]:
+    """Fetch/download audio from any provider or format and decode to PCM."""
+    if isinstance(source, dict):
+        url = str(source.get("audio_url") or "").strip()
+        task_id = str(source.get("task_id") or "").strip()
+    elif isinstance(source, (str, Path)):
+        url = str(source).strip()
+        task_id = ""
+    else:
+        # Raw bytes
+        return decode_audio_stream(source, target_sr=target_sr)
+
+    if not url:
+        raise AudioContentError("Segment thiếu audio_url để tải âm thanh.")
+
+    # Handle OmniVoice local jobs
+    if url.startswith("omnivoice://") or task_id.startswith("omnivoice:"):
+        from auto_yt.services import omnivoice_client
+        raw_job_id = url.removeprefix("omnivoice://") if url.startswith("omnivoice://") else task_id.removeprefix("omnivoice:")
+        raw_bytes = omnivoice_client._request(f"/v1/jobs/{raw_job_id}/audio", timeout=30 * 60)
+        return decode_audio_stream(raw_bytes, target_sr=target_sr)
+
+    # Handle HTTP/HTTPS remote URLs (e.g. Genmax)
+    if url.startswith("http://") or url.startswith("https://"):
+        raw_bytes = download_audio(url)
+        return decode_audio_stream(raw_bytes, target_sr=target_sr)
+
+    # Handle local file paths
+    file_path = Path(url)
+    if file_path.exists():
+        return decode_audio_stream(file_path, target_sr=target_sr)
+
+    raise AudioContentError(f"Không thể nạp segment âm thanh từ nguồn: {url}")
+
+
+def merge_audio_segments_to_mp3(
+    sources: list[dict | str | bytes | Path],
     output_path: Path,
     expected_texts: list[str] | None = None,
+    pause_between_turns: float = 0.25,
+    sample_rate: int = 44100,
+    bit_rate: int = 192000,
 ) -> float:
-    if not audio_urls:
-        raise ValueError("At least one audio URL is required.")
-    if expected_texts is not None and len(expected_texts) != len(audio_urls):
-        raise ValueError("Each audio URL must have matching expected text.")
+    """
+    Decodes audio segments from any provider (OmniVoice local WAVs or Genmax remote MP3s),
+    applies a 10ms boundary fade-in/fade-out to eliminate clicks/pops,
+    inserts natural pause between speaker transitions, and encodes to a pristine,
+    standards-compliant MP3 file with full Xing header & ID3 container.
+    """
+    if not sources:
+        raise ValueError("At least one audio source is required.")
+    if expected_texts is not None and len(expected_texts) != len(sources):
+        raise ValueError("Each audio source must have matching expected text.")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = None
-    expected_encoding = None
-    total_duration = 0.0
+    temporary_path = output_path.with_name(f"{output_path.name}.{uuid.uuid4().hex}.tmp")
+
+    fade_samples = int(0.010 * sample_rate)  # 10ms = 441 samples
+    fade_in_envelope = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
+    fade_out_envelope = np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
+
+    pause_samples = int(pause_between_turns * sample_rate)
+    pause_pcm = np.zeros((2, pause_samples), dtype=np.float32) if pause_samples > 0 else None
+
+    total_samples = 0
 
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=output_path.parent,
-            prefix=f"{output_path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as output_file:
-            temporary_path = Path(output_file.name)
-            for index, audio_url in enumerate(audio_urls):
-                frames, duration_seconds, encoding = extract_mp3_audio_frames(
-                    download_audio(audio_url)
-                )
-                if expected_texts is not None:
-                    validate_spoken_duration(
-                        expected_texts[index],
-                        duration_seconds,
-                    )
-                if expected_encoding is None:
-                    expected_encoding = encoding
-                elif encoding != expected_encoding:
-                    raise AudioContentError(
-                        "Genmax returned MP3 segments with incompatible encodings."
-                    )
-                output_file.write(frames)
-                total_duration += duration_seconds
+        out_container = av.open(str(temporary_path), mode="w", format="mp3")
+        out_stream = out_container.add_stream("mp3", rate=sample_rate)
+        out_stream.bit_rate = bit_rate
+        out_stream.layout = "stereo"
+
+        pts_counter = 0
+        frame_chunk_size = 1152  # Standard MP3 MPEG frame size
+        buffer_pcm = np.zeros((2, 0), dtype=np.float32)
+
+        for index, source in enumerate(sources):
+            pcm, duration_seconds = _load_and_decode_segment(source, target_sr=sample_rate)
+
+            if expected_texts is not None:
+                validate_spoken_duration(expected_texts[index], duration_seconds)
+
+            if pcm.shape[1] > 0:
+                # Apply 10ms fade-in / fade-out
+                if pcm.shape[1] >= fade_samples * 2:
+                    pcm[:, :fade_samples] *= fade_in_envelope
+                    pcm[:, -fade_samples:] *= fade_out_envelope
+                elif pcm.shape[1] > 0:
+                    half = pcm.shape[1] // 2
+                    if half > 0:
+                        pcm[:, :half] *= np.linspace(0.0, 1.0, half, dtype=np.float32)
+                        pcm[:, -half:] *= np.linspace(1.0, 0.0, half, dtype=np.float32)
+
+                buffer_pcm = np.concatenate([buffer_pcm, pcm], axis=1)
+
+                # Add pause if not the last segment
+                if index < len(sources) - 1 and pause_pcm is not None:
+                    buffer_pcm = np.concatenate([buffer_pcm, pause_pcm], axis=1)
+
+            # Encode complete 1152-sample frames from buffer_pcm
+            while buffer_pcm.shape[1] >= frame_chunk_size:
+                chunk = buffer_pcm[:, :frame_chunk_size]
+                buffer_pcm = buffer_pcm[:, frame_chunk_size:]
+
+                frame = av.AudioFrame.from_ndarray(chunk, format="fltp", layout="stereo")
+                frame.rate = sample_rate
+                frame.pts = pts_counter
+                pts_counter += frame_chunk_size
+                total_samples += frame_chunk_size
+
+                for packet in out_stream.encode(frame):
+                    out_container.mux(packet)
+
+        # Encode remaining samples in buffer
+        if buffer_pcm.shape[1] > 0:
+            rem_len = buffer_pcm.shape[1]
+            pad_len = frame_chunk_size - rem_len
+            padded_chunk = np.pad(buffer_pcm, ((0, 0), (0, pad_len)), mode="constant")
+            frame = av.AudioFrame.from_ndarray(padded_chunk, format="fltp", layout="stereo")
+            frame.rate = sample_rate
+            frame.pts = pts_counter
+            total_samples += rem_len
+            for packet in out_stream.encode(frame):
+                out_container.mux(packet)
+
+        # Flush encoder
+        for packet in out_stream.encode(None):
+            out_container.mux(packet)
+
+        out_container.close()
+
         _replace_file_with_retry(temporary_path, output_path)
     except Exception:
-        if temporary_path is not None:
+        if temporary_path.exists():
             temporary_path.unlink(missing_ok=True)
         raise
 
-    return total_duration
+    final_duration = total_samples / sample_rate
+    return final_duration
+
+
+def merge_remote_mp3_files(
+    audio_urls: list[str | dict],
+    output_path: Path,
+    expected_texts: list[str] | None = None,
+) -> float:
+    """Wrapper calling merge_audio_segments_to_mp3 for universal MP3 stitching."""
+    return merge_audio_segments_to_mp3(
+        sources=audio_urls,
+        output_path=output_path,
+        expected_texts=expected_texts,
+        pause_between_turns=0.25,
+    )

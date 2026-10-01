@@ -129,29 +129,38 @@ def clean_turn_text_for_tts(text: str) -> str:
 
 def sanitize_dialogue_script(script_text: str) -> str:
     """Làm sạch toàn diện kịch bản đối thoại trước khi lưu DB hoặc hiển thị UI:
-    - Giữ nguyên các tag phân vai ở đầu lượt thoại: [MC]:, [KHACH_1]:, etc.
+    - Đảm bảo mỗi tag phân vai [MC]:, [KHACH_1]:... luôn bắt đầu trên dòng mới (\n\n)
+    - Giữ nguyên các tag phân vai hợp lệ ở đầu lượt thoại: [MC]:, [KHACH_1]:, etc.
     - Loại bỏ các tag vai bị lọt vào giữa câu: [KHACH_1], [MC], [KHACH_2]...
     - Loại bỏ các biến placeholder kỹ thuật dạng [TÊN...], [NHÂN VẬT...]
     """
     if not script_text or not isinstance(script_text, str):
         return ""
 
+    # 1. Đảm bảo mọi tag vai diễn có dấu hai chấm luôn có ngắt dòng (\n\n) phía trước nếu bị dính liền vào câu trước
+    formatted = re.sub(
+        r'([^\n\r])\s*(\[(?:[A-Za-z0-9_\u00C0-\u024F\u1EA0-\u1EF9\s\-]+)\]\s*:)',
+        r'\1\n\n\2',
+        script_text
+    )
+
+    # 2. Bảo vệ các tag phân vai hợp lệ ([TAG]:) trước khi làm sạch bên trong câu
     placeholder_map = {}
     def _protect_tag(m):
         key = f"__DIALOGUE_TAG_{len(placeholder_map)}__"
-        placeholder_map[key] = m.group(0)
+        placeholder_map[key] = m.group(0).strip() + " "
         return key
 
-    protected = DIALOGUE_TAG_REGEX.sub(_protect_tag, script_text)
+    protected = DIALOGUE_TAG_REGEX.sub(_protect_tag, formatted)
 
-    # Loại bỏ các tag vai nằm bên trong văn bản (không có dấu hai chấm)
+    # 3. Loại bỏ các tag vai nằm bên trong văn bản (không có dấu hai chấm)
     cleaned = re.sub(
         r'\[(?:MC|HOST|KHACH(?:_\d+)?|GUEST(?:_\d+)?|NGUOI_DAN|KHACH_MOI(?:_\d+)?)\]',
         '',
         protected,
         flags=re.IGNORECASE
     )
-    # Loại bỏ placeholder thừa
+    # 4. Loại bỏ placeholder thừa dạng [TÊN...], [NHÂN VẬT...]
     cleaned = re.sub(
         r'\[(?:TEN|TÊN|NHAN_VAT|NHÂN_VẬT|KHACH_MOI)[^\]]*\]',
         '',
@@ -159,13 +168,14 @@ def sanitize_dialogue_script(script_text: str) -> str:
         flags=re.IGNORECASE
     )
 
-    # Khôi phục các tag đầu lượt thoại hợp lệ
+    # 5. Khôi phục các tag đầu lượt thoại hợp lệ
     for key, val in placeholder_map.items():
         cleaned = cleaned.replace(key, val)
 
-    # Chuẩn hóa khoảng trắng thừa do loại bỏ tag
+    # 6. Chuẩn hóa khoảng trắng và dòng trống
     cleaned = re.sub(r'[ \t]+', ' ', cleaned)
     cleaned = re.sub(r' +([,.:;!?])', r'\1', cleaned)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     return cleaned.strip()
 
 
