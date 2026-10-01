@@ -351,6 +351,8 @@ class PromptPipelineData(BaseModel):
 
 
 class PromptImageGenerationData(BaseModel):
+    render_mode: Optional[str] = "google_flow"
+    stock_video_settings: Optional[dict] = Field(default_factory=dict)
     provider: str = "google_flow"
     model: str = "nano_banana_pro"
     aspect_ratio: str = "16:9"

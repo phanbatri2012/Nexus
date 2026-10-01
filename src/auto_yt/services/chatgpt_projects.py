@@ -148,6 +148,14 @@ GOOGLE_FLOW_VIDEO_MODELS = {
 GOOGLE_FLOW_MODELS = {**GOOGLE_FLOW_IMAGE_MODELS, **GOOGLE_FLOW_VIDEO_MODELS}
 
 DEFAULT_IMAGE_GENERATION_SETTINGS = {
+    "render_mode": "google_flow",
+    "stock_video_settings": {
+        "background_videos_dir": "",
+        "custom_stock_videos_path": "",
+        "thumbnail_corner_mode": "random",
+        "show_waveform": True,
+        "show_animated_icon": True,
+    },
     "provider": "google_flow",
     "model": DEFAULT_IMAGE_MODEL,
     "aspect_ratio": "16:9",
@@ -374,6 +382,20 @@ def normalize_image_generation_settings(value: object) -> dict:
         normalized["video_output_count"] = video_output_count if video_output_count in SUPPORTED_OUTPUT_COUNTS else 1
     except (TypeError, ValueError):
         normalized["video_output_count"] = 1
+
+    render_mode = str(settings.get("render_mode") or "google_flow").strip().lower()
+    normalized["render_mode"] = render_mode if render_mode in {"google_flow", "stock_video"} else "google_flow"
+
+    stock_settings = settings.get("stock_video_settings") or {}
+    if not isinstance(stock_settings, dict):
+        stock_settings = {}
+    normalized["stock_video_settings"] = {
+        "background_videos_dir": str(stock_settings.get("background_videos_dir") or "").strip(),
+        "custom_stock_videos_path": str(stock_settings.get("custom_stock_videos_path") or "").strip(),
+        "thumbnail_corner_mode": str(stock_settings.get("thumbnail_corner_mode") or "random").strip(),
+        "show_waveform": bool(stock_settings.get("show_waveform", True)),
+        "show_animated_icon": bool(stock_settings.get("show_animated_icon", True)),
+    }
 
     provider = str(settings.get("provider") or "").strip()
     normalized["provider"] = provider if provider else "google_flow"
