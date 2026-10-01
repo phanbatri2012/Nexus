@@ -845,6 +845,64 @@ export default function Settings({
     );
   };
 
+  const handleContentModeChange = (mode) => {
+    setPromptsData(prev => ({
+      ...prev,
+      versions: {
+        ...prev.versions,
+        [activeVersion]: {
+          ...prev.versions[activeVersion],
+          content_mode: mode
+        }
+      }
+    }));
+    fetch(`http://127.0.0.1:8080/api/prompts/${encodeURIComponent(activeVersion)}/content-mode`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content_mode: mode })
+    }).catch(() => {});
+  };
+
+  const handleCastSettingChange = (role, field, value) => {
+    setPromptsData(prev => {
+      const version = prev.versions[activeVersion] || {};
+      const cast = { ...(version.cast_settings || {}) };
+      if (role === 'turn_pause_seconds') {
+        cast.turn_pause_seconds = Number(value);
+      } else {
+        cast[role] = { ...(cast[role] || {}), [field]: value };
+      }
+      return {
+        ...prev,
+        versions: {
+          ...prev.versions,
+          [activeVersion]: {
+            ...version,
+            cast_settings: cast
+          }
+        }
+      };
+    });
+  };
+
+  const handleSaveCastSettings = () => {
+    const versionId = activeVersion;
+    const castSettings = promptsData.versions[versionId]?.cast_settings || {};
+    return saveSection(
+      'cast-settings',
+      'Đang lưu cấu hình dàn vai và giọng đối thoại...',
+      'Đã lưu cấu hình dàn vai và giọng đối thoại.',
+      () => fetch(
+        `http://127.0.0.1:8080/api/prompts/${encodeURIComponent(versionId)}/cast-settings`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cast_settings: castSettings })
+        }
+      )
+    );
+  };
+
   const handleSavePromptDefaultYoutubeChannel = async () => {
     const versionId = activeVersion;
     const channelId = (
@@ -1320,42 +1378,349 @@ export default function Settings({
         </div>
       </div>
 
+      {/* Content Mode Selector */}
       <div className="prompt-item" style={{ marginBottom: '20px' }}>
         <div className="prompt-header">
           <div>
-            <label>🎙️ Giọng mặc định của bộ prompt</label>
+            <label>🎭 Loại hình kịch bản video (Content Mode)</label>
             <div className="help-text" style={{ marginTop: '5px' }}>
-              Video Fetcher sẽ tự chọn giọng này khi bạn chọn bộ prompt.
-              Bạn vẫn có thể đổi giọng thủ công trước khi tạo từng video.
+              Chọn giữa chế độ Đối thoại nhiều giọng (1 MC cố định + Khách mời linh hoạt) và Đơn thoại (1 người kể chuyện truyền thống).
             </div>
           </div>
-          <button
-            className="btn-save section-save-button"
-            onClick={handleSavePromptDefaultVoice}
-            disabled={Boolean(savingSection) || activeVersionLocked}
-          >
-            💾 Lưu
-          </button>
         </div>
-        <select
-          value={promptDefaultVoiceId}
-          onChange={(event) => handlePromptDefaultVoiceChange(event.target.value)}
-          className="version-select"
-          style={{ width: '100%', marginTop: '12px' }}
-          disabled={activeVersionLocked}
-        >
-          <option value="">
-            Dùng giọng mặc định chung
-            {globalDefaultVoice ? ` — ${globalDefaultVoice.name}` : ''}
-          </option>
-          {promptDefaultVoiceMissing && (
-            <option value={promptDefaultVoiceId}>
-              ⚠️ Giọng đã bị xóa — sẽ dùng giọng mặc định chung
-            </option>
-          )}
-          <ProviderVoiceOptions voices={voicesData.voices} />
-        </select>
+        <div style={{ display: 'flex', gap: 16, marginTop: 12, flexWrap: 'wrap' }}>
+          <label
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 8,
+              cursor: activeVersionLocked ? 'not-allowed' : 'pointer',
+              background: (currentVersion.content_mode || 'dialogue') === 'dialogue' ? 'rgba(56, 189, 248, 0.15)' : 'rgba(255, 255, 255, 0.03)',
+              padding: '10px 16px',
+              borderRadius: 8,
+              border: (currentVersion.content_mode || 'dialogue') === 'dialogue' ? '1px solid #38bdf8' : '1px solid rgba(255, 255, 255, 0.1)'
+            }}
+          >
+            <input
+              type="radio"
+              name="content_mode"
+              value="dialogue"
+              checked={(currentVersion.content_mode || 'dialogue') === 'dialogue'}
+              onChange={() => handleContentModeChange('dialogue')}
+              disabled={activeVersionLocked}
+            />
+            <span><strong>👥 Chế độ Đối thoại</strong> (1 MC cố định + Khách mời thay đổi)</span>
+          </label>
+          <label
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 8,
+              cursor: activeVersionLocked ? 'not-allowed' : 'pointer',
+              background: currentVersion.content_mode === 'monologue' ? 'rgba(56, 189, 248, 0.15)' : 'rgba(255, 255, 255, 0.03)',
+              padding: '10px 16px',
+              borderRadius: 8,
+              border: currentVersion.content_mode === 'monologue' ? '1px solid #38bdf8' : '1px solid rgba(255, 255, 255, 0.1)'
+            }}
+          >
+            <input
+              type="radio"
+              name="content_mode"
+              value="monologue"
+              checked={currentVersion.content_mode === 'monologue'}
+              onChange={() => handleContentModeChange('monologue')}
+              disabled={activeVersionLocked}
+            />
+            <span><strong>🎙️ Chế độ Đơn thoại</strong> (1 giọng đọc kể chuyện truyền thống)</span>
+          </label>
+        </div>
       </div>
+
+      {/* Cast Management for Dialogue Mode */}
+      {(currentVersion.content_mode || 'dialogue') === 'dialogue' ? (
+        <div className="prompt-item" style={{ marginBottom: '20px' }}>
+          <div className="prompt-header">
+            <div>
+              <label>🎭 Dàn nhân vật & Giọng đọc đối thoại (Cast Profiles)</label>
+              <div className="help-text" style={{ marginTop: '5px' }}>
+                Cấu hình MC cố định của kênh cùng các vai khách mời. Video Fetcher sẽ tự động nạp giọng MC và cho phép bạn chọn nhanh giọng khách mời theo từng tập.
+              </div>
+            </div>
+            <button
+              className="btn-save section-save-button"
+              onClick={handleSaveCastSettings}
+              disabled={Boolean(savingSection) || activeVersionLocked}
+            >
+              💾 Lưu Dàn Vai
+            </button>
+          </div>
+
+          <div style={{ marginTop: 14, display: 'flex', flexDirection: 'column', gap: 16 }}>
+            {/* MC Profile Card */}
+            {(() => {
+              const cast = currentVersion.cast_settings || {};
+              const mc = cast.mc || {
+                role_tag: '[MC]',
+                display_name: 'Tiến sĩ Đinh Đoàn',
+                default_voice_id: currentVersion.default_voice_id || '',
+                subtitle_color: '#FFD700',
+                persona: 'Chuyên gia tâm lý Đinh Đoàn, người dẫn dắt thông thái, phân tích tâm lý, chia sẻ và đúc kết bài học.'
+              };
+              const guest1 = cast.guest_1 || {
+                role_tag: '[KHACH_1]',
+                display_name: 'Khách Mời Chính',
+                default_voice_id: '',
+                subtitle_color: '#00E5FF',
+                persona: 'Người trong cuộc kể lại câu chuyện tâm sự chi tiết, có thể chia sẻ một mạch câu chuyện dài đầy đủ cảm xúc.'
+              };
+              const guest2 = cast.guest_2 || {
+                enabled: false,
+                role_tag: '[KHACH_2]',
+                display_name: 'Khách Mời 2',
+                default_voice_id: '',
+                subtitle_color: '#FF80AB',
+                persona: 'Chuyên gia bổ sung hoặc nhân vật thứ ba trong câu chuyện.'
+              };
+              const turnPause = cast.turn_pause_seconds ?? 0.35;
+
+              return (
+                <>
+                  {/* MC Profile */}
+                  <div style={{ background: 'rgba(255, 215, 0, 0.05)', border: '1px solid rgba(255, 215, 0, 0.25)', borderRadius: 8, padding: '12px 14px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, flexWrap: 'wrap', gap: 8 }}>
+                      <strong style={{ color: '#ffd700', fontSize: '0.95rem' }}>👑 VAI 1: MC / HOST (Cố định của kênh)</strong>
+                      <span style={{ fontSize: '0.78rem', color: '#cbd5e1', background: 'rgba(255, 215, 0, 0.15)', padding: '2px 8px', borderRadius: 4 }}>Thẻ kịch bản: <code>{mc.role_tag || '[MC]'}</code></span>
+                    </div>
+                    <div className="production-settings-grid" style={{ marginBottom: 8 }}>
+                      <label>
+                        Tên hiển thị nhân vật MC
+                        <input
+                          className="version-select"
+                          value={mc.display_name || ''}
+                          onChange={e => handleCastSettingChange('mc', 'display_name', e.target.value)}
+                          placeholder="Tiến sĩ Đinh Đoàn"
+                          disabled={activeVersionLocked}
+                        />
+                      </label>
+                      <label>
+                        Giọng đọc mặc định của MC
+                        <select
+                          className="version-select"
+                          value={mc.default_voice_id || promptDefaultVoiceId}
+                          onChange={e => {
+                            handleCastSettingChange('mc', 'default_voice_id', e.target.value);
+                            handlePromptDefaultVoiceChange(e.target.value);
+                          }}
+                          disabled={activeVersionLocked}
+                        >
+                          <option value="">Chọn giọng cho MC</option>
+                          <ProviderVoiceOptions voices={voicesData.voices} />
+                        </select>
+                      </label>
+                      <label>
+                        Màu phụ đề (Subtitle Color)
+                        <input
+                          type="text"
+                          className="version-select"
+                          value={mc.subtitle_color || '#FFD700'}
+                          onChange={e => handleCastSettingChange('mc', 'subtitle_color', e.target.value)}
+                          placeholder="#FFD700"
+                          disabled={activeVersionLocked}
+                        />
+                      </label>
+                    </div>
+                    <div>
+                      <label style={{ fontSize: '0.84rem', color: '#94a3b8', display: 'block', marginBottom: 4 }}>Phong cách / Persona MC:</label>
+                      <textarea
+                        className="prompt-textarea"
+                        rows={2}
+                        value={mc.persona || ''}
+                        onChange={e => handleCastSettingChange('mc', 'persona', e.target.value)}
+                        placeholder="Mô tả tính cách và phong cách của MC..."
+                        disabled={activeVersionLocked}
+                      />
+                    </div>
+                  </div>
+
+                  {/* Guest 1 Profile */}
+                  <div style={{ background: 'rgba(0, 229, 255, 0.05)', border: '1px solid rgba(0, 229, 255, 0.25)', borderRadius: 8, padding: '12px 14px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, flexWrap: 'wrap', gap: 8 }}>
+                      <strong style={{ color: '#00e5ff', fontSize: '0.95rem' }}>🎙️ VAI 2: KHÁCH MỜI CHÍNH (Thay đổi theo từng tập)</strong>
+                      <span style={{ fontSize: '0.78rem', color: '#cbd5e1', background: 'rgba(0, 229, 255, 0.15)', padding: '2px 8px', borderRadius: 4 }}>Thẻ kịch bản: <code>{guest1.role_tag || '[KHACH_1]'}</code></span>
+                    </div>
+                    <div className="production-settings-grid" style={{ marginBottom: 8 }}>
+                      <label>
+                        Tên gợi ý vai khách mời
+                        <input
+                          className="version-select"
+                          value={guest1.display_name || ''}
+                          onChange={e => handleCastSettingChange('guest_1', 'display_name', e.target.value)}
+                          placeholder="Khách Mời Chính"
+                          disabled={activeVersionLocked}
+                        />
+                      </label>
+                      <label>
+                        Giọng đọc mẫu / gợi ý ban đầu
+                        <select
+                          className="version-select"
+                          value={guest1.default_voice_id || ''}
+                          onChange={e => handleCastSettingChange('guest_1', 'default_voice_id', e.target.value)}
+                          disabled={activeVersionLocked}
+                        >
+                          <option value="">Chọn giọng mẫu cho Khách 1</option>
+                          <ProviderVoiceOptions voices={voicesData.voices} />
+                        </select>
+                      </label>
+                      <label>
+                        Màu phụ đề (Subtitle Color)
+                        <input
+                          type="text"
+                          className="version-select"
+                          value={guest1.subtitle_color || '#00E5FF'}
+                          onChange={e => handleCastSettingChange('guest_1', 'subtitle_color', e.target.value)}
+                          placeholder="#00E5FF"
+                          disabled={activeVersionLocked}
+                        />
+                      </label>
+                    </div>
+                    <div>
+                      <label style={{ fontSize: '0.84rem', color: '#94a3b8', display: 'block', marginBottom: 4 }}>Phong cách / Persona Khách Mời 1 (Có thể kể câu chuyện dài):</label>
+                      <textarea
+                        className="prompt-textarea"
+                        rows={2}
+                        value={guest1.persona || ''}
+                        onChange={e => handleCastSettingChange('guest_1', 'persona', e.target.value)}
+                        placeholder="Mô tả vai trò của khách mời..."
+                        disabled={activeVersionLocked}
+                      />
+                    </div>
+                  </div>
+
+                  {/* Guest 2 Profile */}
+                  <div style={{ background: 'rgba(255, 128, 171, 0.05)', border: '1px solid rgba(255, 128, 171, 0.25)', borderRadius: 8, padding: '12px 14px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, flexWrap: 'wrap', gap: 8 }}>
+                      <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, cursor: 'pointer', margin: 0 }}>
+                        <input
+                          type="checkbox"
+                          checked={Boolean(guest2.enabled)}
+                          onChange={e => handleCastSettingChange('guest_2', 'enabled', e.target.checked)}
+                          disabled={activeVersionLocked}
+                        />
+                        <strong style={{ color: '#ff80ab', fontSize: '0.95rem' }}>🎙️ VAI 3: KHÁCH MỜI 2 / PHỤ (Kịch bản 3 người)</strong>
+                      </label>
+                      <span style={{ fontSize: '0.78rem', color: '#cbd5e1', background: 'rgba(255, 128, 171, 0.15)', padding: '2px 8px', borderRadius: 4 }}>Thẻ kịch bản: <code>{guest2.role_tag || '[KHACH_2]'}</code></span>
+                    </div>
+                    {guest2.enabled && (
+                      <>
+                        <div className="production-settings-grid" style={{ marginBottom: 8 }}>
+                          <label>
+                            Tên gợi ý vai khách mời 2
+                            <input
+                              className="version-select"
+                              value={guest2.display_name || ''}
+                              onChange={e => handleCastSettingChange('guest_2', 'display_name', e.target.value)}
+                              placeholder="Chuyên gia / Khách Mời 2"
+                              disabled={activeVersionLocked}
+                            />
+                          </label>
+                          <label>
+                            Giọng đọc mẫu
+                            <select
+                              className="version-select"
+                              value={guest2.default_voice_id || ''}
+                              onChange={e => handleCastSettingChange('guest_2', 'default_voice_id', e.target.value)}
+                              disabled={activeVersionLocked}
+                            >
+                              <option value="">Chọn giọng cho Khách 2</option>
+                              <ProviderVoiceOptions voices={voicesData.voices} />
+                            </select>
+                          </label>
+                          <label>
+                            Màu phụ đề
+                            <input
+                              type="text"
+                              className="version-select"
+                              value={guest2.subtitle_color || '#FF80AB'}
+                              onChange={e => handleCastSettingChange('guest_2', 'subtitle_color', e.target.value)}
+                              placeholder="#FF80AB"
+                              disabled={activeVersionLocked}
+                            />
+                          </label>
+                        </div>
+                        <div>
+                          <label style={{ fontSize: '0.84rem', color: '#94a3b8', display: 'block', marginBottom: 4 }}>Persona Khách 2:</label>
+                          <textarea
+                            className="prompt-textarea"
+                            rows={2}
+                            value={guest2.persona || ''}
+                            onChange={e => handleCastSettingChange('guest_2', 'persona', e.target.value)}
+                            placeholder="Mô tả vai trò của khách mời thứ 2..."
+                            disabled={activeVersionLocked}
+                          />
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                  {/* Turn Pause Setting */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '8px 12px', background: 'rgba(255, 255, 255, 0.03)', borderRadius: 6 }}>
+                    <label style={{ margin: 0, fontWeight: 600, color: '#e2e8f0', fontSize: '0.88rem' }}>
+                      ⏱️ Khoảng lặng khi đổi lượt nói giữa 2 nhân vật (Turn Pause):
+                    </label>
+                    <input
+                      type="number"
+                      min="0.1"
+                      max="1.5"
+                      step="0.05"
+                      style={{ width: '80px', padding: '4px 8px', borderRadius: 4, background: '#1e293b', border: '1px solid #475569', color: '#fff' }}
+                      value={turnPause}
+                      onChange={e => handleCastSettingChange('turn_pause_seconds', null, e.target.value)}
+                      disabled={activeVersionLocked}
+                    />
+                    <span style={{ fontSize: '0.8rem', color: '#94a3b8' }}>giây (mặc định 0.35s tạo nhịp đàm thoại tự nhiên)</span>
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+        </div>
+      ) : (
+        <div className="prompt-item" style={{ marginBottom: '20px' }}>
+          <div className="prompt-header">
+            <div>
+              <label>🎙️ Giọng mặc định của bộ prompt (Đơn thoại)</label>
+              <div className="help-text" style={{ marginTop: '5px' }}>
+                Video Fetcher sẽ tự chọn giọng này khi bạn chọn bộ prompt. Bạn vẫn có thể đổi giọng thủ công trước khi tạo từng video.
+              </div>
+            </div>
+            <button
+              className="btn-save section-save-button"
+              onClick={handleSavePromptDefaultVoice}
+              disabled={Boolean(savingSection) || activeVersionLocked}
+            >
+              💾 Lưu
+            </button>
+          </div>
+          <select
+            value={promptDefaultVoiceId}
+            onChange={(event) => handlePromptDefaultVoiceChange(event.target.value)}
+            className="version-select"
+            style={{ width: '100%', marginTop: '12px' }}
+            disabled={activeVersionLocked}
+          >
+            <option value="">
+              Dùng giọng mặc định chung
+              {globalDefaultVoice ? ` — ${globalDefaultVoice.name}` : ''}
+            </option>
+            {promptDefaultVoiceMissing && (
+              <option value={promptDefaultVoiceId}>
+                ⚠️ Giọng đã bị xóa — sẽ dùng giọng mặc định chung
+              </option>
+            )}
+            <ProviderVoiceOptions voices={voicesData.voices} />
+          </select>
+        </div>
+      )}
 
       <div className="prompt-item" style={{ marginBottom: '20px' }}>
         <div className="prompt-header">

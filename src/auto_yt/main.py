@@ -59,6 +59,11 @@ from auto_yt.services.audio_review import (
     get_audio_script,
     get_audio_script_hash,
 )
+from auto_yt.dialogue_parser import (
+    parse_dialogue_turns,
+    is_dialogue_script,
+    clean_turn_text_for_tts,
+)
 from auto_yt.services import voice_config
 from auto_yt.services import (
     browser_youtube_uploader,
@@ -416,6 +421,8 @@ class PromptPublishingData(BaseModel):
 class PromptVersion(BaseModel):
     name: str
     prompts: dict
+    content_mode: str = "dialogue"
+    cast_settings: dict = Field(default_factory=dict)
     project_url: str = chatgpt_projects.DEFAULT_CHATGPT_PROJECT_URL
     default_voice_id: str = ""
     default_youtube_channel_id: str = Field(default="", max_length=100)
@@ -432,6 +439,14 @@ class PromptsData(BaseModel):
 
 class PromptVersionNameData(BaseModel):
     name: str
+
+
+class PromptContentModeData(BaseModel):
+    content_mode: str = "dialogue"
+
+
+class PromptCastSettingsData(BaseModel):
+    cast_settings: dict = Field(default_factory=dict)
 
 
 class PromptProjectData(BaseModel):
@@ -9035,6 +9050,43 @@ def save_prompt_default_voice(
         data = _read_prompts_config()
         version = _get_prompt_version(data, version_id)
         version["default_voice_id"] = selected_voice_id
+        normalized_data = _write_prompts_config(data)
+    return {
+        "version_id": version_id,
+        "version": normalized_data["versions"][version_id],
+    }
+
+
+@app.patch("/api/prompts/{version_id}/cast-settings")
+def save_prompt_cast_settings(
+    version_id: str,
+    payload: PromptCastSettingsData,
+):
+    with _prompts_config_lock:
+        _assert_prompt_version_editable(version_id)
+        data = _read_prompts_config()
+        version = _get_prompt_version(data, version_id)
+        version["cast_settings"] = payload.cast_settings
+        normalized_data = _write_prompts_config(data)
+    return {
+        "version_id": version_id,
+        "version": normalized_data["versions"][version_id],
+    }
+
+
+@app.patch("/api/prompts/{version_id}/content-mode")
+def save_prompt_content_mode(
+    version_id: str,
+    payload: PromptContentModeData,
+):
+    mode = payload.content_mode.strip().lower()
+    if mode not in ("dialogue", "monologue"):
+        raise HTTPException(status_code=400, detail="Chế độ kịch bản không hợp lệ.")
+    with _prompts_config_lock:
+        _assert_prompt_version_editable(version_id)
+        data = _read_prompts_config()
+        version = _get_prompt_version(data, version_id)
+        version["content_mode"] = mode
         normalized_data = _write_prompts_config(data)
     return {
         "version_id": version_id,

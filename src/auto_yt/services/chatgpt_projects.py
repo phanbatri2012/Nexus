@@ -716,6 +716,13 @@ def add_project_defaults(data: dict) -> dict:
         version.setdefault("project_url", DEFAULT_CHATGPT_PROJECT_URL)
         version.setdefault("default_voice_id", "")
         version.setdefault("default_youtube_channel_id", "")
+        version.setdefault(
+            "content_mode",
+            "dialogue"
+            if "cast_settings" in version or "talkshow" in str(version.get("name", "")).casefold()
+            else "monologue",
+        )
+        version.setdefault("cast_settings", {})
         version["image_generation_settings"] = normalize_image_generation_settings(
             version.get("image_generation_settings")
         )
