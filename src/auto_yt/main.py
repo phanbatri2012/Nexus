@@ -7568,6 +7568,7 @@ def approve_audio_review(
             prod_snapshot = json.loads(video.get("production_snapshot_json") or "{}")
         except Exception:
             pass
+        prod_snapshot["cast_voice_overrides"] = request.cast_voice_overrides
         db.update_video_production(
             video_id,
             production_snapshot_json=json.dumps(prod_snapshot, ensure_ascii=False),

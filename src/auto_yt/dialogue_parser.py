@@ -67,6 +67,8 @@ def is_dialogue_script(script_text: str) -> bool:
 def clean_turn_text_for_tts(text: str) -> str:
     """Chuẩn hóa văn bản lượt thoại để sẵn sàng đọc TTS:
     - Bỏ các nhãn vai: [MC]:, [KHACH_1]:, MC:, v.v.
+    - Bỏ các nhãn vai lọt vào giữa câu: [KHACH_1], [MC], [KHACH_2], [GUEST], etc.
+    - Bỏ các biến placeholder kỹ thuật: [TÊN...], [NHÂN VẬT...]
     - Bỏ các tiêu đề phần: ### [INTRO], ### [BODY], [PHAN 1]
     - Bỏ các chỉ dẫn sân khấu trong ngoặc đơn / ngoặc vuông / dấu sao: (nghẹn ngào), (cười), [thở dài], *khóc nức nở*
     - Bỏ các ký tự markdown thừa, dấu gạch ngang vô nghĩa
@@ -83,6 +85,21 @@ def clean_turn_text_for_tts(text: str) -> str:
     # Loại bỏ tag vai nếu còn sót ở đầu chuỗi: [MC]:, [KHACH_1]:, MC:, Khách:
     cleaned = re.sub(
         r'^\s*\[?(?:MC|HOST|KHACH(?:_\d+)?|GUEST(?:_\d+)?|NGUOI_DAN|KHACH_MOI(?:_\d+)?)\]?\s*:\s*',
+        '',
+        cleaned,
+        flags=re.IGNORECASE
+    )
+
+    # Loại bỏ các tag vai kỹ thuật bị lọt vào giữa câu văn: [MC], [KHACH_1], [GUEST], etc.
+    cleaned = re.sub(
+        r'\[(?:MC|HOST|KHACH(?:_\d+)?|GUEST(?:_\d+)?|NGUOI_DAN|KHACH_MOI(?:_\d+)?)\]',
+        '',
+        cleaned,
+        flags=re.IGNORECASE
+    )
+    # Loại bỏ các placeholder dạng [TÊN...], [NHÂN VẬT...], [TEN...] nếu AI sinh nhầm
+    cleaned = re.sub(
+        r'\[(?:TEN|TÊN|NHAN_VAT|NHÂN_VẬT|KHACH_MOI)[^\]]*\]',
         '',
         cleaned,
         flags=re.IGNORECASE
@@ -107,6 +124,48 @@ def clean_turn_text_for_tts(text: str) -> str:
     cleaned = re.sub(r'([,.:;!?])(?=[A-Za-z0-9\u00C0-\u024F\u1EA0-\u1EF9])', r'\1 ', cleaned)
     # Gộp nhiều dòng trống liên tiếp
     cleaned = re.sub(r'\n\s*\n+', '\n', cleaned)
+    return cleaned.strip()
+
+
+def sanitize_dialogue_script(script_text: str) -> str:
+    """Làm sạch toàn diện kịch bản đối thoại trước khi lưu DB hoặc hiển thị UI:
+    - Giữ nguyên các tag phân vai ở đầu lượt thoại: [MC]:, [KHACH_1]:, etc.
+    - Loại bỏ các tag vai bị lọt vào giữa câu: [KHACH_1], [MC], [KHACH_2]...
+    - Loại bỏ các biến placeholder kỹ thuật dạng [TÊN...], [NHÂN VẬT...]
+    """
+    if not script_text or not isinstance(script_text, str):
+        return ""
+
+    placeholder_map = {}
+    def _protect_tag(m):
+        key = f"__DIALOGUE_TAG_{len(placeholder_map)}__"
+        placeholder_map[key] = m.group(0)
+        return key
+
+    protected = DIALOGUE_TAG_REGEX.sub(_protect_tag, script_text)
+
+    # Loại bỏ các tag vai nằm bên trong văn bản (không có dấu hai chấm)
+    cleaned = re.sub(
+        r'\[(?:MC|HOST|KHACH(?:_\d+)?|GUEST(?:_\d+)?|NGUOI_DAN|KHACH_MOI(?:_\d+)?)\]',
+        '',
+        protected,
+        flags=re.IGNORECASE
+    )
+    # Loại bỏ placeholder thừa
+    cleaned = re.sub(
+        r'\[(?:TEN|TÊN|NHAN_VAT|NHÂN_VẬT|KHACH_MOI)[^\]]*\]',
+        '',
+        cleaned,
+        flags=re.IGNORECASE
+    )
+
+    # Khôi phục các tag đầu lượt thoại hợp lệ
+    for key, val in placeholder_map.items():
+        cleaned = cleaned.replace(key, val)
+
+    # Chuẩn hóa khoảng trắng thừa do loại bỏ tag
+    cleaned = re.sub(r'[ \t]+', ' ', cleaned)
+    cleaned = re.sub(r' +([,.:;!?])', r'\1', cleaned)
     return cleaned.strip()
 
 
@@ -245,6 +304,22 @@ def resolve_turn_voice(
             cast.get("guest") or cast.get("khach")
         )
         g1_voice = _extract_voice_id_from_entry(val)
+        mc_voice = resolve_turn_voice("MC", cast, default_voice_id, available_voices)
+
+        # 1. Nếu đã có giọng cụ thể, khác MC và khác auto/none/distinct, dùng luôn
+        if g1_voice and g1_voice.lower() not in ("auto", "none", "distinct") and g1_voice != mc_voice:
+            return g1_voice
+
+        # 2. Nếu để auto/trống HOẶC bị trùng với giọng của MC -> Tự động chọn giọng khác biệt
+        if available_voices:
+            fallback = resolve_fallback_guest_voice(
+                used_voice_ids=[mc_voice],
+                available_voices=available_voices,
+                default_fallback=g1_voice or default_voice_id,
+            )
+            if fallback:
+                return fallback
+
         return str(g1_voice or default_voice_id).strip()
 
     if normalized_role in ("KHACH_2", "KHACH_3"):
@@ -253,13 +328,18 @@ def resolve_turn_voice(
         val = cast.get(key_lookup) or cast.get(alt_lookup)
         g_voice = _extract_voice_id_from_entry(val)
         
-        # Nếu đã có giọng cụ thể (và khác 'auto' / 'none'), dùng luôn
-        if g_voice and g_voice.lower() not in ("auto", "none", "distinct"):
-            return g_voice
-
-        # Nếu để auto hoặc chưa có giọng, kích hoạt Smart Fallback
         mc_voice = resolve_turn_voice("MC", cast, default_voice_id, available_voices)
         g1_voice = resolve_turn_voice("KHACH_1", cast, default_voice_id, available_voices)
+
+        # Nếu đã có giọng cụ thể, khác auto và khác MC & Khách 1, dùng luôn
+        if (
+            g_voice
+            and g_voice.lower() not in ("auto", "none", "distinct")
+            and g_voice not in (mc_voice, g1_voice)
+        ):
+            return g_voice
+
+        # Nếu để auto hoặc chưa có giọng / trùng giọng, kích hoạt Smart Fallback
         return resolve_fallback_guest_voice(
             used_voice_ids=[mc_voice, g1_voice],
             available_voices=available_voices,

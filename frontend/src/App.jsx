@@ -689,10 +689,17 @@ function App() {
         throw new Error(data.detail || 'Invalid voice configuration')
       }
       setVoiceOptions(data.voices)
-      setGlobalDefaultVoiceId(data.active_voice_id || data.voices[0]?.id || '')
-      setSelectedVoiceId(data.active_voice_id || data.voices[0]?.id || '')
+      const primaryVoiceId = data.active_voice_id || data.voices[0]?.id || ''
+      setGlobalDefaultVoiceId(primaryVoiceId)
+      setSelectedVoiceId(primaryVoiceId)
+      setSelectedMcVoiceId(primaryVoiceId)
+      
+      const distinctGuestVoice = data.voices.find(v => v.id !== primaryVoiceId)?.id || 'auto'
+      setSelectedGuest1VoiceId(distinctGuestVoice)
+      setSelectedGuest2VoiceId('auto')
+
       setRegenerateVoiceId(previousVoiceId =>
-        previousVoiceId || data.active_voice_id || data.voices[0]?.id || ''
+        previousVoiceId || primaryVoiceId
       )
     } catch (error) {
       console.error('Failed to fetch voices', error)
@@ -710,7 +717,7 @@ function App() {
     const isDialogue = (selectedVersionObj?.contentMode || 'dialogue') === 'dialogue';
     const castOverrides = isDialogue ? {
       mc: selectedMcVoiceId || selectedVoiceId || '',
-      guest_1: selectedGuest1VoiceId || selectedVoiceId || '',
+      guest_1: selectedGuest1VoiceId || 'auto',
       guest_2: selectedGuest2VoiceId || 'auto'
     } : null;
 
@@ -2217,6 +2224,9 @@ function App() {
                             fontSize: '13px', fontWeight: '600', cursor: 'pointer'
                           }}
                         >
+                          <option value="auto" style={{ background: '#1a1a1a', color: '#34d399' }}>
+                            ⚡ Tự động chọn giọng khác biệt (Auto Distinct)
+                          </option>
                           <VoiceOptions voices={voiceOptions} />
                         </select>
                       </div>

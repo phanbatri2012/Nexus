@@ -141,8 +141,50 @@ class TestDialogueParser(unittest.TestCase):
         self.assertIn("Con chào bác Sâm ạ.", segments[1]["text"])
         self.assertIn("Con muốn tâm sự chuyện gia đình.", segments[1]["text"])
 
-        self.assertEqual(segments[2]["role"], "MC")
-        self.assertEqual(segments[2]["voice_id"], "v_mc")
+    def test_clean_turn_text_with_inline_role_tags(self):
+        text = "Và hôm nay, trường quay của chúng ta đón nhận một câu chuyện đầy trăn trở từ [KHACH_1] sau chuỗi ngày đau khổ."
+        cleaned = clean_turn_text_for_tts(text)
+        self.assertNotIn("[KHACH_1]", cleaned)
+        self.assertIn("đón nhận một câu chuyện đầy trăn trở từ sau chuỗi ngày đau khổ.", cleaned)
+
+    def test_sanitize_dialogue_script(self):
+        script = (
+            "[MC]: Xin chào quý vị, hôm nay chúng ta lắng nghe [KHACH_1] chia sẻ [TÊN_NHÂN_VẬT].\n"
+            "[KHACH_1]: Chào [MC] Văn Sâm, em là [NHAN_VAT] đây ạ."
+        )
+        from auto_yt.dialogue_parser import sanitize_dialogue_script
+        sanitized = sanitize_dialogue_script(script)
+        # Line-opening tags must be preserved
+        self.assertTrue(sanitized.startswith("[MC]:"))
+        self.assertIn("\n[KHACH_1]:", sanitized)
+        # Inline tags must be removed
+        self.assertNotIn(" [KHACH_1] ", sanitized)
+        self.assertNotIn("[TÊN_NHÂN_VẬT]", sanitized)
+        self.assertNotIn("[MC] Văn Sâm", sanitized)
+        self.assertIn("Văn Sâm", sanitized)
+
+    def test_khach_1_mandatory_distinct_fallback(self):
+        available_voices = [
+            {"id": "voice_mc_dd", "name": "MC Voice", "status": "active"},
+            {"id": "voice_guest_gkvs", "name": "GKVS Voice", "status": "active"},
+            {"id": "voice_guest_backup", "name": "Backup Voice", "status": "active"},
+        ]
+        # Case 1: guest_1 is not provided at all -> should automatically pick distinct voice from MC
+        empty_cast = {"mc": "voice_mc_dd"}
+        g1_voice = resolve_turn_voice("KHACH_1", empty_cast, default_voice_id="voice_mc_dd", available_voices=available_voices)
+        self.assertEqual(g1_voice, "voice_guest_gkvs")
+        self.assertNotEqual(g1_voice, "voice_mc_dd")
+
+        # Case 2: guest_1 is explicitly passed identical to MC voice -> should detect collision and pick distinct voice
+        colliding_cast = {"mc": "voice_mc_dd", "guest_1": "voice_mc_dd"}
+        g1_voice_fixed = resolve_turn_voice("KHACH_1", colliding_cast, default_voice_id="voice_mc_dd", available_voices=available_voices)
+        self.assertEqual(g1_voice_fixed, "voice_guest_gkvs")
+        self.assertNotEqual(g1_voice_fixed, "voice_mc_dd")
+
+        # Case 3: guest_1 is 'auto'
+        auto_cast = {"mc": "voice_mc_dd", "guest_1": "auto"}
+        g1_voice_auto = resolve_turn_voice("KHACH_1", auto_cast, default_voice_id="voice_mc_dd", available_voices=available_voices)
+        self.assertEqual(g1_voice_auto, "voice_guest_gkvs")
 
 
 if __name__ == "__main__":

@@ -1996,6 +1996,11 @@ def sanitize_generated_script(script_text: str) -> str:
             deduped_blocks.append(block_stripped)
             
         final_content = "\n\n".join(deduped_blocks)
+        try:
+            from auto_yt.dialogue_parser import sanitize_dialogue_script
+            final_content = sanitize_dialogue_script(final_content)
+        except Exception:
+            pass
         separator = "\n" if final_content else ""
         return f"{section_header}{final_content}{separator}"
 
