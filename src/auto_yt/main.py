@@ -625,6 +625,7 @@ class VideoRequest(BaseModel):
     url: str = Field(min_length=1, max_length=2048)
     prompt_version: Optional[str] = Field(default=None, max_length=120)
     voice_id: Optional[str] = Field(default=None, max_length=200)
+    cast_voice_overrides: Optional[dict] = Field(default=None)
     publish_mode: Optional[Literal["public", "schedule", "private"]] = None
     publish_immediately: Optional[bool] = None
 
@@ -5520,6 +5521,30 @@ def process_video(request: VideoRequest):
             _production_snapshot["pipeline"]["youtube_schedule"] = False
             pipeline["youtube_upload"] = True
             pipeline["youtube_schedule"] = False
+    if request.cast_voice_overrides and isinstance(request.cast_voice_overrides, dict):
+        if not isinstance(_production_snapshot.get("cast_settings"), dict):
+            _production_snapshot["cast_settings"] = {}
+        for role_key, voice_id in request.cast_voice_overrides.items():
+            if voice_id and str(voice_id).strip():
+                clean_voice_id = str(voice_id).strip()
+                if role_key == "mc":
+                    if not isinstance(_production_snapshot["cast_settings"].get("mc"), dict):
+                        _production_snapshot["cast_settings"]["mc"] = {}
+                    _production_snapshot["cast_settings"]["mc"]["voice_id"] = clean_voice_id
+                    _production_snapshot["cast_settings"]["mc"]["default_voice_id"] = clean_voice_id
+                elif role_key in ("guest_1", "guest1"):
+                    if not isinstance(_production_snapshot["cast_settings"].get("guest_1"), dict):
+                        _production_snapshot["cast_settings"]["guest_1"] = {}
+                    _production_snapshot["cast_settings"]["guest_1"]["voice_id"] = clean_voice_id
+                    _production_snapshot["cast_settings"]["guest_1"]["default_voice_id"] = clean_voice_id
+                elif role_key in ("guest_2", "guest2"):
+                    if not isinstance(_production_snapshot["cast_settings"].get("guest_2"), dict):
+                        _production_snapshot["cast_settings"]["guest_2"] = {}
+                    _production_snapshot["cast_settings"]["guest_2"]["voice_id"] = clean_voice_id
+                    _production_snapshot["cast_settings"]["guest_2"]["default_voice_id"] = clean_voice_id
+                    if clean_voice_id != "auto":
+                        _production_snapshot["cast_settings"]["guest_2"]["enabled"] = True
+
     requested_voice_id = request.voice_id or _get_prompt_default_voice_id(
         resolved_prompt_version
     )
@@ -5554,6 +5579,7 @@ def process_video(request: VideoRequest):
             and str(existing_payload.get("url") or "").strip() == normalized_url
             and existing_job.get("prompt_version", "") == resolved_prompt_version
             and existing_job.get("voice_id", "") == selected_voice["id"]
+            and existing_payload.get("cast_voice_overrides") == request.cast_voice_overrides
             and chatgpt_projects.normalize_prompt_pipeline(
                 existing_payload.get("pipeline")
             ) == pipeline
@@ -5596,6 +5622,7 @@ def process_video(request: VideoRequest):
             "voice_snapshot": voice_snapshot,
             "pipeline": pipeline,
             "production_snapshot": _production_snapshot,
+            "cast_voice_overrides": request.cast_voice_overrides,
             "publish_mode": publish_mode_override,
         },
         prompt_version=resolved_prompt_version,

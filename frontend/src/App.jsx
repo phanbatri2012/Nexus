@@ -236,6 +236,9 @@ function App() {
   const [voiceOptions, setVoiceOptions] = useState([])
   const [globalDefaultVoiceId, setGlobalDefaultVoiceId] = useState('')
   const [selectedVoiceId, setSelectedVoiceId] = useState('')
+  const [selectedMcVoiceId, setSelectedMcVoiceId] = useState('')
+  const [selectedGuest1VoiceId, setSelectedGuest1VoiceId] = useState('')
+  const [selectedGuest2VoiceId, setSelectedGuest2VoiceId] = useState('auto')
   const [currentVideoVoiceId, setCurrentVideoVoiceId] = useState('')
   const [currentVideoVoiceName, setCurrentVideoVoiceName] = useState('')
   const [currentVideoProviderId, setCurrentVideoProviderId] = useState('genmax')
@@ -470,13 +473,20 @@ function App() {
     const globalVoiceExists = voiceOptions.some(
       voice => voice.id === globalDefaultVoiceId
     )
-    setSelectedVoiceId(
-      promptVoiceExists
-        ? promptVoiceId
-        : globalVoiceExists
-          ? globalDefaultVoiceId
-          : voiceOptions[0].id
-    )
+    const resolvedDefaultVoice = promptVoiceExists
+      ? promptVoiceId
+      : globalVoiceExists
+        ? globalDefaultVoiceId
+        : voiceOptions[0].id
+    setSelectedVoiceId(resolvedDefaultVoice)
+
+    const cast = selectedVersion?.castSettings || {}
+    const mcVoiceId = cast.mc?.voice_id || cast.mc?.default_voice_id || resolvedDefaultVoice
+    const guest1VoiceId = cast.guest_1?.voice_id || cast.guest_1?.default_voice_id || (voiceOptions[1]?.id || resolvedDefaultVoice)
+    const guest2VoiceId = cast.guest_2?.voice_id || cast.guest_2?.default_voice_id || 'auto'
+    setSelectedMcVoiceId(mcVoiceId)
+    setSelectedGuest1VoiceId(guest1VoiceId)
+    setSelectedGuest2VoiceId(guest2VoiceId)
   }, [
     selectedPromptVersion,
     promptVersions,
@@ -659,6 +669,8 @@ function App() {
         const versionsList = Object.entries(data.versions).map(([key, version]) => ({
           key: key,
           name: version.name,
+          contentMode: version.content_mode || 'dialogue',
+          castSettings: version.cast_settings || {},
           defaultVoiceId: version.default_voice_id || ''
         }));
         setPromptVersions(versionsList);
@@ -694,6 +706,14 @@ function App() {
     setErrorMsg('')
     setProgressMsg('Đang thêm video vào hàng đợi...')
     
+    const selectedVersionObj = promptVersions.find(v => v.key === selectedPromptVersion);
+    const isDialogue = (selectedVersionObj?.contentMode || 'dialogue') === 'dialogue';
+    const castOverrides = isDialogue ? {
+      mc: selectedMcVoiceId || selectedVoiceId || '',
+      guest_1: selectedGuest1VoiceId || selectedVoiceId || '',
+      guest_2: selectedGuest2VoiceId || 'auto'
+    } : null;
+
     try {
       const response = await fetch('http://127.0.0.1:8080/api/process-video', {
         method: 'POST',
@@ -702,6 +722,7 @@ function App() {
           url: submittedUrl,
           prompt_version: selectedPromptVersion,
           voice_id: selectedVoiceId || null,
+          cast_voice_overrides: castOverrides,
           publish_mode: publishImmediately ? 'public' : null,
           publish_immediately: publishImmediately
         })
@@ -2138,32 +2159,121 @@ function App() {
                     }}>▼</div>
                   </div>
                 </div>
-                <div style={{
-                  display: 'flex', alignItems: 'center', gap: '12px',
-                  background: 'rgba(255, 255, 255, 0.03)',
-                  padding: '12px 24px', borderRadius: '12px',
-                  border: '1px solid rgba(255, 255, 255, 0.1)'
-                }}>
-                  <label htmlFor="voice-select" style={{
-                    color: '#e0e0e0', fontSize: '15px', fontWeight: '500'
+                {((promptVersions.find(v => v.key === selectedPromptVersion)?.contentMode || 'dialogue') === 'dialogue') ? (
+                  <div style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '8px',
+                    background: 'rgba(255, 255, 255, 0.03)',
+                    padding: '10px 18px',
+                    borderRadius: '12px',
+                    border: '1px solid rgba(56, 189, 248, 0.3)',
+                    boxShadow: '0 4px 6px rgba(0, 0, 0, 0.1)'
                   }}>
-                    🎙️ Giọng đọc:
-                  </label>
-                  <select
-                    id="voice-select"
-                    value={selectedVoiceId}
-                    onChange={(event) => setSelectedVoiceId(event.target.value)}
-                    disabled={voiceOptions.length === 0}
-                    style={{
-                      background: 'rgba(26, 188, 156, 0.15)', color: 'white',
-                      border: '1px solid rgba(26, 188, 156, 0.5)',
-                      padding: '8px 14px', borderRadius: '8px', outline: 'none',
-                      fontSize: '15px', fontWeight: '600', cursor: 'pointer'
-                    }}
-                  >
-                    <VoiceOptions voices={voiceOptions} />
-                  </select>
-                </div>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+                      <span style={{ color: '#38bdf8', fontSize: '13px', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        👥 Phân Vai Giọng Đọc (Cast Voices):
+                      </span>
+                      <span style={{ color: '#94a3b8', fontSize: '11px' }}>
+                        Tên nhân vật do AI tự động lấy từ video gốc
+                      </span>
+                    </div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '12px', alignItems: 'center' }}>
+                      {/* MC Voice */}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <label htmlFor="mc-voice-select" style={{ color: '#fbbf24', fontSize: '12px', fontWeight: 'bold' }}>
+                          🎙️ MC:
+                        </label>
+                        <select
+                          id="mc-voice-select"
+                          value={selectedMcVoiceId}
+                          onChange={(e) => setSelectedMcVoiceId(e.target.value)}
+                          disabled={voiceOptions.length === 0}
+                          style={{
+                            background: 'rgba(251, 191, 36, 0.15)', color: 'white',
+                            border: '1px solid rgba(251, 191, 36, 0.5)',
+                            padding: '6px 10px', borderRadius: '6px', outline: 'none',
+                            fontSize: '13px', fontWeight: '600', cursor: 'pointer'
+                          }}
+                        >
+                          <VoiceOptions voices={voiceOptions} />
+                        </select>
+                      </div>
+
+                      {/* Guest 1 Voice */}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <label htmlFor="guest1-voice-select" style={{ color: '#34d399', fontSize: '12px', fontWeight: 'bold' }}>
+                          🎙️ Khách 1:
+                        </label>
+                        <select
+                          id="guest1-voice-select"
+                          value={selectedGuest1VoiceId}
+                          onChange={(e) => setSelectedGuest1VoiceId(e.target.value)}
+                          disabled={voiceOptions.length === 0}
+                          style={{
+                            background: 'rgba(52, 211, 153, 0.15)', color: 'white',
+                            border: '1px solid rgba(52, 211, 153, 0.5)',
+                            padding: '6px 10px', borderRadius: '6px', outline: 'none',
+                            fontSize: '13px', fontWeight: '600', cursor: 'pointer'
+                          }}
+                        >
+                          <VoiceOptions voices={voiceOptions} />
+                        </select>
+                      </div>
+
+                      {/* Guest 2 Voice */}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <label htmlFor="guest2-voice-select" style={{ color: '#f472b6', fontSize: '12px', fontWeight: 'bold' }}>
+                          🎙️ Khách 2:
+                        </label>
+                        <select
+                          id="guest2-voice-select"
+                          value={selectedGuest2VoiceId}
+                          onChange={(e) => setSelectedGuest2VoiceId(e.target.value)}
+                          disabled={voiceOptions.length === 0}
+                          style={{
+                            background: 'rgba(244, 114, 182, 0.15)', color: 'white',
+                            border: '1px solid rgba(244, 114, 182, 0.5)',
+                            padding: '6px 10px', borderRadius: '6px', outline: 'none',
+                            fontSize: '13px', fontWeight: '600', cursor: 'pointer'
+                          }}
+                        >
+                          <option value="auto" style={{ background: '#1a1a1a', color: '#f472b6' }}>
+                            ⚡ Tự động chọn giọng phụ khác biệt (Auto Distinct)
+                          </option>
+                          <VoiceOptions voices={voiceOptions} />
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{
+                    display: 'flex', alignItems: 'center', gap: '12px',
+                    background: 'rgba(255, 255, 255, 0.03)',
+                    padding: '12px 24px', borderRadius: '12px',
+                    border: '1px solid rgba(255, 255, 255, 0.1)'
+                  }}>
+                    <label htmlFor="voice-select" style={{
+                      color: '#e0e0e0', fontSize: '15px', fontWeight: '500'
+                    }}>
+                      🎙️ Giọng đọc:
+                    </label>
+                    <select
+                      id="voice-select"
+                      value={selectedVoiceId}
+                      onChange={(event) => setSelectedVoiceId(event.target.value)}
+                      disabled={voiceOptions.length === 0}
+                      style={{
+                        background: 'rgba(26, 188, 156, 0.15)', color: 'white',
+                        border: '1px solid rgba(26, 188, 156, 0.5)',
+                        padding: '8px 14px', borderRadius: '8px', outline: 'none',
+                        fontSize: '15px', fontWeight: '600', cursor: 'pointer'
+                      }}
+                    >
+                      <VoiceOptions voices={voiceOptions} />
+                    </select>
+                  </div>
+                )}
 
                 <label style={{
                   display: 'inline-flex',

@@ -139,3 +139,79 @@ def extract_dialogue_speakers(script_text: str) -> list[str]:
         if turn["role"] not in seen:
             seen.append(turn["role"])
     return seen
+
+
+def resolve_fallback_guest_voice(
+    used_voice_ids: list[str],
+    available_voices: list[dict] | None = None,
+    default_fallback: str = "",
+) -> str:
+    """Tự động chọn một giọng phụ khác biệt từ danh mục giọng khả dụng
+    nếu trong kịch bản phát sinh Khách Mời 2 mà chưa được gán giọng trước.
+    """
+    if not available_voices:
+        return default_fallback
+
+    clean_used = {str(v).strip() for v in used_voice_ids if v and str(v).strip()}
+    
+    # 1. Tìm các giọng chưa được gán cho MC hoặc Khách 1
+    unused_voices = [
+        v for v in available_voices
+        if v.get("id") and str(v.get("id")).strip() not in clean_used
+        and v.get("status", "active") == "active"
+    ]
+
+    if unused_voices:
+        # Ưu tiên giọng cùng provider hoặc giọng có sẵn
+        return str(unused_voices[0]["id"]).strip()
+
+    # Nếu tất cả giọng đã bị dùng, fallback về giọng đầu tiên hoặc default_fallback
+    for v in available_voices:
+        if v.get("id") and v.get("status", "active") == "active":
+            return str(v["id"]).strip()
+
+    return default_fallback
+
+
+def resolve_turn_voice(
+    role: str,
+    cast_settings: dict,
+    default_voice_id: str = "",
+    available_voices: list[dict] | None = None,
+) -> str:
+    """Xác định ID giọng đọc cho một vai diễn cụ thể trong kịch bản đối thoại.
+    Hỗ trợ Smart Distinct Fallback cho KHACH_2 nếu chưa được cấu hình.
+    """
+    normalized_role = normalize_role_tag(role)
+    cast = cast_settings or {}
+
+    if normalized_role == "MC":
+        mc_cfg = cast.get("mc") or {}
+        mc_voice = mc_cfg.get("voice_id") or mc_cfg.get("default_voice_id")
+        return str(mc_voice or default_voice_id).strip()
+
+    if normalized_role == "KHACH_1":
+        guest1_cfg = cast.get("guest_1") or {}
+        g1_voice = guest1_cfg.get("voice_id") or guest1_cfg.get("default_voice_id")
+        return str(g1_voice or default_voice_id).strip()
+
+    if normalized_role == "KHACH_2":
+        guest2_cfg = cast.get("guest_2") or {}
+        g2_voice = guest2_cfg.get("voice_id") or guest2_cfg.get("default_voice_id")
+        
+        # Nếu đã có giọng cụ thể (và khác 'auto'), dùng luôn
+        if g2_voice and str(g2_voice).strip() not in ("", "auto", "none"):
+            return str(g2_voice).strip()
+
+        # Nếu để auto hoặc chưa có giọng, kích hoạt Smart Fallback
+        mc_voice = resolve_turn_voice("MC", cast, default_voice_id, available_voices)
+        g1_voice = resolve_turn_voice("KHACH_1", cast, default_voice_id, available_voices)
+        return resolve_fallback_guest_voice(
+            used_voice_ids=[mc_voice, g1_voice],
+            available_voices=available_voices,
+            default_fallback=g1_voice or default_voice_id,
+        )
+
+    # Các vai khác (fallback an toàn)
+    return str(default_voice_id).strip()
+

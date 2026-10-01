@@ -81,6 +81,35 @@ class DialogueSettingsTests(unittest.TestCase):
         self.assertEqual(saved["versions"]["default"]["content_mode"], "monologue")
         self.assertEqual(result["version"]["content_mode"], "monologue")
 
+    @patch.object(main, "_kick_video_queue")
+    def test_process_video_with_cast_voice_overrides(self, mock_kick):
+        req = main.VideoRequest(
+            url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            prompt_version="default",
+            cast_voice_overrides={
+                "mc": "voice_mc_custom",
+                "guest_1": "voice_guest_custom",
+                "guest_2": "auto"
+            }
+        )
+        res = main.process_video(req)
+        try:
+            self.assertIn("job_id", res)
+            job = main.db.get_system_job(res["job_id"])
+            self.assertIsNotNone(job)
+            payload = job.get("payload") or {}
+            self.assertEqual(payload.get("cast_voice_overrides"), req.cast_voice_overrides)
+            snapshot = payload.get("production_snapshot") or {}
+            cast_settings = snapshot.get("cast_settings") or {}
+            self.assertEqual(cast_settings.get("mc", {}).get("voice_id"), "voice_mc_custom")
+            self.assertEqual(cast_settings.get("guest_1", {}).get("voice_id"), "voice_guest_custom")
+            self.assertEqual(cast_settings.get("guest_2", {}).get("voice_id"), "auto")
+        finally:
+            if res.get("job_id"):
+                main.db.update_system_job(res["job_id"], status="canceled")
+                main.db.delete_system_job(res["job_id"])
+
 
 if __name__ == "__main__":
     unittest.main()
+

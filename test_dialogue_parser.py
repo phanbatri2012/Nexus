@@ -69,6 +69,27 @@ class TestDialogueParser(unittest.TestCase):
         self.assertEqual(turns[0]["role"], "MC")
         self.assertEqual(turns[0]["text"], script)
 
+    def test_resolve_turn_voice_and_smart_fallback(self):
+        from auto_yt.dialogue_parser import resolve_turn_voice, resolve_fallback_guest_voice
+        available_voices = [
+            {"id": "voice_mc_dinh_doan", "name": "Đinh Đoàn", "status": "active"},
+            {"id": "voice_guest_lan", "name": "Chị Lan", "status": "active"},
+            {"id": "voice_guest_backup", "name": "Bác Sĩ Nam", "status": "active"},
+        ]
+        cast_settings = {
+            "mc": {"voice_id": "voice_mc_dinh_doan"},
+            "guest_1": {"voice_id": "voice_guest_lan"},
+            "guest_2": {"voice_id": "auto"} # Auto fallback
+        }
+        # MC & Guest 1 resolve directly
+        self.assertEqual(resolve_turn_voice("MC", cast_settings), "voice_mc_dinh_doan")
+        self.assertEqual(resolve_turn_voice("KHACH_1", cast_settings), "voice_guest_lan")
+        
+        # Guest 2 resolves to the unused distinct voice
+        g2_voice = resolve_turn_voice("KHACH_2", cast_settings, available_voices=available_voices)
+        self.assertEqual(g2_voice, "voice_guest_backup")
+
 
 if __name__ == "__main__":
     unittest.main()
+
