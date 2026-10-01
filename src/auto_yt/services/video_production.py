@@ -796,7 +796,10 @@ def _format_scene_video_prompt(
         frame_directive = "Generate exactly one 16:9 high-quality cinematic video clip, not a still image."
 
     # 2. Extract and sanitize action context (completely topic-agnostic)
-    action_clean = _sanitize_scene_prompt_context(scene_action or raw_prompt, max_chars=140)
+    raw_action = scene_action or raw_prompt
+    raw_action = re.sub(r"(?i)depict a concrete.*?narration\s*[:：]?\s*", "", raw_action)
+    raw_action = re.sub(r"(?i)grounded only in this narration\s*[:：]?\s*", "", raw_action)
+    action_clean = _sanitize_scene_prompt_context(raw_action, max_chars=140)
     action_directive = f"Scene action: {action_clean}." if action_clean else ""
 
     # 3. Clean style prompt without still photo keywords
@@ -1770,12 +1773,26 @@ def generate_scene_media(
                     )
                     media_paths.append(video_path)
                 except Exception as exc:
-                    logger.warning(
-                        "flow_video generation for scene %s failed (%s); fast-falling back remaining scenes to base image.",
-                        scene.get("index"),
-                        exc,
+                    from auto_yt.services.google_flow_worker import (
+                        FlowModeError,
+                        FlowAgentSettingsError,
                     )
-                    flow_video_unsupported = True
+                    is_system_unsupported = isinstance(
+                        exc, (FlowModeError, FlowAgentSettingsError)
+                    ) or "không hỗ trợ" in str(exc).lower()
+
+                    if is_system_unsupported:
+                        logger.warning(
+                            "flow_video is completely unsupported by account/interface (%s); fast-falling back remaining scenes to base image.",
+                            exc,
+                        )
+                        flow_video_unsupported = True
+                    else:
+                        logger.warning(
+                            "flow_video generation failed for scene %s (%s); falling back this scene to base image while continuing remaining scenes.",
+                            scene.get("index"),
+                            exc,
+                        )
                     media_paths.append(base_image_paths[index])
             return media_paths
 

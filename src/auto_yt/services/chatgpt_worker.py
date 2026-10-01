@@ -1810,6 +1810,20 @@ def looks_like_citation_artifact(text: str) -> bool:
     return False
 
 
+EDITORIAL_ACTION_WORDS = (
+    "làm", "tránh", "giảm", "tạo", "thắt chặt", "tăng", "rút gọn", "bổ sung",
+    "mở rộng", "nhấn mạnh", "thay đổi", "thêm", "sắp xếp", "viết lại",
+    "chuyển ý", "đào sâu", "khai thác", "kết nối", "dẫn dắt", "sửa", "chia đoạn",
+    "bỏ", "giữ nhịp", "nêu bật", "tách", "triển khai", "mở đầu bằng", "làm rõ",
+    "giải thích",
+)
+
+TRAILING_ACTION_PILLS_PATTERN = re.compile(
+    r'([.!?…][\"”’\']?)(?:\s*(?:' + '|'.join(re.escape(w) for w in sorted(EDITORIAL_ACTION_WORDS, key=len, reverse=True)) + r')[^.!?…\n]*)+',
+    flags=re.IGNORECASE,
+)
+
+
 def clean_text(text: str) -> str:
     """Removes 'Edit', citations, search badges, Canvas artifacts, and common AI conversational fillers from the output."""
     if not isinstance(text, str) or not text:
@@ -1851,12 +1865,7 @@ def clean_text(text: str) -> str:
     # Remove leading 'Edit' that might be left if it wasn't on its own line
     result = re.sub(r'^\s*Edit\s*\n*', '', result)
     # Remove trailing Canvas Action Pills or suggestions attached to narrative ends
-    result = re.sub(
-        r"(?:rút gọn outro[^\n.]*|làm lời kết[^\n.]*|sắp xếp lời kêu gọi[^\n.]*|mở đầu bằng cú móc[^\n.]*|giảm tiết lộ[^\n.]*|làm rõ mốc[^\n.]*|tăng nhịp[^\n.]*|rút gọn chi tiết[^\n.]*)+\s*$",
-        "",
-        result,
-        flags=re.IGNORECASE,
-    ).strip()
+    result = TRAILING_ACTION_PILLS_PATTERN.sub(r'\1', result).strip()
     return result
 
 
