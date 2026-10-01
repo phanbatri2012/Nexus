@@ -63,6 +63,8 @@ from auto_yt.dialogue_parser import (
     parse_dialogue_turns,
     is_dialogue_script,
     clean_turn_text_for_tts,
+    build_dialogue_tts_segments,
+    resolve_turn_voice,
 )
 from auto_yt.services import voice_config
 from auto_yt.services import (
@@ -645,11 +647,13 @@ class RetryAudioRequest(BaseModel):
 class RegenerateAudioRequest(BaseModel):
     voice_id: str
     confirm_credit_charge: bool
+    cast_voice_overrides: Optional[dict] = None
 
 
 class ApproveAudioReviewRequest(BaseModel):
     confirm_credit_charge: bool
     voice_id: Optional[str] = None
+    cast_voice_overrides: Optional[dict] = None
 
 
 class UpdateVideoJobRequest(BaseModel):
@@ -2661,23 +2665,47 @@ def _sync_batch_audio_task(stored_task: dict, segments: list[dict]) -> dict:
         output_path = AUDIO_DIR / filename
         try:
             video = db.get_video(video_id)
-            script_for_tts = apply_tts_filters(
-                get_clean_script_for_tts(video["generated_script"])
-            )
-            current_request_hash = tts.get_generation_request_hash(
-                script_for_tts,
-                task_voice_id,
-                _voice_snapshot_from_record(stored_task),
-            )
+            raw_script = video.get("generated_script", "")
+            script_for_tts = get_clean_script_for_tts(raw_script)
+            is_dialogue = is_dialogue_script(raw_script)
+
+            if is_dialogue:
+                prod_snapshot = {}
+                try:
+                    prod_snapshot = json.loads(video.get("production_snapshot_json") or "{}")
+                except Exception:
+                    pass
+                cast_overrides = prod_snapshot.get("cast_voice_overrides") or {}
+                available_voices = voice_config.load_voice_config().get("voices", [])
+                d_segments = build_dialogue_tts_segments(
+                    script_for_tts,
+                    cast_settings=cast_overrides,
+                    default_voice_id=task_voice_id,
+                    available_voices=available_voices,
+                    max_segment_chars=7500,
+                )
+                for seg in d_segments:
+                    seg["text"] = apply_tts_filters(seg["text"])
+                    seg["characters"] = len(seg["text"])
+                current_request_hash = tts.get_dialogue_request_hash(d_segments)
+                chunks = [s["text"] for s in d_segments]
+            else:
+                filtered_script = apply_tts_filters(script_for_tts)
+                current_request_hash = tts.get_generation_request_hash(
+                    filtered_script,
+                    task_voice_id,
+                    _voice_snapshot_from_record(stored_task),
+                )
+                chunks = tts.split_text_for_tts(
+                    filtered_script,
+                    voice_id=task_voice_id,
+                    voice_snapshot=_voice_snapshot_from_record(stored_task),
+                )
+
             if current_request_hash != stored_task["request_hash"]:
                 raise audio_utils.AudioContentError(
                     "The script changed while audio was being generated."
                 )
-            chunks = tts.split_text_for_tts(
-                script_for_tts,
-                voice_id=task_voice_id,
-                voice_snapshot=_voice_snapshot_from_record(stored_task),
-            )
             duration_seconds = audio_utils.merge_remote_mp3_files(
                 [segment["audio_url"] for segment in segments],
                 output_path,
@@ -2770,6 +2798,8 @@ def _segment_from_remote(
     remote_task: dict,
     voice_id: str,
     voice_snapshot: dict | None = None,
+    role: str = "MC",
+    voice_name: str = "",
 ) -> dict:
     status = remote_task.get("status", "pending")
     audio_url = (remote_task.get("result") or {}).get("audio_url", "")
@@ -2777,6 +2807,9 @@ def _segment_from_remote(
         status = "processing"
     return {
         "index": index,
+        "role": role,
+        "voice_id": voice_id,
+        "voice_name": voice_name,
         "text_hash": tts.get_request_hash(text, voice_id, voice_snapshot),
         "characters": len(text),
         "task_id": remote_task["id"],
@@ -2824,6 +2857,7 @@ def _ensure_batch_audio_task(
     voice_id: str = AUDIO_VOICE_ID,
     voice_name: str = "",
     voice_snapshot: dict | None = None,
+    dialogue_segments: list[dict] | None = None,
 ) -> dict:
     existing_segments = _get_audio_segments(stored_task) if stored_task else []
     existing_by_index = {
@@ -2850,33 +2884,48 @@ def _ensure_batch_audio_task(
             _start_audio_watcher(video_id)
             return stored_task
 
-    # Fail closed: history must be checked before any new paid segment is sent.
-    remote_matches = (
-        tts.find_matching_tasks(chunks, voice_id, voice_snapshot)
-        if voice_snapshot
-        else tts.find_matching_tasks(chunks, voice_id)
-    )
     segments = []
     for index, chunk in enumerate(chunks):
         existing_segment = existing_by_index.get(index)
         if existing_segment:
             segments.append(existing_segment)
             continue
-        remote_task = remote_matches.get(chunk)
+
+        if dialogue_segments and index < len(dialogue_segments):
+            d_seg = dialogue_segments[index]
+            seg_voice_id = d_seg.get("voice_id") or voice_id
+            seg_role = d_seg.get("role") or "MC"
+            seg_voice_name = d_seg.get("voice_name") or voice_name
+        else:
+            seg_voice_id = voice_id
+            seg_role = "MC"
+            seg_voice_name = voice_name
+
+        seg_snapshot = (
+            voice_snapshot
+            if seg_voice_id == voice_id and voice_snapshot
+            else None
+        )
+        remote_task = tts.find_matching_task(chunk, seg_voice_id, seg_snapshot)
         if remote_task:
             segments.append(
                 _segment_from_remote(
                     index,
                     chunk,
                     remote_task,
-                    voice_id,
-                    voice_snapshot,
+                    seg_voice_id,
+                    seg_snapshot,
+                    role=seg_role,
+                    voice_name=seg_voice_name,
                 )
             )
         else:
             segments.append({
                 "index": index,
-                "text_hash": tts.get_request_hash(chunk, voice_id, voice_snapshot),
+                "role": seg_role,
+                "voice_id": seg_voice_id,
+                "voice_name": seg_voice_name,
+                "text_hash": tts.get_request_hash(chunk, seg_voice_id, seg_snapshot),
                 "characters": len(chunk),
                 "task_id": "",
                 "status": "not_submitted",
@@ -2896,25 +2945,35 @@ def _ensure_batch_audio_task(
         for segment in segments:
             if segment["task_id"]:
                 continue
+            idx = segment["index"]
+            seg_text = chunks[idx]
+            seg_voice_id = segment.get("voice_id") or voice_id
+            seg_snapshot = (
+                voice_snapshot
+                if seg_voice_id == voice_id and voice_snapshot
+                else None
+            )
             submitted_task = (
                 tts.submit_tts_task(
-                    chunks[segment["index"]],
-                    voice_id,
-                    voice_snapshot,
+                    seg_text,
+                    seg_voice_id,
+                    seg_snapshot,
                 )
-                if voice_snapshot
+                if seg_snapshot
                 else tts.submit_tts_task(
-                    chunks[segment["index"]],
-                    voice_id,
+                    seg_text,
+                    seg_voice_id,
                 )
             )
             segment.update(
                 _segment_from_remote(
-                    segment["index"],
-                    chunks[segment["index"]],
+                    idx,
+                    seg_text,
                     submitted_task,
-                    voice_id,
-                    voice_snapshot,
+                    seg_voice_id,
+                    seg_snapshot,
+                    role=segment.get("role", "MC"),
+                    voice_name=segment.get("voice_name", ""),
                 )
             )
             task = _store_batch_audio_task(
@@ -3019,23 +3078,48 @@ def _ensure_audio_task(
     voice_snapshot = voice_config.build_voice_snapshot(selected_voice)
     voice_fields = _voice_persistence_fields(selected_voice)
 
-    script_for_tts = get_clean_script_for_tts(video["generated_script"])
+    raw_script = video.get("generated_script", "")
+    script_for_tts = get_clean_script_for_tts(raw_script)
     if not script_for_tts:
         raise RuntimeError(
             "Không tìm thấy kịch bản để đọc (thiếu INTRO/BODY/OUTRO)."
         )
 
-    filtered_script = apply_tts_filters(script_for_tts)
-    chunks = tts.split_text_for_tts(
-        filtered_script,
-        voice_id=voice_id,
-        voice_snapshot=voice_snapshot,
-    )
-    request_hash = tts.get_generation_request_hash(
-        filtered_script,
-        voice_id,
-        voice_snapshot,
-    )
+    is_dialogue = is_dialogue_script(raw_script)
+    if is_dialogue:
+        prod_snapshot = {}
+        try:
+            prod_snapshot = json.loads(video.get("production_snapshot_json") or "{}")
+        except Exception:
+            pass
+        cast_overrides = prod_snapshot.get("cast_voice_overrides") or {}
+        available_voices = voice_config.load_voice_config().get("voices", [])
+        dialogue_segments = build_dialogue_tts_segments(
+            script_for_tts,
+            cast_settings=cast_overrides,
+            default_voice_id=voice_id,
+            available_voices=available_voices,
+            max_segment_chars=7500,
+        )
+        for seg in dialogue_segments:
+            seg["text"] = apply_tts_filters(seg["text"])
+            seg["characters"] = len(seg["text"])
+
+        chunks = [seg["text"] for seg in dialogue_segments]
+        request_hash = tts.get_dialogue_request_hash(dialogue_segments)
+    else:
+        dialogue_segments = None
+        filtered_script = apply_tts_filters(script_for_tts)
+        chunks = tts.split_text_for_tts(
+            filtered_script,
+            voice_id=voice_id,
+            voice_snapshot=voice_snapshot,
+        )
+        request_hash = tts.get_generation_request_hash(
+            filtered_script,
+            voice_id,
+            voice_snapshot,
+        )
 
     with _audio_submit_lock:
         stored_task = db.get_audio_task(video_id)
@@ -3045,7 +3129,7 @@ def _ensure_audio_task(
                     raise RuntimeError(
                         "Video đang có một audio task cho phiên bản kịch bản trước."
                     )
-            elif len(chunks) == 1:
+            elif len(chunks) == 1 and not is_dialogue:
                 if stored_task["status"] == "completed":
                     _save_audio_url(
                         video_id,
@@ -3058,7 +3142,7 @@ def _ensure_audio_task(
                     _start_audio_watcher(video_id)
                 return stored_task
 
-        if len(chunks) > 1:
+        if len(chunks) > 1 or is_dialogue:
             return _ensure_batch_audio_task(
                 video_id,
                 request_hash,
@@ -3071,6 +3155,7 @@ def _ensure_audio_task(
                 voice_id,
                 voice_name,
                 voice_snapshot,
+                dialogue_segments=dialogue_segments,
             )
 
         shared_task = db.get_audio_task_by_request_hash(request_hash)
@@ -7477,6 +7562,18 @@ def approve_audio_review(
         )
     video = _require_actionable_video(video_id)
 
+    if request.cast_voice_overrides and isinstance(request.cast_voice_overrides, dict):
+        prod_snapshot = {}
+        try:
+            prod_snapshot = json.loads(video.get("production_snapshot_json") or "{}")
+        except Exception:
+            pass
+        db.update_video_production(
+            video_id,
+            production_snapshot_json=json.dumps(prod_snapshot, ensure_ascii=False),
+        )
+        video["production_snapshot_json"] = json.dumps(prod_snapshot, ensure_ascii=False)
+
     review = _prepare_audio_review(video_id)
     report = review.get("report") or {}
     if not report.get("can_approve"):
@@ -7680,19 +7777,54 @@ def regenerate_audio_for_video(
             detail="Phải xác nhận nhà cung cấp cloud có thể trừ credit cho audio mới.",
         )
 
-    filtered_script = apply_tts_filters(
-        get_clean_script_for_tts(video["generated_script"])
-    )
-    if not filtered_script:
+    if request.cast_voice_overrides and isinstance(request.cast_voice_overrides, dict):
+        prod_snapshot = {}
+        try:
+            prod_snapshot = json.loads(video.get("production_snapshot_json") or "{}")
+        except Exception:
+            pass
+        prod_snapshot["cast_voice_overrides"] = request.cast_voice_overrides
+        db.update_video_production(
+            video_id,
+            production_snapshot_json=json.dumps(prod_snapshot, ensure_ascii=False),
+        )
+        video["production_snapshot_json"] = json.dumps(prod_snapshot, ensure_ascii=False)
+
+    raw_script = video.get("generated_script", "")
+    script_for_tts = get_clean_script_for_tts(raw_script)
+    if not script_for_tts:
         raise HTTPException(
             status_code=400,
             detail="Không tìm thấy kịch bản để tạo lại audio.",
         )
-    requested_hash = tts.get_generation_request_hash(
-        filtered_script,
-        selected_voice["id"],
-        voice_config.build_voice_snapshot(selected_voice),
-    )
+
+    is_dialogue = is_dialogue_script(raw_script)
+    if is_dialogue:
+        prod_snapshot = {}
+        try:
+            prod_snapshot = json.loads(video.get("production_snapshot_json") or "{}")
+        except Exception:
+            pass
+        cast_overrides = prod_snapshot.get("cast_voice_overrides") or {}
+        available_voices = voice_config.load_voice_config().get("voices", [])
+        dialogue_segments = build_dialogue_tts_segments(
+            script_for_tts,
+            cast_settings=cast_overrides,
+            default_voice_id=selected_voice["id"],
+            available_voices=available_voices,
+            max_segment_chars=7500,
+        )
+        for seg in dialogue_segments:
+            seg["text"] = apply_tts_filters(seg["text"])
+            seg["characters"] = len(seg["text"])
+        requested_hash = tts.get_dialogue_request_hash(dialogue_segments)
+    else:
+        filtered_script = apply_tts_filters(script_for_tts)
+        requested_hash = tts.get_generation_request_hash(
+            filtered_script,
+            selected_voice["id"],
+            voice_config.build_voice_snapshot(selected_voice),
+        )
     stored_task = db.get_audio_task(video_id)
     if stored_task and stored_task["status"] in {"pending", "processing"}:
         raise HTTPException(

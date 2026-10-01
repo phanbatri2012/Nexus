@@ -213,7 +213,16 @@ def _voice_for_hash(voice_id: str, voice_snapshot: dict | None = None) -> dict:
             "status": "active",
         }
     try:
-        return voice_config.get_voice(voice_id)
+        raw_voice = voice_config.get_voice(voice_id)
+        return {
+            "id": raw_voice.get("id") or voice_id,
+            "name": raw_voice.get("name") or "Giọng đã lưu",
+            "provider_id": raw_voice.get("provider_id") or voice_config.GENMAX_PROVIDER_ID,
+            "provider_voice_id": raw_voice.get("provider_voice_id") or raw_voice.get("id") or voice_id,
+            "revision": int(raw_voice.get("revision") or 1),
+            "config": raw_voice.get("config") or {},
+            "status": raw_voice.get("status", "active"),
+        }
     except ValueError:
         # Legacy database rows and isolated tests may reference a Genmax voice
         # that is no longer present in the editable catalog.
@@ -224,6 +233,7 @@ def _voice_for_hash(voice_id: str, voice_snapshot: dict | None = None) -> dict:
             "provider_voice_id": voice_id,
             "revision": 1,
             "config": {},
+            "status": "active",
         }
 
 
@@ -278,6 +288,21 @@ def get_generation_request_hash(
     voice_snapshot: dict | None = None,
 ) -> str:
     return get_request_hash(text, voice_id, voice_snapshot)
+
+
+def get_dialogue_request_hash(segments: list[dict]) -> str:
+    """Tính toán deterministic request hash cho toàn bộ chuỗi phân đoạn đối thoại đa vai."""
+    canonical_data = [
+        {
+            "index": s.get("index", 0),
+            "role": str(s.get("role") or ""),
+            "voice_id": str(s.get("voice_id") or ""),
+            "text": str(s.get("text") or "").strip(),
+        }
+        for s in segments
+    ]
+    raw = json.dumps(canonical_data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def submit_tts_task(
