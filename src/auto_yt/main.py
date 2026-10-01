@@ -2599,7 +2599,7 @@ def _sync_batch_audio_task(stored_task: dict, segments: list[dict]) -> dict:
     task_voice_name = stored_task.get("voice_name", "")
     sync_errors = []
     for segment in segments:
-        if segment.get("status") not in {"pending", "processing"}:
+        if segment.get("status") not in {"pending", "processing", "queued"}:
             continue
         task_id = segment.get("task_id", "")
         if not task_id:

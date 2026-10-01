@@ -120,7 +120,11 @@ def ensure_worker_running(*, base_url: str = DEFAULT_BASE_URL) -> None:
     creation_flags = 0
     startup_info = None
     if os.name == "nt":
-        creation_flags = subprocess.CREATE_NO_WINDOW
+        creation_flags = (
+            subprocess.CREATE_NO_WINDOW
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
         startup_info = subprocess.STARTUPINFO()
         startup_info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startup_info.wShowWindow = subprocess.SW_HIDE

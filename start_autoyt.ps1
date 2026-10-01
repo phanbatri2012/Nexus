@@ -302,21 +302,21 @@ function Start-OmniVoiceWorker {
         return
     }
 
+    $omniVenvPython = Join-Path $omniVoiceRoot ".venv\Scripts\python.exe"
+    if (-not (Test-Path -LiteralPath $omniVenvPython -PathType Leaf)) {
+        $omniVenvPython = $venvPython
+    }
+
+    $stdoutLog = Join-Path $logsRoot "omnivoice.current.stdout.log"
+    $stderrLog = Join-Path $logsRoot "omnivoice.current.stderr.log"
     Write-Step "Starting OmniVoice TTS worker on port 8011..."
-    try {
-        $srcPath = Join-Path $projectRoot "src"
-        $previousPythonPath = $env:PYTHONPATH
-        $env:PYTHONPATH = $srcPath
-        try {
-            & $venvPython -c "from auto_yt.services.omnivoice_client import ensure_worker_running; ensure_worker_running()" *> $null
-        }
-        finally {
-            $env:PYTHONPATH = $previousPythonPath
-        }
-    }
-    catch {
-        Write-Warning "Direct OmniVoice startup returned: $($_.Exception.Message)"
-    }
+    Start-Process `
+        -FilePath $omniVenvPython `
+        -ArgumentList @("-m", "uvicorn", "api_server:app", "--host", "127.0.0.1", "--port", "8011") `
+        -WorkingDirectory $omniVoiceRoot `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput $stdoutLog `
+        -RedirectStandardError $stderrLog
 }
 
 function Test-ChatGPTBrowserReady {
