@@ -299,8 +299,8 @@ class StockVideoRendererTests(unittest.TestCase):
             self.assertEqual(len(captured_cmds), 1)
 
             cmd = captured_cmds[0]
-            # Verify no -loop 1 for static image inputs
             cmd_str = " ".join(cmd)
+            self.assertIn("-reinit_filter 0", cmd_str)
             self.assertIn("-fps_mode cfr", cmd_str)
             self.assertIn("-max_muxing_queue_size 4096", cmd_str)
             self.assertIn("-threads 0", cmd_str)
@@ -309,7 +309,7 @@ class StockVideoRendererTests(unittest.TestCase):
             self.assertIn("r=30", cmd_str)
             self.assertIn("eof_action=repeat", cmd_str)
             self.assertIn("format=yuv420p[bg]", cmd_str)
-            self.assertIn("settb=1/30,setpts=N", cmd_str)
+            self.assertIn("settb=AVTB,setpts=PTS-STARTPTS", cmd_str)
 
 
 if __name__ == "__main__":

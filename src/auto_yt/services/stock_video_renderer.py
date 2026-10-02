@@ -635,12 +635,24 @@ def produce_stock_video(
         canvas_h=TARGET_HEIGHT,
     )
 
-    # 9. Write Concat List
+    # 9. Write Concat List with exact duration directives for rock-solid demuxer synchronization
+    video_durations: dict[Path, float] = {}
+    for v in set(playlist):
+        try:
+            video_durations[v] = probe_media_duration(v)
+        except Exception:
+            video_durations[v] = 10.0
+
     concat_list_file = scratch_dir / "concat_videos.txt"
     with open(concat_list_file, "w", encoding="utf-8") as f:
         for video_item in playlist:
             escaped_path = video_item.as_posix().replace("'", "'\\''")
+            dur = video_durations.get(video_item, 10.0)
             f.write(f"file '{escaped_path}'\n")
+            f.write(f"duration {dur:.3f}\n")
+        if playlist:
+            last_escaped = playlist[-1].as_posix().replace("'", "'\\''")
+            f.write(f"file '{last_escaped}'\n")
 
     # 10. Prepare FFmpeg Filter Complex
     t_x, t_y = coords["thumb"]
@@ -650,17 +662,17 @@ def produce_stock_video(
 
     is_icon_animated = chosen_icon.suffix.lower() == ".gif"
     icon_filter = (
-        f"[4:v]fps={TARGET_FPS},settb=1/{TARGET_FPS},setpts=N,scale=100:100,format=yuva420p[icon]"
+        f"[4:v]fps={TARGET_FPS},settb=AVTB,setpts=PTS-STARTPTS,scale=100:100,format=yuva420p[icon]"
         if is_icon_animated
         else "[4:v]scale=100:100,format=yuva420p[icon]"
     )
 
     filter_complex = (
-        f"[0:v]fps={TARGET_FPS},settb=1/{TARGET_FPS},setpts=N,"
+        f"[0:v]settb=AVTB,"
         f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=increase,"
-        f"crop={TARGET_WIDTH}:{TARGET_HEIGHT},setsar=1,format=yuv420p[bg];"
+        f"crop={TARGET_WIDTH}:{TARGET_HEIGHT},setsar=1,fps={TARGET_FPS},settb=AVTB,setpts=PTS-STARTPTS,format=yuv420p[bg];"
         f"[1:a]showwaves=s=360x70:mode=p2p:colors=white@0.95:scale=sqrt:r={TARGET_FPS},"
-        f"format=yuva420p,settb=1/{TARGET_FPS},setpts=N[wave];"
+        f"format=yuva420p,settb=AVTB,setpts=PTS-STARTPTS[wave];"
         f"{icon_filter};"
         f"[bg][2:v]overlay={t_x}:{t_y}:eof_action=repeat:shortest=0[ov1];"
         f"[ov1][3:v]overlay={c_x}:{c_y}:eof_action=repeat:shortest=0[ov2];"
@@ -683,6 +695,7 @@ def produce_stock_video(
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     cmd = [
         ffmpeg_exe, "-y",
+        "-reinit_filter", "0",
         "-f", "concat", "-safe", "0", "-auto_convert", "1", "-segment_time_metadata", "1", "-i", str(concat_list_file),
         "-i", str(audio_path),
         "-i", str(thumb_styled_path),
