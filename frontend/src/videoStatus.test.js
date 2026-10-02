@@ -43,3 +43,15 @@ test('video actions expose immediate public and schedule publish buttons', async
   assert.match(appSource, /isPublishingSchedule \? '⏳ Đang Đặt lịch\.\.\.' : '📅 Đặt lịch'/)
 })
 
+test('mp4 rendering status prioritizes active job progress over stale artifacts and renders detailed completion stats', async () => {
+  const appSource = await readFile(new URL('./App.jsx', import.meta.url), 'utf8')
+
+  assert.match(appSource, /const isRenderActive = Boolean\(isRendering \|\| renderInfo\?\.is_active/)
+  assert.match(appSource, /const hasMp4Ready = Boolean\(!isRenderActive && renderInfo\?\.has_mp4\)/)
+  assert.match(appSource, /isRenderActive \? \(/)
+  assert.match(appSource, /renderInfo\?\.mp4_details\?\.duration_formatted/)
+  assert.match(appSource, /renderInfo\?\.mp4_details\?\.size_formatted/)
+  assert.match(appSource, /renderInfo\?\.mp4_details\?\.completed_at_formatted/)
+})
+
+

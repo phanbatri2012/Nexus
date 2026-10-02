@@ -8592,6 +8592,38 @@ def reset_scenes_from(video_id: int, from_index: int = 0):
     }
 
 
+def _format_render_duration(seconds: float | None) -> str:
+    if not seconds or seconds <= 0:
+        return ""
+    total_seconds = int(round(seconds))
+    hrs = total_seconds // 3600
+    mins = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    if hrs > 0:
+        return f"{hrs:02d}:{mins:02d}:{secs:02d}"
+    return f"{mins:02d}:{secs:02d}"
+
+
+def _format_render_size(size_bytes: int | None) -> str:
+    if not size_bytes or size_bytes <= 0:
+        return ""
+    if size_bytes >= 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
+    return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+def _format_iso_datetime(iso_str: str | None) -> str:
+    if not iso_str:
+        return ""
+    try:
+        from datetime import datetime
+        clean_str = str(iso_str).replace("Z", "+00:00")
+        dt_obj = datetime.fromisoformat(clean_str)
+        return dt_obj.strftime("%H:%M:%S · %d/%m/%Y")
+    except Exception:
+        return str(iso_str)[:19]
+
+
 @app.get("/api/videos/{video_id}/render-status")
 def get_render_status(video_id: int):
     video = db.get_video(video_id)
@@ -8599,11 +8631,37 @@ def get_render_status(video_id: int):
         raise HTTPException(status_code=404, detail="Không tìm thấy video.")
     artifact = db.get_latest_video_artifact(video_id, "final_mp4")
     jobs = db.list_system_jobs(video_id=video_id, limit=None)
-    render_job = next((j for j in jobs if j.get("job_type") == "video_render"), None)
+    render_jobs = [j for j in jobs if j.get("job_type") == "video_render"]
+    active_job = next((j for j in render_jobs if j.get("status") in {"queued", "running", "retry_wait"}), None)
+    latest_job = render_jobs[0] if render_jobs else None
+    render_job = active_job or latest_job
+
+    has_mp4 = bool(artifact and artifact.get("status") == "ready" and Path(artifact.get("path") or "").is_file())
+
+    mp4_details = None
+    if artifact and has_mp4:
+        duration_sec = artifact.get("duration_seconds")
+        size_bytes = artifact.get("size_bytes")
+        created_at = artifact.get("updated_at") or artifact.get("created_at")
+        mp4_details = {
+            "duration_seconds": duration_sec,
+            "duration_formatted": _format_render_duration(duration_sec),
+            "size_bytes": size_bytes,
+            "size_formatted": _format_render_size(size_bytes),
+            "resolution": "1080p FHD",
+            "fps": "30 FPS",
+            "aspect_ratio": "16:9",
+            "completed_at": created_at,
+            "completed_at_formatted": _format_iso_datetime(created_at),
+            "file_name": Path(artifact.get("path") or "").name,
+        }
+
     return {
         "video_id": video_id,
-        "has_mp4": bool(artifact and artifact.get("status") == "ready" and Path(artifact.get("path") or "").is_file()),
+        "has_mp4": has_mp4,
+        "is_active": bool(active_job),
         "mp4_artifact": artifact,
+        "mp4_details": mp4_details,
         "job": render_job,
     }
 

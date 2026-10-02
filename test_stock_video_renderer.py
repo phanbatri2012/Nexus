@@ -142,6 +142,60 @@ class StockVideoRendererTests(unittest.TestCase):
             mock_stock.assert_called_once()
             self.assertEqual(res["render_mode"], "stock_video")
 
+    def test_get_render_status_endpoint_details_and_active_detection(self):
+        from auto_yt import main
+
+        video_id = db.save_video(
+            url="https://youtube.com/watch?v=render_stat_test",
+            title="Render Status Test",
+            transcript="Transcript",
+            generated_script="Script",
+            prompt_version="default",
+        )
+
+        # 1. Initially, no artifact and no job
+        status1 = main.get_render_status(video_id)
+        self.assertFalse(status1["has_mp4"])
+        self.assertFalse(status1["is_active"])
+        self.assertIsNone(status1["mp4_details"])
+
+        # 2. Add an existing ready artifact
+        mp4_file = self.temp_path / "final.mp4"
+        mp4_file.write_bytes(b"x" * 1048576) # 1 MB
+        artifact = db.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="final_mp4",
+            path=str(mp4_file),
+            content_hash="mp4-test-hash",
+            duration_seconds=3660.72,
+            size_bytes=641311985,
+            status="ready",
+        )
+
+        status2 = main.get_render_status(video_id)
+        self.assertTrue(status2["has_mp4"])
+        self.assertFalse(status2["is_active"])
+        self.assertIsNotNone(status2["mp4_details"])
+        self.assertEqual(status2["mp4_details"]["duration_formatted"], "01:01:01")
+        self.assertEqual(status2["mp4_details"]["size_formatted"], "611.6 MB")
+        self.assertEqual(status2["mp4_details"]["resolution"], "1080p FHD")
+        self.assertEqual(status2["mp4_details"]["fps"], "30 FPS")
+
+        # 3. Create an active running job (e.g. user clicked recreate)
+        job = db.create_system_job(
+            job_id="job-active-render-123",
+            job_type="video_render",
+            title="Dựng video MP4 (Tạo mới)",
+            payload={"video_id": video_id},
+        )
+        db.update_system_job(job["id"], video_id=video_id, status="running", progress="Đang encode MP4 (00:15:00 / 01:01:00)...")
+
+        status3 = main.get_render_status(video_id)
+        self.assertTrue(status3["is_active"])
+        self.assertEqual(status3["job"]["status"], "running")
+        self.assertEqual(status3["job"]["progress"], "Đang encode MP4 (00:15:00 / 01:01:00)...")
+
 
 if __name__ == "__main__":
     unittest.main()
+

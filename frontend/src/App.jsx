@@ -197,6 +197,11 @@ function App() {
   const [renderInfo, setRenderInfo] = useState(null)
   const [isRendering, setIsRendering] = useState(false)
   const [isCancelingRender, setIsCancelingRender] = useState(false)
+
+  const isRenderActive = Boolean(isRendering || renderInfo?.is_active || ['queued', 'running', 'retry_wait'].includes(renderInfo?.job?.status))
+  const isRenderError = !isRenderActive && (renderInfo?.job?.status === 'error' || renderInfo?.job?.status === 'failed')
+  const isRenderCanceled = !isRenderActive && renderInfo?.job?.status === 'canceled'
+  const hasMp4Ready = Boolean(!isRenderActive && renderInfo?.has_mp4)
   const [progressMsg, setProgressMsg] = useState('')
   const [queueRefreshKey, setQueueRefreshKey] = useState(0)
   const [currentVideoId, setCurrentVideoId] = useState(null)
@@ -627,8 +632,8 @@ function App() {
         const data = await response.json();
         if (stopped) return;
         setRenderInfo(data);
-        const jobStatus = data.job?.status;
-        setIsRendering(jobStatus === 'queued' || jobStatus === 'running');
+        const isJobActive = Boolean(data.is_active || ['queued', 'running', 'retry_wait'].includes(data.job?.status));
+        setIsRendering(isJobActive);
       } catch (error) {
         console.error('Failed to sync render status', error);
       }
@@ -1541,8 +1546,8 @@ function App() {
       if (statusRes.ok) {
         const statusData = await statusRes.json();
         setRenderInfo(statusData);
-        const jobStatus = statusData.job?.status;
-        setIsRendering(jobStatus === 'queued' || jobStatus === 'running');
+        const isJobActive = Boolean(statusData.is_active || ['queued', 'running', 'retry_wait'].includes(statusData.job?.status));
+        setIsRendering(isJobActive);
       }
     } catch (error) {
       alert('Lỗi dừng render: ' + error.message);
@@ -3030,8 +3035,8 @@ function App() {
                           {/* 3. Render MP4 */}
                           <div
                             style={{
-                              background: isRendering ? 'rgba(183, 148, 246, 0.08)' : 'rgba(255, 255, 255, 0.03)',
-                              border: isRendering ? '1px solid rgba(183, 148, 246, 0.4)' : '1px solid rgba(255, 255, 255, 0.08)',
+                              background: isRenderActive ? 'rgba(183, 148, 246, 0.08)' : 'rgba(255, 255, 255, 0.03)',
+                              border: isRenderActive ? '1px solid rgba(183, 148, 246, 0.4)' : '1px solid rgba(255, 255, 255, 0.08)',
                               borderRadius: '8px',
                               padding: '10px 12px',
                               display: 'flex',
@@ -3047,20 +3052,22 @@ function App() {
                               <div style={{
                                 fontSize: '0.85em',
                                 fontWeight: '600',
-                                color: isRendering ? '#b794f6' : renderInfo?.has_mp4 ? '#2ecc71' : (renderInfo?.job?.status === 'error' || renderInfo?.job?.status === 'failed') ? '#ff6b6b' : (renderInfo?.job?.status === 'canceled') ? '#f39c12' : '#888'
+                                color: isRenderActive ? '#b794f6' : hasMp4Ready ? '#2ecc71' : (isRenderError || isRenderCanceled) ? '#ff6b6b' : '#888'
                               }}>
-                                {isRendering
+                                {isRenderActive
                                   ? `⏳ ${renderInfo?.job?.progress || 'Đang dựng MP4 & Flow...'}`
-                                  : renderInfo?.has_mp4
-                                    ? '✅ MP4 đã dựng xong (1080p)'
-                                    : renderInfo?.job?.status === 'canceled'
+                                  : hasMp4Ready
+                                    ? (renderInfo?.mp4_details?.duration_formatted
+                                        ? `✅ MP4 đã xong (${renderInfo.mp4_details.duration_formatted} · ${renderInfo.mp4_details.size_formatted || '1080p'})`
+                                        : '✅ MP4 đã dựng xong (1080p)')
+                                    : isRenderCanceled
                                       ? '⏹️ Đã dừng dựng'
-                                      : (renderInfo?.job?.status === 'error' || renderInfo?.job?.status === 'failed')
+                                      : isRenderError
                                         ? '❌ Lỗi dựng MP4'
                                         : '⚪ Chưa dựng MP4'}
                               </div>
                             </div>
-                            {isRendering && (
+                            {isRenderActive && (
                               <div style={{ marginTop: '4px' }}>
                                 <button
                                   onClick={handleCancelRenderVideo}
@@ -3403,32 +3410,44 @@ function App() {
                                 <div>
                                   <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                                     <h4 style={{ color: 'var(--accent)', margin: 0 }}>🎬 Video MP4 (Google Flow & Subtitles):</h4>
-                                    {renderInfo?.has_mp4 && (
+                                    {hasMp4Ready && (
                                       <div className="media-badge-group">
-                                        <span className="media-pill-badge">1080p FHD</span>
-                                        <span className="media-pill-badge">30 FPS</span>
-                                        <span className="media-pill-badge">16:9</span>
+                                        <span className="media-pill-badge">{renderInfo?.mp4_details?.resolution || '1080p FHD'}</span>
+                                        <span className="media-pill-badge">{renderInfo?.mp4_details?.fps || '30 FPS'}</span>
+                                        <span className="media-pill-badge">{renderInfo?.mp4_details?.aspect_ratio || '16:9'}</span>
                                       </div>
                                     )}
                                   </div>
                                   <div style={{
-                                    color: renderInfo?.has_mp4 ? '#2ecc71' : isRendering ? '#f5b041' : (renderInfo?.job?.status === 'error' || renderInfo?.job?.status === 'failed' || renderInfo?.job?.status === 'canceled') ? '#e74c3c' : '#aaa',
+                                    color: isRenderActive ? '#f39c12' : hasMp4Ready ? '#2ecc71' : (isRenderError || isRenderCanceled) ? '#e74c3c' : '#aaa',
                                     fontSize: '0.82em',
-                                    marginTop: '4px'
+                                    marginTop: '4px',
+                                    lineHeight: '1.4'
                                   }}>
-                                    {renderInfo?.has_mp4
-                                      ? '✅ Video MP4 đã render hoàn tất'
-                                      : isRendering
-                                        ? `⏳ ${renderInfo?.job?.progress || (renderInfo?.job?.status === 'running' ? 'Đang tạo ảnh Flow & render MP4...' : 'Đang trong hàng đợi render...')}`
-                                        : renderInfo?.job?.status === 'canceled'
-                                          ? `⏹️ Đã dừng: ${renderInfo?.job?.progress || renderInfo?.job?.error || 'Tác vụ dựng video đã dừng'}`
-                                          : (renderInfo?.job?.status === 'error' || renderInfo?.job?.status === 'failed')
-                                            ? `❌ Lỗi: ${renderInfo?.job?.error || 'Render thất bại'}`
-                                            : 'Chưa dựng video MP4'}
+                                    {isRenderActive ? (
+                                      <span>
+                                        ⏳ {renderInfo?.job?.progress || (renderInfo?.job?.status === 'running' ? 'Đang tạo ảnh Flow & render MP4...' : 'Đang trong hàng đợi render...')}
+                                      </span>
+                                    ) : hasMp4Ready ? (
+                                      <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                                        <span style={{ fontWeight: 'bold' }}>✅ Video MP4 đã render hoàn tất</span>
+                                        <span style={{ color: '#a0aec0', fontSize: '0.92em' }}>
+                                          ⏱️ {renderInfo?.mp4_details?.duration_formatted || (renderInfo?.mp4_artifact?.duration_seconds ? `${Math.round(renderInfo.mp4_artifact.duration_seconds)}s` : 'Chuẩn')}
+                                          {renderInfo?.mp4_details?.size_formatted ? ` · 💾 ${renderInfo.mp4_details.size_formatted}` : (renderInfo?.mp4_artifact?.size_bytes ? ` · 💾 ${(renderInfo.mp4_artifact.size_bytes / (1024*1024)).toFixed(1)} MB` : '')}
+                                          {renderInfo?.mp4_details?.completed_at_formatted ? ` · 🕒 ${renderInfo.mp4_details.completed_at_formatted}` : ''}
+                                        </span>
+                                      </div>
+                                    ) : isRenderCanceled ? (
+                                      <span>⏹️ Đã dừng: {renderInfo?.job?.progress || renderInfo?.job?.error || 'Tác vụ dựng video đã dừng'}</span>
+                                    ) : isRenderError ? (
+                                      <span>❌ Lỗi: {renderInfo?.job?.error || 'Render thất bại'}</span>
+                                    ) : (
+                                      <span>⚪ Chưa dựng video MP4</span>
+                                    )}
                                   </div>
                                 </div>
-                                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                                  {isRendering ? (
+                                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+                                  {isRenderActive ? (
                                     <>
                                       <button
                                         className="btn-primary"
@@ -3468,7 +3487,108 @@ function App() {
                                         {isCancelingRender ? '⏳ Đang dừng...' : '⏹️ Dừng'}
                                       </button>
                                     </>
-                                  ) : (renderInfo?.job?.status === 'error' || renderInfo?.job?.status === 'failed' || renderInfo?.job?.status === 'canceled') ? (
+                                  ) : hasMp4Ready ? (
+                                    <>
+                                      <button
+                                        className="btn-secondary"
+                                        onClick={() => setSceneResetDialog({
+                                          videoId: currentVideoId,
+                                          videoTitle: videoTitle || `Video #${currentVideoId}`,
+                                          fromSceneNumber: 1,
+                                          isSubmitting: false,
+                                          error: ''
+                                        })}
+                                        disabled={isRenderActive || currentVideoIsError}
+                                        style={{
+                                          padding: '4px 12px',
+                                          fontSize: '0.8em',
+                                          background: 'rgba(241, 196, 15, 0.15)',
+                                          border: '1px solid #f1c40f',
+                                          color: '#f1c40f',
+                                          cursor: 'pointer',
+                                          fontWeight: 'bold',
+                                          borderRadius: '4px',
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          gap: '4px'
+                                        }}
+                                        title="Xóa và tạo lại từ một phân cảnh bất kỳ"
+                                      >
+                                        🎯 Tạo lại từ cảnh...
+                                      </button>
+                                      <button
+                                        className="btn-secondary"
+                                        onClick={() => handleRenderVideo('recreate')}
+                                        disabled={isRenderActive || currentVideoIsError}
+                                        style={{ padding: '4px 12px', fontSize: '0.8em' }}
+                                        title="Tạo mới 1 project trên Google Flow và dựng lại toàn bộ từ cảnh 1"
+                                      >
+                                        🔄 Tạo lại toàn bộ
+                                      </button>
+                                      <a
+                                        href={`http://127.0.0.1:8080/api/videos/${currentVideoId}/download-mp4`}
+                                        download={`video_${currentVideoId}.mp4`}
+                                        className="btn-secondary"
+                                        style={{
+                                          padding: '4px 12px',
+                                          fontSize: '0.8em',
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          gap: '5px',
+                                          background: 'rgba(39, 174, 96, 0.2)',
+                                          border: '1px solid #27ae60',
+                                          color: '#2ecc71',
+                                          textDecoration: 'none',
+                                          borderRadius: '4px',
+                                          fontWeight: 'bold'
+                                        }}
+                                      >
+                                        📥 Tải Video MP4
+                                      </a>
+                                      <button
+                                        className="btn-primary"
+                                        onClick={() => handlePublishNow(currentVideoId)}
+                                        disabled={isPublishingNow || isPublishingSchedule || currentVideoIsError}
+                                        style={{
+                                          padding: '4px 14px',
+                                          fontSize: '0.8em',
+                                          background: 'linear-gradient(135deg, #e67e22, #d35400)',
+                                          border: 'none',
+                                          color: '#fff',
+                                          cursor: (isPublishingNow || isPublishingSchedule) ? 'not-allowed' : 'pointer',
+                                          fontWeight: 'bold',
+                                          borderRadius: '4px',
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          gap: '4px'
+                                        }}
+                                        title="Tải lên và Public ngay lập tức lên YouTube"
+                                      >
+                                        {isPublishingNow ? '⏳ Đang Public...' : '⚡ Public ngay'}
+                                      </button>
+                                      <button
+                                        className="btn-primary"
+                                        onClick={() => handlePublishSchedule(currentVideoId)}
+                                        disabled={isPublishingNow || isPublishingSchedule || currentVideoIsError}
+                                        style={{
+                                          padding: '4px 14px',
+                                          fontSize: '0.8em',
+                                          background: 'linear-gradient(135deg, #8e44ad, #9b59b6)',
+                                          border: 'none',
+                                          color: '#fff',
+                                          cursor: (isPublishingNow || isPublishingSchedule) ? 'not-allowed' : 'pointer',
+                                          fontWeight: 'bold',
+                                          borderRadius: '4px',
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          gap: '4px'
+                                        }}
+                                        title="Tải lên và đặt lịch phát sóng tự động lên YouTube"
+                                      >
+                                        {isPublishingSchedule ? '⏳ Đang Đặt lịch...' : '📅 Đặt lịch'}
+                                      </button>
+                                    </>
+                                  ) : (isRenderError || isRenderCanceled) ? (
                                     <>
                                       <button
                                         className="btn-primary"
@@ -3540,7 +3660,7 @@ function App() {
                                         🔄 Tạo lại toàn bộ
                                       </button>
                                     </>
-                                  ) : !renderInfo?.has_mp4 ? (
+                                  ) : (
                                     <button
                                       className="btn-primary"
                                       onClick={() => handleRenderVideo('resume')}
@@ -3558,108 +3678,6 @@ function App() {
                                     >
                                       🎬 Dựng video MP4
                                     </button>
-                                  ) : null}
-                                  {renderInfo?.has_mp4 && (
-                                    <>
-                                      <button
-                                        className="btn-secondary"
-                                        onClick={() => setSceneResetDialog({
-                                          videoId: currentVideoId,
-                                          videoTitle: videoTitle || `Video #${currentVideoId}`,
-                                          fromSceneNumber: 1,
-                                          isSubmitting: false,
-                                          error: ''
-                                        })}
-                                        disabled={isRendering || currentVideoIsError}
-                                        style={{
-                                          padding: '4px 12px',
-                                          fontSize: '0.8em',
-                                          background: 'rgba(241, 196, 15, 0.15)',
-                                          border: '1px solid #f1c40f',
-                                          color: '#f1c40f',
-                                          cursor: 'pointer',
-                                          fontWeight: 'bold',
-                                          borderRadius: '4px',
-                                          display: 'inline-flex',
-                                          alignItems: 'center',
-                                          gap: '4px'
-                                        }}
-                                        title="Xóa và tạo lại từ một phân cảnh bất kỳ"
-                                      >
-                                        🎯 Tạo lại từ cảnh...
-                                      </button>
-                                      <button
-                                        className="btn-secondary"
-                                        onClick={() => handleRenderVideo('recreate')}
-                                        disabled={isRendering || currentVideoIsError}
-                                        style={{ padding: '4px 12px', fontSize: '0.8em' }}
-                                        title="Tạo mới 1 project trên Google Flow và dựng lại toàn bộ từ cảnh 1"
-                                      >
-                                        {isRendering ? '⏳ Đang dựng...' : '🔄 Tạo lại toàn bộ'}
-                                      </button>
-                                      <a
-                                        href={`http://127.0.0.1:8080/api/videos/${currentVideoId}/download-mp4`}
-                                        download={`video_${currentVideoId}.mp4`}
-                                        className="btn-secondary"
-                                        style={{
-                                          padding: '4px 12px',
-                                          fontSize: '0.8em',
-                                          display: 'inline-flex',
-                                          alignItems: 'center',
-                                          gap: '5px',
-                                          background: 'rgba(39, 174, 96, 0.2)',
-                                          border: '1px solid #27ae60',
-                                          color: '#2ecc71',
-                                          textDecoration: 'none',
-                                          borderRadius: '4px',
-                                          fontWeight: 'bold'
-                                        }}
-                                      >
-                                        📥 Tải Video MP4
-                                      </a>
-                                      <button
-                                        className="btn-primary"
-                                        onClick={() => handlePublishNow(currentVideoId)}
-                                        disabled={isPublishingNow || isPublishingSchedule || currentVideoIsError}
-                                        style={{
-                                          padding: '4px 14px',
-                                          fontSize: '0.8em',
-                                          background: 'linear-gradient(135deg, #e67e22, #d35400)',
-                                          border: 'none',
-                                          color: '#fff',
-                                          cursor: (isPublishingNow || isPublishingSchedule) ? 'not-allowed' : 'pointer',
-                                          fontWeight: 'bold',
-                                          borderRadius: '4px',
-                                          display: 'inline-flex',
-                                          alignItems: 'center',
-                                          gap: '4px'
-                                        }}
-                                        title="Tải lên và Public ngay lập tức lên YouTube"
-                                      >
-                                        {isPublishingNow ? '⏳ Đang Public...' : '⚡ Public ngay'}
-                                      </button>
-                                      <button
-                                        className="btn-primary"
-                                        onClick={() => handlePublishSchedule(currentVideoId)}
-                                        disabled={isPublishingNow || isPublishingSchedule || currentVideoIsError}
-                                        style={{
-                                          padding: '4px 14px',
-                                          fontSize: '0.8em',
-                                          background: 'linear-gradient(135deg, #8e44ad, #9b59b6)',
-                                          border: 'none',
-                                          color: '#fff',
-                                          cursor: (isPublishingNow || isPublishingSchedule) ? 'not-allowed' : 'pointer',
-                                          fontWeight: 'bold',
-                                          borderRadius: '4px',
-                                          display: 'inline-flex',
-                                          alignItems: 'center',
-                                          gap: '4px'
-                                        }}
-                                        title="Tải lên và đặt lịch phát sóng tự động lên YouTube"
-                                      >
-                                        {isPublishingSchedule ? '⏳ Đang Đặt lịch...' : '📅 Đặt lịch'}
-                                      </button>
-                                    </>
                                   )}
                                 </div>
                               </div>
