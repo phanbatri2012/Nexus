@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from auto_yt.paths import AUDIO_DIR
 from auto_yt.services import database as db
 from auto_yt.services import (
     browser_youtube_uploader,
@@ -20,6 +22,7 @@ from auto_yt.services import (
 )
 from auto_yt.services.proxy_utils import parse_proxy_url
 
+logger = logging.getLogger(__name__)
 
 CAPTION_NAME = "Tiếng Việt"
 ACTIVE_WORKFLOW_STATUSES = {
@@ -244,14 +247,16 @@ def _resolve_thumbnail_path(script: str, variant: str, thumbnails_dir: Path) -> 
     return None
 
 
-def _artifact_snapshot(artifact: dict) -> dict:
+def _artifact_snapshot(artifact: dict | None) -> dict:
+    if not isinstance(artifact, dict) or not artifact.get("id"):
+        return {}
     path = Path(str(artifact.get("path") or ""))
     return {
         "id": int(artifact["id"]),
         "path": str(artifact.get("path") or ""),
         "content_hash": str(artifact.get("content_hash") or ""),
         "size_bytes": int(artifact.get("size_bytes") or 0),
-        "sha256": _sha256_file(path),
+        "sha256": _sha256_file(path) if path.is_file() else "",
     }
 
 
@@ -427,14 +432,6 @@ def _build_preflight_context(
         missing_key="final_mp4",
         allowed_suffixes={".mp4"},
     )
-    caption_artifact, caption_path = _validate_artifact(
-        db.get_latest_video_artifact(video_id, "captions", status="ready"),
-        video_id=video_id,
-        artifact_type="captions",
-        missing_key="captions_srt",
-        allowed_suffixes={".srt"},
-    )
-
     publishing_settings = snapshot.get("publishing_settings")
     if not isinstance(publishing_settings, dict):
         publishing_settings = {}
@@ -447,6 +444,58 @@ def _build_preflight_context(
         publishing_settings
     )
     snapshot["publishing_settings"] = publishing_settings
+    upload_captions_enabled = bool(publishing_settings.get("upload_captions", True))
+
+    raw_caption_art = db.get_latest_video_artifact(video_id, "captions", status="ready")
+
+    # JIT Auto-Recovery: If upload captions is enabled but artifact is missing, auto-generate from local audio
+    if upload_captions_enabled and not raw_caption_art:
+        try:
+            from auto_yt.services.video_production import create_srt
+            audio_task = db.get_audio_task(video_id)
+            audio_path = None
+            if audio_task and audio_task.get("audio_url"):
+                fname = Path(urlsplit(str(audio_task["audio_url"])).path).name
+                if fname and (AUDIO_DIR / fname).is_file():
+                    audio_path = AUDIO_DIR / fname
+            if not audio_path and audio_task and audio_task.get("request_hash"):
+                cand = AUDIO_DIR / f"video_{video_id}_{audio_task['request_hash'][:16]}.mp3"
+                if cand.is_file():
+                    audio_path = cand
+            if not audio_path:
+                matches = [
+                    p for p in AUDIO_DIR.glob(f"video_{video_id}_*.mp3")
+                    if "_preview_" not in p.name and p.is_file()
+                ]
+                if matches:
+                    audio_path = max(matches, key=lambda p: p.stat().st_mtime)
+            if audio_path and audio_path.exists():
+                logger.info(
+                    "Publish workflow: Auto-generating missing captions for video %s from %s",
+                    video_id,
+                    audio_path,
+                )
+                create_srt(audio_path, video_id, lambda msg, step="captions": None)
+                raw_caption_art = db.get_latest_video_artifact(video_id, "captions", status="ready")
+        except Exception as auto_caption_err:
+            logger.warning(
+                "Publish workflow: Auto-generation of captions failed for video %s: %s",
+                video_id,
+                auto_caption_err,
+            )
+
+    if upload_captions_enabled:
+        caption_artifact, caption_path = _validate_artifact(
+            raw_caption_art,
+            video_id=video_id,
+            artifact_type="captions",
+            missing_key="captions_srt",
+            allowed_suffixes={".srt"},
+        )
+    else:
+        caption_artifact = raw_caption_art
+        caption_path = Path(str(raw_caption_art.get("path") or "")) if raw_caption_art and raw_caption_art.get("path") else None
+
     metadata = snapshot.get("youtube_metadata")
     if not isinstance(metadata, dict) or not metadata.get("snippet"):
         try:
@@ -499,14 +548,15 @@ def _build_preflight_context(
             and expected_video.get("sha256") != current_video_snapshot["sha256"]
         ):
             changed.append("final_mp4")
-        if any(
-            expected_caption.get(key) != current_caption_snapshot.get(key)
-            for key in ("id", "path", "content_hash", "size_bytes")
-        ) or (
-            expected_caption.get("sha256")
-            and expected_caption.get("sha256") != current_caption_snapshot["sha256"]
-        ):
-            changed.append("captions_srt")
+        if upload_captions_enabled and expected_caption and current_caption_snapshot:
+            if any(
+                expected_caption.get(key) != current_caption_snapshot.get(key)
+                for key in ("id", "path", "content_hash", "size_bytes")
+            ) or (
+                expected_caption.get("sha256")
+                and expected_caption.get("sha256") != current_caption_snapshot["sha256"]
+            ):
+                changed.append("captions_srt")
         if (
             str(expected_thumbnail.get("path") or "")
             != current_thumbnail_snapshot["path"]
@@ -548,6 +598,7 @@ def _build_preflight_context(
         "snapshot": snapshot,
         "video": video,
         "final_artifact": final_artifact,
+        "caption_artifact": caption_artifact,
         "video_path": video_path,
         "caption_path": caption_path,
         "thumbnail_path": thumbnail_path,

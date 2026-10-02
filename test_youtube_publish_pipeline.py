@@ -1277,6 +1277,132 @@ class YouTubePublishPipelineTests(unittest.TestCase):
         self.assertEqual(video["publish_status"], "queued")
         self.assertEqual(video["current_stage"], "preflight")
 
+    def test_prepare_publish_context_auto_recovers_missing_captions(self):
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=auto-sub-test",
+            "Auto Sub Title",
+            "Transcript",
+            "### [METADATA & QUIZ]\nMÔ TẢ VIDEO: Description\n\n### [THUMBNAIL CÓ CHỮ]\n[IMAGE_URL:/api/thumbnails/publish.png]\n\n### [THUMBNAIL KHÔNG CHỮ]\n[IMAGE_URL:/api/thumbnails/publish.png]",
+            prompt_version="default",
+        )
+        mp4_path = self.root / "video_auto_sub.mp4"
+        mp4_path.write_bytes(b"mp4-content")
+        mp4_art = database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="final_mp4",
+            path=str(mp4_path),
+            content_hash="mp4-hash-sub",
+            status="ready",
+        )
+        channel = database.save_youtube_channel(
+            channel_id="UC-auto-sub-chan",
+            title="Auto Sub Channel",
+            access_token_encrypted="encrypted-access",
+            token_expiry=(
+                dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)
+            ).isoformat(),
+            gpm_profile_id="gpm-profile",
+            gpm_proxy_info="127.0.0.1:8899:user:password",
+        )
+        audio_file = self.root / f"video_{video_id}_audio.mp3"
+        audio_file.write_bytes(b"audio-mp3-bytes")
+        database.upsert_audio_task(
+            video_id=video_id,
+            task_id="task-audio-1",
+            status="completed",
+            audio_url=f"http://127.0.0.1:8080/api/audio/{audio_file.name}",
+            request_hash="audio-hash-1",
+        )
+
+        dummy_srt = self.root / f"video_{video_id}_auto.srt"
+        dummy_srt.write_text("1\n00:00:00,000 --> 00:00:05,000\nAuto sub\n", encoding="utf-8")
+
+        def mock_create_srt(audio_p, vid_id, prog):
+            database.upsert_video_artifact(
+                video_id=vid_id,
+                artifact_type="captions",
+                path=str(dummy_srt),
+                content_hash="sub-hash-auto",
+                status="ready",
+                mime_type="application/x-subrip",
+                size_bytes=dummy_srt.stat().st_size,
+            )
+            return dummy_srt, "sub-hash-auto"
+
+        job = database.create_system_job(
+            job_id="job-auto-sub-1",
+            job_type="youtube_publish",
+            title="Publish Job Auto Sub",
+            payload={
+                "video_id": video_id,
+                "artifact_id": mp4_art["id"],
+                "snapshot": {
+                    "publishing_settings": {"made_for_kids": False, "upload_captions": True},
+                    "default_youtube_channel_id": channel["channel_id"],
+                },
+            },
+        )
+
+        with patch("auto_yt.services.video_production.create_srt", side_effect=mock_create_srt), \
+             patch.object(youtube_publish_workflow, "AUDIO_DIR", self.root):
+            context = youtube_publish_workflow._build_preflight_context(
+                job,
+                resolve_default_channel_id=lambda v: channel["channel_id"],
+                thumbnails_dir=self.thumbnails_dir,
+            )
+            self.assertIsNotNone(context["caption_artifact"])
+            self.assertEqual(context["caption_artifact"]["status"], "ready")
+            self.assertEqual(str(context["caption_path"]), str(dummy_srt))
+
+    def test_prepare_publish_context_allows_missing_captions_if_upload_captions_disabled(self):
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=no-sub-test",
+            "No Sub Title",
+            "Transcript",
+            "### [METADATA & QUIZ]\nMÔ TẢ VIDEO: Description\n\n### [THUMBNAIL CÓ CHỮ]\n[IMAGE_URL:/api/thumbnails/publish.png]\n\n### [THUMBNAIL KHÔNG CHỮ]\n[IMAGE_URL:/api/thumbnails/publish.png]",
+            prompt_version="default",
+        )
+        mp4_path = self.root / "video_no_sub.mp4"
+        mp4_path.write_bytes(b"mp4-content")
+        mp4_art = database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="final_mp4",
+            path=str(mp4_path),
+            content_hash="mp4-hash-nosub",
+            status="ready",
+        )
+        channel = database.save_youtube_channel(
+            channel_id="UC-no-sub-chan",
+            title="No Sub Channel",
+            access_token_encrypted="encrypted-access",
+            token_expiry=(
+                dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)
+            ).isoformat(),
+            gpm_profile_id="gpm-profile",
+            gpm_proxy_info="127.0.0.1:8899:user:password",
+        )
+        job = database.create_system_job(
+            job_id="job-no-sub-1",
+            job_type="youtube_publish",
+            title="Publish Job No Sub",
+            payload={
+                "video_id": video_id,
+                "artifact_id": mp4_art["id"],
+                "snapshot": {
+                    "publishing_settings": {"made_for_kids": False, "upload_captions": False},
+                    "default_youtube_channel_id": channel["channel_id"],
+                },
+            },
+        )
+
+        context = youtube_publish_workflow._build_preflight_context(
+            job,
+            resolve_default_channel_id=lambda v: channel["channel_id"],
+            thumbnails_dir=self.thumbnails_dir,
+        )
+        self.assertIsNone(context["caption_artifact"])
+        self.assertIsNone(context["caption_path"])
+
 
 if __name__ == "__main__":
     unittest.main()

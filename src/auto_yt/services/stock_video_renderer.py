@@ -518,6 +518,15 @@ def produce_stock_video(
 
     logger.info("Stock Video: Video ID %s audio duration is %.2fs (file: %s)", video_id, audio_duration, audio_path.name)
 
+    # 2e. Ensure SRT Captions artifact is generated and registered
+    srt_path: Path | None = None
+    try:
+        from auto_yt.services.video_production import create_srt
+        srt_path, caption_hash = create_srt(audio_path, video_id, progress)
+        logger.info("Stock Video: Captions SRT ready for video %s at %s (hash: %s)", video_id, srt_path, caption_hash[:8])
+    except Exception as srt_err:
+        logger.warning("Stock Video: Failed to generate SRT captions for video %s: %s", video_id, srt_err)
+
     # 3. Locate thumbnail image
     thumb_path: Path | None = None
 
@@ -804,6 +813,7 @@ def produce_stock_video(
         "artifact": artifact,
         "render_mode": "stock_video",
         "video_path": str(output_path),
+        "captions_path": str(srt_path) if srt_path else None,
         "duration": audio_duration,
         "corner": corner,
         "icon": str(chosen_icon.name),

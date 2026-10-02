@@ -311,6 +311,76 @@ class StockVideoRendererTests(unittest.TestCase):
             self.assertIn("format=yuv420p[bg]", cmd_str)
             self.assertIn("settb=AVTB,setpts=PTS-STARTPTS", cmd_str)
 
+    def test_produce_stock_video_creates_captions_artifact(self):
+        video_id = db.save_video(
+            "https://www.youtube.com/watch?v=stock-sub-test",
+            "Stock Video Captions Test",
+            "Transcript",
+            "### [METADATA & QUIZ]\nMÔ TẢ: Desc\n\n### [THUMBNAIL KHÔNG CHỮ]\n[IMAGE_URL:/api/thumbnails/test_thumb.png]",
+            prompt_version="default",
+        )
+
+        thumb_file = self.temp_path / "test_thumb.png"
+        Image.new("RGB", (1280, 720), color=(100, 150, 200)).save(thumb_file)
+
+        bg_video = self.temp_path / "stock1.mp4"
+        bg_video.write_bytes(b"dummy_mp4_bytes")
+        icon_gif = self.temp_path / "star.gif"
+        icon_gif.write_bytes(b"GIF89a" + b"\x00" * 100)
+
+        dummy_srt = self.temp_path / f"video_{video_id}_caption.srt"
+        dummy_srt.write_text("1\n00:00:00,000 --> 00:00:05,000\nHello\n", encoding="utf-8")
+
+        class MockProc:
+            returncode = 0
+            def poll(self): return 0
+            def kill(self): pass
+
+        def mock_popen(cmd, *args, **kwargs):
+            out_file = Path(cmd[-1])
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            out_file.write_bytes(b"dummy_video_mp4_bytes")
+            return MockProc()
+
+        def mock_create_srt(audio_path, vid_id, progress):
+            db.upsert_video_artifact(
+                video_id=vid_id,
+                artifact_type="captions",
+                path=str(dummy_srt),
+                content_hash="mock_hash_123",
+                status="ready",
+                mime_type="application/x-subrip",
+                size_bytes=dummy_srt.stat().st_size,
+            )
+            return dummy_srt, "mock_hash_123"
+
+        with patch.object(stock_video_renderer, "probe_media_duration", return_value=60.0), \
+             patch.object(stock_video_renderer.imageio_ffmpeg, "get_ffmpeg_exe", return_value="ffmpeg"), \
+             patch.object(stock_video_renderer, "get_available_background_videos", return_value=[bg_video]), \
+             patch.object(stock_video_renderer, "get_available_animated_icons", return_value=[icon_gif]), \
+             patch.object(stock_video_renderer, "AUDIO_DIR", self.temp_path), \
+             patch.object(stock_video_renderer, "THUMBNAILS_DIR", self.temp_path), \
+             patch.object(stock_video_renderer, "RENDERS_DIR", self.temp_path), \
+             patch("auto_yt.services.video_production.create_srt", side_effect=mock_create_srt), \
+             patch.object(stock_video_renderer.subprocess, "Popen", side_effect=mock_popen):
+
+            (self.temp_path / f"video_{video_id}.mp3").write_bytes(b"ID3" + b"\x00" * 1024)
+            (self.temp_path / f"thumb_{video_id}.png").write_bytes(thumb_file.read_bytes())
+
+            res = stock_video_renderer.produce_stock_video(
+                video_id=video_id,
+                snapshot={"render_mode": "stock_video"},
+                progress=lambda m, s="": None,
+                cancel_check=lambda: None,
+            )
+            self.assertEqual(res["render_mode"], "stock_video")
+            self.assertEqual(res["captions_path"], str(dummy_srt))
+
+            caption_art = db.get_latest_video_artifact(video_id, "captions")
+            self.assertIsNotNone(caption_art)
+            self.assertEqual(caption_art["status"], "ready")
+            self.assertEqual(caption_art["path"], str(dummy_srt))
+
 
 if __name__ == "__main__":
     unittest.main()
