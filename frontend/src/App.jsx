@@ -199,9 +199,9 @@ function App() {
   const [isCancelingRender, setIsCancelingRender] = useState(false)
 
   const isRenderActive = Boolean(isRendering || renderInfo?.is_active || ['queued', 'running', 'retry_wait'].includes(renderInfo?.job?.status))
-  const isRenderError = !isRenderActive && (renderInfo?.job?.status === 'error' || renderInfo?.job?.status === 'failed')
-  const isRenderCanceled = !isRenderActive && renderInfo?.job?.status === 'canceled'
-  const hasMp4Ready = Boolean(!isRenderActive && renderInfo?.has_mp4)
+  const isRenderError = !isRenderActive && Boolean(renderInfo?.is_error || renderInfo?.job?.status === 'error' || renderInfo?.job?.status === 'failed')
+  const isRenderCanceled = !isRenderActive && Boolean(renderInfo?.is_canceled || renderInfo?.job?.status === 'canceled')
+  const hasMp4Ready = Boolean(!isRenderActive && !isRenderError && !isRenderCanceled && renderInfo?.has_mp4)
   const [progressMsg, setProgressMsg] = useState('')
   const [queueRefreshKey, setQueueRefreshKey] = useState(0)
   const [currentVideoId, setCurrentVideoId] = useState(null)
@@ -3419,7 +3419,7 @@ function App() {
                                     )}
                                   </div>
                                   <div style={{
-                                    color: isRenderActive ? '#f39c12' : hasMp4Ready ? '#2ecc71' : (isRenderError || isRenderCanceled) ? '#e74c3c' : '#aaa',
+                                    color: isRenderActive ? '#f39c12' : isRenderError ? '#e74c3c' : isRenderCanceled ? '#e67e22' : hasMp4Ready ? '#2ecc71' : '#aaa',
                                     fontSize: '0.82em',
                                     marginTop: '4px',
                                     lineHeight: '1.4'
@@ -3428,6 +3428,15 @@ function App() {
                                       <span>
                                         ⏳ {renderInfo?.job?.progress || (renderInfo?.job?.status === 'running' ? 'Đang tạo ảnh Flow & render MP4...' : 'Đang trong hàng đợi render...')}
                                       </span>
+                                    ) : isRenderError ? (
+                                      <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                                        <span style={{ fontWeight: 'bold', color: '#ff6b6b' }}>❌ Lỗi dựng video MP4</span>
+                                        <span style={{ color: '#ff9999', fontSize: '0.92em', wordBreak: 'break-word' }}>
+                                          {renderInfo?.error_message || renderInfo?.job?.error || 'Tác vụ render thất bại'}
+                                        </span>
+                                      </div>
+                                    ) : isRenderCanceled ? (
+                                      <span>⏹️ Đã dừng: {renderInfo?.job?.progress || renderInfo?.job?.error || 'Tác vụ dựng video đã dừng'}</span>
                                     ) : hasMp4Ready ? (
                                       <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
                                         <span style={{ fontWeight: 'bold' }}>✅ Video MP4 đã render hoàn tất</span>
@@ -3437,10 +3446,6 @@ function App() {
                                           {renderInfo?.mp4_details?.completed_at_formatted ? ` · 🕒 ${renderInfo.mp4_details.completed_at_formatted}` : ''}
                                         </span>
                                       </div>
-                                    ) : isRenderCanceled ? (
-                                      <span>⏹️ Đã dừng: {renderInfo?.job?.progress || renderInfo?.job?.error || 'Tác vụ dựng video đã dừng'}</span>
-                                    ) : isRenderError ? (
-                                      <span>❌ Lỗi: {renderInfo?.job?.error || 'Render thất bại'}</span>
                                     ) : (
                                       <span>⚪ Chưa dựng video MP4</span>
                                     )}

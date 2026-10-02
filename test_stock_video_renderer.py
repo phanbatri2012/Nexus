@@ -192,8 +192,49 @@ class StockVideoRendererTests(unittest.TestCase):
 
         status3 = main.get_render_status(video_id)
         self.assertTrue(status3["is_active"])
+        self.assertFalse(status3["has_mp4"])
+        self.assertEqual(status3["state"], "active")
         self.assertEqual(status3["job"]["status"], "running")
         self.assertEqual(status3["job"]["progress"], "Đang encode MP4 (00:15:00 / 01:01:00)...")
+
+        # 4. Job failed with error -> must report state="error" and has_mp4=False
+        db.update_system_job(job["id"], status="error", error="FFmpeg crashed (ENOMEM)")
+        status4 = main.get_render_status(video_id)
+        self.assertFalse(status4["is_active"])
+        self.assertTrue(status4["is_error"])
+        self.assertFalse(status4["has_mp4"])
+        self.assertEqual(status4["state"], "error")
+        self.assertEqual(status4["error_message"], "FFmpeg crashed (ENOMEM)")
+
+    def test_purge_video_render_artifacts(self):
+        video_id = db.save_video(
+            url="https://youtube.com/watch?v=purge_test",
+            title="Purge Test",
+            transcript="Transcript",
+            generated_script="Script",
+            prompt_version="default",
+        )
+        dummy_file = self.temp_path / "video_purge_test.mp4"
+        dummy_file.write_bytes(b"dummy_video_content")
+
+        artifact = db.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="final_mp4",
+            path=str(dummy_file),
+            content_hash="purge_hash",
+            duration_seconds=100.0,
+            size_bytes=19,
+            status="ready",
+        )
+        self.assertTrue(dummy_file.exists())
+        self.assertIsNotNone(db.get_latest_video_artifact(video_id, "final_mp4"))
+
+        # Run purge
+        with patch.object(video_production, "RENDERS_DIR", self.temp_path):
+            purged = video_production.purge_video_render_artifacts(video_id)
+            self.assertIn(artifact["id"], purged["purged_artifact_ids"])
+            self.assertFalse(dummy_file.exists())
+            self.assertIsNone(db.get_latest_video_artifact(video_id, "final_mp4"))
 
     def test_ffmpeg_command_construction_optimizations(self):
         # Create dummy assets
@@ -263,10 +304,12 @@ class StockVideoRendererTests(unittest.TestCase):
             self.assertIn("-fps_mode cfr", cmd_str)
             self.assertIn("-max_muxing_queue_size 4096", cmd_str)
             self.assertIn("-threads 0", cmd_str)
+            self.assertIn("-auto_convert 1", cmd_str)
+            self.assertIn("-segment_time_metadata 1", cmd_str)
             self.assertIn("r=30", cmd_str)
             self.assertIn("eof_action=repeat", cmd_str)
             self.assertIn("format=yuv420p[bg]", cmd_str)
-            self.assertIn("settb=AVTB,setpts=PTS-STARTPTS", cmd_str)
+            self.assertIn("settb=1/30,setpts=N", cmd_str)
 
 
 if __name__ == "__main__":

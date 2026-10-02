@@ -433,7 +433,8 @@ def build_background_playlist(
     active_pool = random.sample(pool, sample_size) if len(pool) > sample_size else list(pool)
     durations: dict[Path, float] = {}
 
-    while accumulated_duration < target_duration:
+    buffer_target = target_duration + 30.0  # Guarantee video stream never finishes before audio
+    while accumulated_duration < buffer_target:
         shuffled = list(active_pool)
         random.shuffle(shuffled)
         for video in shuffled:
@@ -444,7 +445,7 @@ def build_background_playlist(
                     durations[video] = 10.0  # Fallback default estimate
             playlist.append(video)
             accumulated_duration += durations[video]
-            if accumulated_duration >= target_duration:
+            if accumulated_duration >= buffer_target:
                 break
 
     return playlist
@@ -649,17 +650,17 @@ def produce_stock_video(
 
     is_icon_animated = chosen_icon.suffix.lower() == ".gif"
     icon_filter = (
-        f"[4:v]fps={TARGET_FPS},settb=AVTB,setpts=PTS-STARTPTS,scale=100:100,format=yuva420p[icon]"
+        f"[4:v]fps={TARGET_FPS},settb=1/{TARGET_FPS},setpts=N,scale=100:100,format=yuva420p[icon]"
         if is_icon_animated
         else "[4:v]scale=100:100,format=yuva420p[icon]"
     )
 
     filter_complex = (
-        f"[0:v]fps={TARGET_FPS},settb=AVTB,setpts=PTS-STARTPTS,"
+        f"[0:v]fps={TARGET_FPS},settb=1/{TARGET_FPS},setpts=N,"
         f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=increase,"
         f"crop={TARGET_WIDTH}:{TARGET_HEIGHT},setsar=1,format=yuv420p[bg];"
         f"[1:a]showwaves=s=360x70:mode=p2p:colors=white@0.95:scale=sqrt:r={TARGET_FPS},"
-        f"format=yuva420p,settb=AVTB,setpts=PTS-STARTPTS[wave];"
+        f"format=yuva420p,settb=1/{TARGET_FPS},setpts=N[wave];"
         f"{icon_filter};"
         f"[bg][2:v]overlay={t_x}:{t_y}:eof_action=repeat:shortest=0[ov1];"
         f"[ov1][3:v]overlay={c_x}:{c_y}:eof_action=repeat:shortest=0[ov2];"
@@ -682,7 +683,7 @@ def produce_stock_video(
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     cmd = [
         ffmpeg_exe, "-y",
-        "-f", "concat", "-safe", "0", "-i", str(concat_list_file),
+        "-f", "concat", "-safe", "0", "-auto_convert", "1", "-segment_time_metadata", "1", "-i", str(concat_list_file),
         "-i", str(audio_path),
         "-i", str(thumb_styled_path),
         "-i", str(title_styled_path),

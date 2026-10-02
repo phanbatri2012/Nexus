@@ -713,6 +713,65 @@ def purge_scene_artifacts_from_index(video_id: int, from_index: int) -> int:
     return removed_count
 
 
+def purge_video_render_artifacts(video_id: int) -> dict:
+    """Purge all rendered MP4/video files from disk and database for a clean re-creation."""
+    purged_files: list[str] = []
+    purged_artifact_ids: list[int] = []
+
+    # 1. Purge all final_mp4, rendered_video, stock_video artifacts from DB
+    all_artifacts = db.list_video_artifacts(video_id)
+    for art in all_artifacts:
+        art_type = str(art.get("artifact_type") or "")
+        if art_type in {"final_mp4", "rendered_video", "stock_video"}:
+            art_path = art.get("path")
+            if art_path:
+                try:
+                    p = Path(art_path)
+                    if p.is_file():
+                        p.unlink(missing_ok=True)
+                        purged_files.append(str(p))
+                except Exception as e:
+                    logger.warning("Error deleting artifact file %s: %s", art_path, e)
+            if art.get("id"):
+                db.delete_video_artifact(art["id"])
+                purged_artifact_ids.append(art["id"])
+
+    # 2. Check disk for any lingering render files matching video_{video_id}_*
+    try:
+        if RENDERS_DIR.exists():
+            for p in RENDERS_DIR.glob(f"video_{video_id}*"):
+                if p.is_file() and p.suffix.lower() in {".mp4", ".mov", ".mkv", ".webm"}:
+                    try:
+                        p.unlink(missing_ok=True)
+                        purged_files.append(str(p))
+                    except Exception as e:
+                        logger.warning("Error deleting lingering render file %s: %s", p, e)
+    except Exception as e:
+        logger.warning("Error scanning RENDERS_DIR for video %s: %s", video_id, e)
+
+    # 3. Reset video record render status in DB
+    try:
+        db.update_video_production(
+            video_id,
+            render_status="queued",
+            production_progress="",
+        )
+    except Exception:
+        pass
+
+    logger.info(
+        "Purged render artifacts for video %s: %d DB records, %d physical files",
+        video_id,
+        len(purged_artifact_ids),
+        len(purged_files),
+    )
+    return {
+        "video_id": video_id,
+        "purged_artifact_ids": purged_artifact_ids,
+        "purged_files": purged_files,
+    }
+
+
 def _sanitize_scene_prompt_for_generation(
     raw_prompt: str,
     *,

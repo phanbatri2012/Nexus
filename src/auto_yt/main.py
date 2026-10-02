@@ -8514,6 +8514,12 @@ def trigger_render_video(video_id: int, mode: str = "resume"):
     prompt_version = video.get("prompt_version") or ""
     snapshot = _get_prompt_production_snapshot(prompt_version)
     force_new_project = (mode == "recreate")
+
+    # If recreating from scratch, cancel any active renders and purge old MP4 artifacts cleanly
+    if force_new_project:
+        cancel_render_video(video_id)
+        video_production.purge_video_render_artifacts(video_id)
+
     job_id = f"video-render-{uuid.uuid4().hex}"
     job = db.create_system_job(
         job_id=job_id,
@@ -8577,7 +8583,9 @@ def reset_scenes_from(video_id: int, from_index: int = 0):
     # 1. Cancel any active render job first
     cancel_render_video(video_id)
 
-    # 2. Purge artifacts from index
+    # 2. Purge artifacts from index (or purge all render artifacts if from_index == 0)
+    if from_index == 0:
+        video_production.purge_video_render_artifacts(video_id)
     purged_count = video_production.purge_scene_artifacts_from_index(video_id, from_index)
 
     # 3. Trigger video render in resume mode
@@ -8636,7 +8644,33 @@ def get_render_status(video_id: int):
     latest_job = render_jobs[0] if render_jobs else None
     render_job = active_job or latest_job
 
-    has_mp4 = bool(artifact and artifact.get("status") == "ready" and Path(artifact.get("path") or "").is_file())
+    is_active = bool(active_job)
+    latest_status = str(latest_job.get("status") or "") if latest_job else ""
+    is_error = bool(latest_job and latest_status in {"error", "failed"})
+    is_canceled = bool(latest_job and latest_status == "canceled")
+    error_message = str(latest_job.get("error") or "") if (latest_job and is_error) else ""
+
+    # A video is only ready if an actual valid file exists AND we are NOT currently in error or running an active re-render
+    has_mp4 = bool(
+        artifact
+        and artifact.get("status") == "ready"
+        and Path(artifact.get("path") or "").is_file()
+        and not is_active
+        and not is_error
+        and not is_canceled
+    )
+
+    # Determine canonical lifecycle state
+    if is_active:
+        state = "active"
+    elif is_error:
+        state = "error"
+    elif is_canceled:
+        state = "canceled"
+    elif has_mp4:
+        state = "ready"
+    else:
+        state = "idle"
 
     mp4_details = None
     if artifact and has_mp4:
@@ -8658,9 +8692,13 @@ def get_render_status(video_id: int):
 
     return {
         "video_id": video_id,
+        "state": state,
         "has_mp4": has_mp4,
-        "is_active": bool(active_job),
-        "mp4_artifact": artifact,
+        "is_active": is_active,
+        "is_error": is_error,
+        "is_canceled": is_canceled,
+        "error_message": error_message,
+        "mp4_artifact": artifact if has_mp4 else None,
         "mp4_details": mp4_details,
         "job": render_job,
     }
