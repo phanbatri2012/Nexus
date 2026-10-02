@@ -22,16 +22,20 @@ class StartupLifecycleTests(unittest.TestCase):
             self.assertIn(declaration, script)
             self.assertLess(script.index(declaration), readiness_probe_position)
 
-    def test_missing_browser_services_are_started_and_shown(self):
+    def test_missing_browser_services_are_started_in_background_without_forcing_show(self):
         script = STARTUP_SCRIPT.read_text(encoding="utf-8")
 
         for expected_action in (
             'Invoke-BrowserServiceAction "chatgpt_browser_service" "start" "ChatGPT"',
             'Invoke-BrowserServiceAction "google_flow_browser_service" "start" "Google Flow"',
+        ):
+            self.assertIn(expected_action, script)
+
+        for forbidden_action in (
             'Invoke-BrowserServiceAction "chatgpt_browser_service" "show" "ChatGPT"',
             'Invoke-BrowserServiceAction "google_flow_browser_service" "show" "Google Flow"',
         ):
-            self.assertIn(expected_action, script)
+            self.assertNotIn(forbidden_action, script)
 
     def test_startup_requires_every_registered_service(self):
         script = STARTUP_SCRIPT.read_text(encoding="utf-8")

@@ -861,8 +861,6 @@ try {
         }
     }
 
-    Invoke-BrowserServiceAction "chatgpt_browser_service" "show" "ChatGPT"
-    Invoke-BrowserServiceAction "google_flow_browser_service" "show" "Google Flow"
     $finalBrowserState = Test-BrowserServicesReady
     $omniVoiceReady = Test-OmniVoiceReady
 
