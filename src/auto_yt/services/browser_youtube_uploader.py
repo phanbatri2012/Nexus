@@ -1626,7 +1626,14 @@ async def upload_video_via_browser(
 
     async with gpm_browser_session(clean_profile, auto_stop=auto_stop_gpm) as (context, _browser):
         cancel_check()
-        page = await context.new_page()
+        target_page = None
+        for p in context.pages:
+            if p.url in ("about:blank", "chrome://newtab/", ""):
+                target_page = p
+                break
+        if target_page is None:
+            target_page = await context.new_page()
+        page = target_page
         step_timeout_ms = int(
             min(DEFAULT_STEP_TIMEOUT_SECONDS, max(5.0, float(timeout_seconds))) * 1000
         )
@@ -2900,7 +2907,14 @@ async def make_video_public_via_browser(
 
     logger.info("Bắt đầu chuyển video %s sang trạng thái Công khai trong GPM profile %s", clean_vid_id, clean_profile)
     async with gpm_browser_session(clean_profile, auto_stop=auto_stop_gpm) as (context, _browser):
-        page = await context.new_page()
+        target_page = None
+        for p in context.pages:
+            if p.url in ("about:blank", "chrome://newtab/", ""):
+                target_page = p
+                break
+        if target_page is None:
+            target_page = await context.new_page()
+        page = target_page
         try:
             edit_url = f"https://studio.youtube.com/video/{clean_vid_id}/edit"
             logger.info("Mở trang chỉnh sửa video YouTube Studio: %s", edit_url)
