@@ -647,14 +647,23 @@ def produce_stock_video(
     i_x, i_y = coords["icon"]
     w_x, w_y = coords["wave"]
 
+    is_icon_animated = chosen_icon.suffix.lower() == ".gif"
+    icon_filter = (
+        f"[4:v]fps={TARGET_FPS},settb=AVTB,setpts=PTS-STARTPTS,scale=100:100,format=yuva420p[icon]"
+        if is_icon_animated
+        else "[4:v]scale=100:100,format=yuva420p[icon]"
+    )
+
     filter_complex = (
-        f"[0:v]fps={TARGET_FPS},scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=increase,"
-        f"crop={TARGET_WIDTH}:{TARGET_HEIGHT},setsar=1,format=yuva420p[bg];"
-        f"[1:a]showwaves=s=360x70:mode=p2p:colors=white@0.95:scale=sqrt,format=yuva420p[wave];"
-        f"[bg][2:v]overlay={t_x}:{t_y}:shortest=0[ov1];"
-        f"[ov1][3:v]overlay={c_x}:{c_y}:shortest=0[ov2];"
-        f"[4:v]scale=100:100[icon];"
-        f"[ov2][icon]overlay={i_x}:{i_y}:shortest=0[ov3];"
+        f"[0:v]fps={TARGET_FPS},settb=AVTB,setpts=PTS-STARTPTS,"
+        f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=increase,"
+        f"crop={TARGET_WIDTH}:{TARGET_HEIGHT},setsar=1,format=yuv420p[bg];"
+        f"[1:a]showwaves=s=360x70:mode=p2p:colors=white@0.95:scale=sqrt:r={TARGET_FPS},"
+        f"format=yuva420p,settb=AVTB,setpts=PTS-STARTPTS[wave];"
+        f"{icon_filter};"
+        f"[bg][2:v]overlay={t_x}:{t_y}:eof_action=repeat:shortest=0[ov1];"
+        f"[ov1][3:v]overlay={c_x}:{c_y}:eof_action=repeat:shortest=0[ov2];"
+        f"[ov2][icon]overlay={i_x}:{i_y}:eof_action=repeat:shortest=0[ov3];"
         f"[ov3][wave]overlay={w_x}:{w_y}:shortest=0[final_v]"
     )
 
@@ -666,8 +675,8 @@ def produce_stock_video(
 
     icon_input_args = (
         ["-ignore_loop", "0", "-i", str(chosen_icon)]
-        if chosen_icon.suffix.lower() == ".gif"
-        else ["-loop", "1", "-i", str(chosen_icon)]
+        if is_icon_animated
+        else ["-i", str(chosen_icon)]
     )
 
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
@@ -675,8 +684,8 @@ def produce_stock_video(
         ffmpeg_exe, "-y",
         "-f", "concat", "-safe", "0", "-i", str(concat_list_file),
         "-i", str(audio_path),
-        "-loop", "1", "-i", str(thumb_styled_path),
-        "-loop", "1", "-i", str(title_styled_path),
+        "-i", str(thumb_styled_path),
+        "-i", str(title_styled_path),
         *icon_input_args,
         "-filter_complex", filter_complex,
         "-map", "[final_v]",
@@ -687,6 +696,9 @@ def produce_stock_video(
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", "192k",
+        "-fps_mode", "cfr",
+        "-max_muxing_queue_size", "4096",
+        "-threads", "0",
         "-t", f"{audio_duration:.3f}",
         str(output_path),
     ]

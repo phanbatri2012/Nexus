@@ -195,6 +195,79 @@ class StockVideoRendererTests(unittest.TestCase):
         self.assertEqual(status3["job"]["status"], "running")
         self.assertEqual(status3["job"]["progress"], "Đang encode MP4 (00:15:00 / 01:01:00)...")
 
+    def test_ffmpeg_command_construction_optimizations(self):
+        # Create dummy assets
+        audio_file = self.temp_path / "audio.mp3"
+        audio_file.write_bytes(b"ID3" + b"\x00" * 1024)
+        thumb_file = self.temp_path / "thumb.png"
+        Image.new("RGB", (640, 360), (10, 20, 30)).save(thumb_file)
+        bg_video = self.temp_path / "bg.mp4"
+        bg_video.touch()
+        icon_gif = self.temp_path / "icon.gif"
+        icon_gif.touch()
+
+        video_id = db.save_video(
+            url="https://youtube.com/watch?v=cmd_test",
+            title="Title Test",
+            transcript="Transcript",
+            generated_script="Script",
+            prompt_version="default",
+        )
+        db.upsert_audio_task(video_id=video_id, task_id="dummy_task", status="completed", audio_url="/audio.mp3", request_hash="dummy_hash")
+
+        captured_cmds = []
+
+        class MockProc:
+            returncode = 0
+            def poll(self):
+                return 0
+            def kill(self):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+
+        def mock_popen(cmd, *args, **kwargs):
+            captured_cmds.append(cmd)
+            # Create dummy output file
+            out_file = Path(cmd[-1])
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            out_file.write_bytes(b"dummy_video_mp4_bytes")
+            return MockProc()
+
+        with patch.object(stock_video_renderer, "probe_media_duration", return_value=3600.0), \
+             patch.object(stock_video_renderer.imageio_ffmpeg, "get_ffmpeg_exe", return_value="ffmpeg"), \
+             patch.object(stock_video_renderer, "get_available_background_videos", return_value=[bg_video]), \
+             patch.object(stock_video_renderer, "get_available_animated_icons", return_value=[icon_gif]), \
+             patch.object(stock_video_renderer, "AUDIO_DIR", self.temp_path), \
+             patch.object(stock_video_renderer, "THUMBNAILS_DIR", self.temp_path), \
+             patch.object(stock_video_renderer, "RENDERS_DIR", self.temp_path), \
+             patch.object(stock_video_renderer.subprocess, "Popen", side_effect=mock_popen):
+
+            (self.temp_path / f"video_{video_id}.mp3").write_bytes(b"ID3" + b"\x00" * 1024)
+            (self.temp_path / f"thumb_{video_id}.png").write_bytes(thumb_file.read_bytes())
+
+            res = stock_video_renderer.produce_stock_video(
+                video_id=video_id,
+                snapshot={"render_mode": "stock_video"},
+                progress=lambda m, s="": None,
+                cancel_check=lambda: None,
+            )
+            self.assertEqual(res["render_mode"], "stock_video")
+            self.assertEqual(len(captured_cmds), 1)
+
+            cmd = captured_cmds[0]
+            # Verify no -loop 1 for static image inputs
+            cmd_str = " ".join(cmd)
+            self.assertIn("-fps_mode cfr", cmd_str)
+            self.assertIn("-max_muxing_queue_size 4096", cmd_str)
+            self.assertIn("-threads 0", cmd_str)
+            self.assertIn("r=30", cmd_str)
+            self.assertIn("eof_action=repeat", cmd_str)
+            self.assertIn("format=yuv420p[bg]", cmd_str)
+            self.assertIn("settb=AVTB,setpts=PTS-STARTPTS", cmd_str)
+
 
 if __name__ == "__main__":
     unittest.main()
