@@ -20,6 +20,7 @@ import secrets
 import shutil
 import subprocess
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -34,6 +35,7 @@ from auto_yt.paths import (
     THUMBNAILS_DIR,
 )
 from auto_yt.services import database as db
+from auto_yt.services import process_registry
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +90,7 @@ def get_available_background_videos(custom_dir: Path | str | None = None) -> lis
 
     videos: list[Path] = []
     for item in target_dir.rglob("*"):
-        if item.is_file() and item.suffix.lower() in SUPPORTED_VIDEO_EXTS:
+        if item.is_file() and not item.name.startswith(".") and item.suffix.lower() in SUPPORTED_VIDEO_EXTS:
             videos.append(item)
 
     return sorted(videos)
@@ -426,20 +428,22 @@ def build_background_playlist(
     playlist: list[Path] = []
     accumulated_duration = 0.0
 
-    # Probe and cache video durations
-    durations = {}
-    for video in pool:
-        try:
-            durations[video] = probe_media_duration(video)
-        except Exception:
-            durations[video] = 10.0  # Fallback default estimate
+    # Sample up to 150 random videos from pool so we don't probe thousands of files
+    sample_size = min(len(pool), 150)
+    active_pool = random.sample(pool, sample_size) if len(pool) > sample_size else list(pool)
+    durations: dict[Path, float] = {}
 
     while accumulated_duration < target_duration:
-        shuffled = list(pool)
+        shuffled = list(active_pool)
         random.shuffle(shuffled)
         for video in shuffled:
+            if video not in durations:
+                try:
+                    durations[video] = probe_media_duration(video)
+                except Exception:
+                    durations[video] = 10.0  # Fallback default estimate
             playlist.append(video)
-            accumulated_duration += durations.get(video, 10.0)
+            accumulated_duration += durations[video]
             if accumulated_duration >= target_duration:
                 break
 
@@ -466,40 +470,102 @@ def produce_stock_video(
     title = str(video.get("generated_title") or video.get("title") or f"Video {video_id}").strip()
 
     # 2. Locate audio file
-    audio_path = AUDIO_DIR / f"video_{video_id}.mp3"
-    if not audio_path.exists():
-        # Check audio artifact
+    audio_path: Path | None = None
+
+    # 2a. Check audio_task in database
+    audio_task = db.get_audio_task(video_id)
+    if audio_task:
+        if audio_task.get("audio_url"):
+            parsed = urllib.parse.urlparse(str(audio_task["audio_url"]))
+            fname = Path(parsed.path).name
+            if fname and (AUDIO_DIR / fname).is_file() and (AUDIO_DIR / fname).stat().st_size > 0:
+                audio_path = AUDIO_DIR / fname
+        if audio_path is None and audio_task.get("request_hash"):
+            candidate = AUDIO_DIR / f"video_{video_id}_{audio_task['request_hash'][:16]}.mp3"
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                audio_path = candidate
+
+    # 2b. Check audio artifact in DB
+    if audio_path is None:
         artifact = db.get_latest_video_artifact(video_id, "audio", status="ready")
-        if artifact and artifact.get("file_path"):
-            audio_path = Path(artifact["file_path"]).resolve()
-        if not audio_path.exists():
-            raise StockVideoRenderError(f"Không tìm thấy file audio MP3 cho video {video_id}: {audio_path}")
+        if artifact and (artifact.get("path") or artifact.get("file_path")):
+            candidate = Path(artifact.get("path") or artifact.get("file_path")).resolve()
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                audio_path = candidate
+
+    # 2c. Check standard video_{video_id}.mp3
+    if audio_path is None:
+        candidate = AUDIO_DIR / f"video_{video_id}.mp3"
+        if candidate.is_file() and candidate.stat().st_size > 0:
+            audio_path = candidate
+
+    # 2d. Check glob matching video_{video_id}_*.mp3 excluding preview files
+    if audio_path is None:
+        matches = [
+            p for p in AUDIO_DIR.glob(f"video_{video_id}_*.mp3")
+            if "_preview_" not in p.name and p.is_file() and p.stat().st_size > 0
+        ]
+        if matches:
+            audio_path = max(matches, key=lambda p: p.stat().st_mtime)
+
+    if audio_path is None or not audio_path.exists():
+        raise StockVideoRenderError(f"Không tìm thấy file audio MP3 cho video {video_id}.")
 
     audio_duration = probe_media_duration(audio_path)
     if audio_duration <= 0.1:
         raise StockVideoRenderError(f"File audio có thời lượng không hợp lệ ({audio_duration}s)")
 
-    logger.info("Stock Video: Video ID %s audio duration is %.2fs", video_id, audio_duration)
+    logger.info("Stock Video: Video ID %s audio duration is %.2fs (file: %s)", video_id, audio_duration, audio_path.name)
 
     # 3. Locate thumbnail image
     thumb_path: Path | None = None
-    # Check thumbnails dir
-    thumb_candidates = [
-        THUMBNAILS_DIR / f"thumb_with_text_{video_id}.png",
-        THUMBNAILS_DIR / f"thumb_no_text_{video_id}.png",
-        THUMBNAILS_DIR / f"thumb_{video_id}.png",
-    ]
-    for candidate in thumb_candidates:
-        if candidate.exists():
-            thumb_path = candidate
-            break
 
+    # 3a. Extract from generated script markers if present
+    script_text = str(video.get("generated_script") or "")
+    if script_text:
+        # Prefer variant in snapshot (with_text vs without_text)
+        preferred_variant = snapshot.get("thumbnail_variant") or "with_text"
+        if preferred_variant == "without_text":
+            match_no_text = re.search(r"### \[THUMBNAIL KHÔNG CHỮ\]\s*\[IMAGE_URL:/api/thumbnails/([^\]]+)\]", script_text)
+            if match_no_text:
+                candidate = THUMBNAILS_DIR / match_no_text.group(1).strip()
+                if candidate.is_file():
+                    thumb_path = candidate
+        if thumb_path is None:
+            match_with_text = re.search(r"### \[THUMBNAIL CÓ CHỮ\]\s*\[IMAGE_URL:/api/thumbnails/([^\]]+)\]", script_text)
+            if match_with_text:
+                candidate = THUMBNAILS_DIR / match_with_text.group(1).strip()
+                if candidate.is_file():
+                    thumb_path = candidate
+        if thumb_path is None:
+            for m in re.finditer(r"\[IMAGE_URL:/api/thumbnails/([^\]]+)\]", script_text):
+                candidate = THUMBNAILS_DIR / m.group(1).strip()
+                if candidate.is_file():
+                    thumb_path = candidate
+                    break
+
+    # 3b. Check thumbnails dir standard candidates
     if thumb_path is None:
-        # Check DB artifact
-        art_thumb = db.get_latest_video_artifact(video_id, "thumbnail_with_text", status="ready") or \
-                    db.get_latest_video_artifact(video_id, "thumbnail_without_text", status="ready")
-        if art_thumb and art_thumb.get("file_path") and Path(art_thumb["file_path"]).exists():
-            thumb_path = Path(art_thumb["file_path"]).resolve()
+        thumb_candidates = [
+            THUMBNAILS_DIR / f"thumb_with_text_{video_id}.png",
+            THUMBNAILS_DIR / f"thumb_no_text_{video_id}.png",
+            THUMBNAILS_DIR / f"thumb_{video_id}.png",
+        ]
+        for candidate in thumb_candidates:
+            if candidate.exists():
+                thumb_path = candidate
+                break
+
+    # 3c. Check DB artifact
+    if thumb_path is None:
+        art_thumb = (
+            db.get_latest_video_artifact(video_id, "thumbnail_with_text", status="ready")
+            or db.get_latest_video_artifact(video_id, "thumbnail_without_text", status="ready")
+        )
+        if art_thumb and (art_thumb.get("path") or art_thumb.get("file_path")):
+            cand = Path(art_thumb.get("path") or art_thumb.get("file_path")).resolve()
+            if cand.is_file():
+                thumb_path = cand
 
     if thumb_path is None:
         # Generate a placeholder thumbnail if none found
@@ -582,14 +648,14 @@ def produce_stock_video(
     w_x, w_y = coords["wave"]
 
     filter_complex = (
-        f"[0:v]scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=increase,"
+        f"[0:v]fps={TARGET_FPS},scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=increase,"
         f"crop={TARGET_WIDTH}:{TARGET_HEIGHT},setsar=1,format=yuva420p[bg];"
         f"[1:a]showwaves=s=360x70:mode=p2p:colors=white@0.95:scale=sqrt,format=yuva420p[wave];"
-        f"[bg][2:v]overlay={t_x}:{t_y}[ov1];"
-        f"[ov1][3:v]overlay={c_x}:{c_y}[ov2];"
+        f"[bg][2:v]overlay={t_x}:{t_y}:shortest=0[ov1];"
+        f"[ov1][3:v]overlay={c_x}:{c_y}:shortest=0[ov2];"
         f"[4:v]scale=100:100[icon];"
-        f"[ov2][icon]overlay={i_x}:{i_y}:shortest=1[ov3];"
-        f"[ov3][wave]overlay={w_x}:{w_y}[final_v]"
+        f"[ov2][icon]overlay={i_x}:{i_y}:shortest=0[ov3];"
+        f"[ov3][wave]overlay={w_x}:{w_y}:shortest=0[final_v]"
     )
 
     # 11. Target Output Path
@@ -598,14 +664,20 @@ def produce_stock_video(
     output_path = RENDERS_DIR / output_filename
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    icon_input_args = (
+        ["-ignore_loop", "0", "-i", str(chosen_icon)]
+        if chosen_icon.suffix.lower() == ".gif"
+        else ["-loop", "1", "-i", str(chosen_icon)]
+    )
+
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     cmd = [
         ffmpeg_exe, "-y",
         "-f", "concat", "-safe", "0", "-i", str(concat_list_file),
         "-i", str(audio_path),
-        "-i", str(thumb_styled_path),
-        "-i", str(title_styled_path),
-        "-ignore_loop", "0", "-i", str(chosen_icon),
+        "-loop", "1", "-i", str(thumb_styled_path),
+        "-loop", "1", "-i", str(title_styled_path),
+        *icon_input_args,
         "-filter_complex", filter_complex,
         "-map", "[final_v]",
         "-map", "1:a",
@@ -623,25 +695,62 @@ def produce_stock_video(
     progress("Đang tiến hành encode MP4 (Stock Video Mode)...", "stock_video_encoding")
 
     logger.info("Running FFmpeg stock render: %s", " ".join(cmd[:10]))
+    ffmpeg_log_path = scratch_dir / "ffmpeg_render.log"
+    ffmpeg_log = open(ffmpeg_log_path, "w", encoding="utf-8", errors="replace")
+
     proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+        stdout=ffmpeg_log,
+        stderr=subprocess.STDOUT,
     )
+    process_registry.register_process(f"video:{video_id}", proc)
 
     try:
+        last_progress_time = time.time()
         while proc.poll() is None:
             cancel_check()
-            time.sleep(1.0)
-        stdout, stderr = proc.communicate()
+            if time.time() - last_progress_time > 8.0:
+                last_progress_time = time.time()
+                try:
+                    if ffmpeg_log_path.exists():
+                        with open(ffmpeg_log_path, "r", encoding="utf-8", errors="replace") as f_read:
+                            lines = f_read.readlines()
+                            for line in reversed(lines[-20:]):
+                                match = re.search(r"time=(\d+:\d+:\d+(?:\.\d+)?)", line)
+                                if match:
+                                    current_time_str = match.group(1)
+                                    tot_h = int(audio_duration // 3600)
+                                    tot_m = int((audio_duration % 3600) // 60)
+                                    tot_s = int(audio_duration % 60)
+                                    progress(
+                                        f"Đang encode MP4 ({current_time_str} / {tot_h:02d}:{tot_m:02d}:{tot_s:02d})...",
+                                        "stock_video_encoding",
+                                    )
+                                    break
+                except Exception:
+                    pass
+            time.sleep(2.0)
+
+        ffmpeg_log.flush()
+        ffmpeg_log.close()
+        process_registry.unregister_process(f"video:{video_id}", proc)
+
         if proc.returncode != 0:
-            raise StockVideoRenderError(f"FFmpeg render lỗi (code {proc.returncode}): {stderr[-600:]}")
+            error_tail = ""
+            try:
+                if ffmpeg_log_path.exists():
+                    error_tail = ffmpeg_log_path.read_text(encoding="utf-8", errors="replace")[-1000:]
+            except Exception:
+                pass
+            raise StockVideoRenderError(f"FFmpeg render lỗi (code {proc.returncode}): {error_tail}")
     except Exception:
         if proc.poll() is None:
             proc.kill()
+        try:
+            ffmpeg_log.close()
+        except Exception:
+            pass
+        process_registry.unregister_process(f"video:{video_id}", proc)
         shutil.rmtree(scratch_dir, ignore_errors=True)
         raise
 
@@ -654,21 +763,16 @@ def produce_stock_video(
     logger.info("Stock Video rendered successfully: %s (%.2f MB)", output_path, output_path.stat().st_size / (1024 * 1024))
 
     # 12. Register Final Artifact in DB
-    artifact_id = db.create_video_artifact(
+    artifact = db.upsert_video_artifact(
         video_id=video_id,
         artifact_type="final_mp4",
-        file_path=str(output_path.resolve()),
+        path=str(output_path.resolve()),
         content_hash=f"stock_{video_id}_{timestamp_str}",
+        size_bytes=output_path.stat().st_size,
+        duration_seconds=audio_duration,
+        mime_type="video/mp4",
         status="ready",
     )
-
-    artifact = db.get_video_artifact(artifact_id) if artifact_id else {
-        "id": artifact_id,
-        "video_id": video_id,
-        "artifact_type": "final_mp4",
-        "file_path": str(output_path.resolve()),
-        "status": "ready",
-    }
 
     return {
         "artifact": artifact,

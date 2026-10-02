@@ -8268,14 +8268,35 @@ def retry_audio_for_video(video_id: int, request: RetryAudioRequest):
             )
         voice_snapshot = _voice_snapshot_from_record(task)
 
-        current_script = apply_tts_filters(
-            get_clean_script_for_tts(video["generated_script"])
-        )
-        current_request_hash = tts.get_generation_request_hash(
-            current_script,
-            task.get("voice_id") or AUDIO_VOICE_ID,
-            voice_snapshot,
-        )
+        raw_script = video.get("generated_script", "")
+        script_for_tts = get_clean_script_for_tts(raw_script)
+        is_dialogue = is_dialogue_script(raw_script)
+        if is_dialogue:
+            prod_snapshot = {}
+            try:
+                prod_snapshot = json.loads(video.get("production_snapshot_json") or "{}")
+            except Exception:
+                pass
+            cast_overrides = prod_snapshot.get("cast_voice_overrides") or prod_snapshot.get("cast_settings") or {}
+            available_voices = voice_config.load_voice_config().get("voices", [])
+            dialogue_segments = build_dialogue_tts_segments(
+                script_for_tts,
+                cast_settings=cast_overrides,
+                default_voice_id=task.get("voice_id") or AUDIO_VOICE_ID,
+                available_voices=available_voices,
+                max_segment_chars=7500,
+            )
+            for seg in dialogue_segments:
+                seg["text"] = apply_tts_filters(seg["text"])
+                seg["characters"] = len(seg["text"])
+            current_request_hash = tts.get_dialogue_request_hash(dialogue_segments)
+        else:
+            filtered_script = apply_tts_filters(script_for_tts)
+            current_request_hash = tts.get_generation_request_hash(
+                filtered_script,
+                task.get("voice_id") or AUDIO_VOICE_ID,
+                voice_snapshot,
+            )
         if current_request_hash != task.get("request_hash"):
             raise HTTPException(
                 status_code=409,
@@ -8300,17 +8321,24 @@ def retry_audio_for_video(video_id: int, request: RetryAudioRequest):
             for segment in failed_segments:
                 text_hash = segment.get("text_hash", "")
                 characters = segment.get("characters", 0)
+                segment_provider_id = (
+                    segment.get("tts_provider_id")
+                    or provider_id
+                    or voice_config.GENMAX_PROVIDER_ID
+                )
                 retried_task = tts.retry_tts_task(
                     segment["task_id"],
-                    provider_id,
+                    segment_provider_id,
                 )
                 segment.update(
                     _segment_from_remote(
                         segment["index"],
                         "",
                         retried_task,
-                        task.get("voice_id") or AUDIO_VOICE_ID,
+                        segment.get("voice_id") or task.get("voice_id") or AUDIO_VOICE_ID,
                         voice_snapshot,
+                        role=segment.get("role", "MC"),
+                        voice_name=segment.get("voice_name", ""),
                     )
                 )
                 segment["text_hash"] = text_hash
