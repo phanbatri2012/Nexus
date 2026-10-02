@@ -254,6 +254,7 @@ function App() {
   const [searchQuery, setSearchQuery] = useState('')
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('')
   const dashboardFetchRequestRef = useRef(0)
+  const lastAppliedPromptVersionRef = useRef('')
   
   const PAGE_SIZE = 10
   const chatGptProfileBusy =
@@ -480,15 +481,19 @@ function App() {
       : globalVoiceExists
         ? globalDefaultVoiceId
         : voiceOptions[0].id
-    setSelectedVoiceId(resolvedDefaultVoice)
 
-    const cast = selectedVersion?.castSettings || {}
-    const mcVoiceId = cast.mc?.voice_id || cast.mc?.default_voice_id || resolvedDefaultVoice
-    const guest1VoiceId = cast.guest_1?.voice_id || cast.guest_1?.default_voice_id || (voiceOptions[1]?.id || resolvedDefaultVoice)
-    const guest2VoiceId = cast.guest_2?.voice_id || cast.guest_2?.default_voice_id || 'auto'
-    setSelectedMcVoiceId(mcVoiceId)
-    setSelectedGuest1VoiceId(guest1VoiceId)
-    setSelectedGuest2VoiceId(guest2VoiceId)
+    const isPromptSwitched = lastAppliedPromptVersionRef.current !== selectedPromptVersion
+    if (isPromptSwitched || !selectedMcVoiceId) {
+      setSelectedVoiceId(resolvedDefaultVoice)
+      const cast = selectedVersion?.castSettings || {}
+      const mcVoiceId = cast.mc?.voice_id || cast.mc?.default_voice_id || resolvedDefaultVoice
+      const guest1VoiceId = cast.guest_1?.voice_id || cast.guest_1?.default_voice_id || (voiceOptions[1]?.id || resolvedDefaultVoice)
+      const guest2VoiceId = cast.guest_2?.voice_id || cast.guest_2?.default_voice_id || 'auto'
+      setSelectedMcVoiceId(mcVoiceId)
+      setSelectedGuest1VoiceId(guest1VoiceId)
+      setSelectedGuest2VoiceId(guest2VoiceId)
+      lastAppliedPromptVersionRef.current = selectedPromptVersion
+    }
   }, [
     selectedPromptVersion,
     promptVersions,
@@ -694,12 +699,12 @@ function App() {
       setVoiceOptions(data.voices)
       const primaryVoiceId = data.active_voice_id || data.voices[0]?.id || ''
       setGlobalDefaultVoiceId(primaryVoiceId)
-      setSelectedVoiceId(primaryVoiceId)
-      setSelectedMcVoiceId(primaryVoiceId)
+      setSelectedVoiceId(previous => previous || primaryVoiceId)
+      setSelectedMcVoiceId(previous => previous || primaryVoiceId)
       
       const distinctGuestVoice = data.voices.find(v => v.id !== primaryVoiceId)?.id || 'auto'
-      setSelectedGuest1VoiceId(distinctGuestVoice)
-      setSelectedGuest2VoiceId('auto')
+      setSelectedGuest1VoiceId(previous => previous || distinctGuestVoice)
+      setSelectedGuest2VoiceId(previous => previous || 'auto')
 
       setRegenerateVoiceId(previousVoiceId =>
         previousVoiceId || primaryVoiceId
@@ -718,8 +723,9 @@ function App() {
     
     const selectedVersionObj = promptVersions.find(v => v.key === selectedPromptVersion);
     const isDialogue = (selectedVersionObj?.contentMode || 'dialogue') === 'dialogue';
+    const primaryVoiceId = isDialogue ? (selectedMcVoiceId || selectedVoiceId || '') : (selectedVoiceId || '');
     const castOverrides = isDialogue ? {
-      mc: selectedMcVoiceId || selectedVoiceId || '',
+      mc: selectedMcVoiceId || primaryVoiceId || '',
       guest_1: selectedGuest1VoiceId || 'auto',
       guest_2: selectedGuest2VoiceId || 'auto'
     } : null;
@@ -731,7 +737,7 @@ function App() {
         body: JSON.stringify({
           url: submittedUrl,
           prompt_version: selectedPromptVersion,
-          voice_id: selectedVoiceId || null,
+          voice_id: primaryVoiceId || null,
           cast_voice_overrides: castOverrides,
           publish_mode: publishImmediately ? 'public' : null,
           publish_immediately: publishImmediately

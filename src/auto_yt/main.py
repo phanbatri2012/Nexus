@@ -2943,6 +2943,12 @@ def _segment_from_remote(
     }
 
 
+def _get_tts_provider_display_name(provider_id: str | None = None) -> str:
+    if str(provider_id or "").strip().lower() == voice_config.OMNIVOICE_PROVIDER_ID:
+        return "OmniVoice"
+    return "Genmax"
+
+
 def _store_batch_audio_task(
     video_id: int,
     request_hash: str,
@@ -3265,6 +3271,19 @@ def _ensure_audio_task(
                 return stored_task
 
         if len(chunks) > 1 or is_dialogue:
+            batch_voice_id = voice_id
+            batch_voice_name = voice_name
+            batch_voice_snapshot = voice_snapshot
+            if is_dialogue and dialogue_segments:
+                primary_seg = dialogue_segments[0]
+                if primary_seg.get("voice_id") and primary_seg["voice_id"] != voice_id:
+                    try:
+                        p_voice = voice_config.get_voice(primary_seg["voice_id"])
+                        batch_voice_id = p_voice["id"]
+                        batch_voice_name = p_voice.get("name", "")
+                        batch_voice_snapshot = voice_config.build_voice_snapshot(p_voice)
+                    except Exception:
+                        pass
             return _ensure_batch_audio_task(
                 video_id,
                 request_hash,
@@ -3274,9 +3293,9 @@ def _ensure_audio_task(
                     if stored_task and stored_task["request_hash"] == request_hash
                     else None
                 ),
-                voice_id,
-                voice_name,
-                voice_snapshot,
+                batch_voice_id,
+                batch_voice_name,
+                batch_voice_snapshot,
                 dialogue_segments=dialogue_segments,
             )
 
@@ -5001,7 +5020,7 @@ def _execute_video_job(job: dict) -> None:
                             else (
                                 "Kịch bản và audio đã hoàn thành"
                                 if audio_task and audio_task.get("status") == "completed"
-                                else "Kịch bản đã tự động duyệt; Genmax đang tạo audio"
+                                else f"Kịch bản đã tự động duyệt; {_get_tts_provider_display_name(audio_task.get('tts_provider_id') if audio_task else voice_snapshot.get('provider_id'))} đang tạo audio"
                             )
                         )
                     )
@@ -5752,7 +5771,15 @@ def process_video(request: VideoRequest):
                     if clean_voice_id != "auto":
                         _production_snapshot["cast_settings"]["guest_2"]["enabled"] = True
 
-    requested_voice_id = request.voice_id or _get_prompt_default_voice_id(
+    primary_voice_id = None
+    if request.cast_voice_overrides and isinstance(request.cast_voice_overrides, dict):
+        primary_voice_id = request.cast_voice_overrides.get("mc") or request.cast_voice_overrides.get("MC")
+    if not primary_voice_id and isinstance(_production_snapshot.get("cast_settings"), dict):
+        mc_conf = _production_snapshot["cast_settings"].get("mc")
+        if isinstance(mc_conf, dict):
+            primary_voice_id = mc_conf.get("voice_id") or mc_conf.get("default_voice_id")
+
+    requested_voice_id = primary_voice_id or request.voice_id or _get_prompt_default_voice_id(
         resolved_prompt_version
     )
     try:
@@ -6028,7 +6055,7 @@ def continue_video_generation(video_id: int):
                                 else (
                                     "⚠️ Kịch bản đã tự động duyệt; audio chưa thể khởi tạo."
                                     if audio_error
-                                    else "🎙️ Kịch bản đã tự động duyệt; Genmax đang tạo audio."
+                                    else f"🎙️ Kịch bản đã tự động duyệt; {_get_tts_provider_display_name(video.get('tts_provider_id') or (audio_task.get('tts_provider_id') if audio_task else None))} đang tạo audio."
                                 )
                             )
                         )
