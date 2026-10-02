@@ -226,6 +226,7 @@ function App() {
   const [sceneResetDialog, setSceneResetDialog] = useState(null)
   const [currentVideoHasCheckpoint, setCurrentVideoHasCheckpoint] = useState(false)
   const [isPublishingNow, setIsPublishingNow] = useState(false)
+  const [isPublishingSchedule, setIsPublishingSchedule] = useState(false)
   const [publishImmediately, setPublishImmediately] = useState(false)
   const [chatGptStatus, setChatGptStatus] = useState({
     busy: false,
@@ -1607,6 +1608,34 @@ function App() {
     }
   };
 
+  const handlePublishSchedule = async (videoId) => {
+    const targetId = videoId || currentVideoId;
+    if (!targetId || isPublishingSchedule) return;
+    if (!confirm(`Xác nhận Đặt lịch đăng video #${targetId} lên YouTube? Video sẽ được tải lên và lên lịch phát sóng tự động theo khung giờ kênh.`)) {
+      return;
+    }
+    setIsPublishingSchedule(true);
+    try {
+      const response = await fetch(`http://127.0.0.1:8080/api/videos/${targetId}/publish-schedule`, {
+        method: 'POST'
+      });
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.detail || data.error || 'Không thể thực hiện Đặt lịch.');
+      }
+      alert(data.message || '📅 Đã đưa video vào hàng đợi Đặt lịch YouTube!');
+      setQueueRefreshKey(k => k + 1);
+      if (currentVideoId === targetId) {
+        await viewSavedVideo(targetId);
+      }
+      await fetchSavedVideos(currentPage, publishFilter);
+    } catch (error) {
+      alert(`Lỗi Đặt lịch: ${error.message}`);
+    } finally {
+      setIsPublishingSchedule(false);
+    }
+  };
+
 
   const parseSections = (text) => {
     if (!text) return [];
@@ -2114,13 +2143,30 @@ function App() {
                                    border: '1px solid #e67e22',
                                    color: '#f39c12',
                                    fontWeight: 'bold',
-                                   cursor: isPublishingNow ? 'not-allowed' : 'pointer'
+                                   cursor: (isPublishingNow || isPublishingSchedule) ? 'not-allowed' : 'pointer'
                                  }}
                                  onClick={() => handlePublishNow(video.id)}
-                                 disabled={isPublishingNow || isError}
+                                 disabled={isPublishingNow || isPublishingSchedule || isError}
                                  title="Tải lên và Public ngay lập tức lên YouTube"
                                >
                                  ⚡ Public ngay
+                               </button>
+                               <button
+                                 className="btn-secondary"
+                                 style={{
+                                   padding: '8px 10px',
+                                   fontSize: '0.85em',
+                                   background: 'rgba(142, 68, 173, 0.15)',
+                                   border: '1px solid #8e44ad',
+                                   color: '#a569bd',
+                                   fontWeight: 'bold',
+                                   cursor: (isPublishingNow || isPublishingSchedule) ? 'not-allowed' : 'pointer'
+                                 }}
+                                 onClick={() => handlePublishSchedule(video.id)}
+                                 disabled={isPublishingNow || isPublishingSchedule || isError}
+                                 title="Tải lên và đặt lịch phát sóng tự động lên YouTube"
+                               >
+                                 📅 Đặt lịch
                                </button>
                              </>
                            )}
@@ -3574,14 +3620,14 @@ function App() {
                                       <button
                                         className="btn-primary"
                                         onClick={() => handlePublishNow(currentVideoId)}
-                                        disabled={isPublishingNow || currentVideoIsError}
+                                        disabled={isPublishingNow || isPublishingSchedule || currentVideoIsError}
                                         style={{
                                           padding: '4px 14px',
                                           fontSize: '0.8em',
                                           background: 'linear-gradient(135deg, #e67e22, #d35400)',
                                           border: 'none',
                                           color: '#fff',
-                                          cursor: isPublishingNow ? 'not-allowed' : 'pointer',
+                                          cursor: (isPublishingNow || isPublishingSchedule) ? 'not-allowed' : 'pointer',
                                           fontWeight: 'bold',
                                           borderRadius: '4px',
                                           display: 'inline-flex',
@@ -3591,6 +3637,27 @@ function App() {
                                         title="Tải lên và Public ngay lập tức lên YouTube"
                                       >
                                         {isPublishingNow ? '⏳ Đang Public...' : '⚡ Public ngay'}
+                                      </button>
+                                      <button
+                                        className="btn-primary"
+                                        onClick={() => handlePublishSchedule(currentVideoId)}
+                                        disabled={isPublishingNow || isPublishingSchedule || currentVideoIsError}
+                                        style={{
+                                          padding: '4px 14px',
+                                          fontSize: '0.8em',
+                                          background: 'linear-gradient(135deg, #8e44ad, #9b59b6)',
+                                          border: 'none',
+                                          color: '#fff',
+                                          cursor: (isPublishingNow || isPublishingSchedule) ? 'not-allowed' : 'pointer',
+                                          fontWeight: 'bold',
+                                          borderRadius: '4px',
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          gap: '4px'
+                                        }}
+                                        title="Tải lên và đặt lịch phát sóng tự động lên YouTube"
+                                      >
+                                        {isPublishingSchedule ? '⏳ Đang Đặt lịch...' : '📅 Đặt lịch'}
                                       </button>
                                     </>
                                   )}

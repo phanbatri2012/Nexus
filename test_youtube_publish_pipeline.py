@@ -1230,6 +1230,54 @@ class YouTubePublishPipelineTests(unittest.TestCase):
                 )
         browser_upload.assert_not_called()
 
+    def test_publish_video_schedule_endpoint(self):
+        import asyncio
+
+        # 1. Non-existent video raises 404
+        with self.assertRaises(HTTPException) as ctx:
+            asyncio.run(main.publish_video_schedule_endpoint(999999))
+        self.assertEqual(ctx.exception.status_code, 404)
+
+        # 2. Video without ready mp4 artifact raises 400
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=schedule-ep-test",
+            "Schedule test title",
+            "Transcript",
+            "### [METADATA & QUIZ]\nMÔ TẢ VIDEO: Description",
+            prompt_version="default",
+        )
+        with self.assertRaises(HTTPException) as ctx:
+            asyncio.run(main.publish_video_schedule_endpoint(video_id))
+        self.assertEqual(ctx.exception.status_code, 400)
+
+        # 3. Video with ready mp4 artifact successfully queues schedule publish job
+        artifact = database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="final_mp4",
+            path=str(self.root / "output.mp4"),
+            content_hash="mp4-hash-test",
+            status="ready",
+        )
+        with patch.object(main, "_kick_production_queue") as kick_mock:
+            res = asyncio.run(main.publish_video_schedule_endpoint(video_id))
+            self.assertTrue(res["success"])
+            self.assertEqual(res["status"], "queued")
+            kick_mock.assert_called_once()
+
+        job = database.get_system_job(res["job_id"])
+        self.assertIsNotNone(job)
+        self.assertEqual(job["job_type"], "youtube_publish")
+        self.assertEqual(job["payload"]["publish_mode"], "schedule")
+        self.assertEqual(job["payload"]["artifact_id"], artifact["id"])
+        self.assertEqual(job["payload"]["snapshot"]["publishing_settings"]["publish_mode"], "schedule")
+        self.assertTrue(job["payload"]["snapshot"]["pipeline"]["youtube_upload"])
+        self.assertTrue(job["payload"]["snapshot"]["pipeline"]["youtube_schedule"])
+
+        video = database.get_video(video_id)
+        self.assertEqual(video["publish_status"], "queued")
+        self.assertEqual(video["current_stage"], "preflight")
+
 
 if __name__ == "__main__":
     unittest.main()
+

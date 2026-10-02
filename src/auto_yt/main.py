@@ -1767,6 +1767,73 @@ async def publish_video_now_endpoint(video_id: int):
     }
 
 
+@app.post("/api/videos/{video_id}/publish-schedule")
+async def publish_video_schedule_endpoint(video_id: int):
+    """Trigger scheduled YouTube publishing for a video according to channel publication slots."""
+    video = db.get_video(video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Không tìm thấy video.")
+
+    artifact = db.get_latest_video_artifact(video_id, "final_mp4", status="ready")
+    if not artifact:
+        raise HTTPException(
+            status_code=400,
+            detail="Video chưa được dựng MP4 hoàn tất. Vui lòng dựng video trước khi đặt lịch.",
+        )
+
+    prompt_version = str(video.get("prompt_version") or "")
+    snapshot = _get_prompt_production_snapshot(prompt_version)
+    if not isinstance(snapshot.get("publishing_settings"), dict):
+        snapshot["publishing_settings"] = {}
+    snapshot["publishing_settings"]["publish_mode"] = "schedule"
+    if not isinstance(snapshot.get("pipeline"), dict):
+        snapshot["pipeline"] = {}
+    snapshot["pipeline"]["youtube_upload"] = True
+    snapshot["pipeline"]["youtube_schedule"] = True
+
+    for old_job in db.list_system_jobs(video_id=video_id, limit=None):
+        if old_job.get("job_type") == "youtube_publish" and old_job.get("status") in {"queued", "paused", "retry_wait", "running"}:
+            db.update_system_job(old_job["id"], status="canceled", cancel_requested=1)
+
+    existing_wf = db.get_youtube_publish_workflow_for_video(video_id)
+    if existing_wf:
+        db.update_youtube_publish_workflow(
+            existing_wf["id"],
+            status="running",
+            stage="preflight",
+            error="",
+            snapshot_json=snapshot,
+        )
+
+    job = db.create_system_job(
+        job_id=f"youtube-publish-{uuid.uuid4().hex}",
+        job_type="youtube_publish",
+        title=f"Đặt lịch YouTube: {video.get('generated_title') or video.get('title') or video_id}",
+        payload={
+            "video_id": video_id,
+            "artifact_id": int(artifact["id"]),
+            "snapshot": snapshot,
+            "publish_mode": "schedule",
+        },
+        prompt_version=prompt_version,
+    )
+    job = db.update_system_job(job["id"], video_id=video_id)
+    db.update_video_production_state(
+        video_id,
+        publish_status="queued",
+        current_stage="preflight",
+        production_progress="Đang chờ tải lên và đặt lịch phát sóng",
+        blocking_reason="",
+    )
+    _kick_production_queue()
+    return {
+        "success": True,
+        "message": "Đã đưa video vào hàng đợi tải lên và đặt lịch YouTube!",
+        "job_id": job["id"],
+        "status": "queued",
+    }
+
+
 @app.get("/api/videos/{video_id}/publications")
 def get_video_publications(video_id: int):
     if not db.get_video(video_id):

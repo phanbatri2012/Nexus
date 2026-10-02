@@ -31,3 +31,15 @@ test('marking a video as published requires and atomically saves its published U
   assert.match(appSource, /disabled=\{publicationDialog\.isSaving \|\| !publicationDialog\.videoId \|\| !publicationDialog\.publishedUrl\.trim\(\)\}/)
   assert.doesNotMatch(appSource, /disabled=\{publicationDialog\.isSaving \|\| !publicationDialog\.defaultChannelTitle\}/)
 })
+
+test('video actions expose immediate public and schedule publish buttons', async () => {
+  const appSource = await readFile(new URL('./App.jsx', import.meta.url), 'utf8')
+
+  assert.match(appSource, /const \[isPublishingSchedule, setIsPublishingSchedule\] = useState\(false\)/)
+  assert.match(appSource, /handlePublishSchedule\s*=\s*async/)
+  assert.match(appSource, /api\/videos\/\$\{targetId\}\/publish-schedule/)
+  assert.match(appSource, /⚡ Public ngay/)
+  assert.match(appSource, /📅 Đặt lịch/)
+  assert.match(appSource, /isPublishingSchedule \? '⏳ Đang Đặt lịch\.\.\.' : '📅 Đặt lịch'/)
+})
+
