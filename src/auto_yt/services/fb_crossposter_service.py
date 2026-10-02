@@ -2792,7 +2792,6 @@ def process_queue_item_jit(
     video_file = TEMP_DOWNLOAD_DIR / f"{youtube_id}_{item_id}.mp4"
     vertical_video_file = TEMP_DOWNLOAD_DIR / f"{youtube_id}_{item_id}_vertical.mp4"
     thumb_file = TEMP_DOWNLOAD_DIR / f"{youtube_id}_{item_id}.jpg"
-    vertical_video_file.unlink(missing_ok=True)
 
     if publish_now and existing_post_id:
         raise ValueError(
@@ -2810,30 +2809,53 @@ def process_queue_item_jit(
             scheduled_time = db.reserve_next_fb_queue_slot(item_id, max_horizon_days=70)
             item["scheduled_publish_time"] = scheduled_time
 
-    # Step 1: Set status to downloading
-    db.update_fb_crossposter_queue_item(item_id, {"status": "downloading", "error_message": ""})
+    # Check if pre-rendered / cached media exists from a previous paused checkpoint
+    need_vertical = bool(settings.get("convert_to_vertical"))
+    target_video_file = vertical_video_file if need_vertical else video_file
+    has_valid_media = (
+        target_video_file.is_file()
+        and target_video_file.stat().st_size > 10240
+        and thumb_file.is_file()
+        and thumb_file.stat().st_size > 512
+    )
 
-    proxy_url = _get_proxy_for_gpm_profile(source_gpm_profile_id)
-    logger.info("JIT Downloading video %s (#%d) (Proxy: %s)", youtube_id, item_id, proxy_url or "Direct")
+    source_tags = item.get("original_tags", [])
+    if not isinstance(source_tags, list):
+        source_tags = _unique_tag_keywords(source_tags)
 
-    ydl_opts: dict[str, Any] = {
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "ffmpeg_location": ensure_ffmpeg_directory(),
-        "outtmpl": str(TEMP_DOWNLOAD_DIR / f"{youtube_id}_{item_id}.%(ext)s"),
-        "merge_output_format": "mp4",
-        "quiet": True,
-        "no_warnings": True,
-        "http_headers": {
-            "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-        },
-        "extractor_args": {
-            "youtube": {"lang": ["vi"]},
-        },
-    }
-    if proxy_url:
-        ydl_opts["proxy"] = proxy_url
+    if has_valid_media:
+        logger.info(
+            "Phát hiện file media đã render sẵn trong cache cho video #%d (%s, %d bytes). Bỏ qua bước Download & Render!",
+            item_id,
+            target_video_file.name,
+            target_video_file.stat().st_size,
+        )
+        upload_video_file = target_video_file
+        db.update_fb_checkpoint(item_id, "CP2_MEDIA_PREPARED", status="uploading", can_resume=True)
+    else:
+        # Step 1: Set status to downloading
+        db.update_fb_checkpoint(item_id, "CP1_SOURCE_READY", status="downloading", error_message="", can_resume=True)
 
-    try:
+        proxy_url = _get_proxy_for_gpm_profile(source_gpm_profile_id)
+        logger.info("JIT Downloading video %s (#%d) (Proxy: %s)", youtube_id, item_id, proxy_url or "Direct")
+
+        ydl_opts: dict[str, Any] = {
+            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "ffmpeg_location": ensure_ffmpeg_directory(),
+            "outtmpl": str(TEMP_DOWNLOAD_DIR / f"{youtube_id}_{item_id}.%(ext)s"),
+            "merge_output_format": "mp4",
+            "quiet": True,
+            "no_warnings": True,
+            "http_headers": {
+                "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+            },
+            "extractor_args": {
+                "youtube": {"lang": ["vi"]},
+            },
+        }
+        if proxy_url:
+            ydl_opts["proxy"] = proxy_url
+
         with YoutubeDL(ydl_opts) as ydl:
             source_info = ydl.extract_info(youtube_url, download=True) or {}
 
@@ -2893,7 +2915,7 @@ def process_queue_item_jit(
             raise RuntimeError("Không thể tải hoặc chuẩn hóa thumbnail YouTube")
 
         upload_video_file = video_file
-        if settings.get("convert_to_vertical"):
+        if need_vertical:
             if sys_job_id:
                 try:
                     db.update_system_job(
@@ -2909,65 +2931,62 @@ def process_queue_item_jit(
             )
             convert_thumbnail_to_vertical(thumb_file)
 
+        db.update_fb_checkpoint(
+            item_id,
+            "CP2_MEDIA_PREPARED",
+            status="uploading",
+            can_resume=True,
+        )
         db.update_fb_crossposter_queue_item(
             item_id,
             {"file_size_bytes": upload_video_file.stat().st_size},
         )
 
-        # Step 2: Set status to uploading
-        db.update_fb_crossposter_queue_item(item_id, {"status": "uploading"})
-        if sys_job_id:
-            try:
-                db.update_system_job(sys_job_id, status="running", progress="Đang tải video lên Facebook...")
-            except Exception:
-                pass
+    # Step 2: Prepare metadata and start upload
+    if sys_job_id:
+        try:
+            db.update_system_job(sys_job_id, status="running", progress="Đang chuẩn bị đăng video lên Facebook...")
+        except Exception:
+            pass
 
-        caption = item.get("fb_description") or build_fb_caption(
-            item.get("fb_title") or item.get("original_title", ""),
-            item.get("original_description", ""),
-            item.get("original_tags", []),
-            settings.get("post_template"),
-            default_tags=default_tags,
-        )
-        if not auto_caption:
-            caption = append_missing_default_hashtags(caption, default_tags)
-        title = item.get("fb_title") or item.get("original_title", "")
-        scheduled_time = None if publish_now else int(item.get("scheduled_publish_time") or 0)
-        content_tag_ids, skipped_tags = resolve_content_tag_ids(
-            item.get("original_tags", []),
-            access_token,
-            target_gpm_profile_id=target_gpm_profile_id,
-            raw_description=item.get("original_description", ""),
-            default_tags=default_tags,
-        )
-        custom_labels = get_custom_labels(
-            item.get("original_tags", []),
-            raw_description=item.get("original_description", ""),
-            default_tags=default_tags,
-        )
-        if skipped_tags:
-            logger.warning(
-                "Facebook content tags skipped for queue item #%d: %s",
-                item_id,
-                ", ".join(skipped_tags),
-            )
+    auto_caption = _caption_is_automatic(
+        item,
+        settings.get("post_template", ""),
+        default_tags=default_tags,
+    )
+    caption = item.get("fb_description") or build_fb_caption(
+        item.get("fb_title") or item.get("original_title", ""),
+        item.get("original_description", ""),
+        item.get("original_tags", []),
+        settings.get("post_template"),
+        default_tags=default_tags,
+    )
+    if not auto_caption:
+        caption = append_missing_default_hashtags(caption, default_tags)
+    title = item.get("fb_title") or item.get("original_title", "")
+    scheduled_time = None if publish_now else int(item.get("scheduled_publish_time") or 0)
 
-        def persist_upload_state(fields: dict[str, Any]) -> None:
-            db.update_fb_crossposter_queue_item(item_id, fields)
-
+    try:
         if upload_mode == "browser":
             from auto_yt.services import fb_reels_browser_service
             import concurrent.futures
 
             def persist_browser_state(st: dict[str, Any]) -> None:
                 msg = st.get("message", "")
+                phase = st.get("phase", "")
+                screenshot = st.get("screenshot", "")
                 if sys_job_id and msg:
                     try:
                         db.update_system_job(sys_job_id, status="running", progress=msg)
                     except Exception:
                         pass
-                if st.get("phase"):
-                    db.update_fb_crossposter_queue_item(item_id, {"upload_phase": st["phase"]})
+                if phase:
+                    db.update_fb_checkpoint(
+                        item_id,
+                        phase=phase,
+                        screenshot_path=screenshot,
+                        can_resume=True,
+                    )
 
             tags = list(default_tags)
             if title and title not in tags:
@@ -2993,6 +3012,7 @@ def process_queue_item_jit(
                                 profile_id=gpm_pid,
                                 video_path=upload_video_file,
                                 caption=caption,
+                                item_id=item_id,
                                 thumb_path=thumb_file,
                                 tags=tags,
                                 schedule_datetime=scheduled_time,
@@ -3008,6 +3028,7 @@ def process_queue_item_jit(
                             profile_id=gpm_pid,
                             video_path=upload_video_file,
                             caption=caption,
+                            item_id=item_id,
                             thumb_path=thumb_file,
                             tags=tags,
                             schedule_datetime=scheduled_time,
@@ -3026,7 +3047,10 @@ def process_queue_item_jit(
                     "meta_published": 1 if publish_now else 0,
                     "meta_scheduled_publish_time": scheduled_time if not publish_now else 0,
                     "meta_verified_at": db.utc_now(),
+                    "checkpoint_phase": "CP8_SUBMITTED",
+                    "can_resume": 0,
                     "error_message": "",
+                    "meta_error_message": "",
                 })
 
                 if sys_job_id:
@@ -3050,24 +3074,60 @@ def process_queue_item_jit(
                     "message": browser_res.get("message", "Thành công"),
                 }
             except Exception as browser_err:
-                if access_token and page_id:
-                    logger.warning(
-                        "Upload qua trình duyệt gặp lỗi (%s). Tự động chuyển sang tải qua Meta Graph API...",
-                        browser_err,
-                    )
-                    if sys_job_id:
-                        try:
-                            db.update_system_job(
-                                sys_job_id,
-                                status="running",
-                                progress=f"Trình duyệt bận ({str(browser_err)[:60]}...). Tự động chuyển sang tải ngầm qua Meta Graph API...",
-                            )
-                        except Exception:
-                            pass
-                else:
-                    raise
+                # STRICT ZERO-FALLBACK: Pause at checkpoint, retain rendered cache, no Graph API fallback!
+                phase = getattr(browser_err, "phase", "CP3_CDP_READY")
+                screenshot_path = getattr(browser_err, "screenshot_path", "")
+                err_msg = str(browser_err)
+                logger.error(
+                    "Upload qua trình duyệt tạm dừng tại Checkpoint [%s] cho video #%d: %s",
+                    phase,
+                    item_id,
+                    err_msg,
+                )
+                db.update_fb_checkpoint(
+                    item_id,
+                    phase=phase,
+                    status="checkpoint_paused",
+                    screenshot_path=screenshot_path,
+                    can_resume=True,
+                    error_message=err_msg,
+                )
+                if sys_job_id:
+                    try:
+                        db.update_system_job(
+                            sys_job_id,
+                            status="failed",
+                            progress=f"Tạm dừng tại [{phase}]: {err_msg[:80]}",
+                            error=err_msg,
+                            finished_at=db.utc_now(),
+                        )
+                    except Exception:
+                        pass
+                raise RuntimeError(f"Tạm dừng tại Checkpoint [{phase}]: {err_msg}") from browser_err
 
-        # Else / Fallback: API Upload Mode
+        # API Upload Mode (upload_mode == "api")
+        content_tag_ids, skipped_tags = resolve_content_tag_ids(
+            source_tags,
+            access_token,
+            target_gpm_profile_id=target_gpm_profile_id,
+            raw_description=item.get("original_description", ""),
+            default_tags=default_tags,
+        )
+        custom_labels = get_custom_labels(
+            source_tags,
+            raw_description=item.get("original_description", ""),
+            default_tags=default_tags,
+        )
+        if skipped_tags:
+            logger.warning(
+                "Facebook content tags skipped for queue item #%d: %s",
+                item_id,
+                ", ".join(skipped_tags),
+            )
+
+        def persist_upload_state(fields: dict[str, Any]) -> None:
+            db.update_fb_crossposter_queue_item(item_id, fields)
+
         upload_result = upload_video_to_facebook(
             page_id=page_id,
             access_token=access_token,
@@ -3109,6 +3169,8 @@ def process_queue_item_jit(
             "upload_phase": "",
             "upload_retry_count": 0,
             "upload_next_retry_at": "",
+            "checkpoint_phase": "CP8_SUBMITTED",
+            "can_resume": 0,
         })
         db.update_fb_crossposter_queue_item(item_id, verification_fields)
         if sys_job_id:
@@ -3138,6 +3200,12 @@ def process_queue_item_jit(
         safe_error = security_logging.redact_sensitive(exc)
         logger.error("JIT processing failed for video #%d (%s): %s", item_id, youtube_id, safe_error)
         current_item = db.get_fb_crossposter_queue_item(item_id) or {}
+        curr_status = str(current_item.get("status") or "")
+
+        # If already set to checkpoint_paused by browser handler, preserve it!
+        if curr_status == "checkpoint_paused":
+            raise
+
         is_retryable_finish = bool(current_item.get("upload_session_id")) and (
             "is_transient" in safe_error or "temporarily unavailable" in safe_error.lower()
         )
@@ -3192,22 +3260,72 @@ def process_queue_item_jit(
                 pass
         raise RuntimeError(safe_error) from exc
     finally:
-        # Step 4: Always cleanup temp files to preserve disk space
-        if video_file.exists():
+        # Step 4: Cleanup temp files ONLY if successfully published/scheduled
+        # Preserve media files if item is paused at a checkpoint for instant resume!
+        try:
+            curr = db.get_fb_crossposter_queue_item(item_id) or {}
+            curr_status = str(curr.get("status") or "")
+            is_paused_or_resumable = (
+                curr_status in {"checkpoint_paused", "retryable"}
+                or int(curr.get("can_resume") or 0) == 1
+            )
+            if not is_paused_or_resumable:
+                if video_file.exists():
+                    try:
+                        video_file.unlink()
+                    except Exception:
+                        pass
+                if vertical_video_file.exists():
+                    try:
+                        vertical_video_file.unlink()
+                    except Exception:
+                        pass
+                if thumb_file.exists():
+                    try:
+                        thumb_file.unlink()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+
+def resume_fb_crossposter_queue_item(
+    item_id: int,
+    sys_job_id: str | None = None,
+    publish_now: bool = False,
+) -> dict[str, Any]:
+    """Resume execution of a queue item currently paused at a checkpoint."""
+    item = db.get_fb_crossposter_queue_item(item_id)
+    if not item:
+        raise ValueError(f"Không tìm thấy video ID #{item_id} trong hàng đợi")
+    db.update_fb_crossposter_queue_item(item_id, {
+        "status": "uploading",
+        "error_message": "",
+        "meta_error_message": "",
+    })
+    return process_queue_item_jit(item_id, sys_job_id=sys_job_id, publish_now=publish_now)
+
+
+def reset_fb_crossposter_checkpoint(item_id: int) -> bool:
+    """Reset checkpoint state and purge cached media for a fresh re-download/re-render."""
+    item = db.get_fb_crossposter_queue_item(item_id)
+    if not item:
+        return False
+    youtube_id = item.get("youtube_id", "")
+    for ext in ("mp4", "jpg"):
+        f1 = TEMP_DOWNLOAD_DIR / f"{youtube_id}_{item_id}.{ext}"
+        f2 = TEMP_DOWNLOAD_DIR / f"{youtube_id}_{item_id}_vertical.{ext}"
+        if f1.exists():
             try:
-                video_file.unlink()
+                f1.unlink()
             except Exception:
                 pass
-        if vertical_video_file.exists():
+        if f2.exists():
             try:
-                vertical_video_file.unlink()
+                f2.unlink()
             except Exception:
                 pass
-        if thumb_file.exists():
-            try:
-                thumb_file.unlink()
-            except Exception:
-                pass
+    return db.reset_fb_checkpoint(item_id)
 
 
 # =========================================================================

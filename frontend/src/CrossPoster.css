@@ -427,6 +427,47 @@
   animation: pulse 1.5s infinite;
 }
 
+.badge-status.checkpoint_paused {
+  background: rgba(234, 179, 8, 0.2);
+  color: #fde047;
+  border: 1px solid rgba(234, 179, 8, 0.45);
+  font-weight: 700;
+  box-shadow: 0 0 8px rgba(234, 179, 8, 0.2);
+}
+
+.badge-checkpoint-phase {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.72rem;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: rgba(56, 189, 248, 0.15);
+  color: #38bdf8;
+  border: 1px solid rgba(56, 189, 248, 0.3);
+  margin-top: 3px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.badge-checkpoint-phase:hover {
+  background: rgba(56, 189, 248, 0.25);
+  border-color: #38bdf8;
+}
+
+.fb-btn-resume {
+  background: linear-gradient(135deg, #eab308 0%, #ca8a04 100%);
+  color: #0f172a;
+  font-weight: 700;
+  border: none;
+}
+
+.fb-btn-resume:hover:not(:disabled) {
+  background: linear-gradient(135deg, #facc15 0%, #eab308 100%);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(234, 179, 8, 0.35);
+}
+
 .badge-status.pending {
   background: rgba(250, 204, 21, 0.15);
   color: #facc15;

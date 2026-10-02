@@ -24,8 +24,20 @@ const STATUS_LABELS = {
   meta_failed: 'Video Meta bị lỗi',
   missing: 'Không còn trên Meta',
   published: 'Đã đăng thực tế',
+  checkpoint_paused: 'Tạm dừng Checkpoint',
   skipped: 'Bỏ qua',
   error: 'Lỗi'
+}
+
+const CHECKPOINT_PHASE_LABELS = {
+  CP1_SOURCE_READY: 'CP1: Tải video gốc',
+  CP2_MEDIA_PREPARED: 'CP2: Render 9:16 & Thumb',
+  CP3_CDP_READY: 'CP3: Kết nối Trình duyệt',
+  CP4_COMPOSER_READY: 'CP4: Mở Meta Composer',
+  CP5_ASSET_UPLOADED: 'CP5: Nạp Video (100%)',
+  CP6_METADATA_FILLED: 'CP6: Điền Caption & Thẻ',
+  CP7_SCHEDULE_SET: 'CP7: Cấu hình Lên lịch',
+  CP8_SUBMITTED: 'CP8: Bấm Xuất bản'
 }
 
 function createDefaultSettings() {
@@ -199,6 +211,9 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
     fb_description: '',
     scheduled_datetime_local: ''
   })
+
+  // Checkpoint Modal State
+  const [checkpointModalItem, setCheckpointModalItem] = useState(null)
 
   // New Campaign Modal State
   const [isNewCampaignModalOpen, setIsNewCampaignModalOpen] = useState(false)
@@ -877,6 +892,71 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
     }
   }
 
+  // Resume Queue Item from Checkpoint
+  const handleResumeItem = async (itemId) => {
+    setIsPublishingId(itemId)
+    setMessage(`Đang tiếp tục video #${itemId} từ Checkpoint...`)
+    setMessageType('info')
+    try {
+      const res = await fetch(`${API_BASE}/api/fb-crossposter/queue/${itemId}/resume`, {
+        method: 'POST'
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      setMessage(data.message || `Đã tiếp tục video #${itemId}.`)
+      setMessageType('success')
+      if (checkpointModalItem && checkpointModalItem.id === itemId) {
+        setCheckpointModalItem(null)
+      }
+      loadQueue(selectedPageId)
+    } catch (err) {
+      setMessage(`❌ Lỗi tiếp tục video #${itemId}: ${err.message}`)
+      setMessageType('error')
+      loadQueue(selectedPageId)
+    } finally {
+      setIsPublishingId(null)
+    }
+  }
+
+  // Reset Checkpoint & Purge Cached Media
+  const handleResetCheckpoint = async (itemId) => {
+    if (!window.confirm(`Reset checkpoint và xóa file media tạm của video #${itemId} để tải & render lại từ đầu?`)) return
+    try {
+      const res = await fetch(`${API_BASE}/api/fb-crossposter/queue/${itemId}/reset-checkpoint`, {
+        method: 'POST'
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      setMessage(data.message || `Đã reset checkpoint video #${itemId}.`)
+      setMessageType('success')
+      if (checkpointModalItem && checkpointModalItem.id === itemId) {
+        setCheckpointModalItem(null)
+      }
+      loadQueue(selectedPageId)
+    } catch (err) {
+      alert(`Lỗi reset checkpoint: ${err.message}`)
+    }
+  }
+
+  // Resume All Paused Items
+  const handleResumeAllPaused = async () => {
+    setMessage(`Đang tiếp tục tất cả video đang tạm dừng tại Checkpoint...`)
+    setMessageType('info')
+    try {
+      const res = await fetch(`${API_BASE}/api/fb-crossposter/queue/resume-all-paused?page_id=${encodeURIComponent(selectedPageId)}`, {
+        method: 'POST'
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      setMessage(data.message)
+      setMessageType('success')
+      loadQueue(selectedPageId)
+    } catch (err) {
+      setMessage(`❌ Lỗi tiếp tục hàng loạt: ${err.message}`)
+      setMessageType('error')
+    }
+  }
+
   // Create New Campaign
   const handleCreateNewCampaign = async () => {
     if (!newCampaignForm.page_id) {
@@ -1453,6 +1533,39 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
         </div>
       )}
 
+      {/* Checkpoint Paused Batch Notice */}
+      {queueItems.some(it => it.status === 'checkpoint_paused') && (
+        <div style={{
+          background: 'rgba(234, 179, 8, 0.12)',
+          border: '1px solid rgba(234, 179, 8, 0.4)',
+          borderRadius: '10px',
+          padding: '14px 18px',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          fontSize: '0.88rem'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <span style={{ fontSize: '1.3rem' }}>📍</span>
+            <div>
+              <div style={{ color: '#fde047', fontWeight: '700' }}>
+                Có {queueItems.filter(it => it.status === 'checkpoint_paused').length} video đang tạm dừng tại Checkpoint Trình duyệt
+              </div>
+              <div style={{ color: '#94a3b8', fontSize: '0.78rem', marginTop: '2px' }}>
+                Video và Thumbnail đã render được bảo toàn trong cache. Vui lòng mở profile trình duyệt rồi bấm Tiếp tục.
+              </div>
+            </div>
+          </div>
+          <button
+            className="fb-btn fb-btn-resume fb-btn-sm"
+            onClick={handleResumeAllPaused}
+            title="Tiếp tục xử lý tất cả video đang tạm dừng tại Checkpoint"
+          >
+            ▶ Tiếp Tục Tất Cả Video Dừng
+          </button>
+        </div>
+      )}
+
       {/* Settings & Automation Accordion */}
       <div className="fb-settings-accordion">
         <div className="fb-settings-header" onClick={() => setIsSettingsOpen(!isSettingsOpen)}>
@@ -1817,6 +1930,18 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
                         </span>
                       )}
                     </div>
+                    {item.checkpoint_phase && (
+                      <div style={{ marginTop: '3px' }}>
+                        <span
+                          className="badge-checkpoint-phase"
+                          onClick={() => setCheckpointModalItem(item)}
+                          title="Nhấp để xem chi tiết Checkpoint & Ảnh chụp màn hình"
+                        >
+                          📍 {CHECKPOINT_PHASE_LABELS[item.checkpoint_phase] || item.checkpoint_phase}
+                          {item.checkpoint_screenshot && ' 📸'}
+                        </span>
+                      </div>
+                    )}
                     {item.error_message && (
                       <div style={{ fontSize: '0.75rem', color: '#f87171', marginTop: '2px' }}>
                         ⚠️ {item.error_message}
@@ -1841,7 +1966,27 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
                   </td>
                   <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
                     <div style={{ display: 'inline-flex', gap: '6px' }}>
-                      {!item.fb_post_id && !['published', 'meta_scheduled', 'processing', 'verifying'].includes(item.status) && (
+                      {(item.status === 'checkpoint_paused' || item.can_resume) && (
+                        <>
+                          <button
+                            className="fb-btn fb-btn-resume fb-btn-sm"
+                            onClick={() => handleResumeItem(item.id)}
+                            disabled={isPublishingId === item.id}
+                            title="Tiếp tục đăng tải từ Checkpoint này (Bỏ qua render)"
+                          >
+                            {isPublishingId === item.id ? '...' : '▶ Tiếp tục'}
+                          </button>
+                          <button
+                            className="fb-btn fb-btn-secondary fb-btn-sm"
+                            onClick={() => handleResetCheckpoint(item.id)}
+                            disabled={isPublishingId === item.id}
+                            title="Xóa cache và làm lại từ đầu"
+                          >
+                            Reset
+                          </button>
+                        </>
+                      )}
+                      {!item.fb_post_id && !['published', 'meta_scheduled', 'processing', 'verifying', 'checkpoint_paused'].includes(item.status) && (
                         <button
                           className="fb-btn fb-btn-primary fb-btn-sm"
                           onClick={() => handlePublishNow(item.id)}
@@ -2108,6 +2253,80 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
             <div className="fb-modal-footer">
               <button className="fb-btn fb-btn-secondary" onClick={() => setIsNewCampaignModalOpen(false)}>Hủy</button>
               <button className="fb-btn fb-btn-primary" onClick={handleCreateNewCampaign}>Tạo Chiến Dịch</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Checkpoint Details & Screenshot Modal */}
+      {checkpointModalItem && (
+        <div className="fb-modal-backdrop" onClick={() => setCheckpointModalItem(null)}>
+          <div className="fb-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '720px' }}>
+            <div className="fb-modal-header">
+              <h3 style={{ margin: 0, fontSize: '1.1rem', color: '#fde047', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                📍 Chi Tiết Checkpoint Video #{checkpointModalItem.id}
+              </h3>
+              <button
+                onClick={() => setCheckpointModalItem(null)}
+                style={{ background: 'none', border: 'none', color: '#94a3b8', fontSize: '1.2rem', cursor: 'pointer' }}
+              >✕</button>
+            </div>
+            <div className="fb-modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px', maxHeight: '75vh', overflowY: 'auto' }}>
+              <div>
+                <div style={{ fontSize: '0.85rem', color: '#94a3b8', marginBottom: '4px' }}>Tên Video:</div>
+                <div style={{ fontWeight: '600', color: '#f8fafc' }}>{checkpointModalItem.fb_title || checkpointModalItem.original_title}</div>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+                <div style={{ background: 'rgba(15, 23, 42, 0.6)', padding: '10px 14px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.06)' }}>
+                  <div style={{ fontSize: '0.75rem', color: '#94a3b8' }}>Giai đoạn Checkpoint</div>
+                  <div style={{ color: '#38bdf8', fontWeight: '700', marginTop: '2px' }}>
+                    {CHECKPOINT_PHASE_LABELS[checkpointModalItem.checkpoint_phase] || checkpointModalItem.checkpoint_phase || 'Chưa ghi nhận'}
+                  </div>
+                </div>
+                <div style={{ background: 'rgba(15, 23, 42, 0.6)', padding: '10px 14px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.06)' }}>
+                  <div style={{ fontSize: '0.75rem', color: '#94a3b8' }}>Trạng thái Cache Media</div>
+                  <div style={{ color: '#4ade80', fontWeight: '700', marginTop: '2px' }}>
+                    ✅ Đã bảo toàn Video 9:16 & Thumb
+                  </div>
+                </div>
+              </div>
+
+              {checkpointModalItem.error_message && (
+                <div style={{ background: 'rgba(239, 68, 68, 0.1)', border: '1px solid rgba(239, 68, 68, 0.25)', padding: '10px 14px', borderRadius: '8px', color: '#fca5a5', fontSize: '0.85rem' }}>
+                  <strong>Lý do tạm dừng:</strong> {checkpointModalItem.error_message}
+                </div>
+              )}
+
+              {checkpointModalItem.checkpoint_screenshot && (
+                <div>
+                  <div style={{ fontSize: '0.85rem', color: '#94a3b8', marginBottom: '6px' }}>Ảnh chụp màn hình lúc tạm dừng:</div>
+                  <div style={{ borderRadius: '8px', overflow: 'hidden', border: '1px solid rgba(255,255,255,0.1)' }}>
+                    <img
+                      src={`${API_BASE}/api/fb-crossposter/screenshot/${checkpointModalItem.checkpoint_screenshot.split(/[\\/]/).pop()}`}
+                      alt="Checkpoint Screenshot"
+                      style={{ width: '100%', maxHeight: '350px', objectFit: 'contain', background: '#000' }}
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="fb-modal-footer" style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <button
+                className="fb-btn fb-btn-secondary"
+                onClick={() => handleResetCheckpoint(checkpointModalItem.id)}
+              >
+                🔄 Reset & Render Lại
+              </button>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button className="fb-btn fb-btn-secondary" onClick={() => setCheckpointModalItem(null)}>Đóng</button>
+                <button
+                  className="fb-btn fb-btn-resume"
+                  onClick={() => handleResumeItem(checkpointModalItem.id)}
+                >
+                  ▶ Tiếp Tục Từ Checkpoint
+                </button>
+              </div>
             </div>
           </div>
         </div>

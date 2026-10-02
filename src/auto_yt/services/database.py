@@ -1112,6 +1112,10 @@ def init_db():
             previous_fb_post_id TEXT DEFAULT '',
             cleanup_status TEXT DEFAULT '',
             repair_history_json TEXT DEFAULT '[]',
+            checkpoint_phase TEXT DEFAULT '',
+            checkpoint_data_json TEXT DEFAULT '{}',
+            checkpoint_screenshot TEXT DEFAULT '',
+            can_resume INTEGER DEFAULT 0,
             created_at TEXT DEFAULT '',
             updated_at TEXT DEFAULT '',
             UNIQUE(youtube_id, target_page_id)
@@ -1136,6 +1140,19 @@ def init_db():
         try:
             c.execute(
                 f"ALTER TABLE fb_crossposter_settings ADD COLUMN {column_definition}"
+            )
+        except sqlite3.OperationalError:
+            pass
+
+    for column_definition in (
+        "checkpoint_phase TEXT DEFAULT ''",
+        "checkpoint_data_json TEXT DEFAULT '{}'",
+        "checkpoint_screenshot TEXT DEFAULT ''",
+        "can_resume INTEGER DEFAULT 0",
+    ):
+        try:
+            c.execute(
+                f"ALTER TABLE fb_crossposter_queue ADD COLUMN {column_definition}"
             )
         except sqlite3.OperationalError:
             pass
@@ -4578,6 +4595,7 @@ def update_fb_crossposter_queue_item(item_id: int, fields: dict) -> bool:
             "upload_session_id", "upload_video_id", "upload_phase",
             "upload_retry_count", "upload_next_retry_at", "previous_fb_post_id",
             "cleanup_status", "repair_history_json",
+            "checkpoint_phase", "checkpoint_data_json", "checkpoint_screenshot", "can_resume",
         }
         updates = []
         values = []
@@ -4604,6 +4622,45 @@ def update_fb_crossposter_queue_item(item_id: int, fields: dict) -> bool:
             raise ValueError("Thời điểm đăng này đã được một video khác giữ trên cùng Fanpage") from exc
     finally:
         conn.close()
+
+
+def update_fb_checkpoint(
+    item_id: int,
+    phase: str,
+    *,
+    status: str | None = None,
+    checkpoint_data: dict | None = None,
+    screenshot_path: str | None = None,
+    can_resume: bool = True,
+    error_message: str | None = None,
+) -> bool:
+    """Record a checkpoint phase update with optional asset metadata and error screenshot."""
+    fields: dict[str, Any] = {
+        "checkpoint_phase": str(phase or "").strip(),
+        "can_resume": 1 if can_resume else 0,
+    }
+    if status is not None:
+        fields["status"] = status
+    if checkpoint_data is not None:
+        fields["checkpoint_data_json"] = json.dumps(checkpoint_data, ensure_ascii=False)
+    if screenshot_path is not None:
+        fields["checkpoint_screenshot"] = str(screenshot_path or "").strip()
+    if error_message is not None:
+        fields["error_message"] = str(error_message or "").strip()
+        fields["meta_error_message"] = str(error_message or "").strip()
+    return update_fb_crossposter_queue_item(item_id, fields)
+
+
+def reset_fb_checkpoint(item_id: int) -> bool:
+    """Reset checkpoint state back to fresh pending/scheduled state."""
+    return update_fb_crossposter_queue_item(item_id, {
+        "checkpoint_phase": "",
+        "checkpoint_data_json": "{}",
+        "checkpoint_screenshot": "",
+        "can_resume": 0,
+        "error_message": "",
+        "status": "pending",
+    })
 
 
 def append_fb_recovery_history(item_id: int, event: str, details: dict | None = None) -> None:

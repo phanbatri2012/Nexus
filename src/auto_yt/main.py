@@ -10874,6 +10874,103 @@ def repair_fb_crossposter_item(item_id: int):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@app.post("/api/fb-crossposter/queue/{item_id}/resume")
+def resume_fb_crossposter_item(item_id: int):
+    """Resume execution of a queue item paused at a checkpoint."""
+    try:
+        item = db.get_fb_crossposter_queue_item(item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Không tìm thấy video")
+        result = fb_crossposter_service.resume_fb_crossposter_queue_item(item_id)
+        target_page_id = item.get("target_page_id") or ""
+        return {
+            "success": True,
+            "result": result,
+            "item": db.get_fb_crossposter_queue_item(item_id),
+            "stats": db.get_fb_crossposter_stats(target_page_id),
+            "message": f"Đã tiếp tục tiến trình đăng từ Checkpoint: {result.get('status')}",
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/fb-crossposter/queue/{item_id}/reset-checkpoint")
+def reset_fb_crossposter_item_checkpoint(item_id: int):
+    """Reset checkpoint state and purge cached files to allow clean re-download and re-render."""
+    try:
+        success = fb_crossposter_service.reset_fb_crossposter_checkpoint(item_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Không tìm thấy video")
+        item = db.get_fb_crossposter_queue_item(item_id)
+        target_page_id = (item and item.get("target_page_id")) or ""
+        return {
+            "success": True,
+            "item": item,
+            "stats": db.get_fb_crossposter_stats(target_page_id),
+            "message": "Đã reset checkpoint và xóa file cache tạm",
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/fb-crossposter/queue/{item_id}/checkpoint")
+def get_fb_crossposter_item_checkpoint(item_id: int):
+    """Get detailed checkpoint phase, cache status, and error screenshot."""
+    item = db.get_fb_crossposter_queue_item(item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Không tìm thấy video")
+    youtube_id = item.get("youtube_id", "")
+    v1 = fb_crossposter_service.TEMP_DOWNLOAD_DIR / f"{youtube_id}_{item_id}.mp4"
+    v2 = fb_crossposter_service.TEMP_DOWNLOAD_DIR / f"{youtube_id}_{item_id}_vertical.mp4"
+    t1 = fb_crossposter_service.TEMP_DOWNLOAD_DIR / f"{youtube_id}_{item_id}.jpg"
+    return {
+        "item_id": item_id,
+        "status": item.get("status"),
+        "checkpoint_phase": item.get("checkpoint_phase"),
+        "checkpoint_screenshot": item.get("checkpoint_screenshot"),
+        "can_resume": bool(item.get("can_resume")),
+        "error_message": item.get("error_message"),
+        "has_cached_media": (v2.is_file() and v2.stat().st_size > 10240) or (v1.is_file() and v1.stat().st_size > 10240),
+        "has_cached_thumb": t1.is_file() and t1.stat().st_size > 512,
+    }
+
+
+@app.post("/api/fb-crossposter/queue/resume-all-paused")
+def resume_all_paused_fb_items(page_id: str = Query(default="")):
+    """Resume all items currently in checkpoint_paused state for a Fanpage."""
+    try:
+        queue_data = db.get_fb_crossposter_queue(target_page_id=page_id, status="checkpoint_paused", page_size=200)
+        items = queue_data.get("items", [])
+        resumed_count = 0
+        errors = []
+        for it in items:
+            try:
+                fb_crossposter_service.resume_fb_crossposter_queue_item(it["id"])
+                resumed_count += 1
+            except Exception as e:
+                errors.append(f"#{it['id']}: {e}")
+        return {
+            "success": True,
+            "resumed_count": resumed_count,
+            "total_paused": len(items),
+            "errors": errors,
+            "stats": db.get_fb_crossposter_stats(page_id),
+            "message": f"Đã tiếp tục xử lý {resumed_count}/{len(items)} video bị tạm dừng",
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/fb-crossposter/screenshot/{filename}")
+def get_fb_crossposter_screenshot(filename: str):
+    """Serve error screenshot image file."""
+    safe_name = Path(filename).name
+    target = Path("data/logs/crossposter") / safe_name
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="Không tìm thấy ảnh chụp màn hình")
+    return FileResponse(str(target), media_type="image/png")
+
+
 @app.post("/api/fb-crossposter/queue/{item_id}/skip")
 def skip_fb_crossposter_item(item_id: int):
     """Mark a queue item as skipped."""

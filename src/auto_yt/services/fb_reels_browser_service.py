@@ -27,8 +27,24 @@ REELS_COMPOSER_URL = "https://business.facebook.com/latest/reels_composer/"
 CALENDAR_URL = "https://business.facebook.com/latest/content_calendar"
 
 
+SCREENSHOTS_DIR = Path("data/logs/crossposter")
+
+
 class FbBrowserAutomationError(RuntimeError):
-    """Raised when an automation action fails on Meta Business Suite."""
+    """Raised when an automation action fails on Meta Business Suite with checkpoint context."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        phase: str = "CP3_CDP_READY",
+        screenshot_path: str = "",
+        can_resume: bool = True,
+    ) -> None:
+        super().__init__(message)
+        self.phase = phase
+        self.screenshot_path = screenshot_path
+        self.can_resume = can_resume
 
 
 def _format_schedule_time(dt_val: datetime.datetime | str | int | None) -> tuple[str, str, str]:
@@ -68,6 +84,7 @@ async def schedule_reel_via_gpm(
     video_path: Path | str,
     caption: str,
     *,
+    item_id: int | None = None,
     thumb_path: Path | str | None = None,
     tags: list[str] | None = None,
     schedule_datetime: datetime.datetime | str | int | None = None,
@@ -97,8 +114,13 @@ async def schedule_reel_via_gpm(
     date_slash, date_iso, time_24h = _format_schedule_time(schedule_datetime)
     full_schedule_label = f"{date_slash} {time_24h}"
 
-    def notify(phase: str, message: str, progress: int | None = None):
-        logger.info("[FB-Playwright %s] %s", clean_profile_id, message)
+    current_checkpoint = "CP3_CDP_READY"
+    page = None
+
+    def notify(phase: str, message: str, progress: int | None = None, screenshot: str = ""):
+        nonlocal current_checkpoint
+        current_checkpoint = phase
+        logger.info("[FB-Playwright %s][%s] %s", clean_profile_id, phase, message)
         if state_callback:
             try:
                 state_callback({
@@ -106,11 +128,28 @@ async def schedule_reel_via_gpm(
                     "message": message,
                     "progress": progress,
                     "profile_id": clean_profile_id,
+                    "item_id": item_id,
+                    "screenshot": screenshot,
                 })
             except Exception:
                 pass
 
-    notify("starting", f"Đang kết nối Profile {clean_profile_id} qua Playwright CDP...", 5)
+    notify("CP3_CDP_READY", f"Đang kết nối Profile {clean_profile_id} qua Playwright CDP...", 5)
+
+    async def _capture_error_screenshot(target_page: Any) -> str:
+        try:
+            if not target_page or target_page.is_closed():
+                return ""
+            SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+            ts = int(datetime.datetime.now().timestamp())
+            prefix = f"checkpoint_item_{item_id}" if item_id else f"checkpoint_profile_{clean_profile_id}"
+            file_name = f"{prefix}_{ts}.png"
+            dest = SCREENSHOTS_DIR / file_name
+            await target_page.screenshot(path=str(dest), full_page=False)
+            return str(dest)
+        except Exception as ss_err:
+            logger.debug("Không thể chụp màn hình lỗi: %s", ss_err)
+            return ""
 
     async with channel_browser_session(clean_profile_id) as (context, _browser, _profile_meta):
         page = await context.new_page()
@@ -119,7 +158,7 @@ async def schedule_reel_via_gpm(
             page.set_default_timeout(25000)
 
             # 1. Navigate to Reels Composer
-            notify("navigating", "Đang mở giao diện Meta Business Suite Reels Composer...", 10)
+            notify("CP4_COMPOSER_READY", "Đang mở giao diện Meta Business Suite Reels Composer...", 10)
             target_composer_url = REELS_COMPOSER_URL
             if target_page_id:
                 target_composer_url = f"{REELS_COMPOSER_URL}?asset_id={target_page_id}"
@@ -135,8 +174,12 @@ async def schedule_reel_via_gpm(
 
             # Check if redirected to login / checkpoint
             if "facebook.com/login" in current_url or "checkpoint" in current_url or "accounts/login" in current_url:
+                ss_file = await _capture_error_screenshot(page)
                 raise FbBrowserAutomationError(
-                    f"Profile GPM {clean_profile_id} chưa đăng nhập Facebook hoặc bị checkpoint. Vui lòng mở profile và đăng nhập trước."
+                    f"Profile {clean_profile_id} chưa đăng nhập Facebook hoặc bị checkpoint an minh. Vui lòng đăng nhập trên trình duyệt rồi bấm Tiếp tục.",
+                    phase="CP4_COMPOSER_READY",
+                    screenshot_path=ss_file,
+                    can_resume=True,
                 )
 
             # If opened in Calendar or Home, click "Tạo bài viết" -> "Tạo thước phim"
@@ -160,7 +203,7 @@ async def schedule_reel_via_gpm(
             await asyncio.sleep(2.5)
 
             # 2. Upload Video
-            notify("uploading_video", f"Đang tải lên file video {v_path.name} ({v_path.stat().st_size // (1024*1024)} MB)...", 20)
+            notify("CP5_ASSET_UPLOADED", f"Đang tải lên file video {v_path.name} ({v_path.stat().st_size // (1024*1024)} MB)...", 20)
             
             # Look for video file input
             file_input = page.locator('input[type="file"][accept*="video"], input[type="file"]').first
@@ -179,7 +222,7 @@ async def schedule_reel_via_gpm(
                 file_chooser = await fc_info.value
                 await file_chooser.set_files(str(v_path))
 
-            notify("processing_upload", "Đang chờ video upload lên Meta Business Suite (100%)...", 35)
+            notify("CP5_ASSET_UPLOADED", "Đang chờ video upload lên Meta Business Suite (100%)...", 35)
 
             # Wait for upload progress to reach 100% or button "Tiếp" enabled
             upload_finished = False
@@ -198,7 +241,7 @@ async def schedule_reel_via_gpm(
                         upload_finished = True
                         break
 
-            notify("entering_content", "Video đã tải lên xong. Đang nhập mô tả, tùy chỉnh FB & IG...", 50)
+            notify("CP6_METADATA_FILLED", "Video đã tải lên xong. Đang nhập mô tả, tùy chỉnh FB & IG...", 50)
 
             # 3. Facebook & Instagram Customization Toggle
             try:
@@ -247,7 +290,7 @@ async def schedule_reel_via_gpm(
 
             # 5. Upload Custom Thumbnail
             if t_path and t_path.is_file():
-                notify("uploading_thumbnail", f"Đang tải lên hình thu nhỏ {t_path.name}...", 60)
+                notify("CP6_METADATA_FILLED", f"Đang tải lên hình thu nhỏ {t_path.name}...", 60)
                 try:
                     # Click tab "Tải hình ảnh lên"
                     upload_img_tab = page.locator(
@@ -280,7 +323,7 @@ async def schedule_reel_via_gpm(
                 tag_list.append(page_name)
 
             if tag_list:
-                notify("adding_tags", f"Đang thêm {len(tag_list)} thẻ từ khóa...", 65)
+                notify("CP6_METADATA_FILLED", f"Đang thêm {len(tag_list)} thẻ từ khóa...", 65)
                 try:
                     tag_input = page.locator(
                         'input[placeholder*="Thêm từ khóa liên quan"], '
@@ -301,21 +344,20 @@ async def schedule_reel_via_gpm(
                     logger.debug("Lỗi khi điền tags: %s", tag_err)
 
             # 7. Move from Step 1 (Tạo) -> Step 2 (Chỉnh sửa)
-            notify("moving_next", "Chuyển sang bước Chỉnh sửa...", 70)
+            notify("CP6_METADATA_FILLED", "Chuyển sang bước Chỉnh sửa...", 70)
             next_btn_1 = page.locator('button:has-text("Tiếp"), div[role="button"]:has-text("Tiếp"), button:has-text("Next")').last
             await next_btn_1.click()
             await asyncio.sleep(2.5)
 
             # 8. Move from Step 2 (Chỉnh sửa) -> Step 3 (Chia sẻ)
-            # Step 2 is skipped as requested
-            notify("moving_next", "Bỏ qua bước Chỉnh sửa, chuyển sang bước Chia sẻ...", 75)
+            notify("CP7_SCHEDULE_SET", "Bỏ qua bước Chỉnh sửa, chuyển sang bước Chia sẻ...", 75)
             next_btn_2 = page.locator('button:has-text("Tiếp"), div[role="button"]:has-text("Tiếp"), button:has-text("Next")').last
             if await next_btn_2.is_visible():
                 await next_btn_2.click()
                 await asyncio.sleep(2.5)
 
             # 9. Step 3 (Chia sẻ): Schedule & Options Configuration
-            notify("configuring_schedule", f"Đang cấu hình lịch đăng ({full_schedule_label}) và các tùy chọn...", 80)
+            notify("CP7_SCHEDULE_SET", f"Đang cấu hình lịch đăng ({full_schedule_label}) và các tùy chọn...", 80)
 
             if publish_now:
                 # Option: Chia sẻ ngay
@@ -445,7 +487,7 @@ async def schedule_reel_via_gpm(
 
             # 13. Final Click: "Lên lịch" / "Chia sẻ"
             action_btn_name = "Chia sẻ" if publish_now else "Lên lịch"
-            notify("submitting", f"Đang bấm nút '{action_btn_name}' hoàn tất...", 90)
+            notify("CP8_SUBMITTED", f"Đang bấm nút '{action_btn_name}' hoàn tất...", 90)
 
             final_btn = page.locator(
                 f'button:has-text("{action_btn_name}"), div[role="button"]:has-text("{action_btn_name}"), '
@@ -464,7 +506,7 @@ async def schedule_reel_via_gpm(
                     'div[aria-label="Đóng"], button[aria-label="Đóng"], button[aria-label="Close"]'
                 ).first
                 if await dismiss_btn.is_visible():
-                    notify("submitting", "Đã đóng thông báo xác nhận của Meta...", 95)
+                    notify("CP8_SUBMITTED", "Đã đóng thông báo xác nhận của Meta...", 95)
                     await dismiss_btn.click()
                     await asyncio.sleep(1.5)
                     break
@@ -472,7 +514,7 @@ async def schedule_reel_via_gpm(
                 if "content_calendar" in page.url or "latest/home" in page.url:
                     break
 
-            notify("completed", f"Thành công! Reels đã được lên lịch lúc {full_schedule_label}.", 100)
+            notify("CP8_SUBMITTED", f"Thành công! Reels đã được lên lịch lúc {full_schedule_label}.", 100)
 
             return {
                 "success": True,
@@ -486,8 +528,17 @@ async def schedule_reel_via_gpm(
 
         except Exception as exc:
             logger.error("Lỗi trong quá trình tự động upload Reels Facebook: %s", exc, exc_info=True)
-            notify("error", f"Lỗi: {exc}", 0)
-            raise FbBrowserAutomationError(f"Thất bại khi thao tác trên Meta Business Suite: {exc}") from exc
+            if isinstance(exc, FbBrowserAutomationError):
+                notify(exc.phase, f"Lỗi: {exc}", 0, screenshot=exc.screenshot_path)
+                raise
+            ss_file = await _capture_error_screenshot(page)
+            notify(current_checkpoint, f"Lỗi: {exc}", 0, screenshot=ss_file)
+            raise FbBrowserAutomationError(
+                f"Thao tác trình duyệt gặp lỗi tại bước {current_checkpoint}: {exc}",
+                phase=current_checkpoint,
+                screenshot_path=ss_file,
+                can_resume=True,
+            ) from exc
         finally:
             try:
                 await page.close()
