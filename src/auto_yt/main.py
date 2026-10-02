@@ -6876,8 +6876,23 @@ def _run_system_job_center_action(
                 "retry": "reserved",
             }.get(action)
             if workflow_status:
+                extra_updates = {}
+                if action in {"resume", "retry"}:
+                    if str(workflow.get("stage") or "") == "needs_review":
+                        extra_updates["stage"] = "preflight"
+                    snap = workflow.get("snapshot") or {}
+                    if isinstance(snap, dict):
+                        b_state = snap.get("browser_upload_state")
+                        if isinstance(b_state, dict):
+                            b_state.pop("remote_identity_unknown", None)
+                            b_state.pop("error", None)
+                            b_state.pop("error_type", None)
+                            if b_state.get("stage") == "needs_review":
+                                b_state["stage"] = "preflight"
+                            snap["browser_upload_state"] = b_state
+                            extra_updates["snapshot_json"] = json.dumps(snap, ensure_ascii=False)
                 db.update_youtube_publish_workflow(
-                    workflow["id"], status=workflow_status, error=""
+                    workflow["id"], status=workflow_status, error="", **extra_updates
                 )
     _sync_legacy_job(updated_job)
     if kick_queues:

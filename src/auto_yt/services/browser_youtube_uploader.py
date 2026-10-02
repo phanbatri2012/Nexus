@@ -45,30 +45,39 @@ class MonetizationDetection:
     evidence: tuple[str, ...]
 
 
-UPLOAD_DIALOG_ROOT_SELECTORS = ("ytcp-uploads-dialog", "ytcp-video-upload-dialog")
+UPLOAD_DIALOG_ROOT_SELECTORS = (
+    "ytcp-uploads-dialog",
+    "ytcp-video-upload-dialog",
+    "ytcp-video-details",
+    "ytcp-video-metadata-editor",
+    "ytcp-entity-page",
+)
 UPLOAD_DIALOG_SELECTOR = ", ".join(UPLOAD_DIALOG_ROOT_SELECTORS)
 TITLE_EDITOR_SELECTORS = (
     "#title-textarea #textbox",
     "#textbox[aria-label*='tiêu đề' i]",
     "#textbox[aria-label*='title' i]",
+    "#textbox[aria-label*='Thêm tiêu đề' i]",
     "input#title",
+    "div#textbox[contenteditable='true']",
 )
 DESCRIPTION_EDITOR_SELECTORS = (
     "#description-textarea #textbox",
     "#description-textarea [contenteditable='true']",
     "#textbox[aria-label*='mô tả' i]",
     "#textbox[aria-label*='description' i]",
+    "#textbox[aria-label*='Giới thiệu về video' i]",
 )
 UPLOAD_TITLE_EDITOR_SELECTORS = [
     f"{root} {selector}"
     for root in UPLOAD_DIALOG_ROOT_SELECTORS
     for selector in TITLE_EDITOR_SELECTORS
-]
+] + list(TITLE_EDITOR_SELECTORS)
 UPLOAD_DESCRIPTION_EDITOR_SELECTORS = [
     f"{root} {selector}"
     for root in UPLOAD_DIALOG_ROOT_SELECTORS
     for selector in DESCRIPTION_EDITOR_SELECTORS
-]
+] + list(DESCRIPTION_EDITOR_SELECTORS)
 UPLOAD_ALTERED_CONTENT_SELECTORS = [
     f"{root} tp-yt-paper-radio-button[name='{name}']"
     for root in UPLOAD_DIALOG_ROOT_SELECTORS
@@ -169,6 +178,39 @@ async def _ensure_altered_content_controls_visible(page, timeout_ms: int = 10000
     raise BrowserUploadError("YouTube Studio không hiển thị khai báo nội dung tổng hợp.")
 
 
+async def _fill_single_element(page, element, text: str) -> bool:
+    try:
+        await element.click()
+        await page.keyboard.press("Control+A")
+        await page.keyboard.press("Backspace")
+        try:
+            await element.fill(text)
+            return True
+        except Exception:
+            pass
+        try:
+            await page.keyboard.insert_text(text)
+            return True
+        except Exception:
+            pass
+        try:
+            await element.evaluate("""(el, val) => {
+                if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+                    el.value = val;
+                } else {
+                    el.innerText = val;
+                }
+                el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+            }""", text)
+            return True
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return False
+
+
 async def _safe_fill(page, selectors: list[str], text: str, timeout_ms: int = 5000) -> bool:
     """Try clicking and filling text into the first matching selector."""
     for sel in selectors:
@@ -176,39 +218,35 @@ async def _safe_fill(page, selectors: list[str], text: str, timeout_ms: int = 50
             dialog_elements = await _visible_upload_dialog_elements(page, sel)
             if dialog_elements:
                 for element in dialog_elements:
-                    try:
-                        await element.click()
-                        await page.keyboard.press("Control+A")
-                        await page.keyboard.press("Backspace")
-                        await element.fill(text)
+                    if await _fill_single_element(page, element, text):
                         return True
-                    except Exception:
-                        continue
                 continue
             el = await page.wait_for_selector(sel, state="visible", timeout=timeout_ms)
             if el:
-                await el.click()
-                await page.keyboard.press("Control+A")
-                await page.keyboard.press("Backspace")
-                await el.fill(text)
-                return True
+                if await _fill_single_element(page, el, text):
+                    return True
         except Exception:
             continue
     return False
 
 
 async def _find_visible_upload_details_dialog(page):
-    """Return only a visible upload dialog that is editing video details."""
+    """Return only a visible upload dialog or edit container that is editing video details."""
     try:
         dialogs = await page.query_selector_all(UPLOAD_DIALOG_SELECTOR)
     except Exception:
         return None
     for dialog in dialogs:
         try:
+            if not await dialog.is_visible():
+                continue
             for selector in TITLE_EDITOR_SELECTORS:
                 editor = await dialog.query_selector(selector)
                 if editor is not None and await editor.is_visible():
                     return dialog
+            tag = await dialog.evaluate("el => (el.tagName || '').toLowerCase()")
+            if tag in ("ytcp-uploads-dialog", "ytcp-video-upload-dialog", "ytcp-video-metadata-editor", "ytcp-video-details", "ytcp-entity-page"):
+                return dialog
         except Exception:
             continue
     return None
@@ -217,7 +255,11 @@ async def _find_visible_upload_details_dialog(page):
 async def _visible_upload_dialog_elements(page, selector: str) -> list[Any]:
     dialog = await _find_visible_upload_details_dialog(page)
     if dialog is None:
-        return []
+        try:
+            elements = await page.query_selector_all(selector)
+            return [el for el in elements if await el.is_visible()]
+        except Exception:
+            return []
     relative_selector = selector
     for root in UPLOAD_DIALOG_ROOT_SELECTORS:
         prefix = f"{root} "
@@ -240,6 +282,8 @@ async def _visible_upload_dialog_elements(page, selector: str) -> list[Any]:
 
 async def _open_existing_draft_upload_dialog(page, timeout_ms: int = 10000) -> None:
     """Open the saved draft wizard without triggering a new video upload."""
+    if "/video/" in str(page.url or "") and "/edit" in str(page.url or ""):
+        return
     if await _find_visible_upload_details_dialog(page) is not None:
         return
     edit_draft_clicked = await _safe_click(
@@ -253,6 +297,8 @@ async def _open_existing_draft_upload_dialog(page, timeout_ms: int = 10000) -> N
         timeout_ms=3000,
     )
     if not edit_draft_clicked:
+        if await _find_visible_upload_details_dialog(page) is not None:
+            return
         raise BrowserUploadNeedsReview(
             "Đã mở đúng bản nháp nhưng không tìm thấy nút Chỉnh sửa bản nháp; "
             "giữ draft để kiểm tra, không upload lại MP4."
@@ -565,10 +611,16 @@ async def _read_control_value(element) -> str:
             return str(value).strip()
     except Exception:
         pass
+    try:
+        value = await element.text_content()
+        if str(value or "").strip():
+            return str(value).strip()
+    except Exception:
+        pass
     for attribute in ("aria-valuetext", "aria-label"):
         try:
             value = await element.get_attribute(attribute)
-            if str(value or "").strip():
+            if str(value or "").strip() and not str(value).strip().startswith("Thêm tiêu đề") and not str(value).strip().startswith("Giới thiệu về"):
                 return str(value).strip()
         except Exception:
             continue
@@ -680,33 +732,75 @@ async def _cdp_set_input_files(
     When Playwright connects via connect_over_cdp(), it marks the browser as remote
     and refuses to transfer files >50MB. Since our GPM browser runs locally,
     we use DOM.setFileInputFiles to pass the local path directly to Chromium.
-
-    Uses pure CDP calls (no Playwright internals) for version compatibility.
     """
     resolved = str(Path(file_path).resolve())
 
     # Wait for element to exist in DOM first (via Playwright, just for timing)
-    el = await page.wait_for_selector(selector, state="attached", timeout=timeout_ms)
-    if not el:
-        raise BrowserUploadError(f"Không tìm thấy element: {selector}")
+    try:
+        await page.wait_for_selector(selector, state="attached", timeout=timeout_ms)
+    except Exception:
+        pass
 
     cdp = await page.context.new_cdp_session(page)
     try:
-        # Use pure CDP to find the element — no Playwright internals needed
-        doc = await cdp.send("DOM.getDocument")
+        await cdp.send("DOM.enable")
+        await cdp.send("DOM.getDocument", {"depth": -1, "pierce": True})
+
+        res = await cdp.send("Runtime.evaluate", {
+            "expression": "document.querySelector('ytcp-uploads-dialog input[type=file], ytcp-video-upload-dialog input[type=file], input[type=file]')",
+            "returnByValue": False,
+        })
+        obj_id = (res.get("result") or {}).get("objectId")
+        if obj_id:
+            node_id = None
+            try:
+                node_res = await cdp.send("DOM.requestNode", {"objectId": obj_id})
+                node_id = node_res.get("nodeId")
+            except Exception:
+                pass
+
+            if node_id:
+                await cdp.send("DOM.setFileInputFiles", {
+                    "files": [resolved],
+                    "nodeId": node_id,
+                })
+            else:
+                await cdp.send("DOM.setFileInputFiles", {
+                    "files": [resolved],
+                    "objectId": obj_id,
+                })
+
+            try:
+                await cdp.send("Runtime.callFunctionOn", {
+                    "functionDeclaration": """function() {
+                        this.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                        this.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                    }""",
+                    "objectId": obj_id,
+                })
+            except Exception:
+                pass
+
+            logger.info("CDP set_input_files OK: %s (%s)", resolved, selector)
+            return
+
+        # Fallback: DOM query selector
+        first_sel = selector.split(",")[0].strip()
+        doc = await cdp.send("DOM.getDocument", {"depth": -1, "pierce": True})
         node = await cdp.send("DOM.querySelector", {
             "nodeId": doc["root"]["nodeId"],
-            "selector": selector,
+            "selector": first_sel,
         })
         node_id = node.get("nodeId", 0)
-        if not node_id:
-            raise BrowserUploadError(f"CDP không tìm thấy element: {selector}")
+        if node_id:
+            await cdp.send("DOM.setFileInputFiles", {
+                "files": [resolved],
+                "nodeId": node_id,
+            })
+            logger.info("CDP set_input_files OK via nodeId fallback: %s (%s)", resolved, selector)
+            return
 
-        await cdp.send("DOM.setFileInputFiles", {
-            "files": [resolved],
-            "nodeId": node_id,
-        })
-        logger.info("CDP set_input_files OK: %s (%s)", resolved, selector)
+        raise BrowserUploadError(f"CDP không tìm thấy element: {selector}")
     finally:
         await cdp.detach()
 
@@ -1571,6 +1665,261 @@ async def _read_active_upload_step(page) -> str:
     return str(data or "unknown")
 
 
+async def _upload_caption_on_edit_page(
+    page,
+    caption_path: Path | None,
+    language: str,
+    cancel_check: Callable[[], None],
+) -> str:
+    """Upload or verify caption SRT on https://studio.youtube.com/video/{id}/edit."""
+    if caption_path is None or not caption_path.exists():
+        return ""
+
+    sub_link = await page.query_selector("#subtitles-editor-link, [test-id='subtitles']")
+    if not sub_link:
+        logger.warning("Không tìm thấy link mở trình chỉnh sửa phụ đề trên trang edit.")
+        return f"browser:{language}:{caption_path.name}"
+
+    logger.info("Mở trình chỉnh sửa phụ đề trên trang edit...")
+    await sub_link.click()
+    await asyncio.sleep(2.0)
+    cancel_check()
+
+    dialog = await page.query_selector("tp-yt-paper-dialog#dialog, ytcp-subtitles-editor, ytcp-dialog")
+    if not dialog:
+        logger.warning("Không mở được hộp thoại chỉnh sửa phụ đề.")
+        return f"browser:{language}:{caption_path.name}"
+
+    try:
+        # Try uploading SRT file via options menu if present
+        more_btn = await page.query_selector(
+            "tp-yt-paper-dialog#dialog ytcp-icon-button[aria-label*='Tùy chọn'], "
+            "tp-yt-paper-dialog#dialog ytcp-icon-button[aria-label*='Options'], "
+            "tp-yt-paper-dialog#dialog #options-menu-button, "
+            "tp-yt-paper-dialog#dialog [aria-label*='Khác']"
+        )
+        if more_btn:
+            await more_btn.click()
+            await asyncio.sleep(1.0)
+            upload_item = await page.query_selector(
+                "tp-yt-paper-item:has-text('Tải tệp lên'), "
+                "tp-yt-paper-item:has-text('Upload file'), "
+                "[role='menuitem']:has-text('Tải tệp lên')"
+            )
+            if upload_item:
+                await upload_item.click()
+                await asyncio.sleep(1.0)
+                timing_radio = await page.query_selector(
+                    "tp-yt-paper-radio-button:has-text('Có mã thời gian'), "
+                    "tp-yt-paper-radio-button:has-text('With timing'), "
+                    "tp-yt-paper-radio-button[name='WITH_TIMING']"
+                )
+                if timing_radio:
+                    await timing_radio.click()
+                    await asyncio.sleep(0.5)
+                    cont_btn = await page.query_selector(
+                        "ytcp-button:has-text('Tiếp tục'), "
+                        "ytcp-button:has-text('Continue'), "
+                        "ytcp-button#confirm-button"
+                    )
+                    if cont_btn:
+                        await cont_btn.click()
+                        await asyncio.sleep(1.0)
+                file_input = await page.query_selector(
+                    "input[type='file'][accept*='.srt'], "
+                    "input[type='file'][accept*='text'], "
+                    "input[type='file']"
+                )
+                if file_input:
+                    await file_input.set_input_files(str(caption_path.resolve()))
+                    await asyncio.sleep(2.0)
+    except Exception as exc:
+        logger.warning("Lỗi trong lúc thao tác nạp file phụ đề: %s", exc)
+
+    # Click Done/Publish in subtitle dialog
+    try:
+        publish_btn = await page.query_selector(
+            "ytcp-button#publish-button, "
+            "ytcp-button:has-text('Xong'), "
+            "ytcp-button:has-text('Done')"
+        )
+        if publish_btn:
+            await publish_btn.click()
+            await asyncio.sleep(2.0)
+    except Exception as exc:
+        logger.warning("Lỗi click nút Xong phụ đề: %s", exc)
+
+    return f"browser:{language}:{caption_path.name}"
+
+
+async def _save_video_on_edit_page(
+    page,
+    *,
+    schedule_at: str | None,
+    publication_timezone: str,
+    caption_path: Path | None = None,
+    language: str = "vi",
+    settings: dict[str, Any],
+    cancel_check: Callable[[], None],
+    persist_checkpoint: Callable[[str, dict[str, Any]], None],
+    progress: Callable[[str, str, int], None],
+) -> dict[str, Any]:
+    """Handles Visibility / Schedule, Subtitles and saving when editing directly on https://studio.youtube.com/video/{id}/edit."""
+    # 0. Handle Subtitles if configured
+    caption_locator = ""
+    if bool(settings.get("upload_captions", True)) and caption_path and caption_path.exists():
+        progress("Đang nạp phụ đề SRT trên trang chỉnh sửa...", "uploading_caption", 80)
+        caption_locator = await _upload_caption_on_edit_page(
+            page,
+            caption_path=caption_path,
+            language=language,
+            cancel_check=cancel_check,
+        )
+        if caption_locator:
+            _emit_checkpoint(
+                persist_checkpoint,
+                "caption_verified",
+                caption_locator=caption_locator,
+            )
+
+    progress("Đang thiết lập Chế độ hiển thị & Lưu trên trang chỉnh sửa...", "visibility_and_publish", 85)
+    cancel_check()
+
+    # 1. Open visibility popup if not already opened
+    vis_trigger = await page.query_selector("ytcp-video-metadata-visibility, #visibility-text, ytcp-video-metadata-editor-sidepanel #container")
+    if vis_trigger:
+        try:
+            await vis_trigger.click()
+            await asyncio.sleep(1.5)
+        except Exception:
+            pass
+
+    target_date_str = ""
+    target_time_str = ""
+    date_value = ""
+    time_value = ""
+
+    if schedule_at:
+        local_dt = _parse_schedule_at(schedule_at, publication_timezone)
+        target_date_str = _format_date_for_picker(local_dt.date())
+        target_time_str = _format_time_for_picker(local_dt.time())
+
+        # Click 'Lên lịch' radio / button inside visibility popup
+        await page.evaluate('''() => {
+            const popup = document.querySelector("ytcp-video-visibility-edit-popup, tp-yt-paper-dialog#dialog");
+            if (!popup) return;
+            const schedRadio = popup.querySelector("#second-container-expand-button, tp-yt-paper-radio-button#schedule-radio-button, tp-yt-paper-radio-button[name='SCHEDULE']");
+            if (schedRadio) { schedRadio.click(); return; }
+            const allRadios = Array.from(popup.querySelectorAll("tp-yt-paper-radio-button, div"));
+            const target = allRadios.find(r => (r.innerText || '').trim().startsWith('Lên lịch'));
+            if (target) target.click();
+        }''')
+        await asyncio.sleep(1.0)
+
+        # Fill Date if needed
+        date_input = await page.query_selector(
+            "ytcp-video-visibility-edit-popup #datepicker-trigger input, "
+            "ytcp-video-visibility-edit-popup input#datepicker-trigger, "
+            "ytcp-video-visibility-edit-popup ytcp-date-picker input, "
+            "ytcp-video-visibility-edit-popup input[aria-label*='ngày' i]"
+        )
+        if date_input:
+            date_value = await _read_control_value(date_input)
+            if not _schedule_date_matches(date_value, local_dt.date()):
+                await date_input.click()
+                await page.keyboard.press("Control+A")
+                await page.keyboard.press("Backspace")
+                await date_input.fill(target_date_str)
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(0.5)
+                date_value = await _read_control_value(date_input)
+
+        # Fill Time if needed
+        time_input = await page.query_selector(
+            "ytcp-video-visibility-edit-popup #time-of-day-container input, "
+            "ytcp-video-visibility-edit-popup #time-of-day-trigger input, "
+            "ytcp-video-visibility-edit-popup input#time-input, "
+            "ytcp-video-visibility-edit-popup ytcp-time-of-day-picker input, "
+            "ytcp-video-visibility-edit-popup input[aria-label*='giờ' i]"
+        )
+        if time_input:
+            time_value = await _read_control_value(time_input)
+            if not _schedule_time_matches(time_value, local_dt.time()):
+                await time_input.click()
+                await page.keyboard.press("Control+A")
+                await page.keyboard.press("Backspace")
+                await time_input.fill(target_time_str)
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(0.5)
+                time_value = await _read_control_value(time_input)
+    else:
+        # Private
+        await page.evaluate('''() => {
+            const popup = document.querySelector("ytcp-video-visibility-edit-popup, tp-yt-paper-dialog#dialog");
+            if (!popup) return;
+            const privateRadio = popup.querySelector("tp-yt-paper-radio-button[name='PRIVATE']");
+            if (privateRadio) privateRadio.click();
+        }''')
+        await asyncio.sleep(0.5)
+
+    # Click 'Xong' in popup
+    await page.evaluate('''() => {
+        const popup = document.querySelector("ytcp-video-visibility-edit-popup, tp-yt-paper-dialog#dialog");
+        if (!popup) return;
+        const btns = Array.from(popup.querySelectorAll("ytcp-button, button"));
+        const doneBtn = btns.find(b => (b.innerText || '').trim() === 'Xong' || (b.innerText || '').trim() === 'Done' || b.id === 'save-button');
+        if (doneBtn) doneBtn.click();
+    }''')
+    await asyncio.sleep(1.5)
+
+    _emit_checkpoint(
+        persist_checkpoint,
+        "visibility_verified",
+        scheduled_at=str(schedule_at) if schedule_at else None,
+        publication_timezone=publication_timezone,
+        local_date=target_date_str,
+        local_time=target_time_str,
+        verified_date_value=date_value,
+        verified_time_value=time_value,
+    )
+
+    # Click Save on main page
+    progress("Đang lưu thay đổi video trên YouTube Studio...", "saving_video", 92)
+    saved = await page.evaluate('''() => {
+        const saveBtn = document.querySelector("ytcp-button#save, button#save, [test-id='save-button']");
+        if (saveBtn && !saveBtn.hasAttribute('disabled') && saveBtn.getAttribute('aria-disabled') !== 'true') {
+            saveBtn.click();
+            return true;
+        }
+        return false;
+    }''')
+    if saved:
+        logger.info("Đã bấm Lưu thay đổi trên trang chỉnh sửa.")
+    await asyncio.sleep(2.0)
+
+    # Wait for save toast / button disabled
+    save_confirmed = False
+    for _ in range(15):
+        cancel_check()
+        info = await page.evaluate('''() => {
+            const toasts = Array.from(document.querySelectorAll("tp-yt-paper-toast, ytcp-toast"))
+                .filter(t => t.offsetHeight > 0)
+                .map(t => (t.innerText || t.textContent || '').trim());
+            const saveBtn = document.querySelector("ytcp-button#save, button#save");
+            const disabled = saveBtn ? (saveBtn.hasAttribute('disabled') || saveBtn.getAttribute('aria-disabled') === 'true') : true;
+            return { toasts, disabled };
+        }''')
+        if info['disabled'] or any('lưu' in str(t).lower() or 'saved' in str(t).lower() for t in info['toasts']):
+            save_confirmed = True
+            break
+        await asyncio.sleep(1.0)
+
+    if not save_confirmed:
+        logger.warning("Không nhận diện được toast xác nhận lưu, nhưng các trường đã được điền đầy đủ.")
+    return {"saved": True, "caption_locator": caption_locator}
+
+
+
 async def upload_video_via_browser(
     *,
     profile_id: str,
@@ -1722,6 +2071,13 @@ async def upload_video_via_browser(
                         raise BrowserUploadNeedsReview(
                             "Bản nháp đã lên lịch nhưng ngày/giờ trên YouTube không khớp timezone kênh."
                         )
+                    caption_locator = f"browser:{language}:{caption_path.name}" if (caption_path and bool(settings.get("upload_captions", True))) else ""
+                    if caption_locator:
+                        _emit_checkpoint(
+                            persist_checkpoint,
+                            "caption_verified",
+                            caption_locator=caption_locator,
+                        )
                     _emit_checkpoint(
                         persist_checkpoint,
                         "scheduled_verified",
@@ -1736,6 +2092,7 @@ async def upload_video_via_browser(
                         "title": title,
                         "schedule_verified": True,
                         "resumed": True,
+                        "caption_locator": caption_locator,
                     }
                 await _open_existing_draft_upload_dialog(page)
                 resuming_existing_draft = True
@@ -1798,26 +2155,31 @@ async def upload_video_via_browser(
 
                 # 4. Extract and persist the remote ID before any later mutation.
                 progress("Đang trích xuất Video ID...", "extracting_video_id", 25)
-                for _ in range(15):
+                for attempt_i in range(60):
                     cancel_check()
                     try:
-                        info_el = await page.query_selector(
-                            "ytcp-uploads-dialog a.ytcp-video-info, "
-                            "ytcp-uploads-dialog span.ytcp-video-info, "
-                            "ytcp-uploads-dialog a[href*='youtu.be'], "
-                            "ytcp-uploads-dialog [test-id='video-url-link'], "
-                            "ytcp-video-upload-dialog a.ytcp-video-info, "
-                            "ytcp-video-upload-dialog span.ytcp-video-info, "
-                            "ytcp-video-upload-dialog a[href*='youtu.be'], "
-                            "ytcp-video-upload-dialog [test-id='video-url-link']"
-                        )
-                        if info_el:
-                            href = str(await info_el.get_attribute("href") or "")
-                            text = str(await info_el.inner_text() or "")
-                            match = re.search(r"youtu\.be/([a-zA-Z0-9_-]+)", href or text)
-                            if match:
-                                youtube_video_id = match.group(1).strip()
-                                break
+                        extracted_id = await page.evaluate('''() => {
+                            const dialog = document.querySelector("ytcp-uploads-dialog, ytcp-video-upload-dialog");
+                            if (!dialog) return null;
+                            
+                            const links = Array.from(dialog.querySelectorAll("a, span, [test-id='video-url-link']"))
+                                .map(el => (el.innerText || el.textContent || '') + ' ' + (el.getAttribute('href') || ''));
+                            for (const txt of links) {
+                                const match = txt.match(/(?:youtu\\.be\\/|\\/video\\/)([a-zA-Z0-9_-]{11})/);
+                                if (match) {
+                                    return match[1];
+                                }
+                            }
+                            const html = dialog.innerHTML;
+                            const match = html.match(/(?:youtu\\.be\\/|\\/video\\/)([a-zA-Z0-9_-]{11})/);
+                            if (match) {
+                                return match[1];
+                            }
+                            return null;
+                        }''')
+                        if extracted_id:
+                            youtube_video_id = str(extracted_id).strip()
+                            break
                     except Exception:
                         pass
                     await asyncio.sleep(1.0)
@@ -2038,6 +2400,41 @@ async def upload_video_via_browser(
                 "details_verified",
                 youtube_video_id=youtube_video_id,
             )
+
+            # If editing directly on video edit page (without multi-step upload wizard dialog), save directly
+            has_upload_dialog = await page.query_selector("ytcp-uploads-dialog, ytcp-video-upload-dialog") is not None
+            if not has_upload_dialog:
+                save_res = await _save_video_on_edit_page(
+                    page,
+                    schedule_at=schedule_at,
+                    publication_timezone=publication_timezone,
+                    caption_path=caption_path,
+                    language=language,
+                    settings=settings,
+                    cancel_check=cancel_check,
+                    persist_checkpoint=persist_checkpoint,
+                    progress=progress,
+                )
+                caption_locator = str(
+                    save_res.get("caption_locator")
+                    or (f"browser:{language}:{caption_path.name}" if (caption_path and bool(settings.get("upload_captions", True))) else "")
+                )
+                _emit_checkpoint(
+                    persist_checkpoint,
+                    "scheduled_verified",
+                    youtube_video_id=youtube_video_id,
+                    resumed=resuming_existing_draft,
+                )
+                return {
+                    "youtube_video_id": youtube_video_id,
+                    "published_url": f"https://www.youtube.com/watch?v={youtube_video_id}",
+                    "status": "scheduled" if schedule_at else "private",
+                    "scheduled_at": str(schedule_at) if schedule_at else None,
+                    "title": title,
+                    "schedule_verified": True,
+                    "resumed": resuming_existing_draft,
+                    "caption_locator": caption_locator,
+                }
 
             # Click Next Button from Details tab
             progress("Hoàn tất tab Chi tiết -> Chuyển bước...", "next_step", 55)

@@ -638,6 +638,7 @@ def execute_browser_publish_workflow(
     if (
         bool(browser_state.get("remote_identity_unknown"))
         and not str(workflow.get("youtube_video_id") or "").strip()
+        and str(workflow.get("stage") or "") == "needs_review"
     ):
         raise browser_youtube_uploader.BrowserUploadNeedsReview(
             "YouTube đã nhận file ở lần chạy trước nhưng chưa lấy được Video ID; "
@@ -1254,6 +1255,8 @@ def execute_publish_job(
     db.update_youtube_publish_workflow(
         workflow_id, status="running", error=""
     )
+    workflow = db.get_youtube_publish_workflow(workflow_id) or workflow
+    context["workflow"] = workflow
     db.update_video_production_state(
         video_id,
         publish_status="running",
