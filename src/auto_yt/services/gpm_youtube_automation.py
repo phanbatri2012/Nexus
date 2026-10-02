@@ -18,6 +18,7 @@ from auto_yt.services.gpm_service import (
     gpm_browser_session,
     open_tab_in_running_gpm_process,
     start_gpm_profile,
+    wait_for_cdp_readiness,
 )
 
 logger = logging.getLogger(__name__)
@@ -271,70 +272,85 @@ async def open_url_in_gpm_profile(
             except ValueError:
                 pass
 
-    # 2. Try HTTP DevTools /json/new first if remote_port exists
-    if remote_port:
+    # 2. Try HTTP DevTools /json/new first if remote_port or ws_url exists
+    if remote_port or ws_url:
         try:
-            encoded_url = urllib.parse.quote(target_url, safe="")
-            new_tab_url = f"http://127.0.0.1:{remote_port}/json/new?{encoded_url}"
-            req = urllib.request.Request(new_tab_url, method="PUT")
-            try:
-                with urllib.request.urlopen(req, timeout=5.0) as resp:
-                    tab_data = json.loads(resp.read().decode("utf-8"))
-                    tab_id = tab_data.get("id")
-                    if tab_id:
-                        activate_url = f"http://127.0.0.1:{remote_port}/json/activate/{tab_id}"
-                        with urllib.request.urlopen(activate_url, timeout=5.0) as act_resp:
-                            pass
-                    return {
-                        "success": True,
-                        "profile_id": clean_id,
-                        "url": target_url,
-                        "message": f"Đã mở URL trong GPM Profile {clean_id}",
-                    }
-            except Exception:
-                get_req = urllib.request.Request(new_tab_url, method="GET")
-                with urllib.request.urlopen(get_req, timeout=5.0) as resp:
-                    tab_data = json.loads(resp.read().decode("utf-8"))
-                    tab_id = tab_data.get("id")
-                    if tab_id:
-                        activate_url = f"http://127.0.0.1:{remote_port}/json/activate/{tab_id}"
-                        with urllib.request.urlopen(activate_url, timeout=5.0) as act_resp:
-                            pass
-                    return {
-                        "success": True,
-                        "profile_id": clean_id,
-                        "url": target_url,
-                        "message": f"Đã mở URL trong GPM Profile {clean_id}",
-                    }
-        except Exception as http_exc:
-            logger.debug("Không thể mở qua HTTP /json/new: %s. Chuyển sang Playwright CDP...", http_exc)
+            endpoint_url = await wait_for_cdp_readiness(
+                port=remote_port,
+                ws_url=ws_url,
+                max_wait_seconds=10.0,
+                poll_interval=0.5,
+            )
+            # If resolved port is available, try /json/new
+            port_to_use = remote_port
+            if not port_to_use and "127.0.0.1:" in endpoint_url:
+                m = re.search(r":(\d+)", endpoint_url)
+                if m:
+                    port_to_use = int(m.group(1))
 
-    # 3. Fallback to Playwright CDP
-    if ws_url or remote_port:
-        from playwright.async_api import async_playwright
-        endpoint_url = ws_url if ws_url else f"http://127.0.0.1:{remote_port}"
-        playwright_cm = async_playwright()
-        playwright = await playwright_cm.start()
-        try:
-            browser = await playwright.chromium.connect_over_cdp(endpoint_url)
-            contexts = browser.contexts
-            context = contexts[0] if contexts else await browser.new_context()
-            page = await context.new_page()
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=int(timeout_seconds * 1000))
-            await page.bring_to_front()
-            return {
-                "success": True,
-                "profile_id": clean_id,
-                "url": target_url,
-                "message": f"Đã mở URL trong GPM Profile {clean_id}",
-            }
-        except Exception as exc:
-            logger.warning("CDP mở tab thất bại: %s. Chuyển sang IPC...", exc)
-        finally:
+            if port_to_use:
+                try:
+                    encoded_url = urllib.parse.quote(target_url, safe="")
+                    new_tab_url = f"http://127.0.0.1:{port_to_use}/json/new?{encoded_url}"
+                    req = urllib.request.Request(new_tab_url, method="PUT")
+                    try:
+                        with urllib.request.urlopen(req, timeout=5.0) as resp:
+                            tab_data = json.loads(resp.read().decode("utf-8"))
+                            tab_id = tab_data.get("id")
+                            if tab_id:
+                                activate_url = f"http://127.0.0.1:{port_to_use}/json/activate/{tab_id}"
+                                with urllib.request.urlopen(activate_url, timeout=5.0) as act_resp:
+                                    pass
+                            return {
+                                "success": True,
+                                "profile_id": clean_id,
+                                "url": target_url,
+                                "message": f"Đã mở URL trong GPM Profile {clean_id}",
+                            }
+                    except Exception:
+                        get_req = urllib.request.Request(new_tab_url, method="GET")
+                        with urllib.request.urlopen(get_req, timeout=5.0) as resp:
+                            tab_data = json.loads(resp.read().decode("utf-8"))
+                            tab_id = tab_data.get("id")
+                            if tab_id:
+                                activate_url = f"http://127.0.0.1:{port_to_use}/json/activate/{tab_id}"
+                                with urllib.request.urlopen(activate_url, timeout=5.0) as act_resp:
+                                    pass
+                            return {
+                                "success": True,
+                                "profile_id": clean_id,
+                                "url": target_url,
+                                "message": f"Đã mở URL trong GPM Profile {clean_id}",
+                            }
+                except Exception as http_exc:
+                    logger.debug("Không thể mở qua HTTP /json/new: %s. Chuyển sang Playwright CDP...", http_exc)
+
+            # Fallback to Playwright CDP with endpoint_url
+            from playwright.async_api import async_playwright
+            playwright_cm = async_playwright()
+            playwright = await playwright_cm.start()
             try:
-                await playwright.stop()
-            except Exception:
-                pass
+                browser = await playwright.chromium.connect_over_cdp(endpoint_url, timeout=10000)
+                contexts = browser.contexts
+                context = contexts[0] if contexts else await browser.new_context()
+                page = await context.new_page()
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=int(timeout_seconds * 1000))
+                await page.bring_to_front()
+                return {
+                    "success": True,
+                    "profile_id": clean_id,
+                    "url": target_url,
+                    "message": f"Đã mở URL trong GPM Profile {clean_id}",
+                }
+            except Exception as exc:
+                logger.warning("CDP mở tab thất bại: %s. Chuyển sang IPC...", exc)
+            finally:
+                try:
+                    await playwright.stop()
+                except Exception:
+                    pass
+        except Exception as probe_exc:
+            logger.debug("CDP readiness probe thất bại: %s. Chuyển sang IPC...", probe_exc)
 
     # 4. Fallback to opening tab via running process IPC
     return await asyncio.to_thread(open_tab_in_running_gpm_process, clean_id, target_url)

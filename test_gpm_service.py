@@ -291,6 +291,7 @@ def test_open_url_preserves_query_parameters_in_cdp_json_new():
     class DummyResponse:
         def __init__(self, data):
             self.data = data
+            self.status = 200
         def read(self):
             return self.data
         def __enter__(self):
@@ -301,6 +302,8 @@ def test_open_url_preserves_query_parameters_in_cdp_json_new():
     def dummy_urlopen(req, timeout=5.0):
         url = req.full_url if hasattr(req, "full_url") else str(req)
         recorded_urls.append(url)
+        if "/json/version" in url:
+            return DummyResponse(json.dumps({"webSocketDebuggerUrl": "ws://127.0.0.1:19999/devtools/browser/tab-123"}).encode("utf-8"))
         if "/json/new" in url:
             return DummyResponse(json.dumps({"id": "tab-123"}).encode("utf-8"))
         return DummyResponse(b"")
@@ -332,6 +335,7 @@ def test_open_tab_in_running_gpm_process_preserves_query_parameters():
     class DummyResponse:
         def __init__(self, data):
             self.data = data
+            self.status = 200
         def read(self):
             return self.data
         def __enter__(self):
@@ -342,6 +346,8 @@ def test_open_tab_in_running_gpm_process_preserves_query_parameters():
     def dummy_urlopen(req, timeout=3.0):
         url = req.full_url if hasattr(req, "full_url") else str(req)
         recorded_urls.append(url)
+        if "/json/version" in url:
+            return DummyResponse(json.dumps({"webSocketDebuggerUrl": "ws://127.0.0.1:18888/devtools/browser/tab-456"}).encode("utf-8"))
         if "/json/new" in url:
             return DummyResponse(json.dumps({"id": "tab-456"}).encode("utf-8"))
         return DummyResponse(b"")
@@ -467,6 +473,7 @@ def test_gpm_session_reuses_running_profile_without_duplicate_window():
 
     with patch("auto_yt.services.gpm_service.find_running_gpm_profile_coordinates", return_value=mock_running_coords), \
          patch("auto_yt.services.gpm_service._request_gpm_api", side_effect=fake_request_api), \
+         patch("auto_yt.services.gpm_service.wait_for_cdp_readiness", AsyncMock(return_value="ws://127.0.0.1:19998/devtools/browser/xyz")), \
          patch("playwright.async_api.async_playwright") as mock_pw_factory:
 
         mock_pw_cm = MagicMock()
@@ -515,6 +522,7 @@ def test_gpm_session_stops_profile_when_started_by_session():
 
     with patch("auto_yt.services.gpm_service.find_running_gpm_profile_coordinates", return_value=None), \
          patch("auto_yt.services.gpm_service._request_gpm_api", side_effect=fake_request_api), \
+         patch("auto_yt.services.gpm_service.wait_for_cdp_readiness", AsyncMock(return_value="ws://127.0.0.1:19997/devtools/browser/abc")), \
          patch("playwright.async_api.async_playwright") as mock_pw_factory:
 
         mock_pw_cm = MagicMock()
@@ -535,6 +543,23 @@ def test_gpm_session_stops_profile_when_started_by_session():
     print("✓ test_gpm_session_stops_profile_when_started_by_session passed")
 
 
+def test_wait_for_cdp_readiness():
+    """Verify that wait_for_cdp_readiness polls /json/version and returns wsUrl successfully."""
+    mock_version = {
+        "Browser": "Chrome/124.0.6367.29",
+        "webSocketDebuggerUrl": "ws://127.0.0.1:60587/devtools/browser/test-uuid"
+    }
+    with patch("auto_yt.services.gpm_service.get_cdp_version_info", return_value=mock_version):
+        res = asyncio.run(gpm_service.wait_for_cdp_readiness(port=60587, max_wait_seconds=2.0))
+        assert res == "ws://127.0.0.1:60587/devtools/browser/test-uuid"
+
+    # Test fallback to ws_url
+    with patch("auto_yt.services.gpm_service.get_cdp_version_info", return_value=None):
+        res = asyncio.run(gpm_service.wait_for_cdp_readiness(ws_url="ws://127.0.0.1:55555/devtools/browser/direct", max_wait_seconds=0.1))
+        assert res == "ws://127.0.0.1:55555/devtools/browser/direct"
+    print("✓ test_wait_for_cdp_readiness passed")
+
+
 if __name__ == "__main__":
     test_gpm_config_load_and_save()
     test_gpm_check_connection_online()
@@ -549,4 +574,5 @@ if __name__ == "__main__":
     test_post_comment_reply_via_gpm_with_auto_heart()
     test_gpm_session_reuses_running_profile_without_duplicate_window()
     test_gpm_session_stops_profile_when_started_by_session()
+    test_wait_for_cdp_readiness()
     print("\n🎉 ALL GPM TESTS PASSED SUCCESSFULLY!")

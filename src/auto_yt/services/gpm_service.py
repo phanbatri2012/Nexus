@@ -37,15 +37,77 @@ def _get_profile_async_lock(profile_id: str) -> asyncio.Lock:
         return _profile_async_locks[profile_id]
 
 
+def get_cdp_version_info(port: int | None, timeout: float = 1.5) -> dict[str, Any] | None:
+    """Query Chromium /json/version endpoint and return JSON dictionary if responsive."""
+    if not port or port <= 0:
+        return None
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=timeout) as vresp:
+            if vresp.status == 200:
+                raw = vresp.read().decode("utf-8", errors="replace")
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    return parsed
+    except Exception:
+        pass
+    return None
+
+
 def is_cdp_port_live(port: int | None) -> bool:
     """Check if the given Chromium remote debugging port is active and responding."""
-    if not port or port <= 0:
-        return False
-    try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1.5) as vresp:
-            return vresp.status == 200
-    except Exception:
-        return False
+    return get_cdp_version_info(port) is not None
+
+
+async def wait_for_cdp_readiness(
+    port: int | None = None,
+    ws_url: str = "",
+    *,
+    max_wait_seconds: float = 25.0,
+    poll_interval: float = 0.5,
+) -> str:
+    """Poll Chromium CDP endpoint until socket binds and responds, returning valid WebSocket or HTTP URL.
+
+    Prevents WSAECONNREFUSED / ECONNREFUSED race conditions during asynchronous browser spawn.
+    """
+    clean_ws = str(ws_url or "").strip()
+    target_port = port
+    if not target_port and clean_ws:
+        port_match = re.search(r":(\d+)", clean_ws)
+        if port_match:
+            try:
+                target_port = int(port_match.group(1))
+            except ValueError:
+                pass
+
+    start_time = time.monotonic()
+    while (time.monotonic() - start_time) < max_wait_seconds:
+        if target_port and target_port > 0:
+            version_data = await asyncio.to_thread(get_cdp_version_info, target_port, 1.5)
+            if version_data:
+                resolved_ws = str(version_data.get("webSocketDebuggerUrl") or "").strip()
+                if resolved_ws:
+                    return resolved_ws
+                return f"http://127.0.0.1:{target_port}"
+        elif clean_ws:
+            return clean_ws
+        await asyncio.sleep(poll_interval)
+
+    # Final attempt
+    if target_port and target_port > 0:
+        version_data = await asyncio.to_thread(get_cdp_version_info, target_port, 1.5)
+        if version_data:
+            resolved_ws = str(version_data.get("webSocketDebuggerUrl") or "").strip()
+            if resolved_ws:
+                return resolved_ws
+            return f"http://127.0.0.1:{target_port}"
+
+    if clean_ws:
+        return clean_ws
+
+    raise GpmConnectionError(
+        f"Cổng kết nối CDP ({target_port or 'N/A'}) không phản hồi sau {max_wait_seconds:.1f}s. "
+        "Trình duyệt GPM có thể chưa khởi động xong hoặc bị đóng bất ngờ."
+    )
 
 DEFAULT_GPM_API_URL = "http://127.0.0.1:19995"
 GPM_CONFIG_PATH = DATA_DIR / "gpm_config.json"
@@ -800,8 +862,21 @@ async def gpm_browser_session(
 
         ws_url = str(launch_info.get("websocket_debugging_url") or "").strip()
         remote_port = launch_info.get("remote_debugging_port")
-        if not remote_port and not ws_url:
-            logger.warning("CDP coordinates không có cho Profile GPM %s, đang thử force_restart...", clean_id)
+
+        endpoint_url = ""
+        try:
+            endpoint_url = await wait_for_cdp_readiness(
+                port=remote_port,
+                ws_url=ws_url,
+                max_wait_seconds=20.0,
+                poll_interval=0.5,
+            )
+        except Exception as probe_err:
+            logger.warning(
+                "Readiness probe cho Profile GPM %s gặp lỗi (%s). Tiến hành Force Restart...",
+                clean_id,
+                probe_err,
+            )
             launch_info = await asyncio.to_thread(
                 start_gpm_profile,
                 clean_id,
@@ -813,19 +888,41 @@ async def gpm_browser_session(
             was_already_running = False
             ws_url = str(launch_info.get("websocket_debugging_url") or "").strip()
             remote_port = launch_info.get("remote_debugging_port")
-
-        if not remote_port and not ws_url:
-            raise GpmProfileLaunchError(
-                f"Không tìm thấy cổng kết nối CDP cho Profile GPM '{clean_id}'. "
-                "Hãy đảm bảo Profile đã được bật hoặc khởi chạy qua hệ thống."
+            endpoint_url = await wait_for_cdp_readiness(
+                port=remote_port,
+                ws_url=ws_url,
+                max_wait_seconds=25.0,
+                poll_interval=0.5,
             )
-        endpoint_url = ws_url if ws_url else f"http://127.0.0.1:{remote_port}"
+
+        if not endpoint_url:
+            raise GpmProfileLaunchError(
+                f"Không thể kết nối cổng CDP cho Profile GPM '{clean_id}'. "
+                "Hãy đảm bảo Profile đã được bật và cấu hình mạng/proxy hoạt động bình thường."
+            )
 
         playwright_cm = async_playwright()
         playwright = await playwright_cm.start()
         browser = None
         try:
-            browser = await playwright.chromium.connect_over_cdp(endpoint_url, timeout=10000)
+            last_conn_err = None
+            for attempt in range(1, 4):
+                try:
+                    browser = await playwright.chromium.connect_over_cdp(endpoint_url, timeout=15000)
+                    break
+                except Exception as conn_exc:
+                    last_conn_err = conn_exc
+                    if attempt < 3:
+                        logger.warning(
+                            "Kết nối CDP lần %d tới Profile %s gặp lỗi (%s), đợi 1.0s thử lại...",
+                            attempt,
+                            clean_id,
+                            conn_exc,
+                        )
+                        await asyncio.sleep(1.0)
+                    else:
+                        raise last_conn_err
+
             contexts = browser.contexts
             if contexts:
                 context = contexts[0]
