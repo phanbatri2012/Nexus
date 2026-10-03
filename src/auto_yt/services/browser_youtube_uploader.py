@@ -638,8 +638,11 @@ async def _wait_for_file_upload_complete(
             for k in [
                 "đã hoàn tất quá trình tải lên",
                 "upload complete",
+                "đã tải lên 100%",
+                "100% uploaded",
                 "quá trình xử lý sắp bắt đầu",
                 "processing will begin shortly",
+                "quá trình kiểm tra sắp bắt đầu",
                 "đang xử lý",
                 "processing",
                 "đã xử lý xong",
@@ -647,6 +650,9 @@ async def _wait_for_file_upload_complete(
                 "checks complete",
                 "không tìm thấy vấn đề",
                 "no issues found",
+                "đã lưu dưới dạng bản nháp",
+                "saved as draft",
+                "bản nháp đã được lưu",
             ]
         )
         if is_done or last_pct >= 100:
@@ -737,9 +743,17 @@ def _schedule_timestamp_matches(page_markup: str, expected: dt.datetime) -> bool
 
 
 async def _set_datepicker_value(page, target_date: dt.date) -> tuple[bool, str]:
-    """Robust datepicker setter for YouTube Studio Upload Wizard and Edit Page."""
-    target_date_str = _format_date_for_picker(target_date)
+    """Robust datepicker setter for YouTube Studio Upload Wizard and Edit Page.
+    Handles same-month, future-month calendar navigation and multiple locale date formats."""
     target_day = target_date.day
+    candidate_date_strings = [
+        f"{target_date.day} thg {target_date.month}, {target_date.year}",
+        f"{target_date.day:02d}/{target_date.month:02d}/{target_date.year}",
+        f"{target_date.day}/{target_date.month}/{target_date.year}",
+        target_date.strftime("%b %d, %Y"),
+        target_date.strftime("%d %b %Y"),
+        f"{target_date.month:02d}/{target_date.day:02d}/{target_date.year}",
+    ]
 
     dp_trigger = await page.query_selector(
         "ytcp-datetime-picker #datepicker-trigger, #datepicker-trigger, "
@@ -759,8 +773,36 @@ async def _set_datepicker_value(page, target_date: dt.date) -> tuple[bool, str]:
         except Exception:
             pass
 
-    # 1. Click matching day in calendar via DOM evaluate
+    # 1. Check if calendar is open and navigate months if needed
     try:
+        month_matched = await page.evaluate("""(targetYear, targetMonth) => {
+            const header = document.querySelector('ytcp-date-picker #month-label, .month-label, .calendar-header, ytcp-calendar-header');
+            if (!header) return true;
+            const text = (header.innerText || header.textContent || '').toLowerCase();
+            return text.includes(String(targetYear)) && (text.includes(String(targetMonth)) || text.includes('thg ' + targetMonth));
+        }""", target_date.year, target_date.month)
+
+        if not month_matched:
+            for _ in range(12):
+                next_btn = await page.query_selector(
+                    "ytcp-date-picker #next-month, #next-month, "
+                    "ytcp-icon-button#next-month-button, button[aria-label*='tiếp theo' i], button[aria-label*='Next' i]"
+                )
+                if next_btn and await next_btn.is_visible():
+                    await next_btn.click()
+                    await asyncio.sleep(0.3)
+                    month_now_matched = await page.evaluate("""(targetYear, targetMonth) => {
+                        const header = document.querySelector('ytcp-date-picker #month-label, .month-label, .calendar-header, ytcp-calendar-header');
+                        if (!header) return true;
+                        const text = (header.innerText || header.textContent || '').toLowerCase();
+                        return text.includes(String(targetYear)) && (text.includes(String(targetMonth)) || text.includes('thg ' + targetMonth));
+                    }""", target_date.year, target_date.month)
+                    if month_now_matched:
+                        break
+                else:
+                    break
+
+        # Click matching day in calendar via DOM evaluate
         clicked = await page.evaluate("""(day) => {
             const days = Array.from(document.querySelectorAll('.calendar-day:not(.disabled), ytcp-calendar-day:not([disabled])'));
             const matching = days.find(d => (d.innerText || d.textContent || '').trim() === String(day));
@@ -785,7 +827,7 @@ async def _set_datepicker_value(page, target_date: dt.date) -> tuple[bool, str]:
     except Exception as c_exc:
         logger.debug("Lỗi click lịch: %s", c_exc)
 
-    # 2. Try input inside datepicker popup
+    # 2. Try filling input inside datepicker popup with candidate strings
     date_inputs = [
         "ytcp-date-picker input",
         "tp-yt-paper-dialog#dialog input",
@@ -798,20 +840,29 @@ async def _set_datepicker_value(page, target_date: dt.date) -> tuple[bool, str]:
         try:
             inp = await page.query_selector(sel)
             if inp and await inp.is_visible():
-                await inp.click()
-                await page.keyboard.press("Control+A")
-                await page.keyboard.press("Backspace")
-                await inp.fill(target_date_str)
-                await page.keyboard.press("Enter")
-                await asyncio.sleep(0.4)
-                try:
-                    await page.click("ytcp-uploads-dialog #visibility-title, ytcp-uploads-dialog #second-container", timeout=1000)
-                except Exception:
-                    pass
-                val = await _read_control_value(dp_trigger) if dp_trigger else await _read_control_value(inp)
-                if _schedule_date_matches(val, target_date):
-                    logger.info("Đã điền ngày thành công bằng input %s: %s", sel, val)
-                    return True, val
+                for date_str in candidate_date_strings:
+                    await inp.click()
+                    await page.keyboard.press("Control+A")
+                    await page.keyboard.press("Backspace")
+                    await inp.fill(date_str)
+                    await page.keyboard.press("Enter")
+                    await asyncio.sleep(0.3)
+                    await page.evaluate("""(targetStr) => {
+                        const inputEl = document.querySelector('ytcp-date-picker input, ytcp-datetime-picker input');
+                        if (inputEl) {
+                            inputEl.value = targetStr;
+                            inputEl.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                            inputEl.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                        }
+                    }""", date_str)
+                    try:
+                        await page.click("ytcp-uploads-dialog #visibility-title, ytcp-uploads-dialog #second-container", timeout=1000)
+                    except Exception:
+                        pass
+                    val = await _read_control_value(dp_trigger) if dp_trigger else await _read_control_value(inp)
+                    if _schedule_date_matches(val, target_date):
+                        logger.info("Đã điền ngày thành công bằng input %s (%s): %s", sel, date_str, val)
+                        return True, val
         except Exception:
             continue
 
@@ -820,10 +871,23 @@ async def _set_datepicker_value(page, target_date: dt.date) -> tuple[bool, str]:
 
 
 async def _set_timepicker_value(page, target_time: dt.time) -> tuple[bool, str]:
-    """Robust timepicker setter for YouTube Studio Upload Wizard and Edit Page."""
-    target_time_str = _format_time_for_picker(target_time)
+    """Robust timepicker setter for YouTube Studio Upload Wizard and Edit Page.
+    Handles 24-hour and 12-hour AM/PM formats, dropdown item selection and manual typing."""
+    hour_24 = target_time.strftime("%H:%M")
+    hour_24_short = f"{target_time.hour}:{target_time.minute:02d}"
+    hour_12 = target_time.hour % 12 or 12
+    meridiem_lower = "pm" if target_time.hour >= 12 else "am"
+    meridiem_upper = "PM" if target_time.hour >= 12 else "AM"
 
-    # 1. Click time input to reveal time dropdown
+    time_candidates = [
+        hour_24,
+        hour_24_short,
+        f"{hour_12}:{target_time.minute:02d} {meridiem_upper}",
+        f"{hour_12}:{target_time.minute:02d} {meridiem_lower}",
+        f"{hour_12}:{target_time.minute:02d}{meridiem_upper}",
+        f"{hour_12}:{target_time.minute:02d}{meridiem_lower}",
+    ]
+
     time_selectors = [
         "ytcp-datetime-picker #time-of-day-container input",
         "ytcp-datetime-picker tp-yt-paper-input#textbox input",
@@ -845,18 +909,21 @@ async def _set_timepicker_value(page, target_time: dt.time) -> tuple[bool, str]:
                     logger.info("Giờ đặt lịch đã đúng sẵn: %s", val)
                     return True, val
                 await inp.click()
-                await asyncio.sleep(0.6)
+                await asyncio.sleep(0.5)
 
                 # 2. Click matching tp-yt-paper-item in time dropdown list
-                time_clicked = await page.evaluate("""(targetStr) => {
+                time_clicked = await page.evaluate("""(candidates) => {
                     const items = Array.from(document.querySelectorAll('ytcp-time-of-day-picker tp-yt-paper-item, tp-yt-paper-dialog tp-yt-paper-item'));
-                    const target = items.find(i => (i.innerText || '').trim() === targetStr);
+                    const target = items.find(i => {
+                        const txt = (i.innerText || i.textContent || '').trim();
+                        return candidates.includes(txt) || candidates.some(c => c.toLowerCase() === txt.toLowerCase());
+                    });
                     if (target) {
                         target.click();
                         return true;
                     }
                     return false;
-                }""", target_time_str)
+                }""", time_candidates)
 
                 if time_clicked:
                     await asyncio.sleep(0.4)
@@ -865,34 +932,35 @@ async def _set_timepicker_value(page, target_time: dt.time) -> tuple[bool, str]:
                         logger.info("Đã chọn giờ thành công qua item dropdown: %s", val)
                         return True, val
 
-                # 3. Direct fill and event dispatch
-                await inp.click()
-                await page.keyboard.press("Control+A")
-                await page.keyboard.press("Backspace")
-                await inp.fill(target_time_str)
-                await page.keyboard.press("Enter")
-                await asyncio.sleep(0.3)
-                await page.evaluate("""(targetStr) => {
-                    const inputEl = document.querySelector('ytcp-datetime-picker #time-of-day-container input, #time-of-day-container input');
-                    if (inputEl) {
-                        inputEl.value = targetStr;
-                        inputEl.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-                        inputEl.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-                    }
-                    const paper = document.querySelector('ytcp-datetime-picker tp-yt-paper-input#textbox');
-                    if (paper) {
-                        paper.value = targetStr;
-                        paper.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-                    }
-                }""", target_time_str)
-                try:
-                    await page.click("ytcp-uploads-dialog #visibility-title, ytcp-uploads-dialog #second-container", timeout=1000)
-                except Exception:
-                    pass
-                val = await _read_control_value(inp)
-                if _schedule_time_matches(val, target_time):
-                    logger.info("Đã điền giờ thành công bằng %s: %s", sel, val)
-                    return True, val
+                # 3. Direct fill and event dispatch with multiple candidates
+                for cand in [hour_24, f"{hour_12}:{target_time.minute:02d} {meridiem_upper}"]:
+                    await inp.click()
+                    await page.keyboard.press("Control+A")
+                    await page.keyboard.press("Backspace")
+                    await inp.fill(cand)
+                    await page.keyboard.press("Enter")
+                    await asyncio.sleep(0.3)
+                    await page.evaluate("""(targetStr) => {
+                        const inputEl = document.querySelector('ytcp-datetime-picker #time-of-day-container input, #time-of-day-container input');
+                        if (inputEl) {
+                            inputEl.value = targetStr;
+                            inputEl.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                            inputEl.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                        }
+                        const paper = document.querySelector('ytcp-datetime-picker tp-yt-paper-input#textbox');
+                        if (paper) {
+                            paper.value = targetStr;
+                            paper.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                        }
+                    }""", cand)
+                    try:
+                        await page.click("ytcp-uploads-dialog #visibility-title, ytcp-uploads-dialog #second-container", timeout=1000)
+                    except Exception:
+                        pass
+                    val = await _read_control_value(inp)
+                    if _schedule_time_matches(val, target_time):
+                        logger.info("Đã điền giờ thành công bằng %s (%s): %s", sel, cand, val)
+                        return True, val
         except Exception:
             continue
 
@@ -2931,7 +2999,7 @@ async def upload_video_via_browser(
                         timeout_ms=5000,
                     )
                     suitability_saved = False
-                    for _ in range(10):
+                    for _ in range(12):
                         saved_marker = await page.query_selector(
                             "tp-yt-paper-toast:has-text('Đã lưu thông tin đánh giá'), "
                             "tp-yt-paper-toast:has-text('Rating saved'), "
@@ -2941,7 +3009,18 @@ async def upload_video_via_browser(
                         if saved_marker is not None and await saved_marker.is_visible():
                             suitability_saved = True
                             break
-                        await asyncio.sleep(0.25)
+                        submit_btn = await page.query_selector("ytcp-self-certification ytcp-button#submit-questionnaire-button")
+                        if submit_btn is not None:
+                            disabled = await submit_btn.get_attribute("disabled")
+                            aria_disabled = await submit_btn.get_attribute("aria-disabled")
+                            if disabled is not None or str(aria_disabled).lower() == "true":
+                                suitability_saved = True
+                                break
+                        await asyncio.sleep(0.3)
+                    if not suitability_saved:
+                        next_btn = await page.query_selector("ytcp-uploads-dialog ytcp-button#next-button, ytcp-video-upload-dialog ytcp-button#next-button")
+                        if next_btn is not None and await next_btn.is_visible():
+                            suitability_saved = True
                     if not suitability_saved:
                         raise BrowserUploadNeedsReview(
                             "Đã gửi tự đánh giá quảng cáo nhưng YouTube Studio chưa xác nhận đã lưu."
@@ -2993,17 +3072,15 @@ async def upload_video_via_browser(
                             end_screen_source_video_id,
                         )
                     upload_captions = bool(settings.get("upload_captions", True))
-                    if upload_captions:
-                        if caption_path is None:
-                            raise BrowserUploadError(
-                                "Bộ prompt yêu cầu upload phụ đề nhưng không có file SRT."
-                            )
+                    if upload_captions and caption_path and caption_path.exists():
                         progress("Đang tải phụ đề SRT...", "uploading_caption", 74)
                         caption_locator = await _upload_caption_from_elements(
                             page,
                             caption_path,
                             language,
                         )
+                    elif upload_captions and (caption_path is None or not caption_path.exists()):
+                        logger.info("Cấu hình upload_captions bật nhưng không có file phụ đề SRT; bỏ qua bước tải phụ đề.")
                     elements_recorded = True
                     _emit_checkpoint(
                         persist_checkpoint,
@@ -3057,9 +3134,19 @@ async def upload_video_via_browser(
             if not reached_visibility:
                 raise BrowserUploadError("Không thể đến bước Chế độ hiển thị của upload wizard.")
 
-            # 9. Tab Visibility (Private vs Schedule)
+            # 9. Tab Visibility (Private vs Schedule vs Public)
             progress("Đang thiết lập Chế độ hiển thị & Đặt lịch...", "visibility_and_publish", 85)
             cancel_check()
+
+            # Ensure Chromium finishes uploading 100% video stream before finalizing visibility
+            if not resuming_existing_draft:
+                progress("Đang chờ tải lên 100% file video lên YouTube...", "uploading_file", 80)
+                await _wait_for_file_upload_complete(
+                    page,
+                    timeout_seconds=timeout_seconds,
+                    progress=progress,
+                    cancel_check=cancel_check,
+                )
 
             if schedule_at:
                 local_dt = _parse_schedule_at(schedule_at, publication_timezone)
@@ -3124,17 +3211,7 @@ async def upload_video_via_browser(
                     verified_time_value=time_value,
                 )
 
-                # 3. Wait for Chromium to finish uploading 100% video stream before scheduling
-                if not resuming_existing_draft:
-                    progress("Đang chờ tải lên 100% file video lên YouTube...", "uploading_file", 80)
-                    await _wait_for_file_upload_complete(
-                        page,
-                        timeout_seconds=timeout_seconds,
-                        progress=progress,
-                        cancel_check=cancel_check,
-                    )
-
-                # 4. Click Schedule Done Button
+                # 3. Click Schedule Done Button
                 schedule_done_selectors = [
                     "ytcp-uploads-dialog ytcp-button#done-button",
                     "ytcp-uploads-dialog #done-button button",

@@ -803,7 +803,7 @@ def execute_browser_publish_workflow(
         or latest_workflow.get("caption_id")
         or ""
     ).strip()
-    if bool(context["publishing_settings"].get("upload_captions", True)) and not caption_locator:
+    if context.get("caption_path") and bool(context["publishing_settings"].get("upload_captions", True)) and not caption_locator:
         raise browser_youtube_uploader.BrowserUploadNeedsReview(
             "Chưa xác minh được phụ đề SRT trên YouTube Studio."
         )

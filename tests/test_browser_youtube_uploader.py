@@ -112,6 +112,42 @@ class TestBrowserYouTubeUploader(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(res)
         page.keyboard.insert_text.assert_awaited_once_with("Sample Text")
 
+    async def test_set_datepicker_value_already_matches(self):
+        from auto_yt.services.browser_youtube_uploader import _set_datepicker_value
+        page = AsyncMock()
+        mock_trigger = AsyncMock()
+        mock_trigger.input_value.return_value = "3 thg 10, 2026"
+        page.query_selector.return_value = mock_trigger
+
+        ok, val = await _set_datepicker_value(page, dt.date(2026, 10, 3))
+        self.assertTrue(ok)
+        self.assertEqual(val, "3 thg 10, 2026")
+
+    async def test_set_timepicker_value_already_matches(self):
+        from auto_yt.services.browser_youtube_uploader import _set_timepicker_value
+        page = AsyncMock()
+        mock_input = AsyncMock()
+        mock_input.is_visible.return_value = True
+        mock_input.input_value.return_value = "11:00"
+        page.query_selector.return_value = mock_input
+
+        ok, val = await _set_timepicker_value(page, dt.time(11, 0))
+        self.assertTrue(ok)
+        self.assertEqual(val, "11:00")
+
+    async def test_wait_for_file_upload_complete_immediate(self):
+        from auto_yt.services.browser_youtube_uploader import _wait_for_file_upload_complete
+        page = AsyncMock()
+        page.evaluate.return_value = "Đã hoàn tất quá trình tải lên. Đang xử lý..."
+        progress_called = []
+        def on_prog(msg, st, pct):
+            progress_called.append((msg, st, pct))
+
+        await _wait_for_file_upload_complete(page, timeout_seconds=5.0, progress=on_prog)
+        self.assertTrue(len(progress_called) > 0)
+        self.assertEqual(progress_called[-1][1], "upload_complete")
+
 
 if __name__ == "__main__":
     unittest.main()
+
