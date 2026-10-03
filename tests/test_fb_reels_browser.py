@@ -110,6 +110,16 @@ class TestFbReelsBrowser(unittest.TestCase):
         self.assertTrue(err.can_resume)
         self.assertIn("Session Facebook bị hết hạn", str(err))
 
+    def test_upload_file_via_cdp_missing_file_raises(self):
+        from auto_yt.services.fb_reels_browser_service import upload_file_via_cdp
+        import asyncio
+
+        async def _test():
+            with self.assertRaises(FileNotFoundError):
+                await upload_file_via_cdp(None, "non_existent_file_path_xyz_123.mp4")
+
+        asyncio.run(_test())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1426,8 +1426,36 @@ def upload_video_to_facebook(
         raise last_small_error
 
 
+def is_valid_video_file(path: Path) -> bool:
+    """Validate that a video file exists, is non-empty, and can be read by FFmpeg."""
+    if not path.is_file() or path.stat().st_size < 10240:
+        return False
+    try:
+        ffmpeg_directory = Path(ensure_ffmpeg_directory())
+        ffmpeg_executable = ffmpeg_directory / "ffmpeg.exe"
+        if not ffmpeg_executable.is_file():
+            return path.stat().st_size > 10240
+        cmd = [
+            str(ffmpeg_executable),
+            "-v",
+            "error",
+            "-i",
+            str(path),
+            "-t",
+            "1",
+            "-f",
+            "null",
+            "-",
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
+        return result.returncode == 0
+    except Exception as check_err:
+        logger.debug("Kiểm tra tính hợp lệ của video %s gặp lỗi: %s", path.name, check_err)
+        return False
+
+
 def convert_video_to_vertical(source_path: Path, output_path: Path) -> Path:
-    """Render a 1080x1920 H.264 copy with the full source centered over a blurred fill."""
+    """Render a 1080x1920 H.264 copy with the full source centered over a blurred fill atomically."""
     if not source_path.is_file():
         raise FileNotFoundError(f"Không tìm thấy video nguồn để chuyển 9:16: {source_path.name}")
 
@@ -1437,13 +1465,15 @@ def convert_video_to_vertical(source_path: Path, output_path: Path) -> Path:
         raise RuntimeError("Không tìm thấy FFmpeg để chuyển video sang 9:16")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.unlink(missing_ok=True)
+    temp_output = output_path.with_name(f"{output_path.stem}.tmp{output_path.suffix}")
+    temp_output.unlink(missing_ok=True)
+
     filter_graph = (
         "[0:v]split=2[background][foreground];"
         f"[background]scale={VERTICAL_VIDEO_WIDTH}:{VERTICAL_VIDEO_HEIGHT}:"
         "force_original_aspect_ratio=increase,"
         f"crop={VERTICAL_VIDEO_WIDTH}:{VERTICAL_VIDEO_HEIGHT},"
-        "boxblur=30:2[blurred];"
+        "boxblur=25:2[blurred];"
         f"[foreground]scale={VERTICAL_VIDEO_WIDTH}:{VERTICAL_VIDEO_HEIGHT}:"
         "force_original_aspect_ratio=decrease[content];"
         "[blurred][content]overlay=(W-w)/2:(H-h)/2,"
@@ -1463,16 +1493,16 @@ def convert_video_to_vertical(source_path: Path, output_path: Path) -> Path:
         "-c:v",
         "libx264",
         "-preset",
-        "medium",
+        "veryfast",
         "-crf",
-        "20",
+        "22",
         "-c:a",
         "aac",
         "-b:a",
         "192k",
         "-movflags",
         "+faststart",
-        str(output_path),
+        str(temp_output),
     ]
     result = subprocess.run(
         command,
@@ -1480,12 +1510,16 @@ def convert_video_to_vertical(source_path: Path, output_path: Path) -> Path:
         text=True,
         check=False,
     )
-    if result.returncode != 0 or not output_path.is_file() or output_path.stat().st_size <= 0:
-        output_path.unlink(missing_ok=True)
+    if result.returncode != 0 or not temp_output.is_file() or temp_output.stat().st_size <= 0:
+        temp_output.unlink(missing_ok=True)
         error_detail = str(result.stderr or "FFmpeg không tạo được file đầu ra").strip()
         if len(error_detail) > 1200:
             error_detail = error_detail[-1200:]
         raise RuntimeError(f"Không thể chuyển video sang 9:16: {error_detail}")
+
+    # Atomic move
+    output_path.unlink(missing_ok=True)
+    temp_output.replace(output_path)
     return output_path
 
 
@@ -2813,8 +2847,7 @@ def process_queue_item_jit(
     need_vertical = bool(settings.get("convert_to_vertical"))
     target_video_file = vertical_video_file if need_vertical else video_file
     has_valid_media = (
-        target_video_file.is_file()
-        and target_video_file.stat().st_size > 10240
+        is_valid_video_file(target_video_file)
         and thumb_file.is_file()
         and thumb_file.stat().st_size > 512
     )

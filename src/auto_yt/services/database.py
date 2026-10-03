@@ -4659,6 +4659,8 @@ def reset_fb_checkpoint(item_id: int) -> bool:
         "checkpoint_screenshot": "",
         "can_resume": 0,
         "error_message": "",
+        "meta_error_message": "",
+        "meta_state": "",
         "status": "pending",
     })
 
@@ -5111,12 +5113,12 @@ def get_fb_crossposter_stats(target_page_id: str = "") -> dict:
 
 
 def get_next_queue_items_for_pre_schedule(target_page_id: str, count: int) -> list[dict]:
-    """Retrieve the next K items from the queue for pre-scheduling (including previously failed items)."""
+    """Retrieve the next K items from the queue for pre-scheduling (including previously failed/missing items)."""
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         now_ts = int(datetime.datetime.now().timestamp())
-        where_sql = "WHERE status IN ('pending', 'scheduled', 'error') AND (fb_post_id IS NULL OR fb_post_id = '')"
+        where_sql = "WHERE status IN ('pending', 'scheduled', 'error', 'failed', 'missing', 'checkpoint_paused') AND (fb_post_id IS NULL OR fb_post_id = '' OR status = 'missing')"
         params: list[object] = []
         if target_page_id and target_page_id.strip():
             where_sql += " AND target_page_id = ?"
@@ -5147,17 +5149,29 @@ def get_fb_queue_items_for_schedule_ahead(days_ahead: int, target_page_id: str =
 
 
 def reset_fb_crossposter_queue_errors(target_page_id: str = "") -> int:
-    """Return retryable errors without a Meta object to the unscheduled queue."""
+    """Return retryable errors, missing items, and stale paused checkpoints to the unscheduled queue."""
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
     try:
-        where_sql = "WHERE status = 'error' AND (fb_post_id IS NULL OR fb_post_id = '')"
+        where_sql = "WHERE (status IN ('error', 'failed', 'missing', 'checkpoint_paused') OR can_resume = 1) AND (fb_post_id IS NULL OR fb_post_id = '' OR status = 'missing')"
         params = []
         if target_page_id and target_page_id.strip():
             where_sql += " AND target_page_id = ?"
             params.append(target_page_id.strip())
         
         cursor = conn.execute(
-            f"UPDATE fb_crossposter_queue SET status = 'pending', scheduled_publish_time = 0, error_message = '' {where_sql}",
+            f"""
+            UPDATE fb_crossposter_queue 
+            SET status = 'pending', 
+                scheduled_publish_time = 0,
+                checkpoint_phase = '', 
+                checkpoint_data_json = '{{}}',
+                checkpoint_screenshot = '',
+                can_resume = 0,
+                error_message = '',
+                meta_error_message = '',
+                meta_state = ''
+            {where_sql}
+            """,
             params,
         )
         conn.commit()
