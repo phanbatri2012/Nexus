@@ -3409,7 +3409,7 @@ function App() {
                               }}>
                                 <div>
                                   <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                                    <h4 style={{ color: 'var(--accent)', margin: 0 }}>🎬 Video MP4 (Google Flow & Subtitles):</h4>
+                                    <h4 style={{ color: 'var(--accent)', margin: 0 }}>🎬 Video MP4 ({renderInfo?.render_mode === 'stock_video' ? 'Stock Video & Audio' : 'Google Flow & Subtitles'}):</h4>
                                     {hasMp4Ready && (
                                       <div className="media-badge-group">
                                         <span className="media-pill-badge">{renderInfo?.mp4_details?.resolution || '1080p FHD'}</span>

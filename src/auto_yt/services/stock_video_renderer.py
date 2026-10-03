@@ -101,6 +101,13 @@ def probe_media_duration(file_path: Path) -> float:
     raise StockVideoRenderError(f"Không thể đo thời lượng của file: {file_path}")
 
 
+def _escape_subtitle_path(path: Path) -> str:
+    """Escape Windows paths properly for FFmpeg subtitles filter graph."""
+    value = str(path.resolve()).replace("\\", "/")
+    value = value.replace(":", r"\:").replace("'", r"\'")
+    return value
+
+
 def get_available_background_videos(custom_dir: Path | str | None = None) -> list[Path]:
     """Scan and return list of all valid video files in background videos directory."""
     target_dir = Path(custom_dir).resolve() if custom_dir else BACKGROUND_VIDEOS_DIR
@@ -112,7 +119,7 @@ def get_available_background_videos(custom_dir: Path | str | None = None) -> lis
             item.is_file()
             and not item.name.startswith(".")
             and "tmp" not in item.name.lower()
-            and item.stat().st_size >= 50 * 1024
+            and item.stat().st_size >= 100 * 1024
             and item.suffix.lower() in SUPPORTED_VIDEO_EXTS
         ):
             videos.append(item)
@@ -713,7 +720,7 @@ def produce_stock_video(
             escaped_path = video_item.as_posix().replace("'", "'\\''")
             f.write(f"file '{escaped_path}'\n")
 
-    # 10. Prepare FFmpeg Filter Complex
+    # 10. Prepare FFmpeg Filter Complex & Subtitles
     t_x, t_y = coords["thumb"]
     c_x, c_y = coords["card"]
     i_x, i_y = coords["icon"]
@@ -726,6 +733,18 @@ def produce_stock_video(
         else f"[4:v]scale=100:100,format=yuva420p,settb=AVTB,setpts=PTS-STARTPTS[icon]"
     )
 
+    has_subtitles = srt_path is not None and srt_path.is_file() and srt_path.stat().st_size > 0
+    sub_filter = ""
+    if has_subtitles:
+        escaped_srt = _escape_subtitle_path(srt_path)
+        sub_filter = (
+            f";[ov_wave]subtitles=filename='{escaped_srt}':"
+            f"force_style='FontName=Arial,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,Outline=2,Shadow=0,MarginV=35'[final_v]"
+        )
+        overlay_target = "[ov_wave]"
+    else:
+        overlay_target = "[final_v]"
+
     filter_complex = (
         f"[0:v]fps={TARGET_FPS},"
         f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=increase,"
@@ -737,7 +756,8 @@ def produce_stock_video(
         f"[bg][2:v]overlay={t_x}:{t_y}:eof_action=repeat:shortest=0[ov1];"
         f"[ov1][3:v]overlay={c_x}:{c_y}:eof_action=repeat:shortest=0[ov2];"
         f"[ov2][icon]overlay={i_x}:{i_y}:eof_action=repeat:shortest=0[ov3];"
-        f"[ov3][wave]overlay={w_x}:{w_y}:shortest=0[final_v]"
+        f"[ov3][wave]overlay={w_x}:{w_y}:shortest=0{overlay_target}"
+        f"{sub_filter}"
     )
 
     # 11. Target Output Path
@@ -760,6 +780,9 @@ def produce_stock_video(
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     cmd = [
         ffmpeg_exe, "-y",
+        "-fflags", "+genpts+igndts",
+        "-avoid_negative_ts", "make_zero",
+        "-err_detect", "ignore_err",
         "-f", "concat", "-safe", "0", "-auto_convert", "1", "-i", str(concat_list_file),
         "-i", str(audio_path),
         "-i", str(thumb_styled_path),
@@ -775,7 +798,7 @@ def produce_stock_video(
         "-c:a", "aac",
         "-b:a", "192k",
         "-fps_mode", "cfr",
-        "-max_muxing_queue_size", "8192",
+        "-max_muxing_queue_size", "16384",
         "-threads", "0",
         "-t", f"{audio_duration:.3f}",
         str(output_path),
@@ -827,12 +850,31 @@ def produce_stock_video(
 
         if proc.returncode != 0:
             error_tail = ""
+            saved_log_path = None
             try:
                 if ffmpeg_log_path.exists():
-                    error_tail = ffmpeg_log_path.read_text(encoding="utf-8", errors="replace")[-1000:]
-            except Exception:
-                pass
-            raise StockVideoRenderError(f"FFmpeg render lỗi (code {proc.returncode}): {error_tail}")
+                    raw_log = ffmpeg_log_path.read_text(encoding="utf-8", errors="replace")
+                    # Save persistent debug log into data/logs
+                    logs_dir = Path(scratch_dir.parent.parent.parent / "logs")
+                    logs_dir.mkdir(parents=True, exist_ok=True)
+                    saved_log_path = logs_dir / f"ffmpeg_stock_error_video_{video_id}_{timestamp_str}.log"
+                    saved_log_path.write_text(raw_log, encoding="utf-8")
+
+                    lines = [line.strip() for line in raw_log.splitlines() if line.strip()]
+                    err_lines = [
+                        l for l in lines
+                        if any(k in l.lower() for k in ["error", "fatal", "invalid", "conversion failed", "no such", "failed", "cannot"])
+                        and not l.startswith("frame=")
+                    ]
+                    if err_lines:
+                        error_tail = " | ".join(err_lines[-5:])
+                    else:
+                        error_tail = raw_log[-2000:].strip()
+            except Exception as log_ex:
+                logger.warning("Failed to parse error log: %s", log_ex)
+
+            log_hint = f" (Log: {saved_log_path.name})" if saved_log_path else ""
+            raise StockVideoRenderError(f"FFmpeg render lỗi (code {proc.returncode}): {error_tail}{log_hint}")
     except Exception:
         if proc.poll() is None:
             proc.kill()
