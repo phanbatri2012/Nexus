@@ -22,7 +22,7 @@ import subprocess
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 import imageio_ffmpeg
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
@@ -48,6 +48,24 @@ SUPPORTED_ICON_EXTS = {".gif", ".webp", ".png"}
 
 class StockVideoRenderError(RuntimeError):
     pass
+
+
+def probe_video_info(file_path: Path) -> dict[str, Any]:
+    """Probe video resolution, pixel format, and duration."""
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    cmd = [ffmpeg_exe, "-i", str(file_path)]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    w, h, pix, dur = 0, 0, "", 0.0
+    m_vid = re.search(r"Video:.*?([a-zA-Z0-9_]+)(?:\([^)]+\))?,\s*(\d+)x(\d+)", res.stderr)
+    if m_vid:
+        pix = m_vid.group(1)
+        w = int(m_vid.group(2))
+        h = int(m_vid.group(3))
+    m_dur = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", res.stderr)
+    if m_dur:
+        hd, md, sd = m_dur.groups()
+        dur = float(hd) * 3600 + float(md) * 60 + float(sd)
+    return {"width": w, "height": h, "pix_fmt": pix, "duration": dur}
 
 
 def probe_media_duration(file_path: Path) -> float:
@@ -90,7 +108,13 @@ def get_available_background_videos(custom_dir: Path | str | None = None) -> lis
 
     videos: list[Path] = []
     for item in target_dir.rglob("*"):
-        if item.is_file() and not item.name.startswith(".") and item.suffix.lower() in SUPPORTED_VIDEO_EXTS:
+        if (
+            item.is_file()
+            and not item.name.startswith(".")
+            and "tmp" not in item.name.lower()
+            and item.stat().st_size >= 50 * 1024
+            and item.suffix.lower() in SUPPORTED_VIDEO_EXTS
+        ):
             videos.append(item)
 
     return sorted(videos)
@@ -419,36 +443,74 @@ def calculate_layout_coordinates(
 def build_background_playlist(
     available_videos: Sequence[Path],
     target_duration: float,
-) -> list[Path]:
-    """Select and shuffle background videos to cover target duration."""
+    target_w: int = TARGET_WIDTH,
+    target_h: int = TARGET_HEIGHT,
+) -> tuple[list[Path], dict[Path, float]]:
+    """Select and loop a curated, resolution-uniform set of background videos."""
     if not available_videos:
         raise StockVideoRenderError("Danh sách video nền trống.")
 
     pool = list(available_videos)
-    playlist: list[Path] = []
-    accumulated_duration = 0.0
+    random.shuffle(pool)
 
-    # Sample up to 150 random videos from pool so we don't probe thousands of files
-    sample_size = min(len(pool), 150)
-    active_pool = random.sample(pool, sample_size) if len(pool) > sample_size else list(pool)
+    # 1. Curate a set of 8-15 high quality clips matching target resolution and duration >= 3.0s
+    curated_candidates: list[tuple[Path, float]] = []
     durations: dict[Path, float] = {}
 
-    buffer_target = target_duration + 30.0  # Guarantee video stream never finishes before audio
-    while accumulated_duration < buffer_target:
-        shuffled = list(active_pool)
-        random.shuffle(shuffled)
-        for video in shuffled:
-            if video not in durations:
-                try:
-                    durations[video] = probe_media_duration(video)
-                except Exception:
-                    durations[video] = 10.0  # Fallback default estimate
+    sample_pool = pool[: min(len(pool), 80)]
+    for video in sample_pool:
+        try:
+            info = probe_video_info(video)
+            if info["width"] == target_w and info["height"] == target_h and info["duration"] >= 3.0:
+                curated_candidates.append((video, info["duration"]))
+                durations[video] = info["duration"]
+                if len(curated_candidates) >= 15:
+                    break
+        except Exception:
+            continue
+
+    # If no exact target_w x target_h matches found, fallback to any valid clips >= 2s
+    if not curated_candidates:
+        for video in sample_pool:
+            try:
+                info = probe_video_info(video)
+                if info["duration"] >= 2.0:
+                    curated_candidates.append((video, info["duration"]))
+                    durations[video] = info["duration"]
+                    if len(curated_candidates) >= 10:
+                        break
+            except Exception:
+                continue
+
+    if not curated_candidates:
+        raise StockVideoRenderError("Không tìm thấy video nền hợp lệ trong kho video.")
+
+    # 2. Build playlist by looping through curated candidates until target_duration + 60s is covered
+    playlist: list[Path] = []
+    accumulated_duration = 0.0
+    buffer_target = target_duration + 60.0
+
+    max_loops = 2000
+    loop_count = 0
+    while accumulated_duration < buffer_target and loop_count < max_loops:
+        loop_count += 1
+        shuffled_round = list(curated_candidates)
+        random.shuffle(shuffled_round)
+        for video, dur in shuffled_round:
             playlist.append(video)
-            accumulated_duration += durations[video]
+            accumulated_duration += dur
             if accumulated_duration >= buffer_target:
                 break
 
-    return playlist
+    logger.info(
+        "Stock Video: Selected %d unique clips (%s) looped into %d playlist items (total %.1fs for target %.1fs)",
+        len(curated_candidates),
+        f"{target_w}x{target_h}",
+        len(playlist),
+        accumulated_duration,
+        target_duration,
+    )
+    return playlist, durations
 
 
 def produce_stock_video(
@@ -598,7 +660,7 @@ def produce_stock_video(
     cancel_check()
     progress("Đang chuẩn bị playlist video nền và bố cục ngẫu nhiên...", "stock_video_layout")
 
-    playlist = build_background_playlist(available_videos, audio_duration)
+    playlist, video_durations = build_background_playlist(available_videos, audio_duration)
 
     # 5. Pick Animated Icon
     available_icons = get_available_animated_icons()
@@ -644,24 +706,12 @@ def produce_stock_video(
         canvas_h=TARGET_HEIGHT,
     )
 
-    # 9. Write Concat List with exact duration directives for rock-solid demuxer synchronization
-    video_durations: dict[Path, float] = {}
-    for v in set(playlist):
-        try:
-            video_durations[v] = probe_media_duration(v)
-        except Exception:
-            video_durations[v] = 10.0
-
+    # 9. Write Concat List
     concat_list_file = scratch_dir / "concat_videos.txt"
     with open(concat_list_file, "w", encoding="utf-8") as f:
         for video_item in playlist:
             escaped_path = video_item.as_posix().replace("'", "'\\''")
-            dur = video_durations.get(video_item, 10.0)
             f.write(f"file '{escaped_path}'\n")
-            f.write(f"duration {dur:.3f}\n")
-        if playlist:
-            last_escaped = playlist[-1].as_posix().replace("'", "'\\''")
-            f.write(f"file '{last_escaped}'\n")
 
     # 10. Prepare FFmpeg Filter Complex
     t_x, t_y = coords["thumb"]
@@ -671,16 +721,17 @@ def produce_stock_video(
 
     is_icon_animated = chosen_icon.suffix.lower() == ".gif"
     icon_filter = (
-        f"[4:v]fps={TARGET_FPS},settb=AVTB,setpts=PTS-STARTPTS,scale=100:100,format=yuva420p[icon]"
+        f"[4:v]fps={TARGET_FPS},scale=100:100,format=yuva420p,settb=AVTB,setpts=N/({TARGET_FPS}*TB)[icon]"
         if is_icon_animated
-        else "[4:v]scale=100:100,format=yuva420p[icon]"
+        else f"[4:v]scale=100:100,format=yuva420p,settb=AVTB,setpts=PTS-STARTPTS[icon]"
     )
 
     filter_complex = (
-        f"[0:v]settb=AVTB,"
+        f"[0:v]fps={TARGET_FPS},"
         f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=increase,"
-        f"crop={TARGET_WIDTH}:{TARGET_HEIGHT},setsar=1,fps={TARGET_FPS},settb=AVTB,setpts=PTS-STARTPTS,format=yuv420p[bg];"
-        f"[1:a]showwaves=s=360x70:mode=p2p:colors=white@0.95:scale=sqrt:r={TARGET_FPS},"
+        f"crop={TARGET_WIDTH}:{TARGET_HEIGHT},setsar=1,settb=AVTB,setpts=N/({TARGET_FPS}*TB),format=yuv420p[bg];"
+        f"[1:a]asplit=2[a_wave][a_out];"
+        f"[a_wave]showwaves=s=360x70:mode=p2p:colors=white@0.95:scale=sqrt:r={TARGET_FPS},"
         f"format=yuva420p,settb=AVTB,setpts=PTS-STARTPTS[wave];"
         f"{icon_filter};"
         f"[bg][2:v]overlay={t_x}:{t_y}:eof_action=repeat:shortest=0[ov1];"
@@ -691,7 +742,12 @@ def produce_stock_video(
 
     # 11. Target Output Path
     timestamp_str = time.strftime("%Y%m%d_%H%M%S")
-    output_filename = f"video_{video_id}_stock_{timestamp_str}.mp4"
+    slug = db.extract_generated_video_slug(
+        script_text,
+        default_title=title,
+    ) or f"video_{video_id}"
+    resolved_name = db.resolve_render_filename(video_id, slug, renders_dir=RENDERS_DIR)
+    output_filename = f"{resolved_name}.mp4"
     output_path = RENDERS_DIR / output_filename
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -704,15 +760,14 @@ def produce_stock_video(
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     cmd = [
         ffmpeg_exe, "-y",
-        "-reinit_filter", "0",
-        "-f", "concat", "-safe", "0", "-auto_convert", "1", "-segment_time_metadata", "1", "-i", str(concat_list_file),
+        "-f", "concat", "-safe", "0", "-auto_convert", "1", "-i", str(concat_list_file),
         "-i", str(audio_path),
         "-i", str(thumb_styled_path),
         "-i", str(title_styled_path),
         *icon_input_args,
         "-filter_complex", filter_complex,
         "-map", "[final_v]",
-        "-map", "1:a",
+        "-map", "[a_out]",
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "20",
@@ -720,7 +775,7 @@ def produce_stock_video(
         "-c:a", "aac",
         "-b:a", "192k",
         "-fps_mode", "cfr",
-        "-max_muxing_queue_size", "4096",
+        "-max_muxing_queue_size", "8192",
         "-threads", "0",
         "-t", f"{audio_duration:.3f}",
         str(output_path),

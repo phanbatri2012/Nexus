@@ -135,7 +135,7 @@ def get_gpm_config() -> dict[str, Any]:
     if not GPM_CONFIG_PATH.exists():
         return {
             "api_url": DEFAULT_GPM_API_URL,
-            "auto_stop_on_finish": True,
+            "auto_stop_on_finish": False,
             "timeout_seconds": DEFAULT_TIMEOUT_SECONDS,
         }
     try:
@@ -151,7 +151,7 @@ def get_gpm_config() -> dict[str, Any]:
 
     return {
         "api_url": api_url,
-        "auto_stop_on_finish": bool(data.get("auto_stop_on_finish", True)),
+        "auto_stop_on_finish": bool(data.get("auto_stop_on_finish", False)),
         "timeout_seconds": float(data.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS),
     }
 
@@ -770,38 +770,19 @@ def start_gpm_profile(
             _active_gpm_profiles[clean_id] = running_info
             return running_info
         if str(resp.get("message") or "") == "ALREADY_OPEN":
-            logger.warning("GPM Profile %s đã mở sẵn nhưng không có CDP port. Đang tự động dọn dẹp và khởi động lại qua API...", clean_id)
-            kill_gpm_profile_processes(clean_id, api_url=api_url)
-            stop_gpm_profile(clean_id, api_url=api_url)
-            time.sleep(1.5)
-            # Retry starting with CDP
-            resp = _request_gpm_api(f"/profiles/start/{clean_id}", api_url=api_url, params=params, timeout=45.0)
-            data = resp.get("data") or {}
-            if isinstance(data, dict):
-                raw_addr = str(data.get("selenium_remote_debug_address") or data.get("remote_debugging_address") or "").strip()
-                raw_port = data.get("remote_debugging_port") or data.get("remote_port") or data.get("port")
-                if not raw_port and ":" in raw_addr:
-                    try:
-                        raw_port = int(raw_addr.split(":")[-1])
-                    except (ValueError, IndexError):
-                        pass
-                if raw_port:
-                    data["remote_debugging_port"] = raw_port
-                if raw_addr:
-                    data["selenium_remote_debug_address"] = raw_addr
-                raw_ws = str(data.get("websocket_debugging_url") or data.get("wsUrl") or "").strip()
-                if raw_ws:
-                    data["websocket_debugging_url"] = raw_ws
-                if data.get("websocket_debugging_url") or data.get("remote_debugging_port") or data.get("selenium_remote_debug_address"):
-                    _active_gpm_profiles[clean_id] = data
-                    return data
+            running_info = find_running_gpm_profile_coordinates(clean_id, api_url=api_url)
+            if running_info:
+                logger.info("Phát hiện GPM Profile %s đang mở sẵn với port %s", clean_id, running_info.get("remote_debugging_port"))
+                running_info["already_running"] = True
+                _active_gpm_profiles[clean_id] = running_info
+                return running_info
 
-            logger.info("GPM Profile %s đã mở sẵn (chế độ thường/không có CDP port)", clean_id)
+            logger.info("GPM Profile %s đã mở sẵn (trạng thái ALREADY_OPEN)", clean_id)
             return {
                 "success": True,
                 "profile_id": clean_id,
                 "status": "already_open",
-                "already_running_no_cdp": True,
+                "already_running": True,
                 "message": "Profile GPM đã mở sẵn",
             }
         msg = resp.get("message", "Unknown error")
@@ -908,18 +889,36 @@ async def gpm_browser_session(
             last_conn_err = None
             for attempt in range(1, 4):
                 try:
-                    browser = await playwright.chromium.connect_over_cdp(endpoint_url, timeout=15000)
+                    conn_target = f"http://127.0.0.1:{remote_port}" if remote_port else endpoint_url
+                    browser = await playwright.chromium.connect_over_cdp(conn_target, timeout=30000)
                     break
                 except Exception as conn_exc:
                     last_conn_err = conn_exc
                     if attempt < 3:
                         logger.warning(
-                            "Kết nối CDP lần %d tới Profile %s gặp lỗi (%s), đợi 1.0s thử lại...",
+                            "Kết nối CDP lần %d tới Profile %s gặp lỗi (%s). Force restart profile và thử lại...",
                             attempt,
                             clean_id,
                             conn_exc,
                         )
-                        await asyncio.sleep(1.0)
+                        _active_gpm_profiles.pop(clean_id, None)
+                        launch_info = await asyncio.to_thread(
+                            start_gpm_profile,
+                            clean_id,
+                            skip_proxy_check=skip_proxy_check,
+                            addition_args=addition_args,
+                            force_restart=True,
+                            api_url=api_url,
+                        )
+                        was_already_running = False
+                        ws_url = str(launch_info.get("websocket_debugging_url") or "").strip()
+                        remote_port = launch_info.get("remote_debugging_port")
+                        endpoint_url = await wait_for_cdp_readiness(
+                            port=remote_port,
+                            ws_url=ws_url,
+                            max_wait_seconds=25.0,
+                            poll_interval=0.5,
+                        )
                     else:
                         raise last_conn_err
 
@@ -932,11 +931,6 @@ async def gpm_browser_session(
             yield context, browser
 
         finally:
-            if browser is not None and should_auto_stop and not was_already_running:
-                try:
-                    await browser.close()
-                except Exception as exc:
-                    logger.debug("Lỗi khi đóng kết nối CDP browser: %s", exc)
             try:
                 await playwright.stop()
             except Exception:

@@ -3594,12 +3594,12 @@ function App() {
                                       </button>
                                     </>
                                   ) : (isRenderError || isRenderCanceled) ? (
-                                    <>
+                                    renderInfo?.render_mode === 'stock_video' ? (
                                       <button
                                         className="btn-primary"
-                                        onClick={() => handleRenderVideo('resume')}
+                                        onClick={() => handleRenderVideo('recreate')}
                                         disabled={currentVideoIsError}
-                                        title="Dùng lại project cũ trên Google Flow và tiếp tục tạo các cảnh còn thiếu"
+                                        title="Dựng lại toàn bộ video MP4 từ video nền và file âm thanh"
                                         style={{
                                           padding: '4px 14px',
                                           fontSize: '0.82em',
@@ -3614,57 +3614,81 @@ function App() {
                                           gap: '4px'
                                         }}
                                       >
-                                        ▶️ Tạo tiếp
+                                        🔄 Dựng lại video MP4
                                       </button>
-                                      <button
-                                        className="btn-secondary"
-                                        onClick={() => setSceneResetDialog({
-                                          videoId: currentVideoId,
-                                          videoTitle: videoTitle || `Video #${currentVideoId}`,
-                                          fromSceneNumber: 17,
-                                          isSubmitting: false,
-                                          error: ''
-                                        })}
-                                        disabled={currentVideoIsError}
-                                        title="Xóa và tạo lại từ một phân cảnh bất kỳ"
-                                        style={{
-                                          padding: '4px 14px',
-                                          fontSize: '0.82em',
-                                          background: 'rgba(241, 196, 15, 0.15)',
-                                          border: '1px solid #f1c40f',
-                                          color: '#f1c40f',
-                                          cursor: 'pointer',
-                                          fontWeight: 'bold',
-                                          borderRadius: '4px',
-                                          display: 'inline-flex',
-                                          alignItems: 'center',
-                                          gap: '4px'
-                                        }}
-                                      >
-                                        🎯 Tạo lại từ cảnh...
-                                      </button>
-                                      <button
-                                        className="btn-secondary"
-                                        onClick={() => handleRenderVideo('recreate')}
-                                        disabled={currentVideoIsError}
-                                        title="Tạo mới một project trên Google Flow và tạo lại toàn bộ từ cảnh 1"
-                                        style={{
-                                          padding: '4px 14px',
-                                          fontSize: '0.82em',
-                                          background: 'rgba(231, 76, 60, 0.15)',
-                                          border: '1px solid #e74c3c',
-                                          color: '#ff6b6b',
-                                          cursor: 'pointer',
-                                          fontWeight: 'bold',
-                                          borderRadius: '4px',
-                                          display: 'inline-flex',
-                                          alignItems: 'center',
-                                          gap: '4px'
-                                        }}
-                                      >
-                                        🔄 Tạo lại toàn bộ
-                                      </button>
-                                    </>
+                                    ) : (
+                                      <>
+                                        <button
+                                          className="btn-primary"
+                                          onClick={() => handleRenderVideo('resume')}
+                                          disabled={currentVideoIsError}
+                                          title="Dùng lại project cũ trên Google Flow và tiếp tục tạo các cảnh còn thiếu"
+                                          style={{
+                                            padding: '4px 14px',
+                                            fontSize: '0.82em',
+                                            background: 'linear-gradient(135deg, #1abc9c, #16a085)',
+                                            cursor: 'pointer',
+                                            fontWeight: 'bold',
+                                            borderRadius: '4px',
+                                            border: 'none',
+                                            color: '#fff',
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            gap: '4px'
+                                          }}
+                                        >
+                                          ▶️ Tạo tiếp
+                                        </button>
+                                        <button
+                                          className="btn-secondary"
+                                          onClick={() => setSceneResetDialog({
+                                            videoId: currentVideoId,
+                                            videoTitle: videoTitle || `Video #${currentVideoId}`,
+                                            fromSceneNumber: 17,
+                                            isSubmitting: false,
+                                            error: ''
+                                          })}
+                                          disabled={currentVideoIsError}
+                                          title="Xóa và tạo lại từ một phân cảnh bất kỳ"
+                                          style={{
+                                            padding: '4px 14px',
+                                            fontSize: '0.82em',
+                                            background: 'rgba(241, 196, 15, 0.15)',
+                                            border: '1px solid #f1c40f',
+                                            color: '#f1c40f',
+                                            cursor: 'pointer',
+                                            fontWeight: 'bold',
+                                            borderRadius: '4px',
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            gap: '4px'
+                                          }}
+                                        >
+                                          🎯 Tạo lại từ cảnh...
+                                        </button>
+                                        <button
+                                          className="btn-secondary"
+                                          onClick={() => handleRenderVideo('recreate')}
+                                          disabled={currentVideoIsError}
+                                          title="Tạo mới một project trên Google Flow và tạo lại toàn bộ từ cảnh 1"
+                                          style={{
+                                            padding: '4px 14px',
+                                            fontSize: '0.82em',
+                                            background: 'rgba(231, 76, 60, 0.15)',
+                                            border: '1px solid #e74c3c',
+                                            color: '#ff6b6b',
+                                            cursor: 'pointer',
+                                            fontWeight: 'bold',
+                                            borderRadius: '4px',
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            gap: '4px'
+                                          }}
+                                        >
+                                          🔄 Tạo lại toàn bộ
+                                        </button>
+                                      </>
+                                    )
                                   ) : (
                                     <button
                                       className="btn-primary"

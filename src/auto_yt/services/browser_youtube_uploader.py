@@ -282,44 +282,41 @@ async def _visible_upload_dialog_elements(page, selector: str) -> list[Any]:
     return visible_elements
 
 
-async def _open_existing_draft_upload_dialog(page, timeout_ms: int = 10000) -> None:
+async def _open_existing_draft_upload_dialog(page, timeout_ms: int = 10000) -> bool:
     """Open the saved draft wizard without triggering a new video upload."""
-    if "/video/" in str(page.url or "") and "/edit" in str(page.url or ""):
-        return
     if await _find_visible_upload_details_dialog(page) is not None:
-        return
+        return True
+    edit_draft_selectors = [
+        "ytcp-button#edit-draft-button",
+        "#edit-draft-button",
+        "[test-id='edit-draft-button']",
+        "ytcp-button:has-text('Chỉnh sửa bản nháp')",
+        "ytcp-button:has-text('Edit draft')",
+        "button:has-text('Chỉnh sửa bản nháp')",
+        "button:has-text('Edit draft')",
+        "ytcp-video-row:has-text('Bản nháp') ytcp-button:has-text('Chỉnh sửa bản nháp')",
+        "ytcp-video-row:has-text('Draft') ytcp-button:has-text('Edit draft')",
+    ]
     edit_draft_clicked = await _safe_click(
         page,
-        [
-            "ytcp-button:has-text('Chỉnh sửa bản nháp')",
-            "ytcp-button:has-text('Edit draft')",
-            "button:has-text('Chỉnh sửa bản nháp')",
-            "button:has-text('Edit draft')",
-        ],
-        timeout_ms=3000,
+        edit_draft_selectors,
+        timeout_ms=4000,
     )
-    if not edit_draft_clicked:
-        if await _find_visible_upload_details_dialog(page) is not None:
-            return
-        raise BrowserUploadNeedsReview(
-            "Đã mở đúng bản nháp nhưng không tìm thấy nút Chỉnh sửa bản nháp; "
-            "giữ draft để kiểm tra, không upload lại MP4."
-        )
-
-    deadline = time.monotonic() + max(0.1, timeout_ms / 1000)
-    while time.monotonic() < deadline:
-        if await _find_visible_upload_details_dialog(page) is not None:
-            return
-        await asyncio.sleep(0.25)
-    raise BrowserUploadNeedsReview(
-        "YouTube Studio không mở được wizard của bản nháp đã lưu; "
-        "giữ draft để kiểm tra, không upload lại MP4."
-    )
+    if edit_draft_clicked:
+        deadline = time.monotonic() + max(0.1, timeout_ms / 1000)
+        while time.monotonic() < deadline:
+            if await _find_visible_upload_details_dialog(page) is not None:
+                logger.info("Đã mở thành công Upload Wizard cho bản nháp đã lưu.")
+                return True
+            await asyncio.sleep(0.25)
+    return await _find_visible_upload_details_dialog(page) is not None
 
 
 async def _ensure_resumed_draft_dialog(page, resuming_existing_draft: bool) -> None:
     if resuming_existing_draft:
-        await _open_existing_draft_upload_dialog(page)
+        opened = await _open_existing_draft_upload_dialog(page)
+        if not opened and "/edit" not in str(page.url or ""):
+            logger.warning("Chưa mở được dialog wizard cho bản nháp, tiếp tục với giao diện trang hiện tại...")
 
 
 async def _require_click(
@@ -3214,9 +3211,25 @@ async def upload_video_via_browser(
                 # 3. Click Schedule Done Button
                 schedule_done_selectors = [
                     "ytcp-uploads-dialog ytcp-button#done-button",
+                    "ytcp-uploads-dialog ytcp-button#publish-button",
+                    "ytcp-uploads-dialog ytcp-button#save-button",
+                    "ytcp-uploads-dialog ytcp-button:has-text('Lên lịch')",
+                    "ytcp-uploads-dialog ytcp-button:has-text('Schedule')",
+                    "ytcp-uploads-dialog ytcp-button:has-text('Lưu')",
+                    "ytcp-uploads-dialog ytcp-button:has-text('Save')",
                     "ytcp-uploads-dialog #done-button button",
                     "ytcp-video-upload-dialog ytcp-button#done-button",
+                    "ytcp-video-upload-dialog ytcp-button#publish-button",
+                    "ytcp-video-upload-dialog ytcp-button#save-button",
+                    "ytcp-video-upload-dialog ytcp-button:has-text('Lên lịch')",
+                    "ytcp-video-upload-dialog ytcp-button:has-text('Schedule')",
+                    "ytcp-video-upload-dialog ytcp-button:has-text('Lưu')",
+                    "ytcp-video-upload-dialog ytcp-button:has-text('Save')",
                     "ytcp-video-upload-dialog #done-button button",
+                    "ytcp-button#done-button",
+                    "ytcp-button#publish-button",
+                    "ytcp-button:has-text('Lên lịch')",
+                    "ytcp-button:has-text('Schedule')",
                 ]
                 await _wait_for_enabled_action(
                     page,
@@ -3450,6 +3463,100 @@ async def upload_video_via_browser(
                 raise BrowserUploadNeedsReview(
                     f"Video có hạn chế cần kiểm tra thủ công: {final_restriction}."
                 )
+            if schedule_at and not schedule_verified_on_page:
+                # Self-Healing Draft Recovery: If video is still showing as a Draft, automatically trigger wizard to finalize schedule
+                draft_btn_selectors = [
+                    "ytcp-button#edit-draft-button",
+                    "#edit-draft-button",
+                    "[test-id='edit-draft-button']",
+                    "ytcp-button:has-text('Chỉnh sửa bản nháp')",
+                    "ytcp-button:has-text('Edit draft')",
+                    "button:has-text('Chỉnh sửa bản nháp')",
+                    "button:has-text('Edit draft')",
+                ]
+                draft_btn_clicked = await _safe_click(page, draft_btn_selectors, timeout_ms=3000)
+                if draft_btn_clicked:
+                    logger.info("Phát hiện video đang ở trạng thái Bản nháp trên YouTube Studio. Đang tự động kích hoạt Wizard để hoàn tất Đặt lịch...")
+                    await asyncio.sleep(2.0)
+                    for draft_step in range(6):
+                        cancel_check()
+                        active_step = await _read_active_upload_step(page)
+                        if active_step == "visibility":
+                            logger.info("Đã chuyển đến tab Chế độ hiển thị trong draft wizard.")
+                            break
+                        next_clicked = await _safe_click(
+                            page,
+                            [
+                                "ytcp-uploads-dialog ytcp-button#next-button",
+                                "ytcp-video-upload-dialog ytcp-button#next-button",
+                                "ytcp-uploads-dialog #next-button button",
+                                "ytcp-video-upload-dialog #next-button button",
+                            ],
+                            timeout_ms=4000,
+                        )
+                        if not next_clicked:
+                            break
+                        await asyncio.sleep(1.5)
+
+                    # Select Schedule inside draft wizard
+                    await _safe_click(
+                        page,
+                        [
+                            "ytcp-uploads-dialog tp-yt-paper-radio-button#schedule-radio-button",
+                            "ytcp-uploads-dialog tp-yt-paper-radio-button[name='SCHEDULE']",
+                            "ytcp-uploads-dialog #second-container-expand-button",
+                            "ytcp-video-upload-dialog tp-yt-paper-radio-button#schedule-radio-button",
+                            "ytcp-video-upload-dialog tp-yt-paper-radio-button[name='SCHEDULE']",
+                            "ytcp-video-upload-dialog #second-container-expand-button",
+                        ],
+                        timeout_ms=5000,
+                    )
+                    await asyncio.sleep(1.0)
+                    await _set_datepicker_value(page, local_dt.date())
+                    await _set_timepicker_value(page, local_dt.time())
+                    await asyncio.sleep(1.0)
+
+                    # Click Done / Schedule
+                    await _safe_click(page, schedule_done_selectors, timeout_ms=8000)
+                    await asyncio.sleep(3.0)
+
+                    # Close completion dialog if shown
+                    try:
+                        share_dialog = await page.wait_for_selector(
+                            UPLOAD_COMPLETION_DIALOG_SELECTOR,
+                            state="visible",
+                            timeout=15000,
+                        )
+                        close_btn = await page.wait_for_selector(
+                            "ytcp-button#close-button, ytcp-button:has-text('Đóng'), ytcp-button:has-text('Close'), ytcp-video-share-dialog #close-button",
+                            state="visible",
+                            timeout=5000,
+                        )
+                        if close_btn:
+                            await close_btn.click()
+                            await asyncio.sleep(2.0)
+                    except Exception:
+                        pass
+
+                    # Re-verify on edit page
+                    try:
+                        await page.goto(
+                            f"https://studio.youtube.com/video/{youtube_video_id}/edit",
+                            wait_until="commit",
+                            timeout=45000,
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(3.0)
+                    editor_text = str(await page.locator("body").inner_text() or "")
+                    page_html = await page.content()
+                    if re.search(r"Đã lên lịch|Scheduled", editor_text, re.IGNORECASE):
+                        schedule_verified_on_page = True
+                        schedule_matches = (
+                            _schedule_date_matches(editor_text, local_dt.date())
+                            and _schedule_time_matches(editor_text, local_dt.time())
+                        ) or _schedule_timestamp_matches(page_html, local_dt)
+
             if schedule_at and not schedule_verified_on_page:
                 raise BrowserUploadNeedsReview(
                     "Đã bấm đặt lịch nhưng trang video chưa hiển thị trạng thái Đã lên lịch."

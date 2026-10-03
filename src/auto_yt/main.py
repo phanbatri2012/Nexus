@@ -8705,9 +8705,19 @@ def get_render_status(video_id: int):
             "file_name": Path(artifact.get("path") or "").name,
         }
 
+    prompt_version = video.get("prompt_version") or ""
+    snapshot = _get_prompt_production_snapshot(prompt_version)
+    render_mode = (
+        snapshot.get("render_mode")
+        or (snapshot.get("image_generation_settings") or {}).get("render_mode")
+        or (snapshot.get("pipeline") or {}).get("render_mode")
+        or "google_flow"
+    )
+
     return {
         "video_id": video_id,
         "state": state,
+        "render_mode": render_mode,
         "has_mp4": has_mp4,
         "is_active": is_active,
         "is_error": is_error,
