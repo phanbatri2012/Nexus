@@ -394,6 +394,21 @@ export default function YouTubeChannelSettings({
     changeChannel(channel.id, 'publication_slots', slots)
   }
 
+  const cleanupReservations = async channel => {
+    setBusy(true)
+    try {
+      const response = await fetch(`${API_BASE}/api/youtube-comments/channels/${channel.id}/cleanup-reservations`, {
+        method: 'POST'
+      })
+      const data = await response.json()
+      setMessage(data.message || 'Đã giải phóng các khung giờ giữ chỗ.')
+    } catch (error) {
+      setMessage(`Lỗi: ${error.message}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const saveChannel = async channel => {
     setBusy(true)
     try {
@@ -1050,9 +1065,19 @@ export default function YouTubeChannelSettings({
                   <button className="btn-danger" type="button" onClick={() => removePublicationSlot(channel, index)}>Xóa</button>
                 </div>
               ))}
-              <button className="btn-secondary" type="button" onClick={() => addPublicationSlot(channel)}>
-                + Thêm khung giờ đăng
-              </button>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <button className="btn-secondary" type="button" onClick={() => addPublicationSlot(channel)}>
+                  + Thêm khung giờ đăng
+                </button>
+                <button
+                  className="btn-secondary"
+                  type="button"
+                  title="Xóa bỏ các khung giờ đang bị giữ chỗ bởi tiến trình cũ đã lỗi hoặc dừng"
+                  onClick={() => cleanupReservations(channel)}
+                >
+                  🧹 Dọn dẹp slot giữ chỗ treo
+                </button>
+              </div>
             </div>
             <div style={{ display: 'flex', gap: 16, alignItems: 'center', flexWrap: 'wrap', marginTop: 12 }}>
               <label style={{ color: channel.publication_paused ? '#f5b041' : '#ddd' }}>

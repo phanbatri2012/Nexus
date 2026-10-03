@@ -1402,6 +1402,41 @@ async def verify_channel_gpm_studio_login(channel_db_id: int):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.get("/api/youtube-comments/channels/{channel_db_id}/schedule-reservations")
+async def get_channel_schedule_reservations(channel_db_id: int):
+    """Retrieve all publication slot reservations for a YouTube channel."""
+    channel = db.get_youtube_channel(channel_db_id)
+    if not channel:
+        raise HTTPException(status_code=404, detail="Không tìm thấy kênh YouTube.")
+    reservations = db.list_channel_schedule_reservations(
+        channel_db_id,
+        statuses=("reserved", "scheduled", "canceled"),
+    )
+    return {
+        "channel_id": channel_db_id,
+        "channel_title": channel.get("title"),
+        "reservations": reservations,
+    }
+
+
+@app.post("/api/youtube-comments/channels/{channel_db_id}/cleanup-reservations")
+async def cleanup_channel_schedule_reservations_endpoint(channel_db_id: int):
+    """Clean up stale or orphan reservations for a YouTube channel."""
+    channel = db.get_youtube_channel(channel_db_id)
+    if not channel:
+        raise HTTPException(status_code=404, detail="Không tìm thấy kênh YouTube.")
+    cleaned_count = db.cleanup_stale_channel_schedule_reservations(
+        youtube_channel_id=channel_db_id,
+        max_age_seconds=1800,
+    )
+    return {
+        "success": True,
+        "channel_id": channel_db_id,
+        "cleaned_count": cleaned_count,
+        "message": f"Đã giải phóng {cleaned_count} khung giờ giữ chỗ không còn hoạt động.",
+    }
+
+
 # =========================================================================
 # Multi-Platform Channel & Page Scanner API (YouTube, Facebook, TikTok)
 # Supports both GPM-Login Profiles & Local Chromium (Cốc Cốc, Chrome, Edge)

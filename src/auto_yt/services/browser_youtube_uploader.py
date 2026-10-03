@@ -107,7 +107,11 @@ UPLOAD_THUMBNAIL_PREVIEW_SELECTOR = (
 UPLOAD_COMPLETION_DIALOG_SELECTOR = (
     "ytcp-video-share-dialog, ytcp-publish-dialog, "
     "ytcp-dialog:has-text('Đã lên lịch cho video'), "
-    "ytcp-dialog:has-text('Video scheduled')"
+    "ytcp-dialog:has-text('Video scheduled'), "
+    "ytcp-dialog:has-text('Đã lên lịch'), "
+    "ytcp-dialog:has-text('Scheduled'), "
+    "ytcp-dialog:has-text('Đã xuất bản'), "
+    "ytcp-dialog:has-text('Published')"
 )
 MONETIZATION_MODE_AUTO = "auto_enable_if_available"
 MONETIZATION_MODE_KEEP_OFF = "keep_off"
@@ -2111,13 +2115,28 @@ async def _save_video_on_edit_page(
     cancel_check()
 
     # 1. Open visibility popup if not already opened
-    vis_trigger = await page.query_selector("ytcp-video-metadata-visibility, #visibility-text, ytcp-video-metadata-editor-sidepanel #container")
+    vis_trigger = await page.query_selector(
+        "ytcp-video-metadata-visibility, "
+        "ytcp-video-metadata-visibility #trigger, "
+        "ytcp-video-metadata-visibility #visibility-button, "
+        "ytcp-video-metadata-visibility ytcp-dropdown-trigger, "
+        "[test-id='visibility-button'], "
+        "#visibility-text, "
+        "ytcp-video-metadata-editor-sidepanel #visibility-container, "
+        "ytcp-video-metadata-editor-sidepanel #container"
+    )
     if vis_trigger:
         try:
             await vis_trigger.click()
             await asyncio.sleep(1.5)
         except Exception:
             pass
+    else:
+        await page.evaluate('''() => {
+            const el = document.querySelector("ytcp-video-metadata-visibility, [test-id='visibility-button'], #visibility-text, ytcp-video-metadata-editor-sidepanel #visibility-container");
+            if (el) el.click();
+        }''')
+        await asyncio.sleep(1.5)
 
     target_date_str = ""
     target_time_str = ""
@@ -2131,12 +2150,15 @@ async def _save_video_on_edit_page(
 
         # Click 'Lên lịch' radio / button inside visibility popup
         await page.evaluate('''() => {
-            const popup = document.querySelector("ytcp-video-visibility-edit-popup, tp-yt-paper-dialog#dialog");
+            const popup = document.querySelector("ytcp-video-visibility-edit-popup, tp-yt-paper-dialog#dialog, [role='dialog']");
             if (!popup) return;
-            const schedRadio = popup.querySelector("#second-container-expand-button, tp-yt-paper-radio-button#schedule-radio-button, tp-yt-paper-radio-button[name='SCHEDULE']");
+            const schedRadio = popup.querySelector("#second-container-expand-button, tp-yt-paper-radio-button#schedule-radio-button, tp-yt-paper-radio-button[name='SCHEDULE'], #radio-schedule");
             if (schedRadio) { schedRadio.click(); return; }
-            const allRadios = Array.from(popup.querySelectorAll("tp-yt-paper-radio-button, div"));
-            const target = allRadios.find(r => (r.innerText || '').trim().startsWith('Lên lịch'));
+            const allRadios = Array.from(popup.querySelectorAll("tp-yt-paper-radio-button, div, span"));
+            const target = allRadios.find(r => {
+                const txt = (r.innerText || r.textContent || '').trim().toLowerCase();
+                return txt.startsWith('lên lịch') || txt.startsWith('schedule');
+            });
             if (target) target.click();
         }''')
         await asyncio.sleep(1.0)
@@ -2151,19 +2173,22 @@ async def _save_video_on_edit_page(
     else:
         # Private
         await page.evaluate('''() => {
-            const popup = document.querySelector("ytcp-video-visibility-edit-popup, tp-yt-paper-dialog#dialog");
+            const popup = document.querySelector("ytcp-video-visibility-edit-popup, tp-yt-paper-dialog#dialog, [role='dialog']");
             if (!popup) return;
-            const privateRadio = popup.querySelector("tp-yt-paper-radio-button[name='PRIVATE']");
+            const privateRadio = popup.querySelector("tp-yt-paper-radio-button[name='PRIVATE'], tp-yt-paper-radio-button#private-radio-button");
             if (privateRadio) privateRadio.click();
         }''')
         await asyncio.sleep(0.5)
 
     # Click 'Xong' in popup
     await page.evaluate('''() => {
-        const popup = document.querySelector("ytcp-video-visibility-edit-popup, tp-yt-paper-dialog#dialog");
+        const popup = document.querySelector("ytcp-video-visibility-edit-popup, tp-yt-paper-dialog#dialog, [role='dialog']");
         if (!popup) return;
         const btns = Array.from(popup.querySelectorAll("ytcp-button, button"));
-        const doneBtn = btns.find(b => (b.innerText || '').trim() === 'Xong' || (b.innerText || '').trim() === 'Done' || b.id === 'save-button');
+        const doneBtn = btns.find(b => {
+            const txt = (b.innerText || b.textContent || '').trim().toLowerCase();
+            return txt === 'xong' || txt === 'done' || txt === 'lên lịch' || txt === 'schedule' || b.id === 'save-button' || b.id === 'done-button';
+        });
         if (doneBtn) doneBtn.click();
     }''')
     await asyncio.sleep(1.5)
@@ -2182,7 +2207,7 @@ async def _save_video_on_edit_page(
     # Click Save on main page
     progress("Đang lưu thay đổi video trên YouTube Studio...", "saving_video", 92)
     saved = await page.evaluate('''() => {
-        const saveBtn = document.querySelector("ytcp-button#save, button#save, [test-id='save-button']");
+        const saveBtn = document.querySelector("ytcp-button#save, button#save, [test-id='save-button'], #save-button button, ytcp-button#save-button");
         if (saveBtn && !saveBtn.hasAttribute('disabled') && saveBtn.getAttribute('aria-disabled') !== 'true') {
             saveBtn.click();
             return true;
@@ -2193,6 +2218,31 @@ async def _save_video_on_edit_page(
         logger.info("Đã bấm Lưu thay đổi trên trang chỉnh sửa.")
     await asyncio.sleep(2.0)
 
+    # Handle any confirmation modal if saving while checks are running
+    for _ in range(3):
+        conf = await page.query_selector("ytcp-confirmation-dialog, ytcp-dialog, tp-yt-paper-dialog#dialog")
+        if conf and await conf.is_visible():
+            await _safe_click(
+                page,
+                [
+                    "ytcp-confirmation-dialog #confirm-button",
+                    "ytcp-dialog #confirm-button",
+                    "ytcp-button#confirm-button",
+                    "button#confirm-button",
+                    "ytcp-button:has-text('Vẫn lưu')",
+                    "ytcp-button:has-text('Lưu')",
+                    "ytcp-button:has-text('Xác nhận')",
+                    "ytcp-button:has-text('Đã hiểu')",
+                    "ytcp-button:has-text('Save anyway')",
+                    "ytcp-button:has-text('Save')",
+                    "ytcp-button:has-text('Got it')",
+                ],
+                timeout_ms=2000,
+            )
+            await asyncio.sleep(1.0)
+            break
+        await asyncio.sleep(0.5)
+
     # Wait for save toast / button disabled
     save_confirmed = False
     for _ in range(15):
@@ -2201,7 +2251,7 @@ async def _save_video_on_edit_page(
             const toasts = Array.from(document.querySelectorAll("tp-yt-paper-toast, ytcp-toast"))
                 .filter(t => t.offsetHeight > 0)
                 .map(t => (t.innerText || t.textContent || '').trim());
-            const saveBtn = document.querySelector("ytcp-button#save, button#save");
+            const saveBtn = document.querySelector("ytcp-button#save, button#save, [test-id='save-button'], #save-button button, ytcp-button#save-button");
             const disabled = saveBtn ? (saveBtn.hasAttribute('disabled') || saveBtn.getAttribute('aria-disabled') === 'true') : true;
             return { toasts, disabled };
         }''')
@@ -3246,33 +3296,57 @@ async def upload_video_via_browser(
                 if not done_clicked:
                     raise BrowserUploadError("Không thể click nút 'Lên lịch' (Done/Schedule) trên YouTube Studio.")
 
-                await asyncio.sleep(3.0)
+                await asyncio.sleep(2.0)
 
-                confirmation = await page.query_selector("ytcp-confirmation-dialog")
-                if confirmation is not None and await confirmation.is_visible():
-                    confirmation_text = str(await confirmation.inner_text() or "")
-                    checks_pending = bool(
-                        re.search(
-                            r"vẫn đang kiểm tra|still checking",
-                            confirmation_text,
-                            re.IGNORECASE,
-                        )
+                # Robust check for confirmation / checks-running dialog
+                for _ in range(6):
+                    confirmation = await page.query_selector(
+                        "ytcp-confirmation-dialog, ytcp-dialog, tp-yt-paper-dialog#dialog, [role='dialog']"
                     )
-                    if not checks_pending:
-                        raise BrowserUploadNeedsReview(
-                            "YouTube Studio hiển thị cảnh báo cần kiểm tra thủ công trước khi đặt lịch."
+                    if confirmation is not None and await confirmation.is_visible():
+                        confirmation_text = str(await confirmation.inner_text() or "")
+                        checks_pending = bool(
+                            re.search(
+                                r"kiểm tra|checking|checks|tiếp diễn|chưa hoàn tất|tiếp tục|vẫn đang|bản quyền|schedule anyway|vẫn lên lịch|lên lịch|got it|đã hiểu|xác nhận|confirm",
+                                confirmation_text,
+                                re.IGNORECASE,
+                            )
                         )
-                    await _require_click(
-                        page,
-                        [
-                            "ytcp-confirmation-dialog #confirm-button",
-                            "ytcp-confirmation-dialog ytcp-button:has-text('Đã hiểu')",
-                            "ytcp-confirmation-dialog ytcp-button:has-text('Got it')",
-                        ],
-                        "Không thể xác nhận thông báo checks đang chạy.",
-                        timeout_ms=3000,
-                    )
-                    await asyncio.sleep(2.0)
+                        if checks_pending:
+                            logger.info(
+                                "Phát hiện hộp thoại xác nhận khi đặt lịch: '%s'. Đang tự động bấm xác nhận...",
+                                confirmation_text.replace('\n', ' ')[:100],
+                            )
+                            confirm_clicked = await _safe_click(
+                                page,
+                                [
+                                    "ytcp-confirmation-dialog #confirm-button",
+                                    "ytcp-dialog #confirm-button",
+                                    "ytcp-button#confirm-button",
+                                    "button#confirm-button",
+                                    "ytcp-button:has-text('Vẫn lên lịch')",
+                                    "ytcp-button:has-text('Schedule anyway')",
+                                    "ytcp-button:has-text('Lên lịch')",
+                                    "ytcp-button:has-text('Schedule')",
+                                    "ytcp-button:has-text('Đã hiểu')",
+                                    "ytcp-button:has-text('Got it')",
+                                    "ytcp-button:has-text('Xác nhận')",
+                                    "ytcp-button:has-text('Confirm')",
+                                    "ytcp-button:has-text('Tiếp tục')",
+                                    "ytcp-button:has-text('Continue')",
+                                ],
+                                timeout_ms=3000,
+                            )
+                            if confirm_clicked:
+                                await asyncio.sleep(2.0)
+                                break
+                        else:
+                            restriction = _find_blocking_restriction(confirmation_text)
+                            if restriction:
+                                raise BrowserUploadNeedsReview(
+                                    f"YouTube Studio hiển thị hạn chế cần kiểm tra thủ công: {restriction}"
+                                )
+                    await asyncio.sleep(0.8)
 
             elif resolved_publish_mode == "public":
                 # Public immediately mode
@@ -3464,7 +3538,11 @@ async def upload_video_via_browser(
                     f"Video có hạn chế cần kiểm tra thủ công: {final_restriction}."
                 )
             if schedule_at and not schedule_verified_on_page:
-                # Self-Healing Draft Recovery: If video is still showing as a Draft, automatically trigger wizard to finalize schedule
+                logger.info(
+                    "Phát hiện video đang ở trạng thái Bản nháp (Draft) trên YouTube Studio. "
+                    "Bắt đầu quy trình tự phục hồi và hoàn tất Đặt lịch (Self-Healing Recovery)..."
+                )
+                # Tier 1: If Draft Wizard button exists on edit page, open and finalize via wizard
                 draft_btn_selectors = [
                     "ytcp-button#edit-draft-button",
                     "#edit-draft-button",
@@ -3476,7 +3554,7 @@ async def upload_video_via_browser(
                 ]
                 draft_btn_clicked = await _safe_click(page, draft_btn_selectors, timeout_ms=3000)
                 if draft_btn_clicked:
-                    logger.info("Phát hiện video đang ở trạng thái Bản nháp trên YouTube Studio. Đang tự động kích hoạt Wizard để hoàn tất Đặt lịch...")
+                    logger.info("Đã mở Draft Wizard từ trang edit. Đang chuyển đến tab Chế độ hiển thị...")
                     await asyncio.sleep(2.0)
                     for draft_step in range(6):
                         cancel_check()
@@ -3518,15 +3596,38 @@ async def upload_video_via_browser(
 
                     # Click Done / Schedule
                     await _safe_click(page, schedule_done_selectors, timeout_ms=8000)
-                    await asyncio.sleep(3.0)
+                    await asyncio.sleep(2.0)
+
+                    # Confirm any checks modal in draft wizard
+                    for _ in range(4):
+                        conf = await page.query_selector(
+                            "ytcp-confirmation-dialog, ytcp-dialog, tp-yt-paper-dialog#dialog, [role='dialog']"
+                        )
+                        if conf and await conf.is_visible():
+                            await _safe_click(
+                                page,
+                                [
+                                    "ytcp-confirmation-dialog #confirm-button",
+                                    "ytcp-dialog #confirm-button",
+                                    "ytcp-button#confirm-button",
+                                    "button#confirm-button",
+                                    "ytcp-button:has-text('Vẫn lên lịch')",
+                                    "ytcp-button:has-text('Schedule anyway')",
+                                    "ytcp-button:has-text('Lên lịch')",
+                                    "ytcp-button:has-text('Schedule')",
+                                    "ytcp-button:has-text('Đã hiểu')",
+                                    "ytcp-button:has-text('Got it')",
+                                    "ytcp-button:has-text('Xác nhận')",
+                                    "ytcp-button:has-text('Confirm')",
+                                ],
+                                timeout_ms=2000,
+                            )
+                            await asyncio.sleep(1.5)
+                            break
+                        await asyncio.sleep(0.5)
 
                     # Close completion dialog if shown
                     try:
-                        share_dialog = await page.wait_for_selector(
-                            UPLOAD_COMPLETION_DIALOG_SELECTOR,
-                            state="visible",
-                            timeout=15000,
-                        )
                         close_btn = await page.wait_for_selector(
                             "ytcp-button#close-button, ytcp-button:has-text('Đóng'), ytcp-button:has-text('Close'), ytcp-video-share-dialog #close-button",
                             state="visible",
@@ -3538,24 +3639,56 @@ async def upload_video_via_browser(
                     except Exception:
                         pass
 
-                    # Re-verify on edit page
+                # Tier 2: Directly configure Visibility and Save on the Edit Page sidepanel
+                try:
+                    await page.goto(
+                        f"https://studio.youtube.com/video/{youtube_video_id}/edit",
+                        wait_until="commit",
+                        timeout=45000,
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(3.0)
+                editor_text = str(await page.locator("body").inner_text() or "")
+                page_html = await page.content()
+
+                if not re.search(r"Đã lên lịch|Scheduled", editor_text, re.IGNORECASE):
+                    logger.info(
+                        "Video vẫn ở trạng thái Bản nháp. Đang tự động lưu Đặt lịch trực tiếp qua bảng điều khiển Video Edit Page..."
+                    )
                     try:
-                        await page.goto(
-                            f"https://studio.youtube.com/video/{youtube_video_id}/edit",
-                            wait_until="commit",
-                            timeout=45000,
+                        await _save_video_on_edit_page(
+                            page,
+                            schedule_at=schedule_at,
+                            publication_timezone=publication_timezone,
+                            caption_path=caption_path,
+                            language=language,
+                            settings=settings,
+                            cancel_check=cancel_check,
+                            persist_checkpoint=persist_checkpoint,
+                            progress=progress,
                         )
-                    except Exception:
-                        pass
-                    await asyncio.sleep(3.0)
-                    editor_text = str(await page.locator("body").inner_text() or "")
-                    page_html = await page.content()
-                    if re.search(r"Đã lên lịch|Scheduled", editor_text, re.IGNORECASE):
-                        schedule_verified_on_page = True
-                        schedule_matches = (
-                            _schedule_date_matches(editor_text, local_dt.date())
-                            and _schedule_time_matches(editor_text, local_dt.time())
-                        ) or _schedule_timestamp_matches(page_html, local_dt)
+                        await asyncio.sleep(3.0)
+                        try:
+                            await page.goto(
+                                f"https://studio.youtube.com/video/{youtube_video_id}/edit",
+                                wait_until="commit",
+                                timeout=45000,
+                            )
+                            await asyncio.sleep(3.0)
+                        except Exception:
+                            pass
+                        editor_text = str(await page.locator("body").inner_text() or "")
+                        page_html = await page.content()
+                    except Exception as save_err:
+                        logger.warning("Lỗi trong lúc tự lưu trên edit page: %s", save_err)
+
+                if re.search(r"Đã lên lịch|Scheduled", editor_text, re.IGNORECASE):
+                    schedule_verified_on_page = True
+                    schedule_matches = (
+                        _schedule_date_matches(editor_text, local_dt.date())
+                        and _schedule_time_matches(editor_text, local_dt.time())
+                    ) or _schedule_timestamp_matches(page_html, local_dt)
 
             if schedule_at and not schedule_verified_on_page:
                 raise BrowserUploadNeedsReview(

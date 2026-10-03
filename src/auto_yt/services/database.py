@@ -5652,14 +5652,88 @@ def list_channel_schedule_reservations(
     placeholders = ",".join("?" for _ in statuses)
     rows = conn.execute(
         f"""
-        SELECT * FROM channel_schedule_reservations
-        WHERE youtube_channel_id = ? AND status IN ({placeholders})
-        ORDER BY scheduled_at
+        SELECT r.*, w.video_id, w.status as workflow_status, v.title as video_title
+        FROM channel_schedule_reservations r
+        LEFT JOIN youtube_publish_workflows w ON r.workflow_id = w.id
+        LEFT JOIN videos v ON w.video_id = v.id
+        WHERE r.youtube_channel_id = ? AND r.status IN ({placeholders})
+        ORDER BY r.scheduled_at ASC
         """,
         (youtube_channel_id, *statuses),
     ).fetchall()
     conn.close()
     return [dict(row) for row in rows]
+
+
+def cleanup_stale_channel_schedule_reservations(
+    conn: sqlite3.Connection | None = None,
+    youtube_channel_id: int | None = None,
+    max_age_seconds: int = 3600,
+) -> int:
+    """Clean up stale 'reserved' records where the parent workflow/job failed, canceled, or expired."""
+    close_after = False
+    if conn is None:
+        conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+        close_after = True
+    try:
+        now = utc_now()
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        channel_clause = "AND r.youtube_channel_id = ?" if youtube_channel_id is not None else ""
+        channel_clause_simple = "AND youtube_channel_id = ?" if youtube_channel_id is not None else ""
+        params: list[Any] = [youtube_channel_id] if youtube_channel_id is not None else []
+
+        # 1. Cancel reservations where workflow or job is in error/canceled/failed
+        cur = conn.execute(
+            f"""
+            UPDATE channel_schedule_reservations
+            SET status = 'canceled', updated_at = ?
+            WHERE status = 'reserved'
+              {channel_clause_simple}
+              AND workflow_id IN (
+                  SELECT w.id FROM youtube_publish_workflows w
+                  LEFT JOIN system_jobs j ON w.system_job_id = j.id
+                  WHERE w.status IN ('error', 'canceled', 'failed')
+                     OR j.status IN ('error', 'cancelled', 'failed')
+              )
+            """,
+            (now, *params),
+        )
+        cleaned_count = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+        # 2. Cancel reservations where updated_at is older than max_age_seconds and workflow is not actively running
+        stale_rows = conn.execute(
+            f"""
+            SELECT r.workflow_id, r.updated_at, r.created_at, w.status as w_status, j.status as j_status
+            FROM channel_schedule_reservations r
+            LEFT JOIN youtube_publish_workflows w ON r.workflow_id = w.id
+            LEFT JOIN system_jobs j ON w.system_job_id = j.id
+            WHERE r.status = 'reserved' {channel_clause}
+            """,
+            params,
+        ).fetchall()
+        for row in stale_rows:
+            wf_id = row["workflow_id"] if isinstance(row, sqlite3.Row) else row[0]
+            upd_str = (row["updated_at"] or row["created_at"]) if isinstance(row, sqlite3.Row) else (row[1] or row[2])
+            w_st = str((row["w_status"] if isinstance(row, sqlite3.Row) else row[3]) or "")
+            j_st = str((row["j_status"] if isinstance(row, sqlite3.Row) else row[4]) or "")
+            is_active = (w_st in ("running", "processing", "browser_upload", "uploading") or j_st in ("running", "processing"))
+            if not is_active and upd_str:
+                try:
+                    upd_dt = datetime.datetime.fromisoformat(str(upd_str).replace("Z", "+00:00"))
+                    if upd_dt.tzinfo is None:
+                        upd_dt = upd_dt.replace(tzinfo=datetime.timezone.utc)
+                    if (now_dt - upd_dt).total_seconds() > max_age_seconds:
+                        conn.execute(
+                            "UPDATE channel_schedule_reservations SET status = 'canceled', updated_at = ? WHERE workflow_id = ?",
+                            (now, wf_id),
+                        )
+                        cleaned_count += 1
+                except Exception:
+                    pass
+        return cleaned_count
+    finally:
+        if close_after:
+            conn.close()
 
 
 def get_channel_schedule_reservation(workflow_id: str) -> dict | None:
@@ -5768,8 +5842,27 @@ def reserve_youtube_publication_slot(
                 (utc_now(), workflow_id),
             )
 
+        # Auto-clean any stale or dead reservations for this channel
+        cleanup_stale_channel_schedule_reservations(conn, channel["id"])
+
         res_rows = conn.execute(
-            "SELECT scheduled_at FROM channel_schedule_reservations WHERE youtube_channel_id = ? AND workflow_id != ? AND status IN ('reserved', 'scheduled')",
+            """
+            SELECT r.scheduled_at 
+            FROM channel_schedule_reservations r
+            LEFT JOIN youtube_publish_workflows w ON r.workflow_id = w.id
+            LEFT JOIN system_jobs j ON w.system_job_id = j.id
+            WHERE r.youtube_channel_id = ? 
+              AND r.workflow_id != ? 
+              AND r.status IN ('reserved', 'scheduled')
+              AND (
+                  r.status = 'scheduled'
+                  OR (
+                      r.status = 'reserved'
+                      AND COALESCE(w.status, '') NOT IN ('error', 'canceled', 'failed')
+                      AND COALESCE(j.status, '') NOT IN ('error', 'cancelled', 'failed')
+                  )
+              )
+            """,
             (channel["id"], workflow_id),
         ).fetchall()
         pub_rows = conn.execute(
@@ -5778,6 +5871,7 @@ def reserve_youtube_publication_slot(
             FROM video_publications
             WHERE youtube_channel_id = ?
               AND COALESCE(NULLIF(scheduled_at, ''), NULLIF(published_at, '')) IS NOT NULL
+              AND processing_status != 'failed'
             """,
             (channel["id"],),
         ).fetchall()

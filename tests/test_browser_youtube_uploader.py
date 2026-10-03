@@ -147,7 +147,14 @@ class TestBrowserYouTubeUploader(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(len(progress_called) > 0)
         self.assertEqual(progress_called[-1][1], "upload_complete")
 
+    def test_completion_dialog_selectors(self):
+        from auto_yt.services.browser_youtube_uploader import UPLOAD_COMPLETION_DIALOG_SELECTOR
+        self.assertIn("ytcp-video-share-dialog", UPLOAD_COMPLETION_DIALOG_SELECTOR)
+        self.assertIn("Scheduled", UPLOAD_COMPLETION_DIALOG_SELECTOR)
+        self.assertIn("Đã lên lịch", UPLOAD_COMPLETION_DIALOG_SELECTOR)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
