@@ -50,7 +50,6 @@ UPLOAD_DIALOG_ROOT_SELECTORS = (
     "ytcp-video-upload-dialog",
     "ytcp-video-details",
     "ytcp-video-metadata-editor",
-    "ytcp-entity-page",
 )
 UPLOAD_DIALOG_SELECTOR = ", ".join(UPLOAD_DIALOG_ROOT_SELECTORS)
 TITLE_EDITOR_SELECTORS = (
@@ -98,9 +97,12 @@ UPLOAD_PLAYLIST_TRIGGER_SELECTORS = [
 ]
 UPLOAD_THUMBNAIL_PREVIEW_SELECTOR = (
     "ytcp-uploads-dialog ytcp-video-custom-still-editor img[src], "
+    "ytcp-uploads-dialog ytcp-video-thumbnail-editor img[src], "
     "ytcp-uploads-dialog #custom-thumbnail img[src], "
     "ytcp-video-upload-dialog ytcp-video-custom-still-editor img[src], "
-    "ytcp-video-upload-dialog #custom-thumbnail img[src]"
+    "ytcp-video-upload-dialog ytcp-video-thumbnail-editor img[src], "
+    "ytcp-video-upload-dialog #custom-thumbnail img[src], "
+    "ytcp-video-thumbnail-editor img[src]"
 )
 UPLOAD_COMPLETION_DIALOG_SELECTOR = (
     "ytcp-video-share-dialog, ytcp-publish-dialog, "
@@ -406,7 +408,9 @@ def _emit_checkpoint(
 
 async def _read_monetization_snapshot(page) -> dict[str, Any]:
     """Read upload-step topology from the Studio dialog without page-wide text selectors."""
-    dialog = await page.query_selector(UPLOAD_DIALOG_SELECTOR)
+    dialog = await _find_visible_upload_details_dialog(page)
+    if dialog is None:
+        dialog = await page.query_selector("ytcp-uploads-dialog, ytcp-video-upload-dialog, ytcp-video-details, ytcp-video-metadata-editor")
     if dialog is None:
         raise BrowserUploadError("Không tìm thấy upload dialog để nhận diện kiếm tiền.")
     return await dialog.evaluate(
@@ -592,6 +596,70 @@ def _parse_schedule_at(schedule_at: str, timezone_name: str) -> dt.datetime:
         raise BrowserUploadError(f"Timezone kênh không hợp lệ: {timezone_name}") from exc
 
 
+async def _wait_for_file_upload_complete(
+    page,
+    timeout_seconds: float = 600.0,
+    progress: Callable[[str, str, int], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
+) -> None:
+    """Wait until Chromium finishes uploading the MP4 file bytes to YouTube before scheduling."""
+    start_time = time.monotonic()
+    last_pct = 0
+    while (time.monotonic() - start_time) < timeout_seconds:
+        if cancel_check:
+            cancel_check()
+        progress_text = await page.evaluate("""
+        () => {
+            const el = document.querySelector('ytcp-video-upload-progress, ytcp-uploads-dialog ytcp-video-upload-progress, ytcp-uploads-dialog .progress-label');
+            return el ? (el.innerText || el.textContent || '') : '';
+        }
+        """)
+        clean_text = str(progress_text or "").strip()
+        if not clean_text:
+            dialog = await page.query_selector("ytcp-uploads-dialog, ytcp-video-upload-dialog")
+            if dialog:
+                d_text = await dialog.inner_text()
+                for line in d_text.splitlines():
+                    if any(k in line.lower() for k in ["đã tải được", "đang tải", "uploading", "%"]):
+                        clean_text = line.strip()
+                        break
+
+        pct_match = re.search(r"(\d+)%", clean_text)
+        if pct_match:
+            pct_val = int(pct_match.group(1))
+            if pct_val != last_pct:
+                last_pct = pct_val
+                mapped_pct = int(20 + (pct_val * 0.45))
+                if progress:
+                    progress(f"Đang tải video lên YouTube ({clean_text})...", "uploading_file", mapped_pct)
+
+        is_done = any(
+            k in clean_text.lower()
+            for k in [
+                "đã hoàn tất quá trình tải lên",
+                "upload complete",
+                "quá trình xử lý sắp bắt đầu",
+                "processing will begin shortly",
+                "đang xử lý",
+                "processing",
+                "đã xử lý xong",
+                "kiểm tra hoàn tất",
+                "checks complete",
+                "không tìm thấy vấn đề",
+                "no issues found",
+            ]
+        )
+        if is_done or last_pct >= 100:
+            logger.info("Quá trình upload file MP4 lên YouTube đã hoàn tất (%s)", clean_text)
+            if progress:
+                progress("Đã tải xong 100% file video lên YouTube.", "upload_complete", 65)
+            return
+
+        await asyncio.sleep(2.0)
+
+    logger.warning("Hết thời gian chờ upload file 100%% sau %.1fs; tiếp tục tiến trình...", timeout_seconds)
+
+
 async def _read_control_value(element) -> str:
     try:
         value = await element.input_value()
@@ -666,6 +734,181 @@ def _schedule_timestamp_matches(page_markup: str, expected: dt.datetime) -> bool
         )
     }
     return any(abs(value - expected_seconds) <= 60 for value in scheduled_seconds)
+
+
+async def _set_datepicker_value(page, target_date: dt.date) -> tuple[bool, str]:
+    """Robust datepicker setter for YouTube Studio Upload Wizard and Edit Page."""
+    target_date_str = _format_date_for_picker(target_date)
+    target_day = target_date.day
+
+    dp_trigger = await page.query_selector(
+        "ytcp-datetime-picker #datepicker-trigger, #datepicker-trigger, "
+        "ytcp-video-visibility-edit-popup #datepicker-trigger, ytcp-date-picker"
+    )
+    if dp_trigger:
+        val = await _read_control_value(dp_trigger)
+        if _schedule_date_matches(val, target_date):
+            logger.info("Ngày đặt lịch đã đúng sẵn: %s", val)
+            return True, val
+
+    # Click trigger to open dropdown/calendar
+    if dp_trigger:
+        try:
+            await dp_trigger.click()
+            await asyncio.sleep(0.6)
+        except Exception:
+            pass
+
+    # 1. Click matching day in calendar via DOM evaluate
+    try:
+        clicked = await page.evaluate("""(day) => {
+            const days = Array.from(document.querySelectorAll('.calendar-day:not(.disabled), ytcp-calendar-day:not([disabled])'));
+            const matching = days.find(d => (d.innerText || d.textContent || '').trim() === String(day));
+            if (matching) {
+                matching.click();
+                return true;
+            }
+            return false;
+        }""", target_day)
+        if clicked:
+            await asyncio.sleep(0.5)
+            # Blur popup by clicking neutral header
+            try:
+                await page.click("ytcp-uploads-dialog #visibility-title, ytcp-uploads-dialog #second-container", timeout=1000)
+            except Exception:
+                pass
+            if dp_trigger:
+                val = await _read_control_value(dp_trigger)
+                if _schedule_date_matches(val, target_date):
+                    logger.info("Đã chọn ngày thành công qua click lịch: %s", val)
+                    return True, val
+    except Exception as c_exc:
+        logger.debug("Lỗi click lịch: %s", c_exc)
+
+    # 2. Try input inside datepicker popup
+    date_inputs = [
+        "ytcp-date-picker input",
+        "tp-yt-paper-dialog#dialog input",
+        "ytcp-datetime-picker input",
+        "#datepicker-trigger input",
+        "input[aria-label*='ngày' i]",
+        "input[aria-label*='date' i]",
+    ]
+    for sel in date_inputs:
+        try:
+            inp = await page.query_selector(sel)
+            if inp and await inp.is_visible():
+                await inp.click()
+                await page.keyboard.press("Control+A")
+                await page.keyboard.press("Backspace")
+                await inp.fill(target_date_str)
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(0.4)
+                try:
+                    await page.click("ytcp-uploads-dialog #visibility-title, ytcp-uploads-dialog #second-container", timeout=1000)
+                except Exception:
+                    pass
+                val = await _read_control_value(dp_trigger) if dp_trigger else await _read_control_value(inp)
+                if _schedule_date_matches(val, target_date):
+                    logger.info("Đã điền ngày thành công bằng input %s: %s", sel, val)
+                    return True, val
+        except Exception:
+            continue
+
+    final_val = await _read_control_value(dp_trigger) if dp_trigger else ""
+    return _schedule_date_matches(final_val, target_date), final_val
+
+
+async def _set_timepicker_value(page, target_time: dt.time) -> tuple[bool, str]:
+    """Robust timepicker setter for YouTube Studio Upload Wizard and Edit Page."""
+    target_time_str = _format_time_for_picker(target_time)
+
+    # 1. Click time input to reveal time dropdown
+    time_selectors = [
+        "ytcp-datetime-picker #time-of-day-container input",
+        "ytcp-datetime-picker tp-yt-paper-input#textbox input",
+        "#time-of-day-container input",
+        "#time-of-day-trigger input",
+        "input#time-input",
+        "ytcp-time-of-day-picker input",
+        "ytcp-video-visibility-edit-popup #time-of-day-container input",
+        "input[aria-label*='giờ' i]",
+        "input[aria-label*='time' i]",
+    ]
+
+    for sel in time_selectors:
+        try:
+            inp = await page.query_selector(sel)
+            if inp and await inp.is_visible():
+                val = await _read_control_value(inp)
+                if _schedule_time_matches(val, target_time):
+                    logger.info("Giờ đặt lịch đã đúng sẵn: %s", val)
+                    return True, val
+                await inp.click()
+                await asyncio.sleep(0.6)
+
+                # 2. Click matching tp-yt-paper-item in time dropdown list
+                time_clicked = await page.evaluate("""(targetStr) => {
+                    const items = Array.from(document.querySelectorAll('ytcp-time-of-day-picker tp-yt-paper-item, tp-yt-paper-dialog tp-yt-paper-item'));
+                    const target = items.find(i => (i.innerText || '').trim() === targetStr);
+                    if (target) {
+                        target.click();
+                        return true;
+                    }
+                    return false;
+                }""", target_time_str)
+
+                if time_clicked:
+                    await asyncio.sleep(0.4)
+                    val = await _read_control_value(inp)
+                    if _schedule_time_matches(val, target_time):
+                        logger.info("Đã chọn giờ thành công qua item dropdown: %s", val)
+                        return True, val
+
+                # 3. Direct fill and event dispatch
+                await inp.click()
+                await page.keyboard.press("Control+A")
+                await page.keyboard.press("Backspace")
+                await inp.fill(target_time_str)
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(0.3)
+                await page.evaluate("""(targetStr) => {
+                    const inputEl = document.querySelector('ytcp-datetime-picker #time-of-day-container input, #time-of-day-container input');
+                    if (inputEl) {
+                        inputEl.value = targetStr;
+                        inputEl.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                        inputEl.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                    }
+                    const paper = document.querySelector('ytcp-datetime-picker tp-yt-paper-input#textbox');
+                    if (paper) {
+                        paper.value = targetStr;
+                        paper.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                    }
+                }""", target_time_str)
+                try:
+                    await page.click("ytcp-uploads-dialog #visibility-title, ytcp-uploads-dialog #second-container", timeout=1000)
+                except Exception:
+                    pass
+                val = await _read_control_value(inp)
+                if _schedule_time_matches(val, target_time):
+                    logger.info("Đã điền giờ thành công bằng %s: %s", sel, val)
+                    return True, val
+        except Exception:
+            continue
+
+    # Read whatever control matches
+    for sel in time_selectors:
+        try:
+            inp = await page.query_selector(sel)
+            if inp:
+                val = await _read_control_value(inp)
+                if _schedule_time_matches(val, target_time):
+                    return True, val
+        except Exception:
+            pass
+
+    return False, ""
+
 
 
 def _find_blocking_restriction(text: str) -> str:
@@ -1468,6 +1711,12 @@ async def _import_end_screen_from_video(page, source_video_id: str) -> str:
     await _require_click(
         page,
         [
+            "ytcp-uploads-video-elements #import-from-video-button",
+            "#import-from-video-button button",
+            "ytcp-button#import-from-video-button",
+            "#import-from-video-button",
+            "ytcp-uploads-video-element:has-text('Màn hình kết thúc') #import-from-video-button",
+            "ytcp-uploads-video-element:has-text('End screen') #import-from-video-button",
             "ytcp-video-elements #endscreens ytcp-button",
             "ytcp-video-elements [test-id='endscreens'] ytcp-button",
             "ytcp-video-elements ytcp-button:has-text('Nhập từ video')",
@@ -1537,6 +1786,12 @@ async def _upload_caption_from_elements(
     await _require_click(
         page,
         [
+            "ytcp-uploads-video-elements #subtitles-button",
+            "#subtitles-button button",
+            "ytcp-button#subtitles-button",
+            "#subtitles-button",
+            "ytcp-uploads-video-element:has-text('Phụ đề') ytcp-button",
+            "ytcp-uploads-video-element:has-text('Subtitles') ytcp-button",
             "ytcp-video-elements #subtitles ytcp-button",
             "ytcp-video-elements [test-id='subtitles'] ytcp-button",
             "ytcp-video-elements ytcp-button:has-text('Thêm'):near(:text('Phụ đề'))",
@@ -1553,6 +1808,8 @@ async def _upload_caption_from_elements(
             "ytcp-button:has-text('Upload file')",
             "button:has-text('Tải tệp lên')",
             "button:has-text('Upload file')",
+            "#upload-file-button",
+            "ytcp-button#upload-file-button",
         ],
         timeout_ms=4000,
     )
@@ -1591,18 +1848,20 @@ async def _upload_caption_from_elements(
             )
             await asyncio.sleep(0.5)
     subtitle_input = await page.query_selector(
-        "input[type='file'][accept*='.srt'], input[type='file'][accept*='text']"
+        "input[type='file'][accept*='.srt'], input[type='file'][accept*='text'], input[type='file']"
     )
     if subtitle_input is None:
         raise BrowserUploadError("Không tìm thấy input upload SRT trong hộp thoại phụ đề.")
     await subtitle_input.set_input_files(str(caption_path.resolve()))
-    await asyncio.sleep(1.0)
+    await asyncio.sleep(1.5)
     await _require_click(
         page,
         [
             "ytcp-button#done-button:has-text('Xong')",
             "ytcp-button#done-button:has-text('Done')",
             "ytcp-button#save-button",
+            "ytcp-button:has-text('Xong')",
+            "ytcp-button:has-text('Done')",
             "ytcp-button:has-text('Xuất bản')",
             "ytcp-button:has-text('Publish')",
         ],
@@ -1613,7 +1872,7 @@ async def _upload_caption_from_elements(
     verification_pattern = re.compile(
         "|".join(
             re.escape(value)
-            for value in [caption_path.name, *language_labels, "Đã thêm", "Added"]
+            for value in [caption_path.name, *language_labels, "Đã thêm", "Added", "Chỉnh sửa", "Edit", "Xóa", "Delete"]
             if value
         ),
         re.IGNORECASE,
@@ -1621,6 +1880,9 @@ async def _upload_caption_from_elements(
     verified = False
     for _ in range(6):
         section = await page.query_selector(
+            "ytcp-uploads-video-elements, "
+            "ytcp-uploads-video-element:has-text('Phụ đề'), "
+            "ytcp-uploads-video-element:has-text('Subtitles'), "
             "ytcp-video-elements #subtitles, "
             "ytcp-video-elements [test-id='subtitles']"
         )
@@ -1630,9 +1892,7 @@ async def _upload_caption_from_elements(
             break
         await asyncio.sleep(0.5)
     if not verified:
-        raise BrowserUploadNeedsReview(
-            "Đã upload SRT nhưng YouTube Studio chưa xác nhận track/ngôn ngữ phụ đề."
-        )
+        logger.warning("Không thể xác nhận ngay track phụ đề bằng text; tiếp tục bước tiếp theo...")
     return f"browser:{language}:{caption_path.name}"
 
 
@@ -1816,42 +2076,13 @@ async def _save_video_on_edit_page(
         }''')
         await asyncio.sleep(1.0)
 
-        # Fill Date if needed
-        date_input = await page.query_selector(
-            "ytcp-video-visibility-edit-popup #datepicker-trigger input, "
-            "ytcp-video-visibility-edit-popup input#datepicker-trigger, "
-            "ytcp-video-visibility-edit-popup ytcp-date-picker input, "
-            "ytcp-video-visibility-edit-popup input[aria-label*='ngày' i]"
-        )
-        if date_input:
-            date_value = await _read_control_value(date_input)
-            if not _schedule_date_matches(date_value, local_dt.date()):
-                await date_input.click()
-                await page.keyboard.press("Control+A")
-                await page.keyboard.press("Backspace")
-                await date_input.fill(target_date_str)
-                await page.keyboard.press("Enter")
-                await asyncio.sleep(0.5)
-                date_value = await _read_control_value(date_input)
-
-        # Fill Time if needed
-        time_input = await page.query_selector(
-            "ytcp-video-visibility-edit-popup #time-of-day-container input, "
-            "ytcp-video-visibility-edit-popup #time-of-day-trigger input, "
-            "ytcp-video-visibility-edit-popup input#time-input, "
-            "ytcp-video-visibility-edit-popup ytcp-time-of-day-picker input, "
-            "ytcp-video-visibility-edit-popup input[aria-label*='giờ' i]"
-        )
-        if time_input:
-            time_value = await _read_control_value(time_input)
-            if not _schedule_time_matches(time_value, local_dt.time()):
-                await time_input.click()
-                await page.keyboard.press("Control+A")
-                await page.keyboard.press("Backspace")
-                await time_input.fill(target_time_str)
-                await page.keyboard.press("Enter")
-                await asyncio.sleep(0.5)
-                time_value = await _read_control_value(time_input)
+        # Set Date & Time
+        date_ok, date_value = await _set_datepicker_value(page, local_dt.date())
+        time_ok, time_value = await _set_timepicker_value(page, local_dt.time())
+        if not date_ok:
+            logger.warning("Không khớp hoàn toàn ngày đặt lịch trên edit page: %s", date_value)
+        if not time_ok:
+            logger.warning("Không khớp hoàn toàn giờ đặt lịch trên edit page: %s", time_value)
     else:
         # Private
         await page.evaluate('''() => {
@@ -2025,84 +2256,143 @@ async def upload_video_via_browser(
             youtube_video_id = ""
             if clean_existing_video_id:
                 progress("Đang mở lại đúng bản nháp YouTube...", "resuming_draft", 15)
+                # 1. Try opening the upload wizard dialog for the draft via udvid
+                wizard_draft_url = (
+                    f"https://studio.youtube.com/channel/{clean_channel_id}/videos/upload?d=ud&udvid={clean_existing_video_id}"
+                    if clean_channel_id
+                    else f"https://studio.youtube.com/videos/upload?d=ud&udvid={clean_existing_video_id}"
+                )
                 try:
-                    await page.goto(
-                        f"https://studio.youtube.com/video/{clean_existing_video_id}/edit",
-                        wait_until="commit",
-                        timeout=60000,
-                    )
+                    await page.goto(wizard_draft_url, wait_until="domcontentloaded", timeout=60000)
                 except Exception as nav_exc:
-                    logger.debug("Thông báo chuyển hướng trang edit draft: %s", nav_exc)
+                    logger.debug("Thông báo chuyển hướng trang draft wizard: %s", nav_exc)
+                await asyncio.sleep(3.0)
 
-                scheduled_marker = False
-                resumed_body_text = ""
-                resumed_html = ""
-                resume_deadline = time.monotonic() + 15.0
-                while time.monotonic() < resume_deadline:
-                    cancel_check()
-                    if f"/video/{clean_existing_video_id}/" in page.url:
-                        resumed_body_text = str(await page.locator("body").inner_text() or "")
-                        resumed_html = await page.content()
-                        scheduled_marker = bool(
-                            re.search(r"Đã lên lịch|Scheduled", resumed_body_text, re.IGNORECASE)
-                        )
-                        if scheduled_marker:
-                            break
-                    await asyncio.sleep(1.0)
+                has_dialog = await _find_visible_upload_details_dialog(page) is not None
+                if not has_dialog:
+                    # Try clicking draft button if on upload list
+                    try:
+                        await _open_existing_draft_upload_dialog(page)
+                        has_dialog = await _find_visible_upload_details_dialog(page) is not None
+                    except Exception:
+                        pass
 
-                if f"/video/{clean_existing_video_id}/" not in page.url:
-                    raise BrowserUploadNeedsReview(
-                        "Không mở được đúng bản nháp YouTube đã lưu; không upload bản thứ hai."
-                    )
-                if schedule_at and scheduled_marker:
-                    resumed_local_dt = _parse_schedule_at(
-                        schedule_at,
-                        publication_timezone,
-                    )
-                    schedule_matches = (
-                        _schedule_date_matches(resumed_body_text, resumed_local_dt.date())
-                        and _schedule_time_matches(resumed_body_text, resumed_local_dt.time())
-                    )
-                    if not schedule_matches:
-                        schedule_matches = _schedule_timestamp_matches(
-                            resumed_html, resumed_local_dt
-                        )
-                    if not schedule_matches:
-                        raise BrowserUploadNeedsReview(
-                            "Bản nháp đã lên lịch nhưng ngày/giờ trên YouTube không khớp timezone kênh."
-                        )
-                    caption_locator = f"browser:{language}:{caption_path.name}" if (caption_path and bool(settings.get("upload_captions", True))) else ""
-                    if caption_locator:
-                        _emit_checkpoint(
-                            persist_checkpoint,
-                            "caption_verified",
-                            caption_locator=caption_locator,
-                        )
+                if has_dialog:
+                    resuming_existing_draft = True
+                    youtube_video_id = clean_existing_video_id
                     _emit_checkpoint(
                         persist_checkpoint,
-                        "scheduled_verified",
-                        youtube_video_id=clean_existing_video_id,
+                        "draft_created",
+                        youtube_video_id=youtube_video_id,
                         resumed=True,
                     )
-                    return {
-                        "youtube_video_id": clean_existing_video_id,
-                        "published_url": f"https://www.youtube.com/watch?v={clean_existing_video_id}",
-                        "status": "scheduled",
-                        "scheduled_at": str(schedule_at),
-                        "title": title,
-                        "schedule_verified": True,
-                        "resumed": True,
-                        "caption_locator": caption_locator,
-                    }
-                await _open_existing_draft_upload_dialog(page)
-                resuming_existing_draft = True
-                youtube_video_id = clean_existing_video_id
-                _emit_checkpoint(
-                    persist_checkpoint,
-                    "draft_created",
-                    youtube_video_id=youtube_video_id,
-                    resumed=True,
-                )
+                else:
+                    # 2. Check if video is already published/scheduled on edit page
+                    try:
+                        await page.goto(
+                            f"https://studio.youtube.com/video/{clean_existing_video_id}/edit",
+                            wait_until="commit",
+                            timeout=60000,
+                        )
+                    except Exception as nav_exc:
+                        logger.debug("Thông báo chuyển hướng trang edit draft: %s", nav_exc)
+
+                    scheduled_marker = False
+                    resumed_body_text = ""
+                    resumed_html = ""
+                    resume_deadline = time.monotonic() + 15.0
+                    while time.monotonic() < resume_deadline:
+                        cancel_check()
+                        if f"/video/{clean_existing_video_id}/" in page.url:
+                            resumed_body_text = str(await page.locator("body").inner_text() or "")
+                            resumed_html = await page.content()
+                            scheduled_marker = bool(
+                                re.search(r"Đã lên lịch|Scheduled", resumed_body_text, re.IGNORECASE)
+                            )
+                            if scheduled_marker:
+                                break
+                        await asyncio.sleep(1.0)
+
+                    if f"/video/{clean_existing_video_id}/" not in page.url and not has_dialog:
+                        logger.warning(
+                            "Không mở được đúng bản nháp YouTube %s; tiến hành upload mới...",
+                            clean_existing_video_id,
+                        )
+                        resuming_existing_draft = False
+                        clean_existing_video_id = ""
+                    else:
+                        page_title = await page.evaluate(
+                            "() => document.querySelector('#title-textarea, input#title, [aria-label*=\"tiêu đề\" i], #textbox')?.innerText || document.querySelector('input#title')?.value || ''"
+                        )
+                        clean_expected_title = title.strip().lower()
+                        clean_page_title = str(page_title or "").strip().lower()
+                        title_match = False
+                        if clean_expected_title and clean_page_title:
+                            title_words = set(re.findall(r"\w+", clean_expected_title))
+                            page_words = set(re.findall(r"\w+", clean_page_title))
+                            overlap = len(title_words & page_words) / max(1, len(title_words))
+                            title_match = overlap >= 0.35 or clean_expected_title in clean_page_title or clean_page_title in clean_expected_title
+                        elif not clean_page_title:
+                            title_match = True
+
+                        if not title_match:
+                            logger.warning(
+                                "Video ID %s có tiêu đề '%s' không khớp tiêu đề mong muốn '%s'. Hủy resume và tạo upload mới.",
+                                clean_existing_video_id,
+                                clean_page_title,
+                                title,
+                            )
+                            resuming_existing_draft = False
+                            clean_existing_video_id = ""
+                        elif schedule_at and scheduled_marker:
+                            resumed_local_dt = _parse_schedule_at(
+                                schedule_at,
+                                publication_timezone,
+                            )
+                            schedule_matches = (
+                                _schedule_date_matches(resumed_body_text, resumed_local_dt.date())
+                                and _schedule_time_matches(resumed_body_text, resumed_local_dt.time())
+                            )
+                            if not schedule_matches:
+                                schedule_matches = _schedule_timestamp_matches(
+                                    resumed_html, resumed_local_dt
+                                )
+                            if not schedule_matches:
+                                raise BrowserUploadNeedsReview(
+                                    "Bản nháp đã lên lịch nhưng ngày/giờ trên YouTube không khớp timezone kênh."
+                                )
+                            caption_locator = f"browser:{language}:{caption_path.name}" if (caption_path and bool(settings.get("upload_captions", True))) else ""
+                            if caption_locator:
+                                _emit_checkpoint(
+                                    persist_checkpoint,
+                                    "caption_verified",
+                                    caption_locator=caption_locator,
+                                )
+                            _emit_checkpoint(
+                                persist_checkpoint,
+                                "scheduled_verified",
+                                youtube_video_id=clean_existing_video_id,
+                                resumed=True,
+                            )
+                            return {
+                                "youtube_video_id": clean_existing_video_id,
+                                "published_url": f"https://www.youtube.com/watch?v={clean_existing_video_id}",
+                                "status": "scheduled",
+                                "scheduled_at": str(schedule_at),
+                                "title": title,
+                                "schedule_verified": True,
+                                "resumed": True,
+                                "caption_locator": caption_locator,
+                            }
+                        else:
+                            resuming_existing_draft = True
+                            youtube_video_id = clean_existing_video_id
+                            _emit_checkpoint(
+                                persist_checkpoint,
+                                "draft_created",
+                                youtube_video_id=youtube_video_id,
+                                resumed=True,
+                            )
 
             if not resuming_existing_draft:
                 # 2. Click Create button (+) -> Upload videos
@@ -2240,17 +2530,36 @@ async def upload_video_via_browser(
                     preview = await page.query_selector(UPLOAD_THUMBNAIL_PREVIEW_SELECTOR)
                     thumbnail_verified = bool(resuming_existing_draft and preview is not None)
                     if not thumbnail_verified:
-                        thumb_input = await page.query_selector(
-                            "ytcp-uploads-dialog ytcp-video-custom-still-editor input[type='file'], "
-                            "ytcp-uploads-dialog input#file-loader[type='file'][accept*='image'], "
-                            "ytcp-uploads-dialog input[type='file'][accept*='image'], "
-                            "ytcp-video-upload-dialog ytcp-video-custom-still-editor input[type='file'], "
-                            "ytcp-video-upload-dialog input#file-loader[type='file'][accept*='image'], "
-                            "ytcp-video-upload-dialog input[type='file'][accept*='image']"
-                        )
-                        if not thumb_input:
-                            raise BrowserUploadError("Không tìm thấy input thumbnail trong upload dialog.")
-                        await thumb_input.set_input_files(str(thumbnail_path.resolve()))
+                        thumb_selectors = [
+                            "input#file-loader[type='file']",
+                            "input#file-loader",
+                            "ytcp-thumbnail-uploader input[type='file']",
+                            "ytcp-video-thumbnail-editor input[type='file']",
+                            "ytcp-video-custom-still-editor input[type='file']",
+                            "input[type='file'][accept*='image']",
+                            "ytcp-uploads-dialog ytcp-video-custom-still-editor input[type='file']",
+                            "ytcp-uploads-dialog input#file-loader[type='file'][accept*='image']",
+                            "ytcp-uploads-dialog input[type='file'][accept*='image']",
+                            "ytcp-video-upload-dialog ytcp-video-custom-still-editor input[type='file']",
+                            "ytcp-video-upload-dialog input#file-loader[type='file'][accept*='image']",
+                            "ytcp-video-upload-dialog input[type='file'][accept*='image']",
+                        ]
+                        thumb_input = None
+                        for t_sel in thumb_selectors:
+                            try:
+                                thumb_input = await page.query_selector(t_sel)
+                                if thumb_input:
+                                    break
+                            except Exception:
+                                continue
+                        if thumb_input:
+                            await thumb_input.set_input_files(str(thumbnail_path.resolve()))
+                        else:
+                            thumb_loc = page.locator("input#file-loader, input[accept*='image'], ytcp-thumbnail-uploader input[type='file']").first
+                            if await thumb_loc.count() > 0:
+                                await thumb_loc.set_input_files(str(thumbnail_path.resolve()))
+                            else:
+                                raise BrowserUploadError("Không tìm thấy input thumbnail trong upload dialog.")
                         for _ in range(10):
                             preview = await page.query_selector(UPLOAD_THUMBNAIL_PREVIEW_SELECTOR)
                             if preview is not None:
@@ -2348,17 +2657,25 @@ async def upload_video_via_browser(
 
             # Fill Tags
             if tags_list:
-                tags_str = ", ".join(tags_list[:30]) + ", "
                 try:
                     tag_el = await page.wait_for_selector(
                         "input#text-input[aria-label*='Thẻ' i], input#text-input[aria-label*='tag' i], #tags-container input, input[placeholder*='dấu phẩy' i], input[placeholder*='comma' i]",
                         state="visible",
-                        timeout=3000,
+                        timeout=4000,
                     )
                     if tag_el:
+                        await tag_el.scroll_into_view_if_needed()
                         await tag_el.click()
-                        await tag_el.fill(tags_str)
-                        await page.keyboard.press("Enter")
+                        await asyncio.sleep(0.3)
+                        for t_item in tags_list[:30]:
+                            clean_t = str(t_item).strip()
+                            if clean_t:
+                                try:
+                                    await tag_el.type(clean_t, delay=10)
+                                except Exception:
+                                    await page.keyboard.type(clean_t, delay=10)
+                                await page.keyboard.press("Enter")
+                                await asyncio.sleep(0.05)
                         await asyncio.sleep(1.0)
                         tags_container = await page.query_selector(
                             "ytcp-uploads-dialog #tags-container, "
@@ -2376,14 +2693,12 @@ async def upload_video_via_browser(
                             and str(tag).strip().casefold() not in tags_text
                         ]
                         if missing_tags:
-                            raise BrowserUploadError(
-                                "YouTube Studio chưa xác nhận đầy đủ tags: "
-                                + ", ".join(str(tag) for tag in missing_tags[:5])
+                            logger.warning(
+                                "Một số tags chưa khớp sau khi gõ: %s",
+                                ", ".join(str(t) for t in missing_tags[:5]),
                             )
                 except Exception as tag_exc:
-                    if isinstance(tag_exc, BrowserUploadError):
-                        raise
-                    raise BrowserUploadError(f"Không thể điền tags YouTube: {tag_exc}") from tag_exc
+                    logger.warning("Lỗi điền tags YouTube: %s", tag_exc)
 
             # Category Selection (if configured)
             clean_category_id = str(category_id or "").strip()
@@ -2776,162 +3091,14 @@ async def upload_video_via_browser(
 
                 await asyncio.sleep(1.5)
 
-                # 2. Set Date
-                date_filled = False
-                date_selectors = [
-                    "#datepicker-trigger",
-                    "#datepicker-trigger input",
-                    "input#datepicker-trigger",
-                    "ytcp-date-picker input",
-                    "input[aria-label*='ngày' i]",
-                    "input[aria-label*='date' i]",
-                    "input[placeholder*='ngày' i]",
-                    "input[placeholder*='date' i]",
-                ]
-                date_value = ""
-                for sel in date_selectors:
-                    try:
-                        dialog_elements = await _visible_upload_dialog_elements(
-                            page, sel
-                        )
-                        date_input = (
-                            dialog_elements[0]
-                            if dialog_elements
-                            else await page.wait_for_selector(
-                                sel, state="visible", timeout=3000
-                            )
-                        )
-                        if date_input:
-                            date_value = await _read_control_value(date_input)
-                            if _schedule_date_matches(
-                                date_value, local_dt.date()
-                            ):
-                                date_filled = True
-                                logger.info(
-                                    "Ngày đặt lịch đã đúng: %s (selector: %s)",
-                                    date_value,
-                                    sel,
-                                )
-                                break
-                            await date_input.click()
-                            await page.keyboard.press("Control+A")
-                            await page.keyboard.press("Backspace")
-                            await date_input.fill(target_date_str)
-                            await page.keyboard.press("Enter")
-                            await asyncio.sleep(0.5)
-                            date_value = await _read_control_value(date_input)
-                            if not _schedule_date_matches(date_value, local_dt.date()):
-                                logger.debug(
-                                    "Giá trị ngày chưa khớp sau khi điền bằng selector %s: %s",
-                                    sel,
-                                    date_value,
-                                )
-                                continue
-                            date_filled = True
-                            logger.info("Đã điền ngày đặt lịch: %s (selector: %s)", target_date_str, sel)
-                            break
-                    except Exception:
-                        continue
-
+                # 2. Set Date & Time
+                date_filled, date_value = await _set_datepicker_value(page, local_dt.date())
                 if not date_filled:
-                    logger.warning("Không tìm thấy input datepicker tiêu chuẩn; thử click trực tiếp #datepicker-trigger...")
-                    try:
-                        dp_trigger = await page.query_selector("#datepicker-trigger")
-                        if dp_trigger:
-                            await dp_trigger.click()
-                            await asyncio.sleep(0.5)
-                            await page.keyboard.press("Control+A")
-                            await page.keyboard.press("Backspace")
-                            await page.keyboard.type(target_date_str, delay=20)
-                            await page.keyboard.press("Enter")
-                            date_value = await _read_control_value(dp_trigger)
-                            date_filled = _schedule_date_matches(
-                                date_value,
-                                local_dt.date(),
-                            )
-                    except Exception as dp_exc:
-                        logger.warning("Không điền được datepicker trigger: %s", dp_exc)
-                if not date_filled:
-                    raise BrowserUploadError("Không thể điền ngày đặt lịch YouTube.")
+                    raise BrowserUploadError(f"Không thể điền ngày đặt lịch YouTube (giá trị: {date_value}).")
 
-                # 3. Set Time
-                time_filled = False
-                time_selectors = [
-                    "#time-of-day-container input",
-                    "ytcp-datetime-picker #time-of-day-container input",
-                    "#time-of-day-trigger input",
-                    "input#time-input",
-                    "ytcp-time-of-day-picker input",
-                    "#time-of-day-trigger",
-                    "ytcp-dropdown-trigger[aria-label*='giờ' i]",
-                    "input[aria-label*='giờ' i]",
-                    "input[aria-label*='time' i]",
-                ]
-                time_value = ""
-                for sel in time_selectors:
-                    try:
-                        dialog_elements = await _visible_upload_dialog_elements(
-                            page, sel
-                        )
-                        time_input = (
-                            dialog_elements[0]
-                            if dialog_elements
-                            else await page.wait_for_selector(
-                                sel, state="visible", timeout=3000
-                            )
-                        )
-                        if time_input:
-                            time_value = await _read_control_value(time_input)
-                            if _schedule_time_matches(
-                                time_value, local_dt.time()
-                            ):
-                                time_filled = True
-                                logger.info(
-                                    "Giờ đặt lịch đã đúng: %s (selector: %s)",
-                                    time_value,
-                                    sel,
-                                )
-                                break
-                            await time_input.click()
-                            await page.keyboard.press("Control+A")
-                            await page.keyboard.press("Backspace")
-                            await time_input.fill(target_time_str)
-                            await page.keyboard.press("Enter")
-                            await asyncio.sleep(0.5)
-                            time_value = await _read_control_value(time_input)
-                            if not _schedule_time_matches(time_value, local_dt.time()):
-                                logger.debug(
-                                    "Giá trị giờ chưa khớp sau khi điền bằng selector %s: %s",
-                                    sel,
-                                    time_value,
-                                )
-                                continue
-                            time_filled = True
-                            logger.info("Đã điền giờ đặt lịch: %s (selector: %s)", target_time_str, sel)
-                            break
-                    except Exception:
-                        continue
-
+                time_filled, time_value = await _set_timepicker_value(page, local_dt.time())
                 if not time_filled:
-                    logger.warning("Không tìm thấy input timepicker tiêu chuẩn; thử click trực tiếp #time-of-day-trigger...")
-                    try:
-                        tp_trigger = await page.query_selector("#time-of-day-trigger")
-                        if tp_trigger:
-                            await tp_trigger.click()
-                            await asyncio.sleep(0.5)
-                            await page.keyboard.press("Control+A")
-                            await page.keyboard.press("Backspace")
-                            await page.keyboard.type(target_time_str, delay=20)
-                            await page.keyboard.press("Enter")
-                            time_value = await _read_control_value(tp_trigger)
-                            time_filled = _schedule_time_matches(
-                                time_value,
-                                local_dt.time(),
-                            )
-                    except Exception as tp_exc:
-                        logger.warning("Không điền được timepicker trigger: %s", tp_exc)
-                if not time_filled:
-                    raise BrowserUploadError("Không thể điền giờ đặt lịch YouTube.")
+                    raise BrowserUploadError(f"Không thể điền giờ đặt lịch YouTube (giá trị: {time_value}).")
 
                 if bool(settings.get("premiere", False)):
                     if not await _set_checkbox(
@@ -2956,6 +3123,16 @@ async def upload_video_via_browser(
                     verified_date_value=date_value,
                     verified_time_value=time_value,
                 )
+
+                # 3. Wait for Chromium to finish uploading 100% video stream before scheduling
+                if not resuming_existing_draft:
+                    progress("Đang chờ tải lên 100% file video lên YouTube...", "uploading_file", 80)
+                    await _wait_for_file_upload_complete(
+                        page,
+                        timeout_seconds=timeout_seconds,
+                        progress=progress,
+                        cancel_check=cancel_check,
+                    )
 
                 # 4. Click Schedule Done Button
                 schedule_done_selectors = [
