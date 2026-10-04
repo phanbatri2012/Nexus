@@ -258,7 +258,7 @@ def is_browser_process_running(browser_key: str) -> bool:
 
 
 def terminate_local_browser_processes(browser_key: str) -> bool:
-    """Safely terminate existing non-debug processes of the browser."""
+    """Safely terminate existing processes of the browser to allow fresh launch with CDP."""
     exe_path, _ = resolve_browser_paths(browser_key)
     if not exe_path:
         return False
@@ -270,7 +270,12 @@ def terminate_local_browser_processes(browser_key: str) -> bool:
             capture_output=True,
             timeout=5.0,
         )
-        time.sleep(1.0)
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if not is_browser_process_running(browser_key):
+                break
+            time.sleep(0.4)
+        time.sleep(0.5)
         return True
     except Exception as exc:
         logger.warning("Không thể tắt tiến trình %s: %s", exe_name, exc)
@@ -290,7 +295,7 @@ def start_local_browser(
     - If force_restart is True: closes running browser processes and launches fresh with CDP.
     - If already running with CDP: navigates/opens target_url and returns coordinates.
     - If running without CDP:
-        * If require_cdp is True: raises informative error to prompt closing browser or restarting.
+        * If require_cdp is True: auto-terminates stale non-CDP processes and relaunches fresh with CDP enabled.
         * If require_cdp is False: opens target_url in a new tab of the existing browser and returns success.
     - If not running: launches with remote debugging port enabled.
     """
@@ -333,44 +338,45 @@ def start_local_browser(
 
     # 2. If running without CDP
     if is_browser_process_running(browser_key):
-        logger.info(
-            "Trình duyệt %s đang chạy chế độ thông thường. Mở thêm tab mới mà không tắt trình duyệt...",
-            browser_display_name,
-        )
-        if target_url:
-            try:
-                subprocess.Popen(
-                    [str(exe_path), target_url],
-                    shell=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except Exception as e:
-                logger.debug("Không thể mở tab qua process invocation: %s", e)
-
         if require_cdp:
-            raise RuntimeError(
-                f"Trình duyệt {browser_display_name} đang mở sẵn ở chế độ thông thường (chưa bật cổng tự động CDP). "
-                f"Hệ thống đã tự động mở thêm tab '{target_url or 'Meta'}' trên trình duyệt của bạn. "
-                f"Để hệ thống tự động quét/thao tác CDP 100%, vui lòng đóng hoàn toàn {browser_display_name} rồi bấm 'Mở trình duyệt' trên hệ thống."
+            # AUTO-RESTART: Since an automated Playwright task requires CDP connection,
+            # cleanly close stale non-CDP browser processes and proceed to launch with CDP below!
+            logger.info(
+                "Trình duyệt %s đang chạy chế độ thông thường (không có CDP). Tự động đóng các tiến trình cũ và khởi động lại với cổng gỡ lỗi CDP...",
+                browser_display_name,
             )
+            terminate_local_browser_processes(browser_key)
+        else:
+            logger.info(
+                "Trình duyệt %s đang chạy chế độ thông thường. Mở thêm tab mới mà không tắt trình duyệt...",
+                browser_display_name,
+            )
+            if target_url:
+                try:
+                    subprocess.Popen(
+                        [str(exe_path), target_url],
+                        shell=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except Exception as e:
+                    logger.debug("Không thể mở tab qua process invocation: %s", e)
 
-        return {
-            "success": True,
-            "port": None,
-            "endpoint_url": None,
-            "ws_url": None,
-            "already_running": True,
-            "already_running_no_cdp": True,
-            "browser_key": browser_key,
-            "profile_dir": profile_dir,
-            "message": (
-                f"Đã mở thêm tab '{target_url or 'Meta'}' trên trình duyệt {browser_display_name} đang chạy. "
-                f"(Lưu ý: Để Quét tự động ở Bước 3, vui lòng tắt hoàn toàn {browser_display_name} rồi bấm lại 'Mở trình duyệt')."
-            ),
-        }
+            return {
+                "success": True,
+                "port": None,
+                "endpoint_url": None,
+                "ws_url": None,
+                "already_running": True,
+                "already_running_no_cdp": True,
+                "browser_key": browser_key,
+                "profile_dir": profile_dir,
+                "message": (
+                    f"Đã mở thêm tab '{target_url or 'Meta'}' trên trình duyệt {browser_display_name} đang chạy. "
+                ),
+            }
 
-    # 3. Not running: pick a free port and launch with remote debugging port
+    # 3. Not running (or terminated above for CDP): pick a free port and launch with remote debugging port
     port = preferred_port or find_free_port()
     args = [
         str(exe_path),

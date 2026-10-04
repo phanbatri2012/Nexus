@@ -1271,7 +1271,7 @@ def start_gpm_profile_endpoint(
                 browser_key=parsed["browser_key"],
                 profile_dir=parsed["profile_dir"],
                 preferred_port=req.remote_debugging_port,
-                require_cdp=False,
+                require_cdp=True,
             )
         return gpm_service.start_gpm_profile(
             profile_id,

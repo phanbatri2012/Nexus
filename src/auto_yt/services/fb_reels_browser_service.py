@@ -275,6 +275,7 @@ async def schedule_reel_via_gpm(
 
     async with channel_browser_session(clean_profile_id) as (context, _browser, _profile_meta):
         page = await context.new_page()
+        await page.bring_to_front()
         try:
             # Set default timeout for individual actions
             page.set_default_timeout(25000)
@@ -739,6 +740,10 @@ async def schedule_reel_via_gpm(
             ) from exc
         finally:
             try:
-                await page.close()
+                if page and not page.is_closed():
+                    if len(context.pages) > 1:
+                        await page.close()
+                    else:
+                        await page.goto("about:blank")
             except Exception:
                 pass

@@ -31,8 +31,9 @@ class GpmAutomationError(RuntimeError):
 async def verify_youtube_login(profile_id: str, timeout_seconds: float = 20.0) -> dict[str, Any]:
     """Check if the given GPM profile has an active YouTube Studio session."""
     logger.info("Kiểm tra đăng nhập YouTube trên GPM profile %s", profile_id)
-    async with gpm_browser_session(profile_id, auto_stop=True) as (context, _browser):
+    async with gpm_browser_session(profile_id, auto_stop=False) as (context, _browser):
         page = await context.new_page()
+        await page.bring_to_front()
         try:
             await page.goto("https://studio.youtube.com", wait_until="domcontentloaded", timeout=int(timeout_seconds * 1000))
             await asyncio.sleep(2.0)
@@ -85,7 +86,10 @@ async def verify_youtube_login(profile_id: str, timeout_seconds: float = 20.0) -
             }
         finally:
             try:
-                await page.close()
+                if len(context.pages) > 1:
+                    await page.close()
+                else:
+                    await page.goto("about:blank")
             except Exception:
                 pass
 
@@ -117,6 +121,7 @@ async def post_comment_reply_via_gpm(
     hearted = False
     async with gpm_browser_session(profile_id, auto_stop=auto_stop) as (context, _browser):
         page = await context.new_page()
+        await page.bring_to_front()
         try:
             await page.goto(target_url, wait_until="domcontentloaded", timeout=int(timeout_seconds * 1000))
             await asyncio.sleep(2.0)
@@ -224,7 +229,10 @@ async def post_comment_reply_via_gpm(
             raise GpmAutomationError(f"Không thể đăng bình luận qua GPM: {exc}") from exc
         finally:
             try:
-                await page.close()
+                if len(context.pages) > 1:
+                    await page.close()
+                else:
+                    await page.goto("about:blank")
             except Exception:
                 pass
 
@@ -245,6 +253,11 @@ async def open_url_in_gpm_profile(
         raise ValueError("Profile ID không được để trống.")
     if not target_url:
         raise ValueError("URL không được để trống.")
+
+    if clean_id.startswith("local_"):
+        from auto_yt.services.channel_scanner_service import open_channel_platform_browser
+        platform = "facebook" if "facebook" in target_url else ("tiktok" if "tiktok" in target_url else "youtube")
+        return open_channel_platform_browser(profile_id=clean_id, platform=platform)
 
     logger.info("Mở URL %s trong GPM profile %s", target_url, clean_id)
 

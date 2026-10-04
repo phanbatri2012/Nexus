@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from auto_yt.services.gpm_service import gpm_browser_session
+from auto_yt.services.channel_scanner_service import channel_browser_session
 from auto_yt.services.browser_diagnostics import capture_browser_diagnostics_async
 
 logger = logging.getLogger(__name__)
@@ -2412,19 +2412,13 @@ async def upload_video_via_browser(
     ).strip().lower()
     clean_channel_id = str(expected_channel_id or "").strip()
     clean_existing_video_id = str(existing_video_id or "").strip()
-    progress("Đang mở trình duyệt GPM của kênh...", "browser_launching", 5)
-    logger.info("Bắt đầu upload qua trình duyệt GPM profile %s cho video '%s'", clean_profile, title)
+    progress("Đang kết nối trình duyệt của kênh...", "browser_launching", 5)
+    logger.info("Bắt đầu upload qua trình duyệt profile %s cho video '%s'", clean_profile, title)
 
-    async with gpm_browser_session(clean_profile, auto_stop=auto_stop_gpm) as (context, _browser):
+    async with channel_browser_session(clean_profile) as (context, _browser, _profile_meta):
         cancel_check()
-        target_page = None
-        for p in context.pages:
-            if p.url in ("about:blank", "chrome://newtab/", ""):
-                target_page = p
-                break
-        if target_page is None:
-            target_page = await context.new_page()
-        page = target_page
+        page = await context.new_page()
+        await page.bring_to_front()
         step_timeout_ms = int(
             min(DEFAULT_STEP_TIMEOUT_SECONDS, max(5.0, float(timeout_seconds))) * 1000
         )
@@ -3782,7 +3776,10 @@ async def upload_video_via_browser(
             raise BrowserUploadError(f"Upload qua trình duyệt thất bại: {exc}") from exc
         finally:
             try:
-                await page.close()
+                if len(context.pages) > 1:
+                    await page.close()
+                else:
+                    await page.goto("about:blank")
             except Exception:
                 pass
 
@@ -3802,16 +3799,10 @@ async def make_video_public_via_browser(
     if not clean_vid_id:
         raise BrowserUploadError("YouTube Video ID không được để trống.")
 
-    logger.info("Bắt đầu chuyển video %s sang trạng thái Công khai trong GPM profile %s", clean_vid_id, clean_profile)
-    async with gpm_browser_session(clean_profile, auto_stop=auto_stop_gpm) as (context, _browser):
-        target_page = None
-        for p in context.pages:
-            if p.url in ("about:blank", "chrome://newtab/", ""):
-                target_page = p
-                break
-        if target_page is None:
-            target_page = await context.new_page()
-        page = target_page
+    logger.info("Bắt đầu chuyển video %s sang trạng thái Công khai trong profile %s", clean_vid_id, clean_profile)
+    async with channel_browser_session(clean_profile) as (context, _browser, _profile_meta):
+        page = await context.new_page()
+        await page.bring_to_front()
         try:
             edit_url = f"https://studio.youtube.com/video/{clean_vid_id}/edit"
             logger.info("Mở trang chỉnh sửa video YouTube Studio: %s", edit_url)
@@ -3880,6 +3871,9 @@ async def make_video_public_via_browser(
             }
         finally:
             try:
-                await page.close()
+                if len(context.pages) > 1:
+                    await page.close()
+                else:
+                    await page.goto("about:blank")
             except Exception:
                 pass

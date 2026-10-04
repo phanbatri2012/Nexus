@@ -828,7 +828,7 @@ async def gpm_browser_session(
         raise ValueError("Profile ID không được để trống.")
 
     config = get_gpm_config()
-    should_auto_stop = auto_stop if auto_stop is not None else config["auto_stop_on_finish"]
+    should_auto_stop = auto_stop if auto_stop is not None else False
 
     async with _get_profile_async_lock(clean_id):
         launch_info = await asyncio.to_thread(
@@ -849,32 +849,43 @@ async def gpm_browser_session(
             endpoint_url = await wait_for_cdp_readiness(
                 port=remote_port,
                 ws_url=ws_url,
-                max_wait_seconds=20.0,
+                max_wait_seconds=15.0 if was_already_running else 25.0,
                 poll_interval=0.5,
             )
         except Exception as probe_err:
-            logger.warning(
-                "Readiness probe cho Profile GPM %s gặp lỗi (%s). Tiến hành Force Restart...",
-                clean_id,
-                probe_err,
-            )
-            launch_info = await asyncio.to_thread(
-                start_gpm_profile,
-                clean_id,
-                skip_proxy_check=skip_proxy_check,
-                addition_args=addition_args,
-                force_restart=True,
-                api_url=api_url,
-            )
-            was_already_running = False
-            ws_url = str(launch_info.get("websocket_debugging_url") or "").strip()
-            remote_port = launch_info.get("remote_debugging_port")
-            endpoint_url = await wait_for_cdp_readiness(
-                port=remote_port,
-                ws_url=ws_url,
-                max_wait_seconds=25.0,
-                poll_interval=0.5,
-            )
+            if not was_already_running:
+                logger.warning(
+                    "Readiness probe cho Profile GPM %s gặp lỗi (%s). Tiến hành Force Restart...",
+                    clean_id,
+                    probe_err,
+                )
+                launch_info = await asyncio.to_thread(
+                    start_gpm_profile,
+                    clean_id,
+                    skip_proxy_check=skip_proxy_check,
+                    addition_args=addition_args,
+                    force_restart=True,
+                    api_url=api_url,
+                )
+                was_already_running = False
+                ws_url = str(launch_info.get("websocket_debugging_url") or "").strip()
+                remote_port = launch_info.get("remote_debugging_port")
+                endpoint_url = await wait_for_cdp_readiness(
+                    port=remote_port,
+                    ws_url=ws_url,
+                    max_wait_seconds=25.0,
+                    poll_interval=0.5,
+                )
+            else:
+                logger.warning(
+                    "Cổng CDP chưa sẵn sàng trên Profile GPM %s đang mở (%s). Sử dụng endpoint hiện có...",
+                    clean_id,
+                    probe_err,
+                )
+                if remote_port:
+                    endpoint_url = f"http://127.0.0.1:{remote_port}"
+                elif ws_url:
+                    endpoint_url = ws_url
 
         if not endpoint_url:
             raise GpmProfileLaunchError(
@@ -894,31 +905,14 @@ async def gpm_browser_session(
                     break
                 except Exception as conn_exc:
                     last_conn_err = conn_exc
-                    if attempt < 3:
+                    if attempt < 3 and not was_already_running:
                         logger.warning(
-                            "Kết nối CDP lần %d tới Profile %s gặp lỗi (%s). Force restart profile và thử lại...",
+                            "Kết nối CDP lần %d tới Profile %s gặp lỗi (%s). Thử lại...",
                             attempt,
                             clean_id,
                             conn_exc,
                         )
-                        _active_gpm_profiles.pop(clean_id, None)
-                        launch_info = await asyncio.to_thread(
-                            start_gpm_profile,
-                            clean_id,
-                            skip_proxy_check=skip_proxy_check,
-                            addition_args=addition_args,
-                            force_restart=True,
-                            api_url=api_url,
-                        )
-                        was_already_running = False
-                        ws_url = str(launch_info.get("websocket_debugging_url") or "").strip()
-                        remote_port = launch_info.get("remote_debugging_port")
-                        endpoint_url = await wait_for_cdp_readiness(
-                            port=remote_port,
-                            ws_url=ws_url,
-                            max_wait_seconds=25.0,
-                            poll_interval=0.5,
-                        )
+                        await asyncio.sleep(1.0)
                     else:
                         raise last_conn_err
 

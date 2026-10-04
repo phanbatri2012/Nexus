@@ -85,7 +85,15 @@ def list_youtube_publish_blockers() -> list[dict[str, Any]]:
                         AND sj.job_type = 'youtube_publish'
                         AND sj.status IN ('running', 'processing', 'in_progress')
                   )
-                  OR datetime(vp.updated_at) >= datetime('now', '-15 minutes')
+                  OR (
+                      datetime(vp.updated_at) >= datetime('now', '-15 minutes')
+                      AND NOT EXISTS (
+                          SELECT 1 FROM system_jobs sj
+                          WHERE sj.video_id = vp.video_id
+                            AND sj.job_type = 'youtube_publish'
+                            AND sj.status IN ('paused', 'failed', 'completed', 'canceled', 'cancelled', 'error')
+                      )
+                  )
               )
             """
         ).fetchall()
