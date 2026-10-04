@@ -52,6 +52,10 @@ class TestChannelScheduleReservations(unittest.TestCase):
                 updated_at TEXT NOT NULL
             );
 
+            CREATE UNIQUE INDEX idx_channel_schedule_reservations_active
+            ON channel_schedule_reservations(youtube_channel_id, scheduled_at)
+            WHERE status IN ('reserved', 'scheduled');
+
             CREATE TABLE video_publications (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 youtube_channel_id INTEGER NOT NULL,
@@ -119,6 +123,81 @@ class TestChannelScheduleReservations(unittest.TestCase):
 
         row = self.conn.execute("SELECT status FROM channel_schedule_reservations WHERE workflow_id = 'wf-stale-2'").fetchone()
         self.assertEqual(row["status"], "canceled")
+
+    def test_canceled_reservation_slot_can_be_reused_by_another_workflow(self):
+        now_str = "2026-10-03T10:00:00+00:00"
+        slot = "2026-10-05T04:00:00+00:00"
+        # First workflow was canceled
+        self.conn.execute("""
+            INSERT INTO channel_schedule_reservations (youtube_channel_id, workflow_id, scheduled_at, status, created_at, updated_at)
+            VALUES (1, 'wf-canceled-1', ?, 'canceled', ?, ?)
+        """, (slot, now_str, now_str))
+
+        # Second workflow attempts to reserve the exact same slot
+        self.conn.execute("""
+            INSERT INTO channel_schedule_reservations (youtube_channel_id, workflow_id, scheduled_at, status, created_at, updated_at)
+            VALUES (1, 'wf-new-2', ?, 'reserved', ?, ?)
+        """, (slot, now_str, now_str))
+
+        rows = self.conn.execute(
+            "SELECT workflow_id, status FROM channel_schedule_reservations WHERE scheduled_at = ? ORDER BY id ASC",
+            (slot,),
+        ).fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["status"], "canceled")
+        self.assertEqual(rows[1]["status"], "reserved")
+        self.assertEqual(rows[1]["workflow_id"], "wf-new-2")
+
+    def test_active_reservations_cannot_collide_on_same_slot(self):
+        now_str = "2026-10-03T10:00:00+00:00"
+        slot = "2026-10-05T04:00:00+00:00"
+        # First workflow active
+        self.conn.execute("""
+            INSERT INTO channel_schedule_reservations (youtube_channel_id, workflow_id, scheduled_at, status, created_at, updated_at)
+            VALUES (1, 'wf-active-1', ?, 'reserved', ?, ?)
+        """, (slot, now_str, now_str))
+
+        # Second workflow tries to reserve same slot -> must fail with IntegrityError
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("""
+                INSERT INTO channel_schedule_reservations (youtube_channel_id, workflow_id, scheduled_at, status, created_at, updated_at)
+                VALUES (1, 'wf-active-2', ?, 'reserved', ?, ?)
+            """, (slot, now_str, now_str))
+
+    def test_migration_channel_schedule_reservations_partial_unique(self):
+        mem_conn = sqlite3.connect(":memory:")
+        mem_conn.row_factory = sqlite3.Row
+        mem_conn.executescript("""
+            CREATE TABLE youtube_channels (id INTEGER PRIMARY KEY, title TEXT);
+            CREATE TABLE youtube_publish_workflows (id TEXT PRIMARY KEY);
+            CREATE TABLE channel_schedule_reservations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                youtube_channel_id INTEGER NOT NULL,
+                workflow_id TEXT NOT NULL UNIQUE,
+                scheduled_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'reserved',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(youtube_channel_id) REFERENCES youtube_channels(id) ON DELETE CASCADE,
+                FOREIGN KEY(workflow_id) REFERENCES youtube_publish_workflows(id) ON DELETE CASCADE,
+                UNIQUE(youtube_channel_id, scheduled_at)
+            );
+            INSERT INTO youtube_channels VALUES (1, 'Channel 1');
+            INSERT INTO youtube_publish_workflows VALUES ('wf-old');
+            INSERT INTO channel_schedule_reservations VALUES (1, 1, 'wf-old', '2026-10-05T04:00:00+00:00', 'canceled', '2026-10-04', '2026-10-04');
+        """)
+        # Running migration on legacy table
+        db._migrate_channel_schedule_reservations_partial_unique(mem_conn)
+
+        # Now inserting a new workflow on same slot must succeed
+        mem_conn.execute("INSERT INTO youtube_publish_workflows VALUES ('wf-new')")
+        mem_conn.execute("""
+            INSERT INTO channel_schedule_reservations (youtube_channel_id, workflow_id, scheduled_at, status, created_at, updated_at)
+            VALUES (1, 'wf-new', '2026-10-05T04:00:00+00:00', 'reserved', '2026-10-04', '2026-10-04')
+        """)
+        row = mem_conn.execute("SELECT * FROM channel_schedule_reservations WHERE workflow_id = 'wf-new'").fetchone()
+        self.assertIsNotNone(row)
+        mem_conn.close()
 
 
 if __name__ == "__main__":

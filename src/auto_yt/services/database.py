@@ -1300,9 +1300,13 @@ def init_db():
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY(youtube_channel_id) REFERENCES youtube_channels(id) ON DELETE CASCADE,
-            FOREIGN KEY(workflow_id) REFERENCES youtube_publish_workflows(id) ON DELETE CASCADE,
-            UNIQUE(youtube_channel_id, scheduled_at)
+            FOREIGN KEY(workflow_id) REFERENCES youtube_publish_workflows(id) ON DELETE CASCADE
         )
+    """)
+    c.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_schedule_reservations_active
+        ON channel_schedule_reservations(youtube_channel_id, scheduled_at)
+        WHERE status IN ('reserved', 'scheduled')
     """)
 
     c.execute("""
@@ -1323,6 +1327,7 @@ def init_db():
 
     _migrate_fb_crossposter_queue_composite_unique(conn)
     _migrate_fb_crossposter_meta_state(conn)
+    _migrate_channel_schedule_reservations_partial_unique(conn)
     _remove_orphan_video_dependencies(conn)
     _clean_existing_scripts_with_sanitizer(conn)
     conn.commit()
@@ -1532,6 +1537,42 @@ def _migrate_fb_crossposter_token_storage(conn: sqlite3.Connection) -> None:
                 "WHERE id = ?",
                 (encrypted, row_id),
             )
+
+
+def _migrate_channel_schedule_reservations_partial_unique(conn: sqlite3.Connection) -> None:
+    """Migrate channel_schedule_reservations to use partial unique index for active slots only."""
+    c = conn.cursor()
+    c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='channel_schedule_reservations'")
+    row = c.fetchone()
+    if row and row[0] and bool(re.search(r"UNIQUE\s*\(\s*youtube_channel_id\s*,\s*scheduled_at\s*\)", row[0], re.IGNORECASE)):
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS channel_schedule_reservations_migrated (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                youtube_channel_id INTEGER NOT NULL,
+                workflow_id TEXT NOT NULL UNIQUE,
+                scheduled_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'reserved',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(youtube_channel_id) REFERENCES youtube_channels(id) ON DELETE CASCADE,
+                FOREIGN KEY(workflow_id) REFERENCES youtube_publish_workflows(id) ON DELETE CASCADE
+            )
+        """)
+        c.execute("""
+            INSERT OR IGNORE INTO channel_schedule_reservations_migrated (
+                id, youtube_channel_id, workflow_id, scheduled_at, status, created_at, updated_at
+            )
+            SELECT id, youtube_channel_id, workflow_id, scheduled_at, status, created_at, updated_at
+            FROM channel_schedule_reservations
+        """)
+        c.execute("DROP TABLE channel_schedule_reservations")
+        c.execute("ALTER TABLE channel_schedule_reservations_migrated RENAME TO channel_schedule_reservations")
+
+    c.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_schedule_reservations_active
+        ON channel_schedule_reservations(youtube_channel_id, scheduled_at)
+        WHERE status IN ('reserved', 'scheduled')
+    """)
 
 
 def save_video(

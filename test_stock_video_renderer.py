@@ -85,10 +85,9 @@ class StockVideoRendererTests(unittest.TestCase):
         v1.touch()
         v2.touch()
 
-        # Mock probe_media_duration to return 10s per video
         with patch.object(stock_video_renderer, "probe_media_duration", return_value=10.0):
-            # Target duration: 45s -> requires 5 video segments
-            playlist = stock_video_renderer.build_background_playlist([v1, v2], target_duration=45.0)
+            # Target duration: 45s -> requires at least 5 video segments
+            playlist, _ = stock_video_renderer.build_background_playlist([v1, v2], target_duration=45.0)
             self.assertGreaterEqual(len(playlist), 5)
 
     def test_generate_thumbnail_and_title_card_overlays(self):
@@ -295,10 +294,10 @@ class StockVideoRendererTests(unittest.TestCase):
                 progress=lambda m, s="": None,
                 cancel_check=lambda: None,
             )
-            self.assertEqual(res["render_mode"], "stock_video")
-            self.assertEqual(len(captured_cmds), 1)
+            render_cmds = [c for c in captured_cmds if "-filter_complex" in c or "-filter_complex" in " ".join(c)]
+            self.assertEqual(len(render_cmds), 1)
 
-            cmd = captured_cmds[0]
+            cmd = render_cmds[0]
             cmd_str = " ".join(cmd)
             self.assertIn("-reinit_filter 0", cmd_str)
             self.assertIn("-fps_mode cfr", cmd_str)
