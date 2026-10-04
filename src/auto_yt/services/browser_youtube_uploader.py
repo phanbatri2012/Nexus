@@ -409,6 +409,15 @@ async def _open_existing_draft_upload_dialog(page, timeout_ms: int = 10000) -> b
     if await _find_visible_upload_details_dialog(page) is not None:
         return True
     edit_draft_selectors = [
+        "ytcp-button#resume-upload-button",
+        "#resume-upload-button",
+        "[test-id='resume-upload']",
+        "ytcp-button:has-text('Tiếp tục tải lên')",
+        "button:has-text('Tiếp tục tải lên')",
+        "ytcp-button:has-text('Resume upload')",
+        "button:has-text('Resume upload')",
+        "ytcp-video-row:has-text('gián đoạn') ytcp-button:has-text('Tiếp tục tải lên')",
+        "ytcp-video-row:has-text('interrupted') ytcp-button:has-text('Resume upload')",
         "ytcp-button#edit-draft-button",
         "#edit-draft-button",
         "[test-id='edit-draft-button']",
@@ -760,21 +769,19 @@ async def _wait_for_file_upload_complete(
                 "đã xử lý",
                 "kiểm tra hoàn tất",
                 "đã kiểm tra xong",
-                "đã kiểm tra",
                 "checks complete",
                 "không tìm thấy vấn đề",
                 "không phát hiện vấn đề",
                 "no issues found",
-                "đã lưu ở chế độ riêng tư",
-                "đã lưu ở chế độ",
-                "đã lưu",
-                "saved",
-                "đã lưu dưới dạng bản nháp",
-                "saved as draft",
-                "bản nháp đã được lưu",
             ];
 
-            const isDone = (pctVal !== null && pctVal >= 100) || doneKeywords.some(k => rawText.includes(k) || progressText.toLowerCase().includes(k) || footerText.toLowerCase().includes(k));
+            let isDone = false;
+            if (pctVal !== null) {
+                isDone = (pctVal >= 100);
+            } else {
+                const combinedStatus = (progressText + ' ' + footerText).toLowerCase();
+                isDone = doneKeywords.some(k => combinedStatus.includes(k));
+            }
 
             return {
                 isDone: Boolean(isDone),
@@ -797,34 +804,32 @@ async def _wait_for_file_upload_complete(
             pct_match = re.search(r"(\d+)%", clean_text)
             if pct_match:
                 pct_val = int(pct_match.group(1))
-            is_done = (pct_val is not None and pct_val >= 100) or any(
-                k in clean_text.lower()
-                for k in [
-                    "đã hoàn tất",
-                    "upload complete",
-                    "đã tải lên 100%",
-                    "100% uploaded",
-                    "quá trình xử lý sắp bắt đầu",
-                    "processing will begin shortly",
-                    "quá trình kiểm tra sắp bắt đầu",
-                    "đang xử lý",
-                    "processing",
-                    "đã xử lý xong",
-                    "đã xử lý",
-                    "kiểm tra hoàn tất",
-                    "đã kiểm tra xong",
-                    "checks complete",
-                    "không tìm thấy vấn đề",
-                    "không phát hiện vấn đề",
-                    "no issues found",
-                    "đã lưu ở chế độ",
-                    "đã lưu",
-                    "saved",
-                    "đã lưu dưới dạng bản nháp",
-                    "saved as draft",
-                    "bản nháp đã được lưu",
-                ]
-            )
+            if pct_val is not None:
+                is_done = (pct_val >= 100)
+            else:
+                is_done = any(
+                    k in clean_text.lower()
+                    for k in [
+                        "đã hoàn tất quá trình tải lên",
+                        "đã hoàn tất",
+                        "upload complete",
+                        "đã tải lên 100%",
+                        "100% uploaded",
+                        "quá trình xử lý sắp bắt đầu",
+                        "processing will begin shortly",
+                        "quá trình kiểm tra sắp bắt đầu",
+                        "đang xử lý",
+                        "processing",
+                        "đã xử lý xong",
+                        "đã xử lý",
+                        "kiểm tra hoàn tất",
+                        "đã kiểm tra xong",
+                        "checks complete",
+                        "không tìm thấy vấn đề",
+                        "không phát hiện vấn đề",
+                        "no issues found",
+                    ]
+                )
 
         if pct_val is not None and pct_val != last_pct:
             last_pct = pct_val
@@ -841,6 +846,81 @@ async def _wait_for_file_upload_complete(
         await asyncio.sleep(2.0)
 
     logger.warning("Hết thời gian chờ upload file 100%% sau %.1fs; tiếp tục tiến trình...", timeout_seconds)
+
+
+async def _resume_interrupted_upload_if_present(
+    page,
+    video_path: Path | None,
+    *,
+    timeout_seconds: float = 600.0,
+    progress: Callable[[str, str, int], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
+) -> bool:
+    """Detect if YouTube Studio shows 'Quá trình tải lên bị gián đoạn' / 'Resume upload' and resume the file upload."""
+    if not video_path or not video_path.exists():
+        return False
+
+    interrupted = await page.evaluate('''() => {
+        const text = (document.body?.innerText || document.body?.textContent || '').toLowerCase();
+        const hasInterruptedText = text.includes('quá trình tải lên bị gián đoạn')
+            || text.includes('upload process interrupted')
+            || text.includes('upload interrupted')
+            || text.includes('quá trình tải lên đã bị gián đoạn');
+
+        const allButtons = Array.from(document.querySelectorAll("ytcp-button, button, [role='button'], tp-yt-paper-button"));
+        const resumeBtn = allButtons.find(b => {
+            const t = (b.innerText || b.textContent || '').trim().toLowerCase();
+            return t === 'tiếp tục tải lên' || t === 'resume upload' || b.id === 'resume-upload-button' || b.getAttribute('test-id') === 'resume-upload';
+        });
+        return Boolean(hasInterruptedText || (resumeBtn && resumeBtn.offsetParent !== null));
+    }''')
+
+    if not interrupted:
+        return False
+
+    logger.info("Phát hiện video đang ở trạng thái 'Quá trình tải lên bị gián đoạn'. Đang tự động tiếp tục upload file MP4: %s", video_path.name)
+    if progress:
+        progress("Đang khôi phục và tiếp tục tải lên file video MP4...", "resuming_upload", 25)
+
+    resume_btn_locator = page.locator(
+        "ytcp-button:has-text('Tiếp tục tải lên'), "
+        "button:has-text('Tiếp tục tải lên'), "
+        "ytcp-button:has-text('Resume upload'), "
+        "button:has-text('Resume upload'), "
+        "ytcp-button#resume-upload-button, "
+        "#resume-upload-button, "
+        "[test-id='resume-upload']"
+    ).first
+
+    file_injected = False
+    try:
+        try:
+            await resume_btn_locator.click(timeout=5000)
+        except Exception:
+            pass
+        await asyncio.sleep(1.5)
+        await _cdp_set_input_files(
+            page,
+            "ytcp-uploads-dialog input[type='file'], ytcp-video-upload-dialog input[type='file'], input[type='file']",
+            video_path,
+            timeout_ms=10000,
+        )
+        logger.info("Đã nạp file MP4 tiếp tục upload qua CDP thành công: %s", video_path.name)
+        file_injected = True
+    except Exception as cdp_err:
+        logger.warning("Không thể nạp file MP4 tiếp tục upload qua CDP: %s", cdp_err)
+
+    if not file_injected:
+        return False
+
+    await asyncio.sleep(2.0)
+    await _wait_for_file_upload_complete(
+        page,
+        timeout_seconds=timeout_seconds,
+        progress=progress,
+        cancel_check=cancel_check,
+    )
+    return True
 
 
 async def _read_control_value(element) -> str:
@@ -1274,6 +1354,8 @@ def _find_blocking_restriction(text: str) -> str:
         r"community guidelines strike",
         r"không đủ điều kiện đăng",
         r"not eligible to publish",
+        r"gián đoạn",
+        r"upload.*interrupted",
     )
     for pattern in blocking_patterns:
         match = re.search(pattern, clean_text, re.IGNORECASE)
@@ -2370,15 +2452,27 @@ async def _save_video_on_edit_page(
     *,
     schedule_at: str | None,
     publication_timezone: str,
+    video_path: Path | None = None,
     caption_path: Path | None = None,
     language: str = "vi",
     settings: dict[str, Any],
+    timeout_seconds: float = 600.0,
     cancel_check: Callable[[], None],
     persist_checkpoint: Callable[[str, dict[str, Any]], None],
     progress: Callable[[str, str, int], None],
 ) -> dict[str, Any]:
     """Handles Visibility / Schedule, Subtitles and saving when editing directly on https://studio.youtube.com/video/{id}/edit."""
-    # 0. Handle Subtitles if configured
+    # 0. Check and resume interrupted upload if present on edit page
+    if video_path and video_path.exists():
+        await _resume_interrupted_upload_if_present(
+            page,
+            video_path,
+            timeout_seconds=timeout_seconds,
+            progress=progress,
+            cancel_check=cancel_check,
+        )
+
+    # 1. Handle Subtitles if configured
     caption_locator = ""
     if bool(settings.get("upload_captions", True)) and caption_path and caption_path.exists():
         progress("Đang nạp phụ đề SRT trên trang chỉnh sửa...", "uploading_caption", 80)
@@ -2641,6 +2735,40 @@ async def upload_video_via_browser(
 
                 has_dialog = await _find_visible_upload_details_dialog(page) is not None
                 if not has_dialog:
+                    # Check if there is an interrupted upload prompt on wizard/content page
+                    resumed_from_interrupted = await _resume_interrupted_upload_if_present(
+                        page,
+                        video_path,
+                        timeout_seconds=timeout_seconds,
+                        progress=progress,
+                        cancel_check=cancel_check,
+                    )
+                    if resumed_from_interrupted:
+                        has_dialog = await _find_visible_upload_details_dialog(page) is not None
+
+                if not has_dialog:
+                    # Check Channel Content page for interrupted upload row
+                    channel_videos_url = (
+                        f"https://studio.youtube.com/channel/{clean_channel_id}/videos/upload?filter=%5B%5D&sort=%7B%22columnType%22%3A%22date%22%2C%22sortOrder%22%3A%22DESCENDING%22%7D"
+                        if clean_channel_id
+                        else "https://studio.youtube.com/videos/upload?filter=%5B%5D&sort=%7B%22columnType%22%3A%22date%22%2C%22sortOrder%22%3A%22DESCENDING%22%7D"
+                    )
+                    try:
+                        await page.goto(channel_videos_url, wait_until="commit", timeout=30000)
+                        await asyncio.sleep(4.0)
+                        resumed_from_interrupted = await _resume_interrupted_upload_if_present(
+                            page,
+                            video_path,
+                            timeout_seconds=timeout_seconds,
+                            progress=progress,
+                            cancel_check=cancel_check,
+                        )
+                        if resumed_from_interrupted:
+                            has_dialog = await _find_visible_upload_details_dialog(page) is not None
+                    except Exception as e:
+                        logger.debug("Kiểm tra interrupted upload trên trang Nội dung kênh: %s", e)
+
+                if not has_dialog:
                     # Try clicking draft button if on upload list
                     try:
                         await _open_existing_draft_upload_dialog(page)
@@ -2677,12 +2805,47 @@ async def upload_video_via_browser(
                         if f"/video/{clean_existing_video_id}/" in page.url:
                             resumed_body_text = str(await page.locator("body").inner_text() or "")
                             resumed_html = await page.content()
+                            is_interrupted = bool(
+                                re.search(r"gián đoạn|interrupted", resumed_body_text, re.IGNORECASE)
+                            )
+                            if is_interrupted:
+                                scheduled_marker = False
+                                break
                             scheduled_marker = bool(
                                 re.search(r"Đã lên lịch|Scheduled", resumed_body_text, re.IGNORECASE)
                             )
                             if scheduled_marker:
                                 break
                         await asyncio.sleep(1.0)
+
+                    is_interrupted = bool(
+                        re.search(r"gián đoạn|interrupted", resumed_body_text, re.IGNORECASE)
+                    )
+                    if is_interrupted:
+                        scheduled_marker = False
+                        if f"/video/{clean_existing_video_id}/" in page.url:
+                            resumed_ok = await _resume_interrupted_upload_if_present(
+                                page,
+                                video_path,
+                                timeout_seconds=timeout_seconds,
+                                progress=progress,
+                                cancel_check=cancel_check,
+                            )
+                            if resumed_ok:
+                                resumed_body_text = str(await page.locator("body").inner_text() or "")
+                                resumed_html = await page.content()
+                                scheduled_marker = bool(
+                                    re.search(r"Đã lên lịch|Scheduled", resumed_body_text, re.IGNORECASE)
+                                )
+                    elif not scheduled_marker and f"/video/{clean_existing_video_id}/" in page.url:
+                        # Check if edit page has interrupted upload warning
+                        await _resume_interrupted_upload_if_present(
+                            page,
+                            video_path,
+                            timeout_seconds=timeout_seconds,
+                            progress=progress,
+                            cancel_check=cancel_check,
+                        )
 
                     if f"/video/{clean_existing_video_id}/" not in page.url and not has_dialog:
                         logger.warning(
@@ -3094,9 +3257,11 @@ async def upload_video_via_browser(
                     page,
                     schedule_at=schedule_at,
                     publication_timezone=publication_timezone,
+                    video_path=video_path,
                     caption_path=caption_path,
                     language=language,
                     settings=settings,
+                    timeout_seconds=timeout_seconds,
                     cancel_check=cancel_check,
                     persist_checkpoint=persist_checkpoint,
                     progress=progress,
@@ -3576,9 +3741,11 @@ async def upload_video_via_browser(
                             page,
                             schedule_at=schedule_at,
                             publication_timezone=publication_timezone,
+                            video_path=video_path,
                             caption_path=caption_path,
                             language=language,
                             settings=settings,
+                            timeout_seconds=timeout_seconds,
                             cancel_check=cancel_check,
                             persist_checkpoint=persist_checkpoint,
                             progress=progress,
@@ -3856,9 +4023,11 @@ async def upload_video_via_browser(
                             page,
                             schedule_at=schedule_at,
                             publication_timezone=publication_timezone,
+                            video_path=video_path,
                             caption_path=caption_path,
                             language=language,
                             settings=settings,
+                            timeout_seconds=timeout_seconds,
                             cancel_check=cancel_check,
                             persist_checkpoint=persist_checkpoint,
                             progress=progress,
