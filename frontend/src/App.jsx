@@ -182,6 +182,7 @@ function App() {
   const [isGeneratingTitle, setIsGeneratingTitle] = useState(false)
   const [isGeneratingSlug, setIsGeneratingSlug] = useState(false)
   const [isGeneratingDescription, setIsGeneratingDescription] = useState(false)
+  const [isGeneratingHashtags, setIsGeneratingHashtags] = useState(false)
   const [isGeneratingTags, setIsGeneratingTags] = useState(false)
   const [isGeneratingPinnedComment, setIsGeneratingPinnedComment] = useState(false)
   const [isGeneratingQuiz, setIsGeneratingQuiz] = useState(false)
@@ -224,6 +225,8 @@ function App() {
   const [videoTitle, setVideoTitle] = useState('')
   const [currentVideoPromptVersion, setCurrentVideoPromptVersion] = useState('')
   const [currentVideoStatus, setCurrentVideoStatus] = useState('active')
+  const [currentVideoPublishStatus, setCurrentVideoPublishStatus] = useState('')
+  const [currentVideoBlockingReason, setCurrentVideoBlockingReason] = useState('')
   const [isCurrentVideoPublished, setIsCurrentVideoPublished] = useState(false)
   const [currentVideoPublications, setCurrentVideoPublications] = useState([])
   const [currentVideoDefaultChannelTitle, setCurrentVideoDefaultChannelTitle] = useState('')
@@ -272,6 +275,7 @@ function App() {
     isGeneratingTitle ||
     isGeneratingSlug ||
     isGeneratingDescription ||
+    isGeneratingHashtags ||
     isGeneratingTags ||
     isGeneratingPinnedComment ||
     isGeneratingQuiz
@@ -835,6 +839,8 @@ function App() {
       setCurrentVideoId(id);  // track which video is loaded
       setAudioReview(null);
       setIsCurrentVideoPublished(Boolean(data.is_published));
+      setCurrentVideoPublishStatus(data.publish_status || '');
+      setCurrentVideoBlockingReason(data.blocking_reason || '');
       setCurrentVideoPublications(data.publications || []);
       setCurrentVideoDefaultChannelTitle(data.default_youtube_channel_title || '');
       setCurrentVideoHasCheckpoint(Boolean(data.has_checkpoint));
@@ -1177,22 +1183,35 @@ function App() {
         throw new Error('Backend trả về sai video. Giao diện chưa được cập nhật.');
       }
 
-      const refreshedResponse = await fetch(
-        `http://127.0.0.1:8080/api/videos/${requestedVideoId}?_=${Date.now()}`,
-        { cache: 'no-store' }
-      );
-      if (!refreshedResponse.ok) {
-        throw new Error('Không thể tải nội dung mới từ database.');
-      }
-      const refreshedVideo = await refreshedResponse.json();
       if (currentVideoIdRef.current === requestedVideoId) {
-        setResultText(refreshedVideo.generated_script);
-        if (refreshedVideo.title) {
-          setVideoTitle(refreshedVideo.title);
+        if (data.script) {
+          setResultText(data.script);
         }
-      } else {
-        alert(`${label} đã được cập nhật. Hãy mở lại đúng video để xem kết quả.`);
+        if (data.title) {
+          setVideoTitle(data.title);
+        }
       }
+
+      try {
+        const refreshedResponse = await fetch(
+          `http://127.0.0.1:8080/api/videos/${requestedVideoId}?_=${Date.now()}`,
+          { cache: 'no-store' }
+        );
+        if (refreshedResponse.ok) {
+          const refreshedVideo = await refreshedResponse.json();
+          if (currentVideoIdRef.current === requestedVideoId) {
+            setResultText(refreshedVideo.generated_script);
+            if (refreshedVideo.title) {
+              setVideoTitle(refreshedVideo.title);
+            }
+            setCurrentVideoPublishStatus(refreshedVideo.publish_status || '');
+            setCurrentVideoBlockingReason(refreshedVideo.blocking_reason || '');
+          }
+        }
+      } catch (syncErr) {
+        console.warn('Silent refresh error after successful generation:', syncErr);
+      }
+
       await fetchSavedVideos(currentPage, publishFilter);
     } catch (error) {
       alert(`Lỗi tạo ${label}: ` + error.message);
@@ -1204,7 +1223,8 @@ function App() {
   const handleGenerateTitle = () => handleGenerateItem('generate-title', 'tiêu đề', setIsGeneratingTitle);
   const handleGenerateSlug = () => handleGenerateItem('generate-slug', 'URL slug', setIsGeneratingSlug);
   const handleGenerateDescription = () => handleGenerateItem('generate-description', 'mô tả', setIsGeneratingDescription);
-  const handleGenerateTags = () => handleGenerateItem('generate-tags', 'tags & hashtags', setIsGeneratingTags);
+  const handleGenerateHashtags = () => handleGenerateItem('generate-hashtags', 'hashtags', setIsGeneratingHashtags);
+  const handleGenerateTags = () => handleGenerateItem('generate-tags', 'tags', setIsGeneratingTags);
   const handleGeneratePinnedComment = () => handleGenerateItem('generate-pinned-comment', 'bình luận ghim', setIsGeneratingPinnedComment);
   const handleGenerateQuiz = () => handleGenerateItem('generate-quiz', 'quiz', setIsGeneratingQuiz);
 
@@ -2654,9 +2674,24 @@ function App() {
                             {isGeneratingDescription ? '⏳ Đang tạo...' : '📝 Mô tả'}
                           </button>
                           <button
+                            onClick={handleGenerateHashtags}
+                            disabled={chatGptControlsDisabled}
+                            title="Tạo lại 3-5 thẻ Hashtags"
+                            style={{
+                              padding: '4px 10px', borderRadius: '4px',
+                              cursor: chatGptControlsDisabled ? 'not-allowed' : 'pointer',
+                              border: '1px solid #00bcd4',
+                              background: chatGptControlsDisabled ? '#333' : 'rgba(0,188,212,0.15)',
+                              color: chatGptControlsDisabled ? '#888' : '#00bcd4',
+                              fontWeight: '600', fontSize: '0.82em'
+                            }}
+                          >
+                            {isGeneratingHashtags ? '⏳ Đang tạo...' : '#️⃣ Hashtags'}
+                          </button>
+                          <button
                             onClick={handleGenerateTags}
                             disabled={chatGptControlsDisabled}
-                            title="Tạo lại Tags & Hashtags"
+                            title="Tạo lại Thẻ từ khóa Tags YouTube"
                             style={{
                               padding: '4px 10px', borderRadius: '4px',
                               cursor: chatGptControlsDisabled ? 'not-allowed' : 'pointer',
@@ -2965,10 +3000,10 @@ function App() {
                             <div style={{
                               fontSize: '0.85em',
                               fontWeight: '600',
-                              color: (generatingThumbnailType !== null || isGeneratingChapters || isGeneratingMetadata || isGeneratingTitle || isGeneratingSlug || isGeneratingDescription || isGeneratingTags || isGeneratingPinnedComment || isGeneratingQuiz) ? '#f5b041' : resultText ? '#2ecc71' : '#888'
+                              color: (generatingThumbnailType !== null || isGeneratingChapters || isGeneratingMetadata || isGeneratingTitle || isGeneratingSlug || isGeneratingDescription || isGeneratingHashtags || isGeneratingTags || isGeneratingPinnedComment || isGeneratingQuiz) ? '#f5b041' : resultText ? '#2ecc71' : '#888'
                             }}>
-                              {(generatingThumbnailType !== null || isGeneratingChapters || isGeneratingMetadata || isGeneratingTitle || isGeneratingSlug || isGeneratingDescription || isGeneratingTags || isGeneratingPinnedComment || isGeneratingQuiz)
-                                ? `⏳ Đang tạo ${generatingThumbnailType !== null ? 'Thumbnail' : isGeneratingChapters ? 'Chapters' : isGeneratingMetadata ? 'Metadata' : isGeneratingTitle ? 'Tiêu đề' : isGeneratingSlug ? 'Slug' : isGeneratingDescription ? 'Mô tả' : isGeneratingTags ? 'Tags' : isGeneratingPinnedComment ? 'Ghim' : 'Quiz'}...`
+                              {(generatingThumbnailType !== null || isGeneratingChapters || isGeneratingMetadata || isGeneratingTitle || isGeneratingSlug || isGeneratingDescription || isGeneratingHashtags || isGeneratingTags || isGeneratingPinnedComment || isGeneratingQuiz)
+                                ? `⏳ Đang tạo ${generatingThumbnailType !== null ? 'Thumbnail' : isGeneratingChapters ? 'Chapters' : isGeneratingMetadata ? 'Metadata' : isGeneratingTitle ? 'Tiêu đề' : isGeneratingSlug ? 'Slug' : isGeneratingDescription ? 'Mô tả' : isGeneratingHashtags ? 'Hashtags' : isGeneratingTags ? 'Tags' : isGeneratingPinnedComment ? 'Ghim' : 'Quiz'}...`
                                 : resultText
                                   ? '✅ Kịch bản hoàn tất'
                                   : '⚪ Chưa có kịch bản'}
@@ -3096,8 +3131,8 @@ function App() {
                           {/* 4. Trạng thái Xuất bản */}
                           <div
                             style={{
-                              background: 'rgba(255, 255, 255, 0.03)',
-                              border: '1px solid rgba(255, 255, 255, 0.08)',
+                              background: (currentVideoPublishStatus === 'paused' || currentVideoPublishStatus === 'error') ? 'rgba(241, 196, 15, 0.08)' : 'rgba(255, 255, 255, 0.03)',
+                              border: (currentVideoPublishStatus === 'paused' || currentVideoPublishStatus === 'error') ? '1px solid rgba(241, 196, 15, 0.4)' : '1px solid rgba(255, 255, 255, 0.08)',
                               borderRadius: '8px',
                               padding: '10px 12px'
                             }}
@@ -3108,9 +3143,19 @@ function App() {
                             <div style={{
                               fontSize: '0.85em',
                               fontWeight: '600',
-                              color: isCurrentVideoPublished ? '#2ecc71' : '#4dd0e1'
+                              color: isCurrentVideoPublished ? '#2ecc71' : (currentVideoPublishStatus === 'paused' || currentVideoPublishStatus === 'error') ? '#f1c40f' : '#4dd0e1'
                             }}>
-                              {isCurrentVideoPublished ? '✅ Đã xuất bản' : '⏳ Chưa đăng / Sẵn sàng'}
+                              {isCurrentVideoPublished
+                                ? '✅ Đã xuất bản'
+                                : currentVideoPublishStatus === 'paused'
+                                  ? `⏸️ Tạm dừng: ${currentVideoBlockingReason || 'Cần kiểm tra'}`
+                                  : currentVideoPublishStatus === 'error'
+                                    ? `❌ Lỗi: ${currentVideoBlockingReason || 'Thất bại'}`
+                                    : currentVideoPublishStatus === 'scheduled'
+                                      ? '🕒 Đã lên lịch đăng'
+                                      : currentVideoPublishStatus === 'processing'
+                                        ? '⏳ Đang đăng YouTube...'
+                                        : '⏳ Chưa đăng / Sẵn sàng'}
                             </div>
                           </div>
                         </div>

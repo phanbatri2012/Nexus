@@ -208,7 +208,13 @@ def extract_generated_video_hashtags(generated_script: str) -> str:
     hashtags_match = HASHTAGS_SECTION_PATTERN.search(generated_script)
     if hashtags_match:
         val = hashtags_match.group(1).strip()
-        return re.sub(r"^[-*\s]*(?:hashtags?|thẻ\s+hashtag):\s*", "", val, flags=re.IGNORECASE).strip()
+        cleaned = re.sub(r"^[-*\s]*(?:hashtags?|thẻ\s+hashtag):\s*", "", val, flags=re.IGNORECASE).strip()
+        hash_tokens = re.findall(r"(?<!\w)#[\w-]+", cleaned)
+        if hash_tokens:
+            return " ".join(hash_tokens[:10])
+        if len(cleaned) <= 300 and not any(marker in cleaned for marker in ("[MC]:", "[KHACH_", "[HOST]:")):
+            return cleaned
+        return ""
     metadata_match = METADATA_SECTION_PATTERN.search(generated_script)
     if metadata_match:
         lines = metadata_match.group(1).splitlines()
@@ -216,11 +222,12 @@ def extract_generated_video_hashtags(generated_script: str) -> str:
             line_clean = line.strip().strip("#*` ")
             label, separator, inline_value = line_clean.partition(":")
             if separator and _normalize_metadata_label(label) in {"HASHTAG", "HASHTAGS"}:
-                return inline_value.strip()
+                inline_tokens = re.findall(r"(?<!\w)#[\w-]+", inline_value)
+                return " ".join(inline_tokens[:10]) if inline_tokens else inline_value.strip()
             if "#" in line and not line.startswith("###") and not line.upper().startswith("TAGS:"):
                 matches = re.findall(r"(?<!\w)#[\w-]+", line)
                 if matches:
-                    return " ".join(matches)
+                    return " ".join(matches[:10])
     return ""
 
 

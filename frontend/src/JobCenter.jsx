@@ -690,7 +690,9 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                   ? { label: 'Đang Auto Login', color: '#4dd0e1' }
                   : { label: 'Cần xác minh ChatGPT', color: '#f1c40f' }
                 : job.status === 'paused' && job.attention_required?.startsWith('youtube_')
-                  ? { label: 'Cần cấu hình', color: '#f1c40f' }
+                  ? job.missing_configuration?.length > 0
+                    ? { label: 'Cần cấu hình', color: '#f1c40f' }
+                    : { label: 'Chờ tiếp tục', color: '#4dd0e1' }
                 : job.type === 'comment_publish' && job.status === 'retry_wait'
                 ? { label: 'Đã hẹn đăng', color: '#4dd0e1' }
                 : STATUS_META[job.status] || STATUS_META.error
@@ -800,16 +802,20 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                       </div>
                     )}
                     {job.status === 'paused' && job.attention_required?.startsWith('youtube_') && (
-                      <div style={{ color: '#f1c40f', marginTop: '9px', fontSize: '0.84em' }}>
-                        {job.missing_configuration?.some(item => ['made_for_kids', 'default_youtube_channel_id'].includes(item))
-                          ? 'Hãy sửa trong Cài đặt (Settings) hoặc Channel Hub rồi bấm “Tiếp tục”.'
-                          : 'Hãy sửa trong Channel Hub rồi bấm “Tiếp tục”.'}
-                        {job.missing_configuration?.length > 0 && (
-                          <div style={{ marginTop: '4px' }}>
-                            Còn thiếu: {job.missing_configuration
-                              .map(item => CONFIGURATION_LABELS[item] || item)
-                              .join(', ')}.
-                          </div>
+                      <div style={{ color: job.missing_configuration?.length > 0 ? '#f1c40f' : '#4dd0e1', marginTop: '9px', fontSize: '0.84em' }}>
+                        {job.missing_configuration?.length > 0 ? (
+                          <>
+                            {job.missing_configuration?.some(item => ['made_for_kids', 'default_youtube_channel_id'].includes(item))
+                              ? 'Hãy sửa trong Cài đặt (Settings) hoặc Channel Hub rồi bấm “Tiếp tục”.'
+                              : 'Hãy sửa trong Channel Hub rồi bấm “Tiếp tục”.'}
+                            <div style={{ marginTop: '4px' }}>
+                              Còn thiếu: {job.missing_configuration
+                                .map(item => CONFIGURATION_LABELS[item] || item)
+                                .join(', ')}.
+                            </div>
+                          </>
+                        ) : (
+                          <div>Video đã được tải lên YouTube. Hãy bấm “Tiếp tục” để tự động hoàn tất lưu và đặt lịch phát sóng.</div>
                         )}
                       </div>
                     )}

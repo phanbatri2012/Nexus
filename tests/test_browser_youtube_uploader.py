@@ -62,6 +62,20 @@ class TestBrowserYouTubeUploader(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(_schedule_time_matches("11:00 AM", t))
         self.assertFalse(_schedule_time_matches("12:00", t))
 
+        t_evening = dt.time(19, 0)
+        self.assertTrue(_schedule_time_matches("19:00", t_evening))
+        self.assertTrue(_schedule_time_matches("7:00 PM", t_evening))
+        self.assertTrue(_schedule_time_matches("07:00 PM", t_evening))
+        self.assertTrue(_schedule_time_matches("7:00pm", t_evening))
+        self.assertFalse(_schedule_time_matches("19:15", t_evening))
+        self.assertFalse(_schedule_time_matches("7:00 AM", t_evening))
+
+        t_single_digit = dt.time(8, 30)
+        self.assertTrue(_schedule_time_matches("8:30", t_single_digit))
+        self.assertTrue(_schedule_time_matches("08:30", t_single_digit))
+        self.assertTrue(_schedule_time_matches("8:30 AM", t_single_digit))
+        self.assertTrue(_schedule_time_matches("08:30 AM", t_single_digit))
+
     def test_classify_monetization_available(self):
         snap = {
             "hasMonetization": True,
@@ -152,6 +166,43 @@ class TestBrowserYouTubeUploader(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ytcp-video-share-dialog", UPLOAD_COMPLETION_DIALOG_SELECTOR)
         self.assertIn("Scheduled", UPLOAD_COMPLETION_DIALOG_SELECTOR)
         self.assertIn("Đã lên lịch", UPLOAD_COMPLETION_DIALOG_SELECTOR)
+
+    async def test_dismiss_dropdown_safely(self):
+        from auto_yt.services.browser_youtube_uploader import _dismiss_dropdown_safely
+        page = AsyncMock()
+        await _dismiss_dropdown_safely(page)
+        page.evaluate.assert_awaited_once()
+        # Verify page.keyboard.press was NEVER called
+        page.keyboard.press.assert_not_called()
+
+    async def test_ensure_upload_dialog_visible_when_already_open(self):
+        from auto_yt.services.browser_youtube_uploader import _ensure_upload_dialog_visible
+        page = AsyncMock()
+        mock_dialog = AsyncMock()
+        mock_dialog.is_visible.return_value = True
+        page.query_selector.return_value = mock_dialog
+
+        visible = await _ensure_upload_dialog_visible(page)
+        self.assertTrue(visible)
+
+    async def test_ensure_upload_dialog_visible_reopens_minimized(self):
+        from auto_yt.services.browser_youtube_uploader import _ensure_upload_dialog_visible
+        page = AsyncMock()
+        mock_dialog = AsyncMock()
+        mock_dialog.is_visible.side_effect = [False, True]
+        mock_mini = AsyncMock()
+        mock_mini.is_visible.return_value = True
+
+        def query_selector_side_effect(sel):
+            if "multi-progress-monitor" in sel or "expand-button" in sel:
+                return mock_mini
+            return mock_dialog
+
+        page.query_selector.side_effect = query_selector_side_effect
+
+        visible = await _ensure_upload_dialog_visible(page)
+        self.assertTrue(visible)
+        mock_mini.click.assert_awaited_once()
 
 
 if __name__ == "__main__":

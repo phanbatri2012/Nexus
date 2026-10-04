@@ -7499,9 +7499,37 @@ async def generate_description_endpoint(req: GenerateComponentRequest):
         updated_script = replace_script_section(latest_video["generated_script"], "MÔ TẢ", description)
         if not db.update_script(req.video_id, updated_script):
             raise RuntimeError("Video not found")
+        if latest_video.get("blocking_reason") and "5000" in str(latest_video.get("blocking_reason")):
+            db.update_video_production(req.video_id, blocking_reason="", publish_status="")
         return {"success": True, "video_id": req.video_id, "description": description, "script": updated_script}
     except Exception as exc:
         print(f"Error in generate_description_endpoint: {exc}", file=sys.stderr)
+        return {"success": False, "error": security_logging.redact_sensitive(exc)}
+    finally:
+        _finish_chatgpt_operation()
+
+
+@app.post("/api/generate-hashtags")
+async def generate_hashtags_endpoint(req: GenerateComponentRequest):
+    from auto_yt.services.chatgpt_worker import generate_hashtags_only
+    video = _require_actionable_video(req.video_id)
+    if not _try_start_chatgpt_operation("hashtags", video.get("prompt_version", ""), req.video_id):
+        return {"success": False, "error": CHATGPT_BUSY_ERROR}
+    try:
+        loop = asyncio.get_event_loop()
+        hashtags = await loop.run_in_executor(
+            None,
+            lambda: generate_hashtags_only(video.get("chat_url", ""), video.get("prompt_version", ""))
+        )
+        latest_video = _require_actionable_video(req.video_id)
+        updated_script = replace_script_section(latest_video["generated_script"], "HASHTAGS", hashtags)
+        if not db.update_script(req.video_id, updated_script):
+            raise RuntimeError("Video not found")
+        if latest_video.get("blocking_reason") and "5000" in str(latest_video.get("blocking_reason")):
+            db.update_video_production(req.video_id, blocking_reason="", publish_status="")
+        return {"success": True, "video_id": req.video_id, "hashtags": hashtags, "script": updated_script}
+    except Exception as exc:
+        print(f"Error in generate_hashtags_endpoint: {exc}", file=sys.stderr)
         return {"success": False, "error": security_logging.redact_sensitive(exc)}
     finally:
         _finish_chatgpt_operation()
@@ -7523,6 +7551,8 @@ async def generate_tags_endpoint(req: GenerateComponentRequest):
         updated_script = replace_script_section(latest_video["generated_script"], "TAGS", tags)
         if not db.update_script(req.video_id, updated_script):
             raise RuntimeError("Video not found")
+        if latest_video.get("blocking_reason") and "5000" in str(latest_video.get("blocking_reason")):
+            db.update_video_production(req.video_id, blocking_reason="", publish_status="")
         return {"success": True, "video_id": req.video_id, "tags": tags, "script": updated_script}
     except Exception as exc:
         print(f"Error in generate_tags_endpoint: {exc}", file=sys.stderr)
@@ -8602,6 +8632,24 @@ def trigger_render_video(video_id: int, mode: str = "resume"):
         raise HTTPException(status_code=400, detail="Video chưa có file âm thanh hoàn tất.")
     prompt_version = video.get("prompt_version") or ""
     snapshot = _get_prompt_production_snapshot(prompt_version)
+    if video.get("production_snapshot_json"):
+        try:
+            saved_snapshot = json.loads(video["production_snapshot_json"])
+            if isinstance(saved_snapshot, dict) and saved_snapshot:
+                if isinstance(saved_snapshot.get("publishing_settings"), dict):
+                    if not isinstance(snapshot.get("publishing_settings"), dict):
+                        snapshot["publishing_settings"] = {}
+                    for k in ("publish_mode", "upload_method", "category_id", "language", "made_for_kids"):
+                        if k in saved_snapshot["publishing_settings"]:
+                            snapshot["publishing_settings"][k] = saved_snapshot["publishing_settings"][k]
+                if isinstance(saved_snapshot.get("pipeline"), dict):
+                    if not isinstance(snapshot.get("pipeline"), dict):
+                        snapshot["pipeline"] = {}
+                    for k in ("youtube_upload", "youtube_schedule"):
+                        if k in saved_snapshot["pipeline"]:
+                            snapshot["pipeline"][k] = saved_snapshot["pipeline"][k]
+        except Exception:
+            pass
     force_new_project = (mode == "recreate")
 
     # If recreating from scratch, cancel any active renders and purge old MP4 artifacts cleanly

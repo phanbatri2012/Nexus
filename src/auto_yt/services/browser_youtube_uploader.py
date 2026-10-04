@@ -727,35 +727,27 @@ async def _wait_for_file_upload_complete(
     while (time.monotonic() - start_time) < timeout_seconds:
         if cancel_check:
             cancel_check()
-        progress_text = await page.evaluate("""
+        status_info = await page.evaluate("""
         () => {
-            const el = document.querySelector('ytcp-video-upload-progress, ytcp-uploads-dialog ytcp-video-upload-progress, ytcp-uploads-dialog .progress-label');
-            return el ? (el.innerText || el.textContent || '') : '';
-        }
-        """)
-        clean_text = str(progress_text or "").strip()
-        if not clean_text:
-            dialog = await page.query_selector("ytcp-uploads-dialog, ytcp-video-upload-dialog")
-            if dialog:
-                d_text = await dialog.inner_text()
-                for line in d_text.splitlines():
-                    if any(k in line.lower() for k in ["đã tải được", "đang tải", "uploading", "%"]):
-                        clean_text = line.strip()
-                        break
+            const dialog = document.querySelector('ytcp-uploads-dialog, ytcp-video-upload-dialog, ytcp-video-metadata-editor');
+            if (!dialog) return { isDone: true, cleanText: 'no_dialog', pctVal: 100 };
 
-        pct_match = re.search(r"(\d+)%", clean_text)
-        if pct_match:
-            pct_val = int(pct_match.group(1))
-            if pct_val != last_pct:
-                last_pct = pct_val
-                mapped_pct = int(20 + (pct_val * 0.45))
-                if progress:
-                    progress(f"Đang tải video lên YouTube ({clean_text})...", "uploading_file", mapped_pct)
+            const progressEl = dialog.querySelector('ytcp-video-upload-progress, .progress-label, ytcp-badge, #dialog-title + *');
+            const footerEl = dialog.querySelector('ytcp-video-metadata-editor-footer, #dialog-footer, .footer, ytcp-animatable');
 
-        is_done = any(
-            k in clean_text.lower()
-            for k in [
+            const rawText = (dialog.innerText || '').toLowerCase();
+            const progressText = progressEl ? (progressEl.innerText || progressEl.textContent || '').trim() : '';
+            const footerText = footerEl ? (footerEl.innerText || footerEl.textContent || '').trim() : '';
+
+            let pctVal = null;
+            const m = (progressText + ' ' + footerText + ' ' + rawText).match(/(\\d+)%/);
+            if (m) {
+                pctVal = parseInt(m[1], 10);
+            }
+
+            const doneKeywords = [
                 "đã hoàn tất quá trình tải lên",
+                "đã hoàn tất",
                 "upload complete",
                 "đã tải lên 100%",
                 "100% uploaded",
@@ -765,16 +757,82 @@ async def _wait_for_file_upload_complete(
                 "đang xử lý",
                 "processing",
                 "đã xử lý xong",
+                "đã xử lý",
                 "kiểm tra hoàn tất",
+                "đã kiểm tra xong",
+                "đã kiểm tra",
                 "checks complete",
                 "không tìm thấy vấn đề",
+                "không phát hiện vấn đề",
                 "no issues found",
+                "đã lưu ở chế độ riêng tư",
+                "đã lưu ở chế độ",
+                "đã lưu",
+                "saved",
                 "đã lưu dưới dạng bản nháp",
                 "saved as draft",
                 "bản nháp đã được lưu",
-            ]
-        )
-        if is_done or last_pct >= 100:
+            ];
+
+            const isDone = (pctVal !== null && pctVal >= 100) || doneKeywords.some(k => rawText.includes(k) || progressText.toLowerCase().includes(k) || footerText.toLowerCase().includes(k));
+
+            return {
+                isDone: Boolean(isDone),
+                pctVal: pctVal,
+                cleanText: progressText || footerText || (m ? m[0] : (isDone ? 'Đã tải lên và xử lý xong' : ''))
+            };
+        }
+        """)
+
+        clean_text = ""
+        is_done = False
+        pct_val = None
+
+        if isinstance(status_info, dict):
+            is_done = bool(status_info.get("isDone"))
+            pct_val = status_info.get("pctVal")
+            clean_text = str(status_info.get("cleanText") or "").strip()
+        elif isinstance(status_info, str):
+            clean_text = status_info.strip()
+            pct_match = re.search(r"(\d+)%", clean_text)
+            if pct_match:
+                pct_val = int(pct_match.group(1))
+            is_done = (pct_val is not None and pct_val >= 100) or any(
+                k in clean_text.lower()
+                for k in [
+                    "đã hoàn tất",
+                    "upload complete",
+                    "đã tải lên 100%",
+                    "100% uploaded",
+                    "quá trình xử lý sắp bắt đầu",
+                    "processing will begin shortly",
+                    "quá trình kiểm tra sắp bắt đầu",
+                    "đang xử lý",
+                    "processing",
+                    "đã xử lý xong",
+                    "đã xử lý",
+                    "kiểm tra hoàn tất",
+                    "đã kiểm tra xong",
+                    "checks complete",
+                    "không tìm thấy vấn đề",
+                    "không phát hiện vấn đề",
+                    "no issues found",
+                    "đã lưu ở chế độ",
+                    "đã lưu",
+                    "saved",
+                    "đã lưu dưới dạng bản nháp",
+                    "saved as draft",
+                    "bản nháp đã được lưu",
+                ]
+            )
+
+        if pct_val is not None and pct_val != last_pct:
+            last_pct = pct_val
+            mapped_pct = int(20 + (pct_val * 0.45))
+            if progress:
+                progress(f"Đang tải video lên YouTube ({clean_text or f'{pct_val}%'})...", "uploading_file", mapped_pct)
+
+        if is_done or (pct_val is not None and pct_val >= 100) or last_pct >= 100:
             logger.info("Quá trình upload file MP4 lên YouTube đã hoàn tất (%s)", clean_text)
             if progress:
                 progress("Đã tải xong 100% file video lên YouTube.", "upload_complete", 65)
@@ -844,9 +902,16 @@ def _schedule_time_matches(value: str, expected: dt.time) -> bool:
     expected_24h = expected.strftime("%H:%M")
     if expected_24h in normalized:
         return True
+    hour_24_short = f"{expected.hour}:{expected.minute:02d}"
+    if hour_24_short in normalized:
+        return True
     hour_12 = expected.hour % 12 or 12
     meridiem = "pm" if expected.hour >= 12 else "am"
-    return f"{hour_12}:{expected.minute:02d}{meridiem}" in normalized
+    if f"{hour_12}:{expected.minute:02d}{meridiem}" in normalized:
+        return True
+    if f"{hour_12:02d}:{expected.minute:02d}{meridiem}" in normalized:
+        return True
+    return False
 
 
 def _schedule_timestamp_matches(page_markup: str, expected: dt.datetime) -> bool:
@@ -861,9 +926,95 @@ def _schedule_timestamp_matches(page_markup: str, expected: dt.datetime) -> bool
     return any(abs(value - expected_seconds) <= 60 for value in scheduled_seconds)
 
 
+async def _dismiss_dropdown_safely(page) -> None:
+    """Safely dismiss open datepicker/timepicker dropdown menus without closing the parent upload dialog.
+    Never broadcasts Escape to the global window or modal dialog."""
+    try:
+        await page.evaluate("""() => {
+            const openDropdowns = document.querySelectorAll(
+                'ytcp-text-menu[opened], ytcp-dropdown[opened], iron-dropdown:not([aria-hidden="true"]), tp-yt-iron-dropdown:not([aria-hidden="true"])'
+            );
+            for (const dd of openDropdowns) {
+                if (typeof dd.close === 'function') {
+                    dd.close();
+                } else if (dd.opened) {
+                    dd.opened = false;
+                }
+            }
+            if (document.activeElement && typeof document.activeElement.blur === 'function') {
+                document.activeElement.blur();
+            }
+        }""")
+    except Exception:
+        pass
+
+
+async def _ensure_upload_dialog_visible(page) -> bool:
+    """Ensure the main upload dialog is visible.
+    If it was minimized to bottom-right toast (ytcp-multi-progress-monitor), reopen it."""
+    try:
+        dialog = await page.query_selector(
+            "ytcp-uploads-dialog, ytcp-video-upload-dialog"
+        )
+        if dialog and await dialog.is_visible():
+            return True
+
+        mini_monitor_expand = await page.query_selector(
+            "ytcp-multi-progress-monitor #expand-button, "
+            "ytcp-multi-progress-monitor .expand-button, "
+            "ytcp-uploads-mini-indicator, "
+            "ytcp-multi-progress-monitor"
+        )
+        if mini_monitor_expand and await mini_monitor_expand.is_visible():
+            logger.info("Phát hiện hộp thoại upload bị thu nhỏ; đang bấm mở lại...")
+            await mini_monitor_expand.click()
+            await asyncio.sleep(1.0)
+            dialog = await page.query_selector(
+                "ytcp-uploads-dialog, ytcp-video-upload-dialog"
+            )
+            if dialog and await dialog.is_visible():
+                logger.info("Đã phục hồi hiển thị hộp thoại upload thành công.")
+                return True
+    except Exception as exc:
+        logger.debug("Lỗi khi kiểm tra/phục hồi upload dialog: %s", exc)
+    return False
+
+
+async def _ensure_schedule_accordion_expanded(page) -> bool:
+    """Ensure the schedule accordion container in visibility dialog is expanded and visible."""
+    try:
+        is_visible = await page.evaluate("""() => {
+            const dt = document.querySelector('ytcp-datetime-picker, #datetime-picker, #datepicker-trigger, #time-of-day-container');
+            if (!dt) return false;
+            const rect = dt.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && window.getComputedStyle(dt).display !== 'none';
+        }""")
+        if is_visible:
+            return True
+
+        schedule_btn = await page.query_selector(
+            "ytcp-uploads-dialog tp-yt-paper-radio-button#schedule-radio-button, "
+            "ytcp-uploads-dialog tp-yt-paper-radio-button[name='SCHEDULE'], "
+            "ytcp-uploads-dialog #second-container-expand-button, "
+            "ytcp-video-upload-dialog tp-yt-paper-radio-button#schedule-radio-button, "
+            "ytcp-video-upload-dialog tp-yt-paper-radio-button[name='SCHEDULE'], "
+            "ytcp-video-upload-dialog #second-container-expand-button, "
+            "tp-yt-paper-radio-button#schedule-radio-button, "
+            "#second-container-expand-button"
+        )
+        if schedule_btn and await schedule_btn.is_visible():
+            await schedule_btn.click()
+            await asyncio.sleep(0.8)
+            return True
+    except Exception as exc:
+        logger.debug("Lỗi khi mở rộng schedule accordion: %s", exc)
+    return False
+
+
 async def _set_datepicker_value(page, target_date: dt.date) -> tuple[bool, str]:
     """Robust datepicker setter for YouTube Studio Upload Wizard and Edit Page.
     Handles same-month, future-month calendar navigation and multiple locale date formats."""
+    await _ensure_schedule_accordion_expanded(page)
     target_day = target_date.day
     candidate_date_strings = [
         f"{target_date.day} thg {target_date.month}, {target_date.year}",
@@ -933,11 +1084,8 @@ async def _set_datepicker_value(page, target_date: dt.date) -> tuple[bool, str]:
         }""", target_day)
         if clicked:
             await asyncio.sleep(0.5)
-            # Blur popup by clicking neutral header
-            try:
-                await page.click("ytcp-uploads-dialog #visibility-title, ytcp-uploads-dialog #second-container", timeout=1000)
-            except Exception:
-                pass
+            # Dismiss dropdown safely without closing upload modal
+            await _dismiss_dropdown_safely(page)
             if dp_trigger:
                 val = await _read_control_value(dp_trigger)
                 if _schedule_date_matches(val, target_date):
@@ -974,10 +1122,7 @@ async def _set_datepicker_value(page, target_date: dt.date) -> tuple[bool, str]:
                             inputEl.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
                         }
                     }""", date_str)
-                    try:
-                        await page.click("ytcp-uploads-dialog #visibility-title, ytcp-uploads-dialog #second-container", timeout=1000)
-                    except Exception:
-                        pass
+                    await _dismiss_dropdown_safely(page)
                     val = await _read_control_value(dp_trigger) if dp_trigger else await _read_control_value(inp)
                     if _schedule_date_matches(val, target_date):
                         logger.info("Đã điền ngày thành công bằng input %s (%s): %s", sel, date_str, val)
@@ -992,6 +1137,8 @@ async def _set_datepicker_value(page, target_date: dt.date) -> tuple[bool, str]:
 async def _set_timepicker_value(page, target_time: dt.time) -> tuple[bool, str]:
     """Robust timepicker setter for YouTube Studio Upload Wizard and Edit Page.
     Handles 24-hour and 12-hour AM/PM formats, dropdown item selection and manual typing."""
+    await _ensure_schedule_accordion_expanded(page)
+
     hour_24 = target_time.strftime("%H:%M")
     hour_24_short = f"{target_time.hour}:{target_time.minute:02d}"
     hour_12 = target_time.hour % 12 or 12
@@ -1010,6 +1157,7 @@ async def _set_timepicker_value(page, target_time: dt.time) -> tuple[bool, str]:
     time_selectors = [
         "ytcp-datetime-picker #time-of-day-container input",
         "ytcp-datetime-picker tp-yt-paper-input#textbox input",
+        "ytcp-datetime-picker input#input",
         "#time-of-day-container input",
         "#time-of-day-trigger input",
         "input#time-input",
@@ -1019,6 +1167,7 @@ async def _set_timepicker_value(page, target_time: dt.time) -> tuple[bool, str]:
         "input[aria-label*='time' i]",
     ]
 
+    # 1. First check if any visible control already matches
     for sel in time_selectors:
         try:
             inp = await page.query_selector(sel)
@@ -1027,32 +1176,47 @@ async def _set_timepicker_value(page, target_time: dt.time) -> tuple[bool, str]:
                 if _schedule_time_matches(val, target_time):
                     logger.info("Giờ đặt lịch đã đúng sẵn: %s", val)
                     return True, val
+        except Exception:
+            pass
+
+    for sel in time_selectors:
+        try:
+            inp = await page.query_selector(sel)
+            if inp and await inp.is_visible():
                 await inp.click()
                 await asyncio.sleep(0.5)
 
                 # 2. Click matching tp-yt-paper-item in time dropdown list
                 time_clicked = await page.evaluate("""(candidates) => {
-                    const items = Array.from(document.querySelectorAll('ytcp-time-of-day-picker tp-yt-paper-item, tp-yt-paper-dialog tp-yt-paper-item'));
-                    const target = items.find(i => {
-                        const txt = (i.innerText || i.textContent || '').trim();
-                        return candidates.includes(txt) || candidates.some(c => c.toLowerCase() === txt.toLowerCase());
-                    });
-                    if (target) {
-                        target.click();
-                        return true;
+                    const items = Array.from(document.querySelectorAll(
+                        'ytcp-time-of-day-picker tp-yt-paper-item, tp-yt-paper-dialog tp-yt-paper-item, tp-yt-paper-listbox tp-yt-paper-item, [role="option"], ytcp-text-menu tp-yt-paper-item'
+                    ));
+                    for (const item of items) {
+                        const txt = (item.innerText || item.textContent || '').trim();
+                        if (!txt) continue;
+                        const norm = txt.toLowerCase().replace(/\\s+/g, '');
+                        for (const c of candidates) {
+                            const cNorm = c.toLowerCase().replace(/\\s+/g, '');
+                            if (norm === cNorm || txt === c || norm.includes(cNorm)) {
+                                item.scrollIntoView({ block: 'nearest' });
+                                item.click();
+                                return { clicked: true, text: txt };
+                            }
+                        }
                     }
-                    return false;
+                    return { clicked: false, text: '' };
                 }""", time_candidates)
 
-                if time_clicked:
+                if time_clicked and time_clicked.get("clicked"):
                     await asyncio.sleep(0.4)
+                    await _dismiss_dropdown_safely(page)
                     val = await _read_control_value(inp)
                     if _schedule_time_matches(val, target_time):
                         logger.info("Đã chọn giờ thành công qua item dropdown: %s", val)
                         return True, val
 
                 # 3. Direct fill and event dispatch with multiple candidates
-                for cand in [hour_24, f"{hour_12}:{target_time.minute:02d} {meridiem_upper}"]:
+                for cand in [hour_24, hour_24_short, f"{hour_12}:{target_time.minute:02d} {meridiem_upper}"]:
                     await inp.click()
                     await page.keyboard.press("Control+A")
                     await page.keyboard.press("Backspace")
@@ -1060,11 +1224,14 @@ async def _set_timepicker_value(page, target_time: dt.time) -> tuple[bool, str]:
                     await page.keyboard.press("Enter")
                     await asyncio.sleep(0.3)
                     await page.evaluate("""(targetStr) => {
-                        const inputEl = document.querySelector('ytcp-datetime-picker #time-of-day-container input, #time-of-day-container input');
-                        if (inputEl) {
+                        const inps = Array.from(document.querySelectorAll(
+                            'ytcp-datetime-picker #time-of-day-container input, #time-of-day-container input, ytcp-time-of-day-picker input, ytcp-datetime-picker input'
+                        ));
+                        for (const inputEl of inps) {
                             inputEl.value = targetStr;
                             inputEl.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
                             inputEl.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                            inputEl.dispatchEvent(new Event('blur', { bubbles: true, composed: true }));
                         }
                         const paper = document.querySelector('ytcp-datetime-picker tp-yt-paper-input#textbox');
                         if (paper) {
@@ -1072,15 +1239,13 @@ async def _set_timepicker_value(page, target_time: dt.time) -> tuple[bool, str]:
                             paper.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
                         }
                     }""", cand)
-                    try:
-                        await page.click("ytcp-uploads-dialog #visibility-title, ytcp-uploads-dialog #second-container", timeout=1000)
-                    except Exception:
-                        pass
+                    await _dismiss_dropdown_safely(page)
                     val = await _read_control_value(inp)
                     if _schedule_time_matches(val, target_time):
                         logger.info("Đã điền giờ thành công bằng %s (%s): %s", sel, cand, val)
                         return True, val
-        except Exception:
+        except Exception as sel_exc:
+            logger.debug("Lỗi selector giờ %s: %s", sel, sel_exc)
             continue
 
     # Read whatever control matches
@@ -1141,6 +1306,10 @@ async def _wait_for_enabled_action(
                 return
             except Exception:
                 continue
+
+        # Check if dialog was minimized and attempt to restore it
+        await _ensure_upload_dialog_visible(page)
+
         dialog = await page.query_selector(UPLOAD_DIALOG_SELECTOR)
         dialog_text = str(await dialog.inner_text() or "") if dialog else ""
         restriction = _find_blocking_restriction(dialog_text)
@@ -1366,7 +1535,7 @@ async def _select_youtube_category(page, category_id: str) -> bool:
                     label,
                 )
                 return False
-        await page.keyboard.press("Escape")
+        await _dismiss_dropdown_safely(page)
         return False
     except Exception as exc:
         logger.warning("Lỗi khi chọn Thể loại YouTube (ID: %s): %s", category_id, exc)
@@ -1410,10 +1579,7 @@ async def _select_dropdown_option(
             raise BrowserUploadError(
                 f"YouTube Studio không xác nhận giá trị {field_name}: {label}."
             )
-    try:
-        await page.keyboard.press("Escape")
-    except Exception:
-        pass
+    await _dismiss_dropdown_safely(page)
     raise BrowserUploadError(
         f"Không tìm thấy giá trị {field_name}: {option_labels[0] if option_labels else ''}."
     )
@@ -3371,27 +3537,56 @@ async def upload_video_via_browser(
                     "ytcp-button:has-text('Lên lịch')",
                     "ytcp-button:has-text('Schedule')",
                 ]
-                await _wait_for_enabled_action(
-                    page,
-                    schedule_done_selectors,
-                    timeout_seconds=timeout_seconds,
-                    cancel_check=cancel_check,
-                    action_name="đặt lịch",
-                )
-                done_clicked = await _safe_click(
-                    page,
-                    schedule_done_selectors,
-                    timeout_ms=8000,
-                )
-                if not done_clicked:
-                    raise BrowserUploadError("Không thể click nút 'Lên lịch' (Done/Schedule) trên YouTube Studio.")
+                try:
+                    await _wait_for_enabled_action(
+                        page,
+                        schedule_done_selectors,
+                        timeout_seconds=min(timeout_seconds, 30.0),
+                        cancel_check=cancel_check,
+                        action_name="đặt lịch",
+                    )
+                    done_clicked = await _safe_click(
+                        page,
+                        schedule_done_selectors,
+                        timeout_ms=8000,
+                    )
+                    if not done_clicked:
+                        raise BrowserUploadError("Không thể click nút 'Lên lịch' (Done/Schedule) trên YouTube Studio.")
 
-                await asyncio.sleep(2.0)
+                    await asyncio.sleep(2.0)
 
-                # Dismiss any confirmation / checks-running dialog ('Đã hiểu' / 'Got it' / 'Vẫn lên lịch')
-                dismissed = await _dismiss_active_confirmation_dialogs(page, timeout_seconds=8.0)
-                if dismissed:
-                    logger.info("Đã tự động xác nhận và đóng hộp thoại kiểm tra/cảnh báo khi đặt lịch.")
+                    # Dismiss any confirmation / checks-running dialog ('Đã hiểu' / 'Got it' / 'Vẫn lên lịch')
+                    dismissed = await _dismiss_active_confirmation_dialogs(page, timeout_seconds=8.0)
+                    if dismissed:
+                        logger.info("Đã tự động xác nhận và đóng hộp thoại kiểm tra/cảnh báo khi đặt lịch.")
+                except BrowserUploadError as schedule_err:
+                    if youtube_video_id:
+                        logger.warning(
+                            "Không thể chốt đặt lịch trên upload wizard dialog (%s); tự động chuyển sang hoàn tất trên trang edit draft (%s)...",
+                            schedule_err,
+                            youtube_video_id,
+                        )
+                        await page.goto(
+                            f"https://studio.youtube.com/video/{youtube_video_id}/edit",
+                            wait_until="commit",
+                            timeout=60000,
+                        )
+                        await asyncio.sleep(3.0)
+                        edit_res = await _save_video_on_edit_page(
+                            page,
+                            schedule_at=schedule_at,
+                            publication_timezone=publication_timezone,
+                            caption_path=caption_path,
+                            language=language,
+                            settings=settings,
+                            cancel_check=cancel_check,
+                            persist_checkpoint=persist_checkpoint,
+                            progress=progress,
+                        )
+                        if edit_res.get("caption_locator"):
+                            caption_locator = edit_res["caption_locator"]
+                    else:
+                        raise
 
             elif resolved_publish_mode == "public":
                 # Public immediately mode

@@ -3928,6 +3928,10 @@ def generate_description_only(chat_url: str, prompt_version: str = "") -> str:
     return generate_single_component_only(chat_url, "description", prompt_version)
 
 
+def generate_hashtags_only(chat_url: str, prompt_version: str = "") -> str:
+    return generate_single_component_only(chat_url, "hashtags", prompt_version)
+
+
 def generate_tags_only(chat_url: str, prompt_version: str = "") -> str:
     return generate_single_component_only(chat_url, "tags", prompt_version)
 
