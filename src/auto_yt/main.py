@@ -6471,6 +6471,7 @@ def _audio_job_center_item(task: dict) -> dict:
         "voice_revision": int(task.get("voice_revision") or 1),
         "created_at": task.get("created_at", ""),
         "updated_at": task.get("updated_at", ""),
+        "started_at": task.get("started_at", "") or task.get("created_at", ""),
         "can_cancel": False,
         "can_retry": False,
     }
@@ -6511,6 +6512,7 @@ def _audio_review_job_center_item(review: dict) -> dict:
         "video_id": review["video_id"],
         "created_at": review.get("updated_at", ""),
         "updated_at": review.get("updated_at", ""),
+        "started_at": review.get("updated_at", ""),
         "can_cancel": False,
         "can_retry": False,
     }
@@ -6551,6 +6553,7 @@ def _download_job_center_item(job: dict) -> dict:
         ),
         "created_at": job.get("created_at", ""),
         "updated_at": job.get("created_at", ""),
+        "started_at": job.get("started_at", "") or job.get("created_at", ""),
         "can_force_stop": job.get("status") in {"running", "stopping", "downloading"},
         "can_cancel": job.get("status") in {"running", "paused"},
         "can_retry": False,
@@ -6739,13 +6742,47 @@ def _filter_job_center_items(
     ]
 
 
-def _sort_job_center_items(items: list[dict]) -> list[dict]:
+def _sort_job_center_items(items: list[dict], sort_by: str = "start_desc") -> list[dict]:
+    if sort_by == "start_asc":
+        return sorted(
+            items,
+            key=lambda item: item.get("started_at") or item.get("created_at") or "9999-99-99T99:99:99",
+        )
+    if sort_by == "created_desc":
+        return sorted(
+            items,
+            key=lambda item: item.get("created_at") or "",
+            reverse=True,
+        )
+    if sort_by == "created_asc":
+        return sorted(
+            items,
+            key=lambda item: item.get("created_at") or "9999-99-99T99:99:99",
+        )
+    if sort_by == "updated_desc":
+        return sorted(
+            items,
+            key=lambda item: item.get("updated_at") or item.get("created_at") or "",
+            reverse=True,
+        )
+    if sort_by == "updated_asc":
+        return sorted(
+            items,
+            key=lambda item: item.get("updated_at") or item.get("created_at") or "9999-99-99T99:99:99",
+        )
+    if sort_by == "active_first":
+        return sorted(
+            items,
+            key=lambda item: (
+                item["status"] in {"queued", "running", "retry_wait", "paused"},
+                item.get("updated_at") or item.get("created_at") or "",
+            ),
+            reverse=True,
+        )
+    # Default: "start_desc" (Thời gian bắt đầu: Mới nhất trước)
     return sorted(
         items,
-        key=lambda item: (
-            item["status"] in {"queued", "running", "retry_wait", "paused"},
-            item.get("updated_at") or item.get("created_at") or "",
-        ),
+        key=lambda item: item.get("started_at") or item.get("created_at") or "",
         reverse=True,
     )
 
@@ -6757,6 +6794,7 @@ def list_jobs(
     job_type: Optional[str] = None,
     status: Literal["all", "active", "error"] = "all",
     search: Optional[str] = None,
+    sort_by: str = "start_desc",
 ):
     requested_limit = max(1, min(int(limit), 500))
     requested_offset = max(0, int(offset))
@@ -6768,7 +6806,8 @@ def list_jobs(
         snapshot_at=snapshot_at,
     )
     filtered_items = _sort_job_center_items(
-        _filter_job_center_items(counted_items, status=status)
+        _filter_job_center_items(counted_items, status=status),
+        sort_by=sort_by,
     )
     action_counts = {
         action: sum(_job_supports_action(item, action) for item in filtered_items)

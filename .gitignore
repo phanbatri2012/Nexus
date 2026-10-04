@@ -27,6 +27,7 @@ data/
 
 *.patch
 *.db
+*.sqlite
 /patch_*.py
 /inspect_*.py
 /extract_*.py

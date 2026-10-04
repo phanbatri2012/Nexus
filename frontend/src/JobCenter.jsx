@@ -125,6 +125,7 @@ function JobCenter({ onOpenVideo, refreshKey }) {
   const [listSnapshotAt, setListSnapshotAt] = useState('')
   const [filter, setFilter] = useState('all')
   const [typeFilter, setTypeFilter] = useState('all')
+  const [sortOrder, setSortOrder] = useState('start_desc')
   const [searchQuery, setSearchQuery] = useState('')
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('')
   const [loading, setLoading] = useState(true)
@@ -177,6 +178,7 @@ function JobCenter({ onOpenVideo, refreshKey }) {
       if (debouncedSearchQuery) params.set('search', debouncedSearchQuery)
       if (filter !== 'all') params.set('status', filter)
       if (typeFilter !== 'all') params.set('job_type', typeFilter)
+      if (sortOrder) params.set('sort_by', sortOrder)
       const response = await fetch(`${API_BASE}/api/jobs?${params.toString()}`)
       const data = await response.json()
       if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
@@ -217,7 +219,7 @@ function JobCenter({ onOpenVideo, refreshKey }) {
     } finally {
       if (requestId === requestIdRef.current) setLoading(false)
     }
-  }, [debouncedSearchQuery, filter, page, pageSize, typeFilter])
+  }, [debouncedSearchQuery, filter, page, pageSize, sortOrder, typeFilter])
 
   useEffect(() => {
     setLoading(true)
@@ -581,6 +583,28 @@ function JobCenter({ onOpenVideo, refreshKey }) {
           <option value="thumbnail_generation">Sinh ảnh Thumbnail</option>
           <option value="tiktok_publish">Đăng video TikTok</option>
         </select>
+        <select
+          aria-label="Sắp xếp danh sách job"
+          value={sortOrder}
+          disabled={Boolean(actionId)}
+          onChange={event => {
+            clearSelection()
+            setSortOrder(event.target.value)
+            setPage(1)
+          }}
+          style={{
+            padding: '9px 14px', borderRadius: '7px', border: '1px solid #555',
+            background: '#191919', color: '#eee', fontWeight: '600'
+          }}
+        >
+          <option value="start_desc">Bắt đầu: Mới nhất trước</option>
+          <option value="start_asc">Bắt đầu: Cũ nhất trước</option>
+          <option value="created_desc">Thời gian tạo: Mới nhất</option>
+          <option value="created_asc">Thời gian tạo: Cũ nhất</option>
+          <option value="updated_desc">Cập nhật: Mới nhất</option>
+          <option value="updated_asc">Cập nhật: Cũ nhất</option>
+          <option value="active_first">Đang xử lý lên đầu (Active first)</option>
+        </select>
         <button
           className="btn-secondary"
           disabled={Boolean(actionId)}
@@ -735,7 +759,9 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                       </div>
                     )}
                     <div style={{ color: '#666', marginTop: '6px', fontSize: '0.78em' }}>
-                      Tạo: {formatDate(job.created_at)}{job.attempt ? ` · Lần chạy ${job.attempt}` : ''}
+                      Tạo: {formatDate(job.created_at)}
+                      {job.started_at && job.started_at !== job.created_at ? ` · Bắt đầu: ${formatDate(job.started_at)}` : ''}
+                      {job.attempt ? ` · Lần chạy ${job.attempt}` : ''}
                     </div>
                     {job.processing_poll_count > 0 && job.publish_stage === 'processing' && (
                       <div style={{ color: '#4dd0e1', marginTop: '6px', fontSize: '0.8em' }}>

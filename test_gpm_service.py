@@ -36,7 +36,7 @@ def test_gpm_config_load_and_save(tmp_path=None):
             # Test default config
             cfg = gpm_service.get_gpm_config()
             assert cfg["api_url"] == gpm_service.DEFAULT_GPM_API_URL
-            assert cfg["auto_stop_on_finish"] is True
+            assert cfg["auto_stop_on_finish"] is False
             assert cfg["timeout_seconds"] == gpm_service.DEFAULT_TIMEOUT_SECONDS
 
             # Test save config
@@ -264,10 +264,39 @@ def test_gpm_already_open_handling():
     mock_resp = {"success": False, "data": None, "message": "ALREADY_OPEN"}
     with patch("auto_yt.services.gpm_service._request_gpm_api", return_value=mock_resp), \
          patch("auto_yt.services.gpm_service.find_running_gpm_profile_coordinates", return_value=None):
-        info = gpm_service.start_gpm_profile("p_already_open")
+        info = gpm_service.start_gpm_profile("p_already_open", require_cdp=False)
         assert info["success"] is True
         assert info["status"] == "already_open"
         assert info["already_running_no_cdp"] is True
+
+    # When require_cdp=True, it kills non-CDP process, stops GPM profile, and restarts with CDP
+    mock_success_restart = {
+        "success": True,
+        "data": {
+            "remote_debugging_port": 54321,
+            "websocket_debugging_url": "ws://127.0.0.1:54321/devtools",
+        }
+    }
+    call_count = 0
+    def mock_request_with_recovery(endpoint, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if "stop" in endpoint:
+            return {"success": True, "data": {}}
+        if "start" in endpoint:
+            if call_count == 1:
+                return mock_resp
+            return mock_success_restart
+        return {"success": True, "data": {}}
+
+    with patch("auto_yt.services.gpm_service._request_gpm_api", side_effect=mock_request_with_recovery), \
+         patch("auto_yt.services.gpm_service.kill_gpm_profile_processes", return_value=1), \
+         patch("auto_yt.services.gpm_service.find_running_gpm_profile_coordinates", return_value=None), \
+         patch("time.sleep", return_value=None):
+        cdp_info = gpm_service.start_gpm_profile("p_recover", require_cdp=True)
+        assert cdp_info["remote_debugging_port"] == 54321
+        assert "ws://127.0.0.1:54321" in cdp_info["websocket_debugging_url"]
+
     print("✓ test_gpm_already_open_handling passed")
 
 
@@ -535,10 +564,10 @@ def test_gpm_session_stops_profile_when_started_by_session():
 
         asyncio.run(run_session())
 
-        # Assert start was called, browser was closed, and stop was called
+        # Assert start was called, playwright was stopped, and stop was called
         assert any("start" in call for call in api_calls), f"Expected start call in {api_calls}"
         assert any("stop" in call for call in api_calls), f"Expected stop call in {api_calls}"
-        mock_browser.close.assert_called_once()
+        mock_playwright.stop.assert_called_once()
 
     print("✓ test_gpm_session_stops_profile_when_started_by_session passed")
 

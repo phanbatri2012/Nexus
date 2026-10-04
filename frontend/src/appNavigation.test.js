@@ -45,6 +45,8 @@ test('wires the persistent Job Center and keeps video submission queueable', asy
   assert.match(jobCenterSource, /BULK_ACTIONS\.map/)
   assert.match(jobCenterSource, /job_type.*typeFilter/)
   assert.match(jobCenterSource, /params\.set\(['"]status['"], filter\)/)
+  assert.match(jobCenterSource, /params\.set\(['"]sort_by['"], sortOrder\)/)
+  assert.match(jobCenterSource, /Sắp xếp danh sách job/)
   assert.match(jobCenterSource, /clearSelection\(\)[\s\S]*setTypeFilter/)
   assert.match(videoQueueSource, /'queued', 'running', 'retry_wait', 'paused'/)
   assert.match(videoQueueSource, /const hasPollableJobs = useMemo/)
