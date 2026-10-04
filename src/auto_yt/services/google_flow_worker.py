@@ -1295,7 +1295,8 @@ class GoogleFlowWorker:
                 if (!url || url.startsWith('data:')) return '';
                 const lower = url.toLowerCase();
                 const valid = lower.startsWith('blob:') ||
-                    lower.includes('flow-content.google/image') ||
+                    lower.includes('flow-content.google') ||
+                    lower.includes('flow.google.com/asb') ||
                     lower.includes('googleusercontent.com') ||
                     /\.(?:png|jpe?g|webp)(?:\?|$)/i.test(url);
                 return valid && !/\.(?:mp4|webm)(?:\?|$)/i.test(url) ? url : '';
@@ -1310,7 +1311,7 @@ class GoogleFlowWorker:
                 if (node.closest(
                     "flow-image-ingredient-chip, flow-ingredient-chip, flow-chat-ingredient-row, " +
                     ".ingredient-chip, .mat-mdc-chip, flow-creative-agent-prompt-box, " +
-                    "flow-base-prompt-box, flow-prompt-box, .message-row.user-row, " +
+                    "flow-base-prompt-box, flow-prompt-box, .message-row.user-row, .user-bubble, " +
                     "flow-chat-bubble[data-role='user'], [data-message-role='user'], " +
                     "[role='menu'], flow-upload-card, [data-testid*='upload' i], .upload-card, " +
                     "[data-testid*='asset-picker' i], .asset-picker, .uploads-picker"
@@ -1356,7 +1357,7 @@ class GoogleFlowWorker:
                 const agentTurn = node.closest(
                     ".message-row.agent-row, flow-chat-bubble[data-role='assistant'], " +
                     "flow-chat-bubble[data-role='agent'], [data-message-role='assistant'], " +
-                    "[data-message-role='agent']"
+                    "[data-message-role='agent'], .agent-bubble"
                 );
                 const labelText = String(
                     (mediaTile && mediaTile.querySelector('.asset-title, .title, .label, .caption')
@@ -1372,6 +1373,9 @@ class GoogleFlowWorker:
                     for (const url of urls) {
                         if (!existing.urls.includes(url)) existing.urls.push(url);
                     }
+                    if (!existing.assetId && assetId) existing.assetId = assetId;
+                    if (!existing.labelText && labelText) existing.labelText = labelText;
+                    if (!existing.turnRole && agentTurn) existing.turnRole = 'agent';
                     existing.width = Math.max(existing.width, Number(node.naturalWidth || node.width || 0) || 0);
                     existing.height = Math.max(existing.height, Number(node.naturalHeight || node.height || 0) || 0);
                     continue;
@@ -1387,7 +1391,7 @@ class GoogleFlowWorker:
                     turnRole: agentTurn ? 'agent' : '',
                     source: node.closest(
                         '.sidebar, .mat-drawer, flow-prompt-history, [data-testid*="result" i], ' +
-                        'flow-chat-panel, flow-chat-view, flow-chat-scroller, .message-row.agent-row'
+                        'flow-chat-panel, flow-chat-view, flow-chat-scroller, .message-row.agent-row, .agent-bubble'
                     )
                         ? 'result_panel' : 'gallery'
                 });
@@ -1474,7 +1478,7 @@ class GoogleFlowWorker:
                         /\.(?:mp4|webm|mov)(?:\?|$)/i.test(url) ||
                         lower.includes('/videoplayback') || lower.includes('/video/');
                     const knownImageUrl = /\.(?:png|jpe?g|webp|gif)(?:\?|$)/i.test(url) ||
-                        lower.includes('/image/');
+                        lower.includes('/image/') || lower.includes('/asb/');
                     if ((fromPlayer || fromVideoAttribute || fromMediaAttribute ||
                         fromDownload || knownVideoUrl) && !knownImageUrl && !urls.includes(url)) {
                         urls.push(url);
@@ -1513,7 +1517,8 @@ class GoogleFlowWorker:
                 if (assetId) identityKeys.push(`asset:${assetId}`);
                 const posterUrl = matchUrls.find((url) =>
                     /\.(?:png|jpe?g|webp|gif)(?:\?|$)/i.test(url) ||
-                    url.toLowerCase().includes('/image')
+                    url.toLowerCase().includes('/image') ||
+                    url.toLowerCase().includes('/asb/')
                 );
                 if (posterUrl) identityKeys.push(`poster:${posterUrl}`);
                 const stableLabel = `${card.getAttribute('id') || ''}|` +
@@ -1856,7 +1861,8 @@ class GoogleFlowWorker:
                                 const lower = url.toLowerCase();
                                 return url && !url.startsWith('data:') &&
                                     (lower.startsWith('blob:') ||
-                                     lower.includes('flow-content.google/image') ||
+                                     lower.includes('flow-content.google') ||
+                                     lower.includes('flow.google.com/asb') ||
                                      lower.includes('googleusercontent.com') ||
                                      /\.(?:png|jpe?g|webp)(?:\?|$)/i.test(url));
                             })));
@@ -3709,9 +3715,9 @@ class GoogleFlowWorker:
                 const cards = Array.from(document.querySelectorAll(
                     "flow-media-tile, [data-media-id], [data-asset-id], " +
                     "[data-testid*='media' i], .media-card, " +
-                    "flow-canvas-tile, flow-canvas-item, .canvas-tile, " +
+                    "flow-canvas-tile, flow-canvas-item, .canvas-tile, flow-image-tile, " +
                     "flow-message-turn img, [data-turn-id] img, .chat-message img, " +
-                    "flow-chat-panel img, .chat-panel img"
+                    "flow-chat-panel img, .chat-panel img, .agent-bubble img"
                 ));
                 for (const card of cards) {
                     if (card.closest(

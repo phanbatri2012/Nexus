@@ -12,7 +12,7 @@ DUPLICATE_PARAGRAPH_MIN_WORDS = 25
 # Genmax voices vary considerably in cadence. Keep the estimate deliberately
 # broad and informational; it must never become a content-length requirement.
 WORDS_PER_MINUTE_SLOW = 160
-WORDS_PER_MINUTE_FAST = 240
+WORDS_PER_MINUTE_FAST = 300
 SECTION_PATTERN = re.compile(
     r"(?ms)^### \[([^\]]+)\]\s*\n(.*?)(?=^### \[[^\]]+\]\s*$|\Z)"
 )

@@ -34,9 +34,9 @@ OMNIVOICE_DEFAULT_VOICE_CONFIG = {
     "target_words_per_minute": 145,
     "pause_ms": 150,
     "max_chunk_chars": 220,
-    "min_words_per_minute": 105,
-    "max_words_per_minute": 240,
-    "num_step": 16,
+    "min_words_per_minute": 90,
+    "max_words_per_minute": 320,
+    "num_step": 32,
     "denoise": False,
 }
 
