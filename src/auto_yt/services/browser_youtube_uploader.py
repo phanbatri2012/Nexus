@@ -286,6 +286,124 @@ async def _visible_upload_dialog_elements(page, selector: str) -> list[Any]:
     return visible_elements
 
 
+async def _dismiss_active_confirmation_dialogs(page, timeout_seconds: float = 6.0) -> bool:
+    """Dismiss any visible confirmation dialog, checks-running dialog ('Đã hiểu' / 'Got it'),
+    warning modal ('Vẫn lên lịch' / 'Schedule anyway' / 'Vẫn lưu'), or share completion dialog."""
+    deadline = time.monotonic() + timeout_seconds
+    dismissed_any = False
+
+    while time.monotonic() < deadline:
+        # 1. Try JS evaluation to find and click dismiss/confirm buttons inside visible overlays
+        try:
+            clicked_via_eval = await page.evaluate('''() => {
+                const dialogs = Array.from(document.querySelectorAll(
+                    "ytcp-confirmation-dialog, ytcp-alert-dialog, ytcp-dialog:not(#video-dialog), tp-yt-paper-dialog, ytcp-video-share-dialog, [role='dialog']"
+                )).filter(d => {
+                    const tag = (d.tagName || '').toLowerCase();
+                    if (tag === 'ytcp-uploads-dialog' || tag === 'ytcp-video-upload-dialog') return false;
+                    const rect = d.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                });
+
+                for (const dialog of dialogs) {
+                    const btns = Array.from(dialog.querySelectorAll("ytcp-button, button, tp-yt-paper-button, [role='button']"))
+                        .filter(b => {
+                            const rect = b.getBoundingClientRect();
+                            return rect.width > 0 && rect.height > 0 && !b.hasAttribute('disabled') && b.getAttribute('aria-disabled') !== 'true';
+                        });
+
+                    const primaryBtn = btns.find(b => {
+                        const txt = (b.innerText || b.textContent || '').trim().toLowerCase();
+                        const id = (b.id || '').toLowerCase();
+                        return txt.includes('đã hiểu') || txt.includes('got it') ||
+                               txt.includes('vẫn lên lịch') || txt.includes('schedule anyway') ||
+                               txt.includes('vẫn lưu') || txt.includes('save anyway') ||
+                               txt.includes('xác nhận') || txt.includes('confirm') ||
+                               txt.includes('tiếp tục') || txt.includes('continue') ||
+                               txt.includes('đóng') || txt.includes('close') ||
+                               id === 'confirm-button' || id === 'dismiss-button' || id === 'close-button';
+                    });
+                    if (primaryBtn) {
+                        primaryBtn.click();
+                        return true;
+                    }
+                }
+                return false;
+            }''')
+            if clicked_via_eval:
+                dismissed_any = True
+                await asyncio.sleep(1.0)
+                continue
+        except Exception:
+            pass
+
+        # 2. Direct button search across the entire page for visible 'Đã hiểu' / 'Got it'
+        try:
+            got_it_clicked = await page.evaluate('''() => {
+                const btns = Array.from(document.querySelectorAll("ytcp-button, button, tp-yt-paper-button, [role='button']"))
+                    .filter(b => {
+                        const rect = b.getBoundingClientRect();
+                        return rect.width > 0 && rect.height > 0 && !b.hasAttribute('disabled') && b.getAttribute('aria-disabled') !== 'true';
+                    });
+                const btn = btns.find(b => {
+                    const txt = (b.innerText || b.textContent || '').trim().toLowerCase();
+                    return txt === 'đã hiểu' || txt === 'got it' || txt.includes('đã hiểu') || txt.includes('got it');
+                });
+                if (btn) {
+                    btn.click();
+                    return true;
+                }
+                return false;
+            }''')
+            if got_it_clicked:
+                dismissed_any = True
+                await asyncio.sleep(1.0)
+                continue
+        except Exception:
+            pass
+
+        # 3. Priority fallback via Playwright locators for specific dialog buttons
+        try:
+            clicked_fallback = await _safe_click(
+                page,
+                [
+                    "ytcp-confirmation-dialog #confirm-button",
+                    "ytcp-confirmation-dialog #dismiss-button",
+                    "ytcp-dialog #confirm-button",
+                    "ytcp-dialog #dismiss-button",
+                    "ytcp-alert-dialog #confirm-button",
+                    "ytcp-alert-dialog #dismiss-button",
+                    "ytcp-video-share-dialog #close-button",
+                    "ytcp-button:has-text('Đã hiểu')",
+                    "ytcp-button:has-text('Got it')",
+                    "button:has-text('Đã hiểu')",
+                    "button:has-text('Got it')",
+                    "ytcp-button:has-text('Vẫn lên lịch')",
+                    "ytcp-button:has-text('Schedule anyway')",
+                    "ytcp-button:has-text('Vẫn lưu')",
+                    "ytcp-button:has-text('Save anyway')",
+                    "ytcp-button:has-text('Xác nhận')",
+                    "ytcp-button:has-text('Confirm')",
+                    "ytcp-button:has-text('Tiếp tục')",
+                    "ytcp-button:has-text('Continue')",
+                    "ytcp-button#close-button",
+                    "ytcp-button:has-text('Đóng')",
+                    "ytcp-button:has-text('Close')",
+                ],
+                timeout_ms=1000,
+            )
+            if clicked_fallback:
+                dismissed_any = True
+                await asyncio.sleep(1.0)
+                continue
+        except Exception:
+            pass
+
+        break
+
+    return dismissed_any
+
+
 async def _open_existing_draft_upload_dialog(page, timeout_ms: int = 10000) -> bool:
     """Open the saved draft wizard without triggering a new video upload."""
     if await _find_visible_upload_details_dialog(page) is not None:
@@ -2219,29 +2337,7 @@ async def _save_video_on_edit_page(
     await asyncio.sleep(2.0)
 
     # Handle any confirmation modal if saving while checks are running
-    for _ in range(3):
-        conf = await page.query_selector("ytcp-confirmation-dialog, ytcp-dialog, tp-yt-paper-dialog#dialog")
-        if conf and await conf.is_visible():
-            await _safe_click(
-                page,
-                [
-                    "ytcp-confirmation-dialog #confirm-button",
-                    "ytcp-dialog #confirm-button",
-                    "ytcp-button#confirm-button",
-                    "button#confirm-button",
-                    "ytcp-button:has-text('Vẫn lưu')",
-                    "ytcp-button:has-text('Lưu')",
-                    "ytcp-button:has-text('Xác nhận')",
-                    "ytcp-button:has-text('Đã hiểu')",
-                    "ytcp-button:has-text('Save anyway')",
-                    "ytcp-button:has-text('Save')",
-                    "ytcp-button:has-text('Got it')",
-                ],
-                timeout_ms=2000,
-            )
-            await asyncio.sleep(1.0)
-            break
-        await asyncio.sleep(0.5)
+    await _dismiss_active_confirmation_dialogs(page, timeout_seconds=5.0)
 
     # Wait for save toast / button disabled
     save_confirmed = False
@@ -3298,55 +3394,10 @@ async def upload_video_via_browser(
 
                 await asyncio.sleep(2.0)
 
-                # Robust check for confirmation / checks-running dialog
-                for _ in range(6):
-                    confirmation = await page.query_selector(
-                        "ytcp-confirmation-dialog, ytcp-dialog, tp-yt-paper-dialog#dialog, [role='dialog']"
-                    )
-                    if confirmation is not None and await confirmation.is_visible():
-                        confirmation_text = str(await confirmation.inner_text() or "")
-                        checks_pending = bool(
-                            re.search(
-                                r"kiểm tra|checking|checks|tiếp diễn|chưa hoàn tất|tiếp tục|vẫn đang|bản quyền|schedule anyway|vẫn lên lịch|lên lịch|got it|đã hiểu|xác nhận|confirm",
-                                confirmation_text,
-                                re.IGNORECASE,
-                            )
-                        )
-                        if checks_pending:
-                            logger.info(
-                                "Phát hiện hộp thoại xác nhận khi đặt lịch: '%s'. Đang tự động bấm xác nhận...",
-                                confirmation_text.replace('\n', ' ')[:100],
-                            )
-                            confirm_clicked = await _safe_click(
-                                page,
-                                [
-                                    "ytcp-confirmation-dialog #confirm-button",
-                                    "ytcp-dialog #confirm-button",
-                                    "ytcp-button#confirm-button",
-                                    "button#confirm-button",
-                                    "ytcp-button:has-text('Vẫn lên lịch')",
-                                    "ytcp-button:has-text('Schedule anyway')",
-                                    "ytcp-button:has-text('Lên lịch')",
-                                    "ytcp-button:has-text('Schedule')",
-                                    "ytcp-button:has-text('Đã hiểu')",
-                                    "ytcp-button:has-text('Got it')",
-                                    "ytcp-button:has-text('Xác nhận')",
-                                    "ytcp-button:has-text('Confirm')",
-                                    "ytcp-button:has-text('Tiếp tục')",
-                                    "ytcp-button:has-text('Continue')",
-                                ],
-                                timeout_ms=3000,
-                            )
-                            if confirm_clicked:
-                                await asyncio.sleep(2.0)
-                                break
-                        else:
-                            restriction = _find_blocking_restriction(confirmation_text)
-                            if restriction:
-                                raise BrowserUploadNeedsReview(
-                                    f"YouTube Studio hiển thị hạn chế cần kiểm tra thủ công: {restriction}"
-                                )
-                    await asyncio.sleep(0.8)
+                # Dismiss any confirmation / checks-running dialog ('Đã hiểu' / 'Got it' / 'Vẫn lên lịch')
+                dismissed = await _dismiss_active_confirmation_dialogs(page, timeout_seconds=8.0)
+                if dismissed:
+                    logger.info("Đã tự động xác nhận và đóng hộp thoại kiểm tra/cảnh báo khi đặt lịch.")
 
             elif resolved_publish_mode == "public":
                 # Public immediately mode
@@ -3469,14 +3520,7 @@ async def upload_video_via_browser(
                 else:
                     confirmation_verified = bool(share_dialog)
 
-                close_btn = await page.wait_for_selector(
-                    "ytcp-button#close-button, ytcp-button:has-text('Đóng'), ytcp-button:has-text('Close'), ytcp-video-share-dialog #close-button",
-                    state="visible",
-                    timeout=8000,
-                )
-                if close_btn:
-                    await close_btn.click()
-                    await asyncio.sleep(2.0)
+                await _dismiss_active_confirmation_dialogs(page, timeout_seconds=5.0)
             except Exception as c_exc:
                 logger.debug("Không đọc được hộp thoại hoàn tất: %s", c_exc)
 
@@ -3598,46 +3642,8 @@ async def upload_video_via_browser(
                     await _safe_click(page, schedule_done_selectors, timeout_ms=8000)
                     await asyncio.sleep(2.0)
 
-                    # Confirm any checks modal in draft wizard
-                    for _ in range(4):
-                        conf = await page.query_selector(
-                            "ytcp-confirmation-dialog, ytcp-dialog, tp-yt-paper-dialog#dialog, [role='dialog']"
-                        )
-                        if conf and await conf.is_visible():
-                            await _safe_click(
-                                page,
-                                [
-                                    "ytcp-confirmation-dialog #confirm-button",
-                                    "ytcp-dialog #confirm-button",
-                                    "ytcp-button#confirm-button",
-                                    "button#confirm-button",
-                                    "ytcp-button:has-text('Vẫn lên lịch')",
-                                    "ytcp-button:has-text('Schedule anyway')",
-                                    "ytcp-button:has-text('Lên lịch')",
-                                    "ytcp-button:has-text('Schedule')",
-                                    "ytcp-button:has-text('Đã hiểu')",
-                                    "ytcp-button:has-text('Got it')",
-                                    "ytcp-button:has-text('Xác nhận')",
-                                    "ytcp-button:has-text('Confirm')",
-                                ],
-                                timeout_ms=2000,
-                            )
-                            await asyncio.sleep(1.5)
-                            break
-                        await asyncio.sleep(0.5)
-
-                    # Close completion dialog if shown
-                    try:
-                        close_btn = await page.wait_for_selector(
-                            "ytcp-button#close-button, ytcp-button:has-text('Đóng'), ytcp-button:has-text('Close'), ytcp-video-share-dialog #close-button",
-                            state="visible",
-                            timeout=5000,
-                        )
-                        if close_btn:
-                            await close_btn.click()
-                            await asyncio.sleep(2.0)
-                    except Exception:
-                        pass
+                    # Confirm any checks modal or completion dialog in draft wizard
+                    await _dismiss_active_confirmation_dialogs(page, timeout_seconds=8.0)
 
                 # Tier 2: Directly configure Visibility and Save on the Edit Page sidepanel
                 try:
