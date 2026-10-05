@@ -10,6 +10,8 @@ from auto_yt.services.browser_youtube_uploader import (
     _parse_schedule_at,
     _schedule_date_matches,
     _schedule_time_matches,
+    _schedule_timestamp_matches,
+    _detect_schedule_verification,
     _classify_monetization_snapshot,
     MonetizationCapability,
     MonetizationDetection,
@@ -203,6 +205,53 @@ class TestBrowserYouTubeUploader(unittest.IsolatedAsyncioTestCase):
         visible = await _ensure_upload_dialog_visible(page)
         self.assertTrue(visible)
         mock_mini.click.assert_awaited_once()
+
+    def test_detect_schedule_verification_json_timestamp_match(self):
+        target_dt = dt.datetime(2026, 10, 6, 18, 0, 0, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
+        ts = int(target_dt.timestamp())
+        mock_html = f'''
+        <html>
+        <script>
+        ytcfg.set({{"scheduledPublishingDetails":{{"scheduledPublishings":[{{"scheduledTimeSeconds":"{ts}","action":"SCHEDULED_PUBLISHING_ACTION_SET_PUBLIC","status":"SCHEDULED_PUBLISHING_STATUS_SCHEDULED"}}]}},"draftStatus":"DRAFT_STATUS_NONE"}});
+        </script>
+        <body>Chi tiết video - Extension injected content</body>
+        </html>
+        '''
+        # Body text does NOT contain "Đã lên lịch" (e.g. obscured by extensions/shadow dom)
+        body_text = "Chi tiết video - Extension injected content"
+        is_scheduled, is_matching = _detect_schedule_verification(body_text, mock_html, target_dt)
+        self.assertTrue(is_scheduled)
+        self.assertTrue(is_matching)
+
+    def test_detect_schedule_verification_body_text_match(self):
+        target_dt = dt.datetime(2026, 10, 6, 18, 0, 0, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
+        body_text = "Chi tiết video. Đã lên lịch 6 thg 10, 2026 lúc 18:00"
+        mock_html = "<html><body>Chi tiết video. Đã lên lịch 6 thg 10, 2026 lúc 18:00</body></html>"
+        is_scheduled, is_matching = _detect_schedule_verification(body_text, mock_html, target_dt)
+        self.assertTrue(is_scheduled)
+        self.assertTrue(is_matching)
+
+    def test_detect_schedule_verification_scheduled_but_time_mismatch(self):
+        target_dt = dt.datetime(2026, 10, 6, 18, 0, 0, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
+        diff_dt = dt.datetime(2026, 10, 5, 12, 0, 0, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
+        ts_diff = int(diff_dt.timestamp())
+        mock_html = f'''
+        <script>
+        ytcfg.set({{"scheduledPublishingDetails":{{"scheduledPublishings":[{{"scheduledTimeSeconds":"{ts_diff}"}}]}},"status":"SCHEDULED_PUBLISHING_STATUS_SCHEDULED"}});
+        </script>
+        '''
+        body_text = "Chi tiết video"
+        is_scheduled, is_matching = _detect_schedule_verification(body_text, mock_html, target_dt)
+        self.assertTrue(is_scheduled)
+        self.assertFalse(is_matching)
+
+    def test_detect_schedule_verification_not_scheduled_draft(self):
+        target_dt = dt.datetime(2026, 10, 6, 18, 0, 0, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
+        mock_html = '<html><script>ytcfg.set({"draftStatus":"DRAFT_STATUS_DRAFT"});</script><body>Bản nháp</body></html>'
+        body_text = "Bản nháp video"
+        is_scheduled, is_matching = _detect_schedule_verification(body_text, mock_html, target_dt)
+        self.assertFalse(is_scheduled)
+        self.assertFalse(is_matching)
 
 
 if __name__ == "__main__":

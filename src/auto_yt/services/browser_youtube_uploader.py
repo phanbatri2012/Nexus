@@ -1006,6 +1006,50 @@ def _schedule_timestamp_matches(page_markup: str, expected: dt.datetime) -> bool
     return any(abs(value - expected_seconds) <= 60 for value in scheduled_seconds)
 
 
+def _detect_schedule_verification(
+    body_text: str,
+    page_markup: str,
+    expected_dt: dt.datetime | None = None,
+) -> tuple[bool, bool]:
+    """Detects whether a video is scheduled on YouTube Studio and whether the scheduled time matches expected_dt.
+
+    Returns:
+        (is_scheduled, is_matching_time)
+    """
+    body_str = str(body_text or "")
+    markup_str = str(page_markup or "")
+
+    # 1. Direct timestamp match from internal JSON payload (most reliable)
+    timestamp_matched = False
+    if expected_dt:
+        timestamp_matched = _schedule_timestamp_matches(markup_str, expected_dt)
+
+    # 2. Check schedule status presence in JSON / DOM
+    has_scheduled_status = bool(
+        timestamp_matched
+        or re.search(r"Đã lên lịch|Scheduled", body_str, re.IGNORECASE)
+        or re.search(
+            r'SCHEDULED_PUBLISHING_STATUS_SCHEDULED|VIDEO_USER_SET_VISIBILITY_SCHEDULED|"scheduledPublishingDetails"',
+            markup_str,
+        )
+    )
+
+    # 3. Check time match
+    time_matched = False
+    if expected_dt:
+        if timestamp_matched:
+            time_matched = True
+        elif has_scheduled_status:
+            time_matched = (
+                _schedule_date_matches(body_str, expected_dt.date())
+                and _schedule_time_matches(body_str, expected_dt.time())
+            )
+    else:
+        time_matched = has_scheduled_status
+
+    return (has_scheduled_status, time_matched)
+
+
 async def _dismiss_dropdown_safely(page) -> None:
     """Safely dismiss open datepicker/timepicker dropdown menus without closing the parent upload dialog.
     Never broadcasts Escape to the global window or modal dialog."""
@@ -2796,7 +2840,13 @@ async def upload_video_via_browser(
                     except Exception as nav_exc:
                         logger.debug("Thông báo chuyển hướng trang edit draft: %s", nav_exc)
 
+                    resumed_local_dt = (
+                        _parse_schedule_at(schedule_at, publication_timezone)
+                        if schedule_at
+                        else None
+                    )
                     scheduled_marker = False
+                    schedule_matches = False
                     resumed_body_text = ""
                     resumed_html = ""
                     resume_deadline = time.monotonic() + 15.0
@@ -2811,8 +2861,10 @@ async def upload_video_via_browser(
                             if is_interrupted:
                                 scheduled_marker = False
                                 break
-                            scheduled_marker = bool(
-                                re.search(r"Đã lên lịch|Scheduled", resumed_body_text, re.IGNORECASE)
+                            scheduled_marker, schedule_matches = _detect_schedule_verification(
+                                resumed_body_text,
+                                resumed_html,
+                                resumed_local_dt,
                             )
                             if scheduled_marker:
                                 break
@@ -2834,8 +2886,10 @@ async def upload_video_via_browser(
                             if resumed_ok:
                                 resumed_body_text = str(await page.locator("body").inner_text() or "")
                                 resumed_html = await page.content()
-                                scheduled_marker = bool(
-                                    re.search(r"Đã lên lịch|Scheduled", resumed_body_text, re.IGNORECASE)
+                                scheduled_marker, schedule_matches = _detect_schedule_verification(
+                                    resumed_body_text,
+                                    resumed_html,
+                                    resumed_local_dt,
                                 )
                     elif not scheduled_marker and f"/video/{clean_existing_video_id}/" in page.url:
                         # Check if edit page has interrupted upload warning
@@ -2879,18 +2933,6 @@ async def upload_video_via_browser(
                             resuming_existing_draft = False
                             clean_existing_video_id = ""
                         elif schedule_at and scheduled_marker:
-                            resumed_local_dt = _parse_schedule_at(
-                                schedule_at,
-                                publication_timezone,
-                            )
-                            schedule_matches = (
-                                _schedule_date_matches(resumed_body_text, resumed_local_dt.date())
-                                and _schedule_time_matches(resumed_body_text, resumed_local_dt.time())
-                            )
-                            if not schedule_matches:
-                                schedule_matches = _schedule_timestamp_matches(
-                                    resumed_html, resumed_local_dt
-                                )
                             if not schedule_matches:
                                 raise BrowserUploadNeedsReview(
                                     "Bản nháp đã lên lịch nhưng ngày/giờ trên YouTube không khớp timezone kênh."
@@ -3913,14 +3955,13 @@ async def upload_video_via_browser(
                     if final_restriction:
                         break
                     if schedule_at:
-                        if re.search(r"Đã lên lịch|Scheduled", editor_text, re.IGNORECASE):
-                            schedule_verified_on_page = True
-                            schedule_matches = (
-                                _schedule_date_matches(editor_text, local_dt.date())
-                                and _schedule_time_matches(editor_text, local_dt.time())
-                            ) or _schedule_timestamp_matches(page_html, local_dt)
-                            if schedule_matches:
-                                break
+                        schedule_verified_on_page, schedule_matches = _detect_schedule_verification(
+                            editor_text,
+                            page_html,
+                            local_dt,
+                        )
+                        if schedule_matches:
+                            break
                     elif resolved_publish_mode == "public":
                         if re.search(r"Công khai|Public", editor_text, re.IGNORECASE):
                             break
@@ -4014,7 +4055,12 @@ async def upload_video_via_browser(
                 editor_text = str(await page.locator("body").inner_text() or "")
                 page_html = await page.content()
 
-                if not re.search(r"Đã lên lịch|Scheduled", editor_text, re.IGNORECASE):
+                is_scheduled_on_edit, _ = _detect_schedule_verification(
+                    editor_text,
+                    page_html,
+                    local_dt,
+                )
+                if not is_scheduled_on_edit:
                     logger.info(
                         "Video vẫn ở trạng thái Bản nháp. Đang tự động lưu Đặt lịch trực tiếp qua bảng điều khiển Video Edit Page..."
                     )
@@ -4047,12 +4093,12 @@ async def upload_video_via_browser(
                     except Exception as save_err:
                         logger.warning("Lỗi trong lúc tự lưu trên edit page: %s", save_err)
 
-                if re.search(r"Đã lên lịch|Scheduled", editor_text, re.IGNORECASE):
-                    schedule_verified_on_page = True
-                    schedule_matches = (
-                        _schedule_date_matches(editor_text, local_dt.date())
-                        and _schedule_time_matches(editor_text, local_dt.time())
-                    ) or _schedule_timestamp_matches(page_html, local_dt)
+                if schedule_at:
+                    schedule_verified_on_page, schedule_matches = _detect_schedule_verification(
+                        editor_text,
+                        page_html,
+                        local_dt,
+                    )
 
             if schedule_at and not schedule_verified_on_page:
                 raise BrowserUploadNeedsReview(
