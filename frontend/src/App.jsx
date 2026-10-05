@@ -16,6 +16,7 @@ import TTSSettings from './TTSSettings'
 import CrossPoster from './CrossPoster'
 import { openVideoStudioInGpm, openVideoWatchInGpm } from './gpmOpener'
 import UserGuideModal from './UserGuideModal'
+import { isSameVideoId, normalizeVideoId } from './videoId.js'
 
 const SECONDS_PER_MINUTE = 60
 const SECONDS_PER_HOUR = 60 * SECONDS_PER_MINUTE
@@ -214,13 +215,13 @@ function App() {
   // Auto-load video on deep link / direct F5
   useEffect(() => {
     if (router.activeView === 'fetcher' && router.subPath) {
-      const videoId = router.subPath.split('/')[0];
-      if (videoId && (!currentVideoIdRef.current || String(currentVideoIdRef.current) !== String(videoId))) {
+      const videoId = normalizeVideoId(router.subPath.split('/')[0]);
+      if (videoId && !isSameVideoId(currentVideoIdRef.current, videoId)) {
         viewSavedVideo(videoId);
       }
     } else if (router.activeView === 'dashboard' && router.subPath.startsWith('video/')) {
-      const videoId = router.subPath.replace(/^video\//, '').split('/')[0];
-      if (videoId && (!currentVideoIdRef.current || String(currentVideoIdRef.current) !== String(videoId))) {
+      const videoId = normalizeVideoId(router.subPath.replace(/^video\//, '').split('/')[0]);
+      if (videoId && !isSameVideoId(currentVideoIdRef.current, videoId)) {
         viewSavedVideo(videoId);
       }
     }
@@ -405,7 +406,7 @@ function App() {
           resolvedPublished = targetPublished;
         }
       }
-      if (videoId === currentVideoId) {
+      if (isSameVideoId(videoId, currentVideoId)) {
         setCurrentVideoStatus(resolvedStatus);
         setIsCurrentVideoPublished(resolvedPublished);
       }
@@ -441,7 +442,7 @@ function App() {
         throw new Error(data.detail || data.error || `HTTP ${response.status}`);
       }
 
-      if (publicationDialog.videoId === currentVideoId) {
+      if (isSameVideoId(publicationDialog.videoId, currentVideoId)) {
         setCurrentVideoStatus('active');
         setIsCurrentVideoPublished(true);
         setCurrentVideoPublications(publications => {
@@ -801,8 +802,13 @@ function App() {
   };
 
   const viewSavedVideo = async (id) => {
+    const normalizedId = normalizeVideoId(id);
+    if (normalizedId === null) {
+      alert('Mã video không hợp lệ.');
+      return;
+    }
     try {
-      const response = await fetch(`http://127.0.0.1:8080/api/videos/${id}`);
+      const response = await fetch(`http://127.0.0.1:8080/api/videos/${normalizedId}`);
       const data = await response.json();
       setUrl(data.url);
       setResultText(data.generated_script);
@@ -838,8 +844,8 @@ function App() {
       setSelectedGuest2VoiceId(guest2Voice);
 
       setShowResult(true);
-      setActiveView('fetcher', String(id));
-      setCurrentVideoId(id);  // track which video is loaded
+      setActiveView('fetcher', String(normalizedId));
+      setCurrentVideoId(normalizedId);  // track which video is loaded
       setAudioReview(null);
       setIsCurrentVideoPublished(Boolean(data.is_published));
       setCurrentVideoPublishStatus(data.publish_status || '');
@@ -900,7 +906,7 @@ function App() {
       if (!response.ok || data.success === false) {
         throw new Error(data.detail || data.error || `HTTP ${response.status}`);
       }
-      if (currentVideoId === id) clearCurrentVideo();
+      if (isSameVideoId(currentVideoId, id)) clearCurrentVideo();
       setQueueRefreshKey(key => key + 1);
       const nextPage = (
         savedVideos.items.length === 1 && currentPage > 1
@@ -1032,10 +1038,16 @@ function App() {
               clearInterval(interval);
               const resultData = job.result;
               if (resultData) {
+                const resultVideoId = normalizeVideoId(resultData.video_id);
+                if (resultVideoId === null) {
+                  setErrorMsg('Backend trả về mã video không hợp lệ.');
+                  resolve();
+                  return;
+                }
                 setResultText(resultData.summary);
                 setFullTranscript(resultData.full_transcript);
                 setChatUrl(resultData.chat_url || '');
-                setCurrentVideoId(resultData.video_id);
+                setCurrentVideoId(resultVideoId);
                 setAudioReview(resultData.audio_review || null);
                 setVideoTitle(resultData.title || '');
                 setCurrentVideoHasCheckpoint(Boolean(resultData.failed_step));
@@ -1147,10 +1159,10 @@ function App() {
       if (!response.ok || !data.success) {
         throw new Error(data.detail || data.error || 'Không thể tạo lại chapter.');
       }
-      if (data.video_id !== requestedVideoId) {
+      if (!isSameVideoId(data.video_id, requestedVideoId)) {
         throw new Error('Backend trả về sai video. Giao diện chưa được cập nhật.');
       }
-      if (currentVideoIdRef.current === requestedVideoId) {
+      if (isSameVideoId(currentVideoIdRef.current, requestedVideoId)) {
         setResultText(data.script);
         setErrorMsg(previousError =>
           previousError.toLowerCase().includes('chapters:')
@@ -1182,11 +1194,11 @@ function App() {
       if (!response.ok || !data.success) {
         throw new Error(data.detail || data.error || `Không thể tạo lại ${label}.`);
       }
-      if (data.video_id !== requestedVideoId) {
+      if (!isSameVideoId(data.video_id, requestedVideoId)) {
         throw new Error('Backend trả về sai video. Giao diện chưa được cập nhật.');
       }
 
-      if (currentVideoIdRef.current === requestedVideoId) {
+      if (isSameVideoId(currentVideoIdRef.current, requestedVideoId)) {
         if (data.script) {
           setResultText(data.script);
         }
@@ -1202,7 +1214,7 @@ function App() {
         );
         if (refreshedResponse.ok) {
           const refreshedVideo = await refreshedResponse.json();
-          if (currentVideoIdRef.current === requestedVideoId) {
+          if (isSameVideoId(currentVideoIdRef.current, requestedVideoId)) {
             setResultText(refreshedVideo.generated_script);
             if (refreshedVideo.title) {
               setVideoTitle(refreshedVideo.title);
@@ -1245,7 +1257,7 @@ function App() {
       if (!response.ok || !data.success) {
         throw new Error(data.detail || data.error || 'Không thể tạo lại tiêu đề.');
       }
-      if (data.video_id !== requestedVideoId) {
+      if (!isSameVideoId(data.video_id, requestedVideoId)) {
         throw new Error('Backend trả về sai video. Giao diện chưa được cập nhật.');
       }
 
@@ -1257,7 +1269,7 @@ function App() {
         throw new Error('Không thể tải metadata mới từ database.');
       }
       const refreshedVideo = await refreshedResponse.json();
-      if (currentVideoIdRef.current === requestedVideoId) {
+      if (isSameVideoId(currentVideoIdRef.current, requestedVideoId)) {
         setResultText(refreshedVideo.generated_script);
       } else {
         alert('Metadata đã được cập nhật. Hãy mở lại đúng video để xem kết quả.');
@@ -1625,7 +1637,7 @@ function App() {
       }
       alert(data.message || '🚀 Đã kích hoạt tác vụ Public ngay!');
       setQueueRefreshKey(k => k + 1);
-      if (currentVideoId === targetId) {
+      if (isSameVideoId(currentVideoId, targetId)) {
         await viewSavedVideo(targetId);
       }
       await fetchSavedVideos(currentPage, publishFilter);
@@ -1653,7 +1665,7 @@ function App() {
       }
       alert(data.message || '📅 Đã đưa video vào hàng đợi Đặt lịch YouTube!');
       setQueueRefreshKey(k => k + 1);
-      if (currentVideoId === targetId) {
+      if (isSameVideoId(currentVideoId, targetId)) {
         await viewSavedVideo(targetId);
       }
       await fetchSavedVideos(currentPage, publishFilter);

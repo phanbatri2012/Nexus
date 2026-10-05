@@ -131,7 +131,7 @@ test('deleting a dashboard video refreshes every video view and clears stale det
 
   assert.match(appSource, /const clearCurrentVideo = \(\) =>/)
   assert.match(appSource, /if \(!response\.ok \|\| data\.success === false\)/)
-  assert.match(appSource, /if \(currentVideoId === id\) clearCurrentVideo\(\)/)
+  assert.match(appSource, /if \(isSameVideoId\(currentVideoId, id\)\) clearCurrentVideo\(\)/)
   assert.match(appSource, /setQueueRefreshKey\(key => key \+ 1\)/)
   assert.match(appSource, /savedVideos\.items\.length === 1 && currentPage > 1/)
   assert.match(appSource, /data\.warnings\?\.length/)
