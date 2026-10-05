@@ -36,27 +36,41 @@ from auto_yt.services.local_browser_service import (
 logger = logging.getLogger(__name__)
 
 
-JS_EXTRACT_YOUTUBE = """(() => {
+JS_EXTRACT_YOUTUBE = r"""(() => {
     let channelId = '';
     let title = '';
     let thumbnail_url = '';
     let handle = '';
     const current_url = window.location.href || '';
 
-    if (current_url.includes('accounts.google.com') || current_url.includes('ServiceLogin')) {
+    if (current_url.includes('accounts.google.com') || current_url.includes('ServiceLogin') || current_url.includes('signin/identifier')) {
         return { is_login_page: true, current_url };
     }
 
+    // 1. Check ytcfg global config
     try {
         if (window.ytcfg && typeof window.ytcfg.get === 'function') {
             channelId = window.ytcfg.get('CHANNEL_ID') || window.ytcfg.get('DELEGATED_SESSION_ID') || window.ytcfg.get('EXTERNAL_CHANNEL_ID') || '';
         }
     } catch(e) {}
 
+    // 2. Check window.ytInitialData
+    try {
+        if (!channelId && window.ytInitialData) {
+            const header = window.ytInitialData.header;
+            if (header && header.c4TabbedHeaderRenderer && header.c4TabbedHeaderRenderer.channelId) {
+                channelId = header.c4TabbedHeaderRenderer.channelId;
+            }
+        }
+    } catch(e) {}
+
+    // 3. Check URL regex
     if (!channelId) {
-        const m = window.location.pathname.match(/\\/channel\\/(UC[a-zA-Z0-9_-]+)/);
+        const m = current_url.match(/\/channel\/(UC[a-zA-Z0-9_-]+)/);
         if (m) channelId = m[1];
     }
+
+    // 4. Check DOM elements for channelId
     if (!channelId) {
         const meta = document.querySelector('meta[itemprop="channelId"]');
         if (meta) channelId = meta.content || '';
@@ -64,34 +78,39 @@ JS_EXTRACT_YOUTUBE = """(() => {
     if (!channelId) {
         const link = document.querySelector('a[href*="/channel/UC"]');
         if (link) {
-            const m = link.href.match(/\\/channel\\/(UC[a-zA-Z0-9_-]+)/);
+            const m = link.href.match(/\/channel\/(UC[a-zA-Z0-9_-]+)/);
             if (m) channelId = m[1];
         }
     }
 
-    const titleElem = document.querySelector('#entity-name, #channel-name, #header-channel-name, ytd-channel-name, .ytcp-entity-page-title');
+    // 5. Channel Title
+    const titleElem = document.querySelector('#entity-name, #channel-name, #header-channel-name, ytd-channel-name, .ytcp-entity-page-title, ytcp-header ytcp-entity-page-title');
     if (titleElem) title = titleElem.innerText.trim();
     if (!title) {
-        title = document.title.replace(/ - YouTube Studio/i, '').replace(/ - YouTube/i, '').replace(/Trang tổng quan của kênh/i, '').trim();
+        title = document.title.replace(/ - YouTube Studio/i, '').replace(/ - YouTube/i, '').replace(/Trang tổng quan của kênh/i, '').replace(/Channel dashboard/i, '').trim();
     }
 
-    const imgCandidates = Array.from(document.querySelectorAll('#entity-image img, #channel-header img, img#avatar, ytcp-entity-page img, #avatar-image img, ytcp-navigation-drawer img, img.ytcp-header-avatar, ytcp-header ytcp-avatar-image img'));
+    // 6. Avatar Image
+    const imgCandidates = Array.from(document.querySelectorAll('#entity-image img, #channel-header img, img#avatar, ytcp-entity-page img, #avatar-image img, ytcp-navigation-drawer img, img.ytcp-header-avatar, ytcp-header ytcp-avatar-image img, ytcp-entity-page #avatar img'));
     for (const img of imgCandidates) {
         const src = img.src || img.getAttribute('src') || '';
-        if (src && !src.includes('yt_studio_logo') && !src.includes('favicon') && !src.includes('data:image/svg') && !src.includes('creator_avatar_placeholder')) {
+        if (src && !src.includes('yt_studio_logo') && !src.includes('favicon') && !src.includes('data:image/svg') && !src.includes('creator_avatar_placeholder') && !src.includes('avatar_placeholder')) {
             thumbnail_url = src;
             break;
         }
     }
 
-    const handleElem = document.querySelector('#entity-handle, #channel-handle, .ytcp-entity-page-handle, ytcp-navigation-drawer #email');
+    // 7. Handle
+    const handleElem = document.querySelector('#entity-handle, #channel-handle, .ytcp-entity-page-handle, ytcp-navigation-drawer #email, ytcp-header #entity-handle');
     if (handleElem) handle = handleElem.innerText.trim();
     if (!handle) {
         const handleMatch = document.body.innerText.match(/@([a-zA-Z0-9_.-]{3,30})/);
         if (handleMatch) handle = handleMatch[0];
     }
 
-    return { channelId, title, thumbnail_url, handle, current_url, is_login_page: false };
+    const is_loading = !channelId && (!title || title === "YouTube Studio" || title === "Studio" || title === "YouTube") && !current_url.includes('accounts.google.com');
+
+    return { channelId, title, thumbnail_url, handle, current_url, is_login_page: false, is_loading };
 })()"""
 
 
@@ -236,55 +255,82 @@ def direct_cdp_evaluate_tab(
     js_expression: str,
     url_keywords: list[str] | None = None,
     timeout: float = 3.5,
+    max_retries: int = 3,
+    retry_interval: float = 0.8,
 ) -> dict[str, Any] | None:
     """Evaluate JavaScript in an active page tab via direct DevTools WebSocket.
 
     Bypasses whole-browser Playwright CDP attach to avoid hanging on background
-    antidetect extensions or service workers. Returns None on connection failure.
+    antidetect extensions or service workers. Retries across temporary navigation states.
     """
-    try:
-        req = urllib.request.Request(f"http://127.0.0.1:{port}/json/list")
-        with urllib.request.urlopen(req, timeout=min(timeout, 2.0)) as resp:
-            tabs = json.loads(resp.read().decode("utf-8"))
-    except Exception as exc:
-        logger.debug("Không thể đọc /json/list từ CDP port %s: %s", port, exc)
-        return None
+    for attempt in range(1, max_retries + 1):
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/json/list")
+            with urllib.request.urlopen(req, timeout=min(timeout, 2.0)) as resp:
+                tabs = json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            logger.debug("Không thể đọc /json/list từ CDP port %s (lần %d): %s", port, attempt, exc)
+            if attempt < max_retries:
+                time.sleep(retry_interval)
+                continue
+            return None
 
-    if not isinstance(tabs, list):
-        return None
+        if not isinstance(tabs, list):
+            if attempt < max_retries:
+                time.sleep(retry_interval)
+                continue
+            return None
 
-    pages = [t for t in tabs if isinstance(t, dict) and t.get("type") == "page"]
-    matched_tab = None
-    if url_keywords:
-        for p in pages:
-            url = str(p.get("url") or "").lower()
-            if any(k.lower() in url for k in url_keywords):
-                matched_tab = p
-                break
-    if not matched_tab and pages:
-        matched_tab = pages[0]
+        pages = [t for t in tabs if isinstance(t, dict) and t.get("type") == "page"]
+        matched_tab = None
+        if url_keywords:
+            for p in pages:
+                url = str(p.get("url") or "").lower()
+                if any(k.lower() in url for k in url_keywords):
+                    matched_tab = p
+                    break
+        if not matched_tab and pages:
+            matched_tab = pages[0]
 
-    if not matched_tab:
-        return None
+        if not matched_tab:
+            if attempt < max_retries:
+                time.sleep(retry_interval)
+                continue
+            return None
 
-    ws_url = matched_tab.get("webSocketDebuggerUrl")
-    if not ws_url:
-        return None
+        ws_url = matched_tab.get("webSocketDebuggerUrl")
+        if not ws_url:
+            if attempt < max_retries:
+                time.sleep(retry_interval)
+                continue
+            return None
 
-    try:
-        ws = websocket.create_connection(ws_url, timeout=timeout, suppress_origin=True)
-        ws.send(json.dumps({
-            "id": 1,
-            "method": "Runtime.evaluate",
-            "params": {"expression": js_expression, "returnByValue": True}
-        }))
-        raw = ws.recv()
-        ws.close()
-        res = json.loads(raw)
-        return res.get("result", {}).get("result", {}).get("value")
-    except Exception as exc:
-        logger.debug("Direct CDP WebSocket eval thất bại trên port %s: %s", port, exc)
-        return None
+        try:
+            ws = websocket.create_connection(ws_url, timeout=timeout, suppress_origin=True)
+            ws.send(json.dumps({
+                "id": attempt,
+                "method": "Runtime.evaluate",
+                "params": {"expression": js_expression, "returnByValue": True}
+            }))
+            raw = ws.recv()
+            ws.close()
+            res = json.loads(raw)
+            val = res.get("result", {}).get("result", {}).get("value")
+            if isinstance(val, dict):
+                # If the page returned is_loading=True and we have retries left, wait and retry
+                if val.get("is_loading") and attempt < max_retries:
+                    time.sleep(retry_interval)
+                    continue
+                return val
+            elif val is not None:
+                return val
+        except Exception as exc:
+            logger.debug("Direct CDP WebSocket eval thất bại trên port %s (lần %d): %s", port, attempt, exc)
+            if attempt < max_retries:
+                time.sleep(retry_interval)
+                continue
+
+    return None
 
 
 def parse_profile_target(profile_id: str) -> dict[str, Any]:
@@ -423,7 +469,7 @@ async def scan_youtube_channel(
     logger.info("Bắt đầu quét kênh YouTube từ Profile %s", profile_id)
     parsed = parse_profile_target(profile_id)
 
-    # 1. Engine 1: Direct CDP Evaluation (Fast ~50ms, zero-overhead)
+    # 1. Engine 1: Direct CDP Evaluation (Fast ~50ms, zero-overhead with retry)
     port = get_profile_cdp_port(profile_id)
     if port:
         logger.info("Engine 1: Đang quét trực tiếp tab YouTube Studio qua CDP port %s...", port)
@@ -431,7 +477,9 @@ async def scan_youtube_channel(
             port,
             JS_EXTRACT_YOUTUBE,
             url_keywords=["studio.youtube.com", "youtube.com"],
-            timeout=4.0,
+            timeout=3.5,
+            max_retries=3,
+            retry_interval=0.8,
         )
         if isinstance(extracted, dict):
             if extracted.get("is_login_page"):
@@ -447,7 +495,7 @@ async def scan_youtube_channel(
             thumbnail_url = str(extracted.get("thumbnail_url") or "").strip()
             handle = str(extracted.get("handle") or "").strip()
 
-            if channel_id or (title and title != "Kênh YouTube"):
+            if channel_id or (title and title not in ("Kênh YouTube", "YouTube Studio", "Studio", "YouTube")):
                 if not channel_id:
                     channel_id = f"UC_GPM_{parsed['id'][:12]}_{int(asyncio.get_event_loop().time())}"
 
@@ -483,7 +531,7 @@ async def scan_youtube_channel(
                     "message": f"🟢 Đã quét và liên kết thành công kênh '{title}' ({channel_id})!",
                 }
 
-    # 2. Engine 2: Playwright CDP Session Fallback with Page Reuse
+    # 2. Engine 2: Playwright CDP Session Fallback with Page Reuse & Safe Retry Loop
     logger.info("Engine 2: Khởi tạo phiên Playwright CDP fallback cho profile %s...", profile_id)
     try:
         async with channel_browser_session(profile_id, target_url="https://studio.youtube.com") as (context, _browser, p_info):
@@ -496,29 +544,60 @@ async def scan_youtube_channel(
             else:
                 page = await context.new_page()
                 created_new = True
-                await page.goto("https://studio.youtube.com", wait_until="domcontentloaded", timeout=min(int(timeout_seconds * 1000), 15000))
-                await asyncio.sleep(2.0)
+                try:
+                    await page.goto("https://studio.youtube.com", wait_until="domcontentloaded", timeout=min(int(timeout_seconds * 1000), 15000))
+                except Exception as nav_exc:
+                    logger.debug("Page goto timeout/error: %s", nav_exc)
 
             try:
-                current_url = page.url
-                if "accounts.google.com" in current_url:
-                    return {
-                        "success": False,
-                        "logged_in": False,
-                        "channel": None,
-                        "profile": p_info,
-                        "message": "Chưa đăng nhập Google trong Profile này. Vui lòng mở trình duyệt để đăng nhập tài khoản YouTube trước.",
-                    }
+                # Safe evaluate loop with retries to absorb in-flight SPA navigations
+                extracted = None
+                deadline = asyncio.get_event_loop().time() + min(timeout_seconds, 15.0)
+                attempts = 0
+                last_eval_res = None
 
-                extracted = await page.evaluate(JS_EXTRACT_YOUTUBE)
-                if isinstance(extracted, dict) and extracted.get("is_login_page"):
-                    return {
-                        "success": False,
-                        "logged_in": False,
-                        "channel": None,
-                        "profile": p_info,
-                        "message": "Chưa đăng nhập Google trong Profile này. Vui lòng mở trình duyệt để đăng nhập tài khoản YouTube trước.",
-                    }
+                while asyncio.get_event_loop().time() < deadline:
+                    attempts += 1
+                    try:
+                        curr_url = page.url or ""
+                        if "accounts.google.com" in curr_url or "ServiceLogin" in curr_url or "signin/identifier" in curr_url:
+                            return {
+                                "success": False,
+                                "logged_in": False,
+                                "channel": None,
+                                "profile": p_info,
+                                "message": "Chưa đăng nhập Google trong Profile này. Vui lòng mở trình duyệt để đăng nhập tài khoản YouTube trước.",
+                            }
+
+                        try:
+                            await page.wait_for_load_state("domcontentloaded", timeout=2000)
+                        except Exception:
+                            pass
+
+                        res = await page.evaluate(JS_EXTRACT_YOUTUBE)
+                        if isinstance(res, dict):
+                            last_eval_res = res
+                            if res.get("is_login_page"):
+                                return {
+                                    "success": False,
+                                    "logged_in": False,
+                                    "channel": None,
+                                    "profile": p_info,
+                                    "message": "Chưa đăng nhập Google trong Profile này. Vui lòng mở trình duyệt để đăng nhập tài khoản YouTube trước.",
+                                }
+                            if res.get("channelId") or (res.get("title") and res.get("title") not in ("Kênh YouTube", "YouTube Studio", "Studio", "YouTube")):
+                                extracted = res
+                                break
+                    except Exception as eval_exc:
+                        logger.debug("Lần evaluate %d gặp lỗi chuyển trang: %s", attempts, eval_exc)
+
+                    await asyncio.sleep(1.0)
+
+                if not extracted and isinstance(last_eval_res, dict):
+                    extracted = last_eval_res
+
+                if not extracted:
+                    extracted = {}
 
                 channel_id = str(extracted.get("channelId") or "").strip()
                 title = str(extracted.get("title") or "").strip() or "Kênh YouTube"
@@ -592,7 +671,9 @@ async def scan_facebook_pages(
             port,
             JS_EXTRACT_FACEBOOK,
             url_keywords=["facebook.com"],
-            timeout=4.0,
+            timeout=3.5,
+            max_retries=3,
+            retry_interval=0.8,
         )
         if isinstance(extracted, dict):
             if extracted.get("is_login_page"):
@@ -643,24 +724,56 @@ async def scan_facebook_pages(
             else:
                 page = await context.new_page()
                 created_new = True
-                await page.goto("https://www.facebook.com/pages/?category=your_pages", wait_until="domcontentloaded", timeout=min(int(timeout_seconds * 1000), 15000))
-                await asyncio.sleep(2.5)
+                try:
+                    await page.goto("https://www.facebook.com/pages/?category=your_pages", wait_until="domcontentloaded", timeout=min(int(timeout_seconds * 1000), 15000))
+                except Exception:
+                    pass
 
             try:
-                current_url = page.url
-                if "login" in current_url or "checkpoint" in current_url:
-                    return {
-                        "success": False,
-                        "logged_in": False,
-                        "pages": [],
-                        "profile": p_info,
-                        "message": "Chưa đăng nhập Facebook trong Profile này. Vui lòng mở trình duyệt và đăng nhập trước.",
-                    }
+                extracted = None
+                deadline = asyncio.get_event_loop().time() + min(timeout_seconds, 15.0)
+                attempts = 0
 
-                extracted = await page.evaluate(JS_EXTRACT_FACEBOOK)
-                discovered = extracted.get("pages") if isinstance(extracted, dict) else []
+                while asyncio.get_event_loop().time() < deadline:
+                    attempts += 1
+                    try:
+                        current_url = page.url or ""
+                        if "login" in current_url or "checkpoint" in current_url:
+                            return {
+                                "success": False,
+                                "logged_in": False,
+                                "pages": [],
+                                "profile": p_info,
+                                "message": "Chưa đăng nhập Facebook trong Profile này. Vui lòng mở trình duyệt và đăng nhập trước.",
+                            }
+
+                        try:
+                            await page.wait_for_load_state("domcontentloaded", timeout=2000)
+                        except Exception:
+                            pass
+
+                        res = await page.evaluate(JS_EXTRACT_FACEBOOK)
+                        if isinstance(res, dict):
+                            if res.get("is_login_page"):
+                                return {
+                                    "success": False,
+                                    "logged_in": False,
+                                    "pages": [],
+                                    "profile": p_info,
+                                    "message": "Chưa đăng nhập Facebook trong Profile này. Vui lòng mở trình duyệt và đăng nhập trước.",
+                                }
+                            discovered = res.get("pages") or []
+                            if len(discovered) > 0:
+                                extracted = res
+                                break
+                    except Exception as eval_exc:
+                        logger.debug("Lần evaluate Facebook %d gặp lỗi: %s", attempts, eval_exc)
+
+                    await asyncio.sleep(1.0)
+
+                discovered = (extracted.get("pages") if isinstance(extracted, dict) else []) or []
                 pages = []
-                for item in (discovered or []):
+                for item in discovered:
                     p_name = str(item.get("name") or "").strip()
                     p_id = str(item.get("page_id") or "").strip()
                     if p_name and p_id:
@@ -718,7 +831,9 @@ async def scan_tiktok_account(
             port,
             JS_EXTRACT_TIKTOK,
             url_keywords=["tiktok.com"],
-            timeout=4.0,
+            timeout=3.5,
+            max_retries=3,
+            retry_interval=0.8,
         )
         if isinstance(extracted, dict):
             if extracted.get("is_login_page"):
@@ -769,24 +884,55 @@ async def scan_tiktok_account(
             else:
                 page = await context.new_page()
                 created_new = True
-                await page.goto("https://www.tiktok.com/creator-center/upload", wait_until="domcontentloaded", timeout=min(int(timeout_seconds * 1000), 15000))
-                await asyncio.sleep(2.5)
+                try:
+                    await page.goto("https://www.tiktok.com/creator-center/upload", wait_until="domcontentloaded", timeout=min(int(timeout_seconds * 1000), 15000))
+                except Exception:
+                    pass
 
             try:
-                current_url = page.url
-                if "login" in current_url:
-                    return {
-                        "success": False,
-                        "logged_in": False,
-                        "account": None,
-                        "profile": p_info,
-                        "message": "Chưa đăng nhập TikTok trong Profile này. Vui lòng mở trình duyệt và đăng nhập trước.",
-                    }
+                extracted = None
+                deadline = asyncio.get_event_loop().time() + min(timeout_seconds, 15.0)
+                attempts = 0
 
-                extracted = await page.evaluate(JS_EXTRACT_TIKTOK)
-                handle = str(extracted.get("handle") or "").strip()
-                name = str(extracted.get("name") or "").strip() or handle
-                avatar_url = str(extracted.get("avatar_url") or "").strip()
+                while asyncio.get_event_loop().time() < deadline:
+                    attempts += 1
+                    try:
+                        current_url = page.url or ""
+                        if "login" in current_url:
+                            return {
+                                "success": False,
+                                "logged_in": False,
+                                "account": None,
+                                "profile": p_info,
+                                "message": "Chưa đăng nhập TikTok trong Profile này. Vui lòng mở trình duyệt và đăng nhập trước.",
+                            }
+
+                        try:
+                            await page.wait_for_load_state("domcontentloaded", timeout=2000)
+                        except Exception:
+                            pass
+
+                        res = await page.evaluate(JS_EXTRACT_TIKTOK)
+                        if isinstance(res, dict):
+                            if res.get("is_login_page"):
+                                return {
+                                    "success": False,
+                                    "logged_in": False,
+                                    "account": None,
+                                    "profile": p_info,
+                                    "message": "Chưa đăng nhập TikTok trong Profile này. Vui lòng mở trình duyệt và đăng nhập trước.",
+                                }
+                            if res.get("handle") or res.get("name"):
+                                extracted = res
+                                break
+                    except Exception as eval_exc:
+                        logger.debug("Lần evaluate TikTok %d gặp lỗi: %s", attempts, eval_exc)
+
+                    await asyncio.sleep(1.0)
+
+                handle = str((extracted or {}).get("handle") or "").strip()
+                name = str((extracted or {}).get("name") or "").strip() or handle
+                avatar_url = str((extracted or {}).get("avatar_url") or "").strip()
 
                 if not handle:
                     handle = f"@user_{p_info['id'][:8]}"

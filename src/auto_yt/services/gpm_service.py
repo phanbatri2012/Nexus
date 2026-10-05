@@ -476,11 +476,33 @@ def open_tab_in_running_gpm_process(
     if sys.platform != "win32":
         raise GpmError("Mở tab trên profile đang chạy chỉ hỗ trợ trên môi trường Windows.")
 
-    # 1. Fast path: if CDP port is known and live, use HTTP /json/new directly
+    # 1. Fast path: if CDP port is known and live, check /json/list to reuse existing tab or use HTTP /json/new
     cached = _active_gpm_profiles.get(clean_id)
     cached_port = cached.get("remote_debugging_port") if cached else None
     if cached_port and is_cdp_port_live(cached_port):
         try:
+            # Check existing open tabs to reuse/focus if matching domain or URL
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{cached_port}/json/list", timeout=2.0) as lresp:
+                    tabs = json.loads(lresp.read().decode("utf-8"))
+                    if isinstance(tabs, list):
+                        target_domain = urllib.parse.urlparse(target_url).netloc
+                        for tab in tabs:
+                            tab_url = str(tab.get("url") or "").lower()
+                            if (target_url.lower() in tab_url or (target_domain and target_domain in tab_url)) and tab.get("id"):
+                                activate_url = f"http://127.0.0.1:{cached_port}/json/activate/{tab['id']}"
+                                with urllib.request.urlopen(activate_url, timeout=2.0):
+                                    pass
+                                return {
+                                    "success": True,
+                                    "profile_id": clean_id,
+                                    "url": target_url,
+                                    "method": "tab_reuse",
+                                    "message": f"Đã chuyển tới tab đang mở trong Profile GPM {clean_id}",
+                                }
+            except Exception:
+                pass
+
             encoded_url = urllib.parse.quote(target_url, safe="")
             new_tab_url = f"http://127.0.0.1:{cached_port}/json/new?{encoded_url}"
             req = urllib.request.Request(new_tab_url, method="PUT")
@@ -734,16 +756,11 @@ def start_gpm_profile(
             _active_gpm_profiles[clean_id] = running_info
             return running_info
         elif running_info and running_info.get("already_running_no_cdp"):
-            if require_cdp:
-                logger.warning(
-                    "GPM Profile %s đang chạy chế độ thông thường (không có cổng CDP). Tự động dọn dẹp và khởi động lại với CDP...",
-                    clean_id,
-                )
-                kill_gpm_profile_processes(clean_id, api_url=api_url)
-                stop_gpm_profile(clean_id, api_url=api_url)
-                time.sleep(0.8)
-            else:
-                return running_info
+            logger.info(
+                "GPM Profile %s đang chạy chế độ thông thường. Tái sử dụng cửa sổ mà không đóng...",
+                clean_id,
+            )
+            return running_info
     else:
         logger.info("Force restart GPM profile %s requested. Dọn dẹp tiến trình cũ...", clean_id)
         kill_gpm_profile_processes(clean_id, api_url=api_url)
@@ -817,41 +834,24 @@ def start_gpm_profile(
             _active_gpm_profiles[clean_id] = running_info
             return running_info
 
-        if require_cdp:
-            logger.warning(
-                "GPM thông báo profile %s '%s' nhưng không phát hiện cổng CDP live. Tự động giải phóng và khởi chạy lại...",
-                clean_id,
-                resp.get("message") or "thiếu CDP",
-            )
-            kill_gpm_profile_processes(clean_id, api_url=api_url)
-            stop_gpm_profile(clean_id, api_url=api_url)
-            time.sleep(1.0)
-            retry_resp = _request_gpm_api(f"/profiles/start/{clean_id}", api_url=api_url, params=params, timeout=45.0)
-            retry_data = retry_resp.get("data") or {}
-            if isinstance(retry_data, dict):
-                retry_data = _normalize_coords(retry_data)
-                if retry_data.get("remote_debugging_port") or retry_data.get("websocket_debugging_url") or retry_data.get("selenium_remote_debug_address"):
-                    _active_gpm_profiles[clean_id] = retry_data
-                    return retry_data
-
-            running_info = find_running_gpm_profile_coordinates(clean_id, api_url=api_url)
-            if running_info and (running_info.get("remote_debugging_port") or running_info.get("websocket_debugging_url")):
-                _active_gpm_profiles[clean_id] = running_info
-                return running_info
-
-            msg = retry_resp.get("message") or resp.get("message") or "Unknown error"
-            raise GpmProfileLaunchError(f"GPM không thể mở profile với cổng CDP: {msg}")
-        else:
-            if str(resp.get("message") or "") == "ALREADY_OPEN" or (running_info and running_info.get("already_running_no_cdp")):
-                return {
-                    "success": True,
-                    "profile_id": clean_id,
-                    "status": "already_open",
-                    "already_running_no_cdp": True,
-                    "message": "Profile GPM đã mở sẵn",
-                }
-            msg = resp.get("message", "Unknown error")
-            raise GpmProfileLaunchError(f"GPM không thể mở profile: {msg}")
+        if str(resp.get("message") or "") == "ALREADY_OPEN" or (running_info and running_info.get("already_running_no_cdp")):
+            return {
+                "success": True,
+                "profile_id": clean_id,
+                "status": "already_open",
+                "already_running_no_cdp": True,
+                "message": "Profile GPM đã mở sẵn",
+            }
+        msg = resp.get("message", "Unknown error")
+        if not require_cdp:
+            return {
+                "success": True,
+                "profile_id": clean_id,
+                "status": "already_open",
+                "already_running_no_cdp": True,
+                "message": "Profile GPM đã mở sẵn",
+            }
+        raise GpmProfileLaunchError(f"GPM không thể mở profile với cổng CDP: {msg}")
 
     _active_gpm_profiles[clean_id] = data
     return data
@@ -919,29 +919,37 @@ async def gpm_browser_session(
                 poll_interval=0.5,
             )
         except Exception as probe_err:
-            logger.warning(
-                "Readiness probe cho Profile GPM %s gặp lỗi (%s). Tiến hành Force Restart...",
-                clean_id,
-                probe_err,
-            )
-            launch_info = await asyncio.to_thread(
-                start_gpm_profile,
-                clean_id,
-                skip_proxy_check=skip_proxy_check,
-                addition_args=addition_args,
-                force_restart=True,
-                require_cdp=True,
-                api_url=api_url,
-            )
-            was_already_running = False
-            ws_url = str(launch_info.get("websocket_debugging_url") or "").strip()
-            remote_port = launch_info.get("remote_debugging_port")
-            endpoint_url = await wait_for_cdp_readiness(
-                port=remote_port,
-                ws_url=ws_url,
-                max_wait_seconds=25.0,
-                poll_interval=0.5,
-            )
+            if was_already_running:
+                logger.warning(
+                    "Readiness probe cho Profile GPM %s đang chạy gặp lỗi (%s). Thử kết nối trực tiếp endpoint...",
+                    clean_id,
+                    probe_err,
+                )
+                endpoint_url = ws_url or (f"http://127.0.0.1:{remote_port}" if remote_port else "")
+            else:
+                logger.warning(
+                    "Readiness probe cho Profile GPM %s gặp lỗi (%s). Thử khởi chạy lại...",
+                    clean_id,
+                    probe_err,
+                )
+                launch_info = await asyncio.to_thread(
+                    start_gpm_profile,
+                    clean_id,
+                    skip_proxy_check=skip_proxy_check,
+                    addition_args=addition_args,
+                    force_restart=True,
+                    require_cdp=True,
+                    api_url=api_url,
+                )
+                was_already_running = False
+                ws_url = str(launch_info.get("websocket_debugging_url") or "").strip()
+                remote_port = launch_info.get("remote_debugging_port")
+                endpoint_url = await wait_for_cdp_readiness(
+                    port=remote_port,
+                    ws_url=ws_url,
+                    max_wait_seconds=25.0,
+                    poll_interval=0.5,
+                )
 
         if not endpoint_url:
             raise GpmProfileLaunchError(

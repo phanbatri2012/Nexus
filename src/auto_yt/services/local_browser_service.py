@@ -318,6 +318,32 @@ def start_local_browser(
         logger.info("Phát hiện %s (Profile %s) đang chạy trên port %s", browser_key, profile_dir, port)
         if target_url:
             try:
+                # Check /json/list to activate if exists
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=2.0) as lresp:
+                        tabs = json.loads(lresp.read().decode("utf-8"))
+                        if isinstance(tabs, list):
+                            target_domain = urllib.parse.urlparse(target_url).netloc
+                            for tab in tabs:
+                                tab_url = str(tab.get("url") or "").lower()
+                                if (target_url.lower() in tab_url or (target_domain and target_domain in tab_url)) and tab.get("id"):
+                                    activate_url = f"http://127.0.0.1:{port}/json/activate/{tab['id']}"
+                                    with urllib.request.urlopen(activate_url, timeout=2.0):
+                                        pass
+                                    return {
+                                        "success": True,
+                                        "port": port,
+                                        "endpoint_url": running["endpoint_url"],
+                                        "ws_url": running["ws_url"],
+                                        "already_running": True,
+                                        "already_running_no_cdp": False,
+                                        "browser_key": browser_key,
+                                        "profile_dir": profile_dir,
+                                        "message": f"Đã chuyển đến tab đang mở trên {browser_display_name}.",
+                                    }
+                except Exception:
+                    pass
+
                 encoded = urllib.parse.quote(target_url, safe="")
                 req = urllib.request.Request(f"http://127.0.0.1:{port}/json/new?{encoded}", method="PUT")
                 with urllib.request.urlopen(req, timeout=3.0):
@@ -338,45 +364,34 @@ def start_local_browser(
 
     # 2. If running without CDP
     if is_browser_process_running(browser_key):
-        if require_cdp:
-            # AUTO-RESTART: Since an automated Playwright task requires CDP connection,
-            # cleanly close stale non-CDP browser processes and proceed to launch with CDP below!
-            logger.info(
-                "Trình duyệt %s đang chạy chế độ thông thường (không có CDP). Tự động đóng các tiến trình cũ và khởi động lại với cổng gỡ lỗi CDP...",
-                browser_display_name,
-            )
-            terminate_local_browser_processes(browser_key)
-        else:
-            logger.info(
-                "Trình duyệt %s đang chạy chế độ thông thường. Mở thêm tab mới mà không tắt trình duyệt...",
-                browser_display_name,
-            )
-            if target_url:
-                try:
-                    subprocess.Popen(
-                        [str(exe_path), target_url],
-                        shell=False,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                except Exception as e:
-                    logger.debug("Không thể mở tab qua process invocation: %s", e)
+        logger.info(
+            "Trình duyệt %s đang chạy chế độ thông thường. Mở thêm tab mới mà không tắt trình duyệt...",
+            browser_display_name,
+        )
+        if target_url:
+            try:
+                subprocess.Popen(
+                    [str(exe_path), target_url],
+                    shell=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as e:
+                logger.debug("Không thể mở tab qua process invocation: %s", e)
 
-            return {
-                "success": True,
-                "port": None,
-                "endpoint_url": None,
-                "ws_url": None,
-                "already_running": True,
-                "already_running_no_cdp": True,
-                "browser_key": browser_key,
-                "profile_dir": profile_dir,
-                "message": (
-                    f"Đã mở thêm tab '{target_url or 'Meta'}' trên trình duyệt {browser_display_name} đang chạy. "
-                ),
-            }
+        return {
+            "success": True,
+            "port": None,
+            "endpoint_url": None,
+            "ws_url": None,
+            "already_running": True,
+            "already_running_no_cdp": True,
+            "browser_key": browser_key,
+            "profile_dir": profile_dir,
+            "message": f"Đã mở thêm tab '{target_url or 'Trình duyệt'}' trên {browser_display_name} đang chạy.",
+        }
 
-    # 3. Not running (or terminated above for CDP): pick a free port and launch with remote debugging port
+    # 3. Not running: pick a free port and launch with remote debugging port
     port = preferred_port or find_free_port()
     args = [
         str(exe_path),
@@ -413,7 +428,7 @@ def start_local_browser(
     if not ws_url:
         raise RuntimeError(
             f"Không thể kích hoạt cổng gỡ lỗi ({port}) cho trình duyệt {browser_display_name}. "
-            f"Vui lòng tắt hoàn toàn trình duyệt {browser_display_name} và thử lại."
+            f"Vui lòng đóng hoàn toàn trình duyệt {browser_display_name} và bấm nút trên Tool để khởi động lại kèm cổng CDP."
         )
 
     return {
@@ -449,6 +464,12 @@ async def local_browser_session(
         target_url=target_url,
         require_cdp=True,
     )
+
+    if launch_info.get("already_running_no_cdp"):
+        raise RuntimeError(
+            f"Trình duyệt {browser_key.title()} đang mở sẵn mà không có cổng tự động hóa CDP. "
+            f"Để quét hoặc tự động hóa, vui lòng đóng các cửa sổ {browser_key.title()} rồi bấm nút 'Mở Trình duyệt' trên Tool để tự động kích hoạt cổng CDP, hoặc sử dụng Profile GPM-Login."
+        )
 
     port = launch_info.get("port")
     endpoint_url = launch_info.get("ws_url") or f"http://127.0.0.1:{port}"
