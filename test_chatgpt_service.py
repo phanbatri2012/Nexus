@@ -13,6 +13,42 @@ from auto_yt.services.chatgpt_runtime import ChatGPTAttentionRequiredError
 
 
 class ChatGptServiceTests(unittest.TestCase):
+    def test_markdown_extraction_preserves_block_boundaries(self):
+        html = (
+            '<div class="markdown"><p>Đoạn mở đầu?</p><button>Copy</button>'
+            '<p>Đoạn kêu gọi hành động.</p>'
+            '<p>MIỄN TRỪ TRÁCH NHIỆM: Nội dung hư cấu.</p></div>'
+        )
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_content(html)
+            markdown = page.locator(".markdown")
+            detached_clone = markdown.evaluate(
+                """(el) => {
+                    const clone = el.cloneNode(true);
+                    clone.querySelectorAll('button').forEach((button) => button.remove());
+                    return {
+                        innerText: clone.innerText,
+                        textContent: clone.textContent.trim(),
+                    };
+                }"""
+            )
+
+            self.assertNotIn("\n", detached_clone["innerText"])
+            self.assertEqual(
+                detached_clone["textContent"],
+                "Đoạn mở đầu?Đoạn kêu gọi hành động."
+                "MIỄN TRỪ TRÁCH NHIỆM: Nội dung hư cấu.",
+            )
+            self.assertEqual(
+                chatgpt_worker._extract_clean_markdown_text(markdown),
+                "Đoạn mở đầu?\n\nĐoạn kêu gọi hành động.\n\n"
+                "MIỄN TRỪ TRÁCH NHIỆM: Nội dung hư cấu.",
+            )
+            browser.close()
+
     def test_assistant_reader_uses_every_non_empty_markdown_region(self):
         message = Mock()
         markdown_nodes = Mock()

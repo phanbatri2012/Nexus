@@ -2214,7 +2214,31 @@ def _extract_clean_markdown_text(node) -> str:
                 }
             });
 
-            return clone.innerText || clone.textContent || '';
+            // A detached clone has no layout, so innerText can collapse block
+            // boundaries and textContent then joins adjacent paragraphs.
+            clone.querySelectorAll('script, style, iframe, object, embed').forEach(
+                (unsafeElement) => unsafeElement.remove()
+            );
+            const extractionHost = document.createElement('div');
+            const sourceWidth = el.getBoundingClientRect().width;
+            extractionHost.setAttribute('aria-hidden', 'true');
+            Object.assign(extractionHost.style, {
+                position: 'fixed',
+                left: '0',
+                top: '0',
+                width: `${sourceWidth || document.documentElement.clientWidth}px`,
+                transform: 'translateX(-100vw)',
+                opacity: '0',
+                pointerEvents: 'none',
+                zIndex: '-1',
+            });
+            extractionHost.appendChild(clone);
+            (document.body || document.documentElement).appendChild(extractionHost);
+            try {
+                return clone.innerText || clone.textContent || '';
+            } finally {
+                extractionHost.remove();
+            }
         }""")
         if isinstance(cleaned, str) and cleaned.strip():
             return clean_text(cleaned)
