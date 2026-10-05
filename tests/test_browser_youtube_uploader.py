@@ -237,12 +237,33 @@ class TestBrowserYouTubeUploader(unittest.IsolatedAsyncioTestCase):
         ts_diff = int(diff_dt.timestamp())
         mock_html = f'''
         <script>
-        ytcfg.set({{"scheduledPublishingDetails":{{"scheduledPublishings":[{{"scheduledTimeSeconds":"{ts_diff}"}}]}},"status":"SCHEDULED_PUBLISHING_STATUS_SCHEDULED"}});
+        ytcfg.set({{"scheduledPublishingDetails":{{"scheduledPublishings":[{{"scheduledTimeSeconds":"{ts_diff}"}}]}},"draftStatus":"DRAFT_STATUS_NONE","status":"SCHEDULED_PUBLISHING_STATUS_SCHEDULED"}});
         </script>
         '''
         body_text = "Chi tiết video"
         is_scheduled, is_matching = _detect_schedule_verification(body_text, mock_html, target_dt)
         self.assertTrue(is_scheduled)
+        self.assertFalse(is_matching)
+
+    def test_detect_schedule_verification_draft_status_invalidates_schedule(self):
+        target_dt = dt.datetime(2026, 10, 6, 18, 0, 0, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
+        ts = int(target_dt.timestamp())
+        mock_html = f'''
+        <script>
+        ytcfg.set({{"scheduledPublishingDetails":{{"scheduledPublishings":[{{"scheduledTimeSeconds":"{ts}"}}]}},"draftStatus":"DRAFT_STATUS_DRAFT","status":"SCHEDULED_PUBLISHING_STATUS_SCHEDULED"}});
+        </script>
+        '''
+        body_text = "Chi tiết video"
+        is_scheduled, is_matching = _detect_schedule_verification(body_text, mock_html, target_dt)
+        self.assertFalse(is_scheduled)
+        self.assertFalse(is_matching)
+
+    def test_detect_schedule_verification_interrupted_text_invalidates_schedule(self):
+        target_dt = dt.datetime(2026, 10, 6, 18, 0, 0, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
+        mock_html = '<html><body>Quá trình tải lên bị gián đoạn. Nhấn vào Tiếp tục tải lên...</body></html>'
+        body_text = "Quá trình tải lên bị gián đoạn. Nhấn vào Tiếp tục tải lên để tải tệp lên"
+        is_scheduled, is_matching = _detect_schedule_verification(body_text, mock_html, target_dt)
+        self.assertFalse(is_scheduled)
         self.assertFalse(is_matching)
 
     def test_matches_playlist_or_podcast_label(self):

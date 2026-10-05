@@ -867,20 +867,28 @@ async def _resume_interrupted_upload_if_present(
     if not video_path or not video_path.exists():
         return False
 
-    interrupted = await page.evaluate('''() => {
-        const text = (document.body?.innerText || document.body?.textContent || '').toLowerCase();
-        const hasInterruptedText = text.includes('quá trình tải lên bị gián đoạn')
-            || text.includes('upload process interrupted')
-            || text.includes('upload interrupted')
-            || text.includes('quá trình tải lên đã bị gián đoạn');
+    interrupted = False
+    for _ in range(5):
+        try:
+            interrupted = await page.evaluate('''() => {
+                const text = (document.body?.innerText || document.body?.textContent || '').toLowerCase();
+                const hasInterruptedText = text.includes('quá trình tải lên bị gián đoạn')
+                    || text.includes('upload process interrupted')
+                    || text.includes('upload interrupted')
+                    || text.includes('quá trình tải lên đã bị gián đoạn');
 
-        const allButtons = Array.from(document.querySelectorAll("ytcp-button, button, [role='button'], tp-yt-paper-button"));
-        const resumeBtn = allButtons.find(b => {
-            const t = (b.innerText || b.textContent || '').trim().toLowerCase();
-            return t === 'tiếp tục tải lên' || t === 'resume upload' || b.id === 'resume-upload-button' || b.getAttribute('test-id') === 'resume-upload';
-        });
-        return Boolean(hasInterruptedText || (resumeBtn && resumeBtn.offsetParent !== null));
-    }''')
+                const allButtons = Array.from(document.querySelectorAll("ytcp-button, button, [role='button'], tp-yt-paper-button"));
+                const resumeBtn = allButtons.find(b => {
+                    const t = (b.innerText || b.textContent || '').trim().toLowerCase();
+                    return t === 'tiếp tục tải lên' || t === 'resume upload' || b.id === 'resume-upload-button' || b.getAttribute('test-id') === 'resume-upload';
+                });
+                return Boolean(hasInterruptedText || (resumeBtn && resumeBtn.offsetParent !== null));
+            }''')
+            if interrupted:
+                break
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
 
     if not interrupted:
         return False
@@ -902,20 +910,29 @@ async def _resume_interrupted_upload_if_present(
     file_injected = False
     try:
         try:
-            await resume_btn_locator.click(timeout=5000)
+            async with page.expect_file_chooser(timeout=3000) as fc_info:
+                await resume_btn_locator.click(timeout=3000)
+            file_chooser = await fc_info.value
+            await file_chooser.set_files(str(video_path))
+            logger.info("Đã nạp file MP4 tiếp tục upload qua file_chooser thành công: %s", video_path.name)
+            file_injected = True
         except Exception:
             pass
-        await asyncio.sleep(1.5)
-        await _cdp_set_input_files(
-            page,
-            "ytcp-uploads-dialog input[type='file'], ytcp-video-upload-dialog input[type='file'], input[type='file']",
-            video_path,
-            timeout_ms=10000,
-        )
-        logger.info("Đã nạp file MP4 tiếp tục upload qua CDP thành công: %s", video_path.name)
-        file_injected = True
+
+        if not file_injected:
+            if await resume_btn_locator.is_visible():
+                await resume_btn_locator.click(timeout=3000)
+            await asyncio.sleep(1.0)
+            await _cdp_set_input_files(
+                page,
+                "ytcp-uploads-dialog input[type='file'], ytcp-video-upload-dialog input[type='file'], input[type='file']",
+                video_path,
+                timeout_ms=10000,
+            )
+            logger.info("Đã nạp file MP4 tiếp tục upload qua CDP thành công: %s", video_path.name)
+            file_injected = True
     except Exception as cdp_err:
-        logger.warning("Không thể nạp file MP4 tiếp tục upload qua CDP: %s", cdp_err)
+        logger.warning("Không thể nạp file MP4 tiếp tục upload: %s", cdp_err)
 
     if not file_injected:
         return False
@@ -1026,6 +1043,15 @@ def _detect_schedule_verification(
     body_str = str(body_text or "")
     markup_str = str(page_markup or "")
 
+    # Guard 1: Video in draft / interrupted / incomplete upload state is NEVER considered scheduled
+    is_draft_or_interrupted = bool(
+        re.search(r"gián đoạn|interrupted|tiếp tục tải lên|resume upload", body_str, re.IGNORECASE)
+        or re.search(r'uploadStatus["\']?\s*:\s*["\']?(?:INTERRUPTED|FAILED|ABORTED)', markup_str, re.IGNORECASE)
+        or re.search(r'"draftStatus"\s*:\s*"DRAFT_STATUS_DRAFT"', markup_str)
+    )
+    if is_draft_or_interrupted:
+        return (False, False)
+
     # 1. Direct timestamp match from internal JSON payload (most reliable)
     timestamp_matched = False
     if expected_dt:
@@ -1036,7 +1062,7 @@ def _detect_schedule_verification(
         timestamp_matched
         or re.search(r"Đã lên lịch|Scheduled", body_str, re.IGNORECASE)
         or re.search(
-            r'SCHEDULED_PUBLISHING_STATUS_SCHEDULED|VIDEO_USER_SET_VISIBILITY_SCHEDULED|"scheduledPublishingDetails"',
+            r'SCHEDULED_PUBLISHING_STATUS_SCHEDULED|VIDEO_USER_SET_VISIBILITY_SCHEDULED',
             markup_str,
         )
     )
@@ -2968,12 +2994,13 @@ async def upload_video_via_browser(
                                 break
                         await asyncio.sleep(1.0)
 
+                    resumed_ok = False
                     is_interrupted = bool(
                         re.search(r"gián đoạn|interrupted", resumed_body_text, re.IGNORECASE)
                     )
                     if is_interrupted:
                         scheduled_marker = False
-                        if f"/video/{clean_existing_video_id}/" in page.url:
+                        if f"/video/{clean_existing_video_id}/" in page.url or clean_channel_id:
                             resumed_ok = await _resume_interrupted_upload_if_present(
                                 page,
                                 video_path,
@@ -2991,7 +3018,7 @@ async def upload_video_via_browser(
                                 )
                     elif not scheduled_marker and f"/video/{clean_existing_video_id}/" in page.url:
                         # Check if edit page has interrupted upload warning
-                        await _resume_interrupted_upload_if_present(
+                        resumed_ok = await _resume_interrupted_upload_if_present(
                             page,
                             video_path,
                             timeout_seconds=timeout_seconds,
@@ -2999,9 +3026,9 @@ async def upload_video_via_browser(
                             cancel_check=cancel_check,
                         )
 
-                    if f"/video/{clean_existing_video_id}/" not in page.url and not has_dialog:
+                    if (is_interrupted and not resumed_ok) or (f"/video/{clean_existing_video_id}/" not in page.url and not has_dialog):
                         logger.warning(
-                            "Không mở được đúng bản nháp YouTube %s; tiến hành upload mới...",
+                            "Bản nháp YouTube %s bị gián đoạn hoặc không khả dụng; tiến hành upload mới...",
                             clean_existing_video_id,
                         )
                         resuming_existing_draft = False
