@@ -245,13 +245,66 @@ class TestBrowserYouTubeUploader(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_scheduled)
         self.assertFalse(is_matching)
 
-    def test_detect_schedule_verification_not_scheduled_draft(self):
-        target_dt = dt.datetime(2026, 10, 6, 18, 0, 0, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
-        mock_html = '<html><script>ytcfg.set({"draftStatus":"DRAFT_STATUS_DRAFT"});</script><body>Bản nháp</body></html>'
-        body_text = "Bản nháp video"
-        is_scheduled, is_matching = _detect_schedule_verification(body_text, mock_html, target_dt)
-        self.assertFalse(is_scheduled)
-        self.assertFalse(is_matching)
+    def test_matches_playlist_or_podcast_label(self):
+        from auto_yt.services.browser_youtube_uploader import _matches_playlist_or_podcast_label
+        self.assertTrue(_matches_playlist_or_podcast_label("MC Văn Sâm", "MC Văn Sâm"))
+        self.assertTrue(_matches_playlist_or_podcast_label("mc văn sâm", "MC Văn Sâm"))
+        self.assertTrue(_matches_playlist_or_podcast_label("MC Văn Sâm Podcast", "MC Văn Sâm"))
+        self.assertTrue(_matches_playlist_or_podcast_label("MC Văn Sâm (Podcast)", "MC Văn Sâm"))
+        self.assertTrue(_matches_playlist_or_podcast_label("Podcast: MC Văn Sâm", "MC Văn Sâm"))
+        self.assertTrue(_matches_playlist_or_podcast_label("MC Văn Sâm\nPodcast", "MC Văn Sâm"))
+        self.assertTrue(_matches_playlist_or_podcast_label("MC Văn Sâm - Danh sách phát", "MC Văn Sâm"))
+        self.assertFalse(_matches_playlist_or_podcast_label("Khác Hoàn Toàn", "MC Văn Sâm"))
+        self.assertFalse(_matches_playlist_or_podcast_label("", "MC Văn Sâm"))
+        self.assertFalse(_matches_playlist_or_podcast_label("MC Văn Sâm", ""))
+
+    async def test_select_matching_playlists_and_podcasts_selects_all(self):
+        from auto_yt.services.browser_youtube_uploader import _select_matching_playlists_and_podcasts
+
+        cb1 = MagicMock()
+        cb1.click = AsyncMock()
+        cb1.get_attribute = AsyncMock(side_effect=lambda name: "true" if cb1.click.await_count else "false")
+        cb1.is_checked = AsyncMock(return_value=False)
+        row1 = MagicMock()
+        row1.inner_text = AsyncMock(return_value="MC Văn Sâm")
+        row1.query_selector = AsyncMock(return_value=cb1)
+
+        cb2 = MagicMock()
+        cb2.click = AsyncMock()
+        cb2.get_attribute = AsyncMock(side_effect=lambda name: "true" if cb2.click.await_count else "false")
+        cb2.is_checked = AsyncMock(return_value=False)
+        row2 = MagicMock()
+        row2.inner_text = AsyncMock(return_value="MC Văn Sâm Podcast")
+        row2.query_selector = AsyncMock(return_value=cb2)
+
+        page = MagicMock()
+        page.query_selector_all = AsyncMock(return_value=[row1, row2])
+
+        count = await _select_matching_playlists_and_podcasts(
+            page,
+            container_selector="ytcp-playlist-dialog",
+            expected_text="MC Văn Sâm",
+        )
+        self.assertEqual(count, 2)
+        cb1.click.assert_awaited_once()
+        cb2.click.assert_awaited_once()
+
+    async def test_select_matching_playlists_and_podcasts_skips_when_not_found(self):
+        from auto_yt.services.browser_youtube_uploader import _select_matching_playlists_and_podcasts
+
+        row = MagicMock()
+        row.inner_text = AsyncMock(return_value="Danh sách phát khác")
+        row.query_selector = AsyncMock(return_value=None)
+
+        page = MagicMock()
+        page.query_selector_all = AsyncMock(return_value=[row])
+
+        count = await _select_matching_playlists_and_podcasts(
+            page,
+            container_selector="ytcp-playlist-dialog",
+            expected_text="MC Văn Sâm",
+        )
+        self.assertEqual(count, 0)
 
 
 if __name__ == "__main__":

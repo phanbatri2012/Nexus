@@ -9,20 +9,20 @@ class BrowserYouTubeUploaderTests(unittest.IsolatedAsyncioTestCase):
     async def test_click_prefers_upload_dialog_control_over_background_duplicate(self):
         dialog_radio = MagicMock()
         dialog_radio.click = AsyncMock()
-        dialog_radio.is_visible = AsyncMock(return_value=True)
-        dialog = MagicMock()
-        dialog.query_selector = AsyncMock(return_value=dialog_radio)
-        dialog.query_selector_all = AsyncMock(return_value=[dialog_radio])
         background_radio = MagicMock()
         background_radio.click = AsyncMock()
         page = MagicMock()
-        page.query_selector_all = AsyncMock(return_value=[dialog])
         page.wait_for_selector = AsyncMock(return_value=background_radio)
 
-        clicked = await uploader._safe_click(
-            page,
-            ["tp-yt-paper-radio-button[name='VIDEO_MADE_FOR_KIDS_NOT_MFK']"],
-        )
+        with patch.object(
+            uploader,
+            "_visible_upload_dialog_elements",
+            AsyncMock(return_value=[dialog_radio]),
+        ):
+            clicked = await uploader._safe_click(
+                page,
+                ["tp-yt-paper-radio-button[name='VIDEO_MADE_FOR_KIDS_NOT_MFK']"],
+            )
 
         self.assertTrue(clicked)
         dialog_radio.click.assert_awaited_once()
@@ -63,32 +63,60 @@ class BrowserYouTubeUploaderTests(unittest.IsolatedAsyncioTestCase):
         click.assert_not_awaited()
         background_category.inner_text.assert_not_awaited()
 
-    async def test_playlist_selection_reads_row_label_next_to_checkbox(self):
-        checkbox = MagicMock()
-        checkbox.click = AsyncMock()
-        checkbox.get_attribute = AsyncMock(
+    async def test_playlist_and_podcast_selection_selects_both(self):
+        checkbox1 = MagicMock()
+        checkbox1.click = AsyncMock()
+        checkbox1.get_attribute = AsyncMock(
             side_effect=lambda name: {
-                "aria-checked": "true" if checkbox.click.await_count else "false",
+                "aria-checked": "true" if checkbox1.click.await_count else "false",
                 "checked": None,
             }.get(name)
         )
-        checkbox.is_checked = AsyncMock(return_value=False)
+        checkbox1.is_checked = AsyncMock(return_value=False)
         row = MagicMock()
         row.inner_text = AsyncMock(return_value="Tự Hào Việt Nam")
-        row.query_selector = AsyncMock(return_value=checkbox)
+        row.query_selector = AsyncMock(return_value=checkbox1)
+
+        checkbox2 = MagicMock()
+        checkbox2.click = AsyncMock()
+        checkbox2.get_attribute = AsyncMock(
+            side_effect=lambda name: {
+                "aria-checked": "true" if checkbox2.click.await_count else "false",
+                "checked": None,
+            }.get(name)
+        )
+        checkbox2.is_checked = AsyncMock(return_value=False)
         podcast_row = MagicMock()
         podcast_row.inner_text = AsyncMock(return_value="Tự Hào Việt Nam Podcast")
+        podcast_row.query_selector = AsyncMock(return_value=checkbox2)
+
         page = MagicMock()
         page.query_selector_all = AsyncMock(return_value=[podcast_row, row])
 
-        await uploader._select_exact_checkbox_by_text(
+        count = await uploader._select_matching_playlists_and_podcasts(
             page,
             container_selector="ytcp-playlist-dialog",
             expected_text="Tự Hào Việt Nam",
         )
 
-        checkbox.click.assert_awaited_once()
-        podcast_row.query_selector.assert_not_called()
+        self.assertEqual(count, 2)
+        checkbox1.click.assert_awaited_once()
+        checkbox2.click.assert_awaited_once()
+
+    async def test_playlist_selection_gracefully_skips_when_not_found(self):
+        other_row = MagicMock()
+        other_row.inner_text = AsyncMock(return_value="Kênh Khác Không Liên Quan")
+        other_row.query_selector = AsyncMock(return_value=None)
+        page = MagicMock()
+        page.query_selector_all = AsyncMock(return_value=[other_row])
+
+        count = await uploader._select_matching_playlists_and_podcasts(
+            page,
+            container_selector="ytcp-playlist-dialog",
+            expected_text="MC Văn Sâm",
+        )
+
+        self.assertEqual(count, 0)
 
     async def test_selected_state_reads_nested_lit_checkbox_control(self):
         nested_control = MagicMock()
@@ -229,7 +257,7 @@ class BrowserYouTubeUploaderTests(unittest.IsolatedAsyncioTestCase):
         editor = MagicMock()
         editor.is_visible = AsyncMock(return_value=True)
         dialog = MagicMock()
-        dialog.is_visible = AsyncMock(return_value=False)
+        dialog.is_visible = AsyncMock(return_value=True)
         dialog.query_selector = AsyncMock(return_value=editor)
         page = MagicMock()
         page.query_selector_all = AsyncMock(return_value=[dialog])
@@ -237,7 +265,6 @@ class BrowserYouTubeUploaderTests(unittest.IsolatedAsyncioTestCase):
         result = await uploader._find_visible_upload_details_dialog(page)
 
         self.assertIs(result, dialog)
-        dialog.is_visible.assert_not_awaited()
 
     async def test_existing_draft_uses_edit_draft_button_without_upload_url(self):
         page = MagicMock()

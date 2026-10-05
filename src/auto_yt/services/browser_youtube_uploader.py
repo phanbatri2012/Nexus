@@ -306,7 +306,7 @@ async def _dismiss_active_confirmation_dialogs(page, timeout_seconds: float = 6.
                 });
 
                 for (const dialog of dialogs) {
-                    const btns = Array.from(dialog.querySelectorAll("ytcp-button, button, tp-yt-paper-button, [role='button']"))
+                    const btns = Array.from(dialog.querySelectorAll("ytcp-button, ytcp-button-lit, button, tp-yt-paper-button, [role='button']"))
                         .filter(b => {
                             const rect = b.getBoundingClientRect();
                             return rect.width > 0 && rect.height > 0 && !b.hasAttribute('disabled') && b.getAttribute('aria-disabled') !== 'true';
@@ -316,12 +316,15 @@ async def _dismiss_active_confirmation_dialogs(page, timeout_seconds: float = 6.
                         const txt = (b.innerText || b.textContent || '').trim().toLowerCase();
                         const id = (b.id || '').toLowerCase();
                         return txt.includes('đã hiểu') || txt.includes('got it') ||
+                               txt.includes('tôi đã hiểu') || txt.includes('i understand') ||
                                txt.includes('vẫn lên lịch') || txt.includes('schedule anyway') ||
                                txt.includes('vẫn lưu') || txt.includes('save anyway') ||
                                txt.includes('xác nhận') || txt.includes('confirm') ||
                                txt.includes('tiếp tục') || txt.includes('continue') ||
                                txt.includes('đóng') || txt.includes('close') ||
-                               id === 'confirm-button' || id === 'dismiss-button' || id === 'close-button';
+                               txt.includes('bỏ qua') || txt.includes('dismiss') || txt.includes('skip') ||
+                               txt === 'ok' ||
+                               id === 'confirm-button' || id === 'dismiss-button' || id === 'close-button' || id === 'ok-button';
                     });
                     if (primaryBtn) {
                         primaryBtn.click();
@@ -340,14 +343,14 @@ async def _dismiss_active_confirmation_dialogs(page, timeout_seconds: float = 6.
         # 2. Direct button search across the entire page for visible 'Đã hiểu' / 'Got it'
         try:
             got_it_clicked = await page.evaluate('''() => {
-                const btns = Array.from(document.querySelectorAll("ytcp-button, button, tp-yt-paper-button, [role='button']"))
+                const btns = Array.from(document.querySelectorAll("ytcp-button, ytcp-button-lit, button, tp-yt-paper-button, [role='button']"))
                     .filter(b => {
                         const rect = b.getBoundingClientRect();
                         return rect.width > 0 && rect.height > 0 && !b.hasAttribute('disabled') && b.getAttribute('aria-disabled') !== 'true';
                     });
                 const btn = btns.find(b => {
                     const txt = (b.innerText || b.textContent || '').trim().toLowerCase();
-                    return txt === 'đã hiểu' || txt === 'got it' || txt.includes('đã hiểu') || txt.includes('got it');
+                    return txt === 'đã hiểu' || txt === 'got it' || txt.includes('đã hiểu') || txt.includes('got it') || txt.includes('tôi đã hiểu') || txt.includes('i understand');
                 });
                 if (btn) {
                     btn.click();
@@ -458,6 +461,10 @@ async def _require_click(
     timeout_ms: int = 5000,
 ) -> None:
     if not await _safe_click(page, selectors, timeout_ms=timeout_ms):
+        if await _dismiss_active_confirmation_dialogs(page, timeout_seconds=2.0):
+            logger.info("Đã tự động đóng dialog/popup cản trở và thử click lại...")
+            if await _safe_click(page, selectors, timeout_ms=min(3000, timeout_ms)):
+                return
         raise BrowserUploadError(error_message)
 
 
@@ -1724,54 +1731,135 @@ async def _require_checkbox_setting(
         )
 
 
+def _matches_playlist_or_podcast_label(label: str, expected_text: str) -> bool:
+    """Check if a playlist or podcast label matches the expected name.
+    
+    Matches exact name (case-insensitive) as well as common podcast/playlist variants
+    such as 'Name Podcast', 'Name (Podcast)', 'Podcast: Name', or multi-line labels.
+    """
+    expected = " ".join(str(expected_text or "").split()).casefold()
+    if not expected:
+        return False
+
+    raw_label = str(label or "").strip()
+    norm_label = " ".join(raw_label.split()).casefold()
+    if not norm_label:
+        return False
+
+    # 1. Exact match
+    if norm_label == expected:
+        return True
+
+    # 2. Match first line of multi-line label
+    lines = [" ".join(line.split()).casefold() for line in raw_label.splitlines() if line.strip()]
+    if lines and lines[0] == expected:
+        return True
+
+    # 3. Label starts with expected name and followed by podcast/playlist qualifier
+    if norm_label.startswith(expected):
+        suffix = norm_label[len(expected):].strip(" -()·[]:,\t\n")
+        if not suffix:
+            return True
+        if suffix in {"podcast", "podcasts", "podcast show", "kênh podcast", "danh sách phát", "playlist"}:
+            return True
+        if suffix.startswith("podcast") or suffix.startswith("danh sách"):
+            return True
+
+    # 4. Label ends with expected name (e.g. 'Podcast: MC Văn Sâm')
+    if norm_label.endswith(expected):
+        prefix = norm_label[:-len(expected)].strip(" -()·[]:,\t\n")
+        if prefix in {"podcast", "podcasts", "podcast show", "danh sách phát", "playlist"}:
+            return True
+
+    return False
+
+
+async def _select_matching_playlists_and_podcasts(
+    page,
+    *,
+    container_selector: str = "ytcp-playlist-dialog",
+    expected_text: str,
+) -> int:
+    """Select all playlist and podcast checkboxes matching the given name in YouTube Studio.
+    
+    If no matches are found, gracefully skips without throwing an error.
+    Returns the number of selected items.
+    """
+    expected = " ".join(str(expected_text or "").split()).casefold()
+    if not expected:
+        return 0
+
+    selected_count = 0
+    for attempt in range(2):
+        rows = await page.query_selector_all(
+            f"{container_selector} li.row, "
+            f"{container_selector} label.ytcp-checkbox-label, "
+            f"{container_selector} ytcp-checkbox-lit, "
+            f"{container_selector} tp-yt-paper-checkbox, "
+            f"{container_selector} [role='checkbox']"
+        )
+        matched_controls = []
+        for row in rows:
+            try:
+                label_text = str(await row.inner_text() or "")
+                if not _matches_playlist_or_podcast_label(label_text, expected_text):
+                    continue
+                control = await row.query_selector(
+                    "tp-yt-paper-checkbox, [role='checkbox'], ytcp-checkbox-lit"
+                )
+                if control is None:
+                    control = row
+                matched_controls.append((control, label_text))
+            except Exception:
+                continue
+
+        for control, label_text in matched_controls:
+            try:
+                if not await _is_selected(control):
+                    await control.click()
+                    await asyncio.sleep(0.25)
+                if await _is_selected(control):
+                    selected_count += 1
+                    logger.info("Đã tích chọn danh sách phát / podcast: %s", " ".join(label_text.split()))
+            except Exception as exc:
+                logger.warning("Không thể click chọn playlist/podcast '%s': %s", label_text, exc)
+
+        if selected_count > 0:
+            break
+
+        if attempt == 0:
+            if await _dismiss_active_confirmation_dialogs(page, timeout_seconds=1.5):
+                logger.info("Đã đóng dialog cản trở khi chọn '%s', thử lại...", expected_text)
+                await asyncio.sleep(0.5)
+                continue
+            break
+
+    if selected_count > 0:
+        logger.info(
+            "Đã chọn thành công %d danh sách phát/podcast khớp với '%s'.",
+            selected_count,
+            expected_text,
+        )
+    else:
+        logger.warning(
+            "Không tìm thấy danh sách phát hoặc podcast có tên '%s' trên kênh, bỏ qua bước này.",
+            expected_text,
+        )
+
+    return selected_count
+
+
 async def _select_exact_checkbox_by_text(
     page,
     *,
     container_selector: str,
     expected_text: str,
 ) -> None:
-    expected = " ".join(str(expected_text or "").split()).casefold()
-    rows = await page.query_selector_all(
-        f"{container_selector} li.row, "
-        f"{container_selector} label.ytcp-checkbox-label"
-    )
-    for row in rows:
-        try:
-            label = " ".join(str(await row.inner_text() or "").split()).casefold()
-            if label != expected:
-                continue
-            control = await row.query_selector(
-                "tp-yt-paper-checkbox, [role='checkbox'], ytcp-checkbox-lit"
-            )
-            if control is None:
-                continue
-            if not await _is_selected(control):
-                await control.click()
-                await asyncio.sleep(0.25)
-            if await _is_selected(control):
-                return
-        except Exception:
-            continue
-
-    controls = await page.query_selector_all(
-        f"{container_selector} tp-yt-paper-checkbox, "
-        f"{container_selector} ytcp-checkbox-lit, "
-        f"{container_selector} [role='checkbox']"
-    )
-    for control in controls:
-        try:
-            label = " ".join(str(await control.inner_text() or "").split()).casefold()
-            if label != expected:
-                continue
-            if not await _is_selected(control):
-                await control.click()
-                await asyncio.sleep(0.25)
-            if await _is_selected(control):
-                return
-        except Exception:
-            continue
-    raise BrowserUploadError(
-        f"Không tìm thấy hoặc không chọn được giá trị chính xác: {expected_text}."
+    """Select matching checkboxes by text (retained for backward compatibility)."""
+    await _select_matching_playlists_and_podcasts(
+        page,
+        container_selector=container_selector,
+        expected_text=expected_text,
     )
 
 
@@ -1810,30 +1898,40 @@ async def _apply_advanced_details_settings(
     notify_subscribers: bool,
 ) -> None:
     """Apply advanced settings visible in the upload Details step."""
+    await _dismiss_active_confirmation_dialogs(page, timeout_seconds=1.5)
     playlist_name = str(settings.get("playlist_name") or "").strip()
     if playlist_name:
-        await _require_click(
-            page,
-            UPLOAD_PLAYLIST_TRIGGER_SELECTORS,
-            "Không thể mở thiết lập playlist.",
-            timeout_ms=4000,
-        )
-        await asyncio.sleep(0.5)
-        await _select_exact_checkbox_by_text(
-            page,
-            container_selector="ytcp-playlist-dialog",
-            expected_text=playlist_name,
-        )
-        await _require_click(
-            page,
-            [
-                "ytcp-playlist-dialog ytcp-button#done-button",
-                "ytcp-playlist-dialog ytcp-button:has-text('Xong')",
-                "ytcp-playlist-dialog ytcp-button:has-text('Done')",
-            ],
-            "Không thể lưu playlist đã chọn.",
-            timeout_ms=4000,
-        )
+        await _dismiss_active_confirmation_dialogs(page, timeout_seconds=1.5)
+        try:
+            await _require_click(
+                page,
+                UPLOAD_PLAYLIST_TRIGGER_SELECTORS,
+                "Không thể mở thiết lập playlist.",
+                timeout_ms=4000,
+            )
+            await asyncio.sleep(0.5)
+            await _select_matching_playlists_and_podcasts(
+                page,
+                container_selector="ytcp-playlist-dialog",
+                expected_text=playlist_name,
+            )
+            await _safe_click(
+                page,
+                [
+                    "ytcp-playlist-dialog ytcp-button#done-button",
+                    "ytcp-playlist-dialog ytcp-button:has-text('Xong')",
+                    "ytcp-playlist-dialog ytcp-button:has-text('Done')",
+                    "ytcp-playlist-dialog #done-button",
+                ],
+                timeout_ms=3000,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Gặp sự cố khi thiết lập playlist '%s', bỏ qua để tiếp tục upload: %s",
+                playlist_name,
+                exc,
+            )
+            await _dismiss_active_confirmation_dialogs(page, timeout_seconds=1.0)
 
     age_restricted = bool(settings.get("age_restriction", False))
     age_selectors = (
@@ -3137,11 +3235,13 @@ async def upload_video_via_browser(
                             else:
                                 raise BrowserUploadError("Không tìm thấy input thumbnail trong upload dialog.")
                         for _ in range(10):
+                            await _dismiss_active_confirmation_dialogs(page, timeout_seconds=0.5)
                             preview = await page.query_selector(UPLOAD_THUMBNAIL_PREVIEW_SELECTOR)
                             if preview is not None:
                                 thumbnail_verified = True
                                 break
                             await asyncio.sleep(0.5)
+                    await _dismiss_active_confirmation_dialogs(page, timeout_seconds=1.5)
                     if not thumbnail_verified:
                         raise BrowserUploadError(
                             "Đã chọn file thumbnail nhưng YouTube Studio chưa hiển thị ảnh xem trước."
@@ -3152,6 +3252,7 @@ async def upload_video_via_browser(
 
             # Audience Selection (Not for kids / For kids)
             cancel_check()
+            await _dismiss_active_confirmation_dialogs(page, timeout_seconds=1.0)
             await _ensure_resumed_draft_dialog(page, resuming_existing_draft)
             audience_selectors = (
                 [
@@ -3185,6 +3286,7 @@ async def upload_video_via_browser(
             await asyncio.sleep(1.0)
 
             # Studio can persist the expanded state. Avoid toggling it closed.
+            await _dismiss_active_confirmation_dialogs(page, timeout_seconds=1.0)
             await _ensure_resumed_draft_dialog(page, resuming_existing_draft)
             await _ensure_altered_content_controls_visible(page)
 
@@ -3223,6 +3325,7 @@ async def upload_video_via_browser(
             await asyncio.sleep(1.0)
 
             progress("Đang áp dụng thiết lập upload nâng cao...", "advanced_details", 48)
+            await _dismiss_active_confirmation_dialogs(page, timeout_seconds=1.0)
             await _ensure_resumed_draft_dialog(page, resuming_existing_draft)
             await _apply_advanced_details_settings(
                 page,
