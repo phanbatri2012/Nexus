@@ -15,6 +15,7 @@ import YouTubeComments from './YouTubeComments'
 import TTSSettings from './TTSSettings'
 import CrossPoster from './CrossPoster'
 import { openVideoStudioInGpm, openVideoWatchInGpm } from './gpmOpener'
+import UserGuideModal from './UserGuideModal'
 
 const SECONDS_PER_MINUTE = 60
 const SECONDS_PER_HOUR = 60 * SECONDS_PER_MINUTE
@@ -165,6 +166,8 @@ function App() {
       localStorage.setItem('nexus_bg_mode', newMode)
     } catch {}
   }
+
+  const [showUserGuide, setShowUserGuide] = useState(false)
 
   const [url, setUrl] = useState('')
   const [isFetching, setIsFetching] = useState(false)
@@ -1902,9 +1905,20 @@ function App() {
             ))}
           </div>
 
-          <div className="status-badge">
-            <span className="status-dot"></span>
-            Ready
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <button
+              type="button"
+              className="header-guide-btn"
+              onClick={() => setShowUserGuide(true)}
+              title="Mở hướng dẫn sử dụng nhanh"
+            >
+              📖 Hướng Dẫn
+            </button>
+
+            <div className="status-badge">
+              <span className="status-dot"></span>
+              Ready
+            </div>
           </div>
         </header>
 
@@ -4175,6 +4189,11 @@ function App() {
             </form>
           </div>
         )}
+
+      <UserGuideModal
+        isOpen={showUserGuide}
+        onClose={() => setShowUserGuide(false)}
+      />
     </div>
   )
 }
