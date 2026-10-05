@@ -1419,7 +1419,10 @@ def raise_if_chatgpt_attention_required(state: dict) -> None:
 
 def check_chatgpt_page_attention(page: Page) -> None:
     """Inspect redirects before strict Project/conversation URL validation."""
-    raise_if_chatgpt_attention_required(get_chatgpt_load_state(page))
+    state = get_chatgpt_load_state(page)
+    raise_if_chatgpt_attention_required(state)
+    if state.get("editor_present") is True:
+        return
     try:
         current_url = str(page.url or "")
         title = str(page.title() or "")

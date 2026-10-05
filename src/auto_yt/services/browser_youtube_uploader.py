@@ -3814,7 +3814,58 @@ async def upload_video_via_browser(
                     timeout_ms=8000,
                 )
                 if not schedule_radio_clicked:
-                    raise BrowserUploadError("Không thể chọn radio 'Lên lịch' (Schedule) trên YouTube Studio.")
+                    if not youtube_video_id:
+                        raise BrowserUploadError("Không thể chọn radio 'Lên lịch' (Schedule) trên YouTube Studio.")
+
+                    # YouTube can close/rebuild the upload wizard after the file reaches 100%.
+                    # Finish the existing draft on its edit page instead of failing or uploading again.
+                    logger.warning(
+                        "Upload wizard không còn điều khiển Lên lịch; chuyển sang hoàn tất bản nháp %s trên trang edit.",
+                        youtube_video_id,
+                    )
+                    await page.goto(
+                        f"https://studio.youtube.com/video/{youtube_video_id}/edit",
+                        wait_until="commit",
+                        timeout=60000,
+                    )
+                    await asyncio.sleep(3.0)
+                    save_res = await _save_video_on_edit_page(
+                        page,
+                        schedule_at=schedule_at,
+                        publication_timezone=publication_timezone,
+                        video_path=video_path,
+                        caption_path=None,
+                        language=language,
+                        settings=settings,
+                        timeout_seconds=timeout_seconds,
+                        cancel_check=cancel_check,
+                        persist_checkpoint=persist_checkpoint,
+                        progress=progress,
+                    )
+                    caption_locator = str(
+                        save_res.get("caption_locator")
+                        or (
+                            f"browser:{language}:{caption_path.name}"
+                            if caption_path and bool(settings.get("upload_captions", True))
+                            else ""
+                        )
+                    )
+                    _emit_checkpoint(
+                        persist_checkpoint,
+                        "scheduled_verified",
+                        youtube_video_id=youtube_video_id,
+                        resumed=resuming_existing_draft,
+                    )
+                    return {
+                        "youtube_video_id": youtube_video_id,
+                        "published_url": f"https://www.youtube.com/watch?v={youtube_video_id}",
+                        "status": "scheduled",
+                        "scheduled_at": str(schedule_at),
+                        "title": title,
+                        "schedule_verified": True,
+                        "resumed": resuming_existing_draft,
+                        "caption_locator": caption_locator,
+                    }
 
                 await asyncio.sleep(1.5)
 

@@ -99,21 +99,17 @@ _BLOCKER_RULES: list[dict[str, Any]] = [
         "html_patterns": [
             re.compile(r"phiên\s+đăng\s+nhập.*?hết\s+hạn", re.IGNORECASE),
             re.compile(r"session\s+has\s+expired", re.IGNORECASE),
-            re.compile(r"log\s+in\s+to\s+continue", re.IGNORECASE),
-            re.compile(r"sign\s+in\s+to\s+continue", re.IGNORECASE),
+            re.compile(r"phiên\s+của\s+bạn\s+đã\s+hết\s+thời\s+gian", re.IGNORECASE),
         ],
         "html_markers": [
             "Phiên đăng nhập đã hết hạn",
             "Phiên đăng nhập của bạn đã hết hạn",
             "Phiên đăng nhập ChatGPT đã hết hạn",
             "Your session has expired",
-            "Sign in to continue",
-            "Log in to continue",
-            "Sign in to confirm you're not a bot",
-            "Đăng nhập để tiếp tục",
             "Please sign in again",
             "Session expired",
             "Phiên của bạn đã hết thời gian sử dụng",
+            "Sign in to confirm you're not a bot",
         ],
     },
 
@@ -234,6 +230,23 @@ def _sanitize_dom_html(html: str) -> str:
     return cleaned
 
 
+def _strip_non_content_tags(html: str) -> str:
+    """Strip scripts, styles, svg, and comments so embedded JSON/hydration payloads don't trigger false positives."""
+    if not html:
+        return ""
+    # Remove comments
+    cleaned = re.sub(r"<!--.*?-->", "", html, flags=re.DOTALL)
+    # Remove script tags and their inner content
+    cleaned = re.sub(r"<script\b[^>]*>.*?</script>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    # Remove style tags and their inner content
+    cleaned = re.sub(r"<style\b[^>]*>.*?</style>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    # Remove svg tags and their inner content
+    cleaned = re.sub(r"<svg\b[^>]*>.*?</svg>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    # Remove template tags and their inner content
+    cleaned = re.sub(r"<template\b[^>]*>.*?</template>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    return cleaned
+
+
 def detect_browser_blockers(
     url: str = "",
     title: str = "",
@@ -243,7 +256,7 @@ def detect_browser_blockers(
     results: list[BlockerDetectionResult] = []
     norm_url = str(url or "").strip()
     norm_title = str(title or "").strip()
-    norm_html = str(html_text or "")
+    norm_html = _strip_non_content_tags(str(html_text or ""))
 
     for rule in _BLOCKER_RULES:
         category = rule["category"]

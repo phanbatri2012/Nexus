@@ -24,6 +24,7 @@ from auto_yt.services.browser_diagnostics import (
     CATEGORY_TERMS_CONSENT,
     CATEGORY_VERIFY_2FA,
     _sanitize_dom_html,
+    _strip_non_content_tags,
     capture_browser_diagnostics_async,
     capture_browser_diagnostics_sync,
     cleanup_old_diagnostics,
@@ -97,6 +98,35 @@ class TestBlockerDetector(unittest.TestCase):
         blockers = detect_browser_blockers(url="https://studio.youtube.com/channel/123", title="Studio", html_text=html)
         self.assertEqual(len(blockers), 0)
 
+    def test_detect_session_expired_ignores_embedded_script_citations(self):
+        # Simulates ChatGPT page containing web search citations inside React script/hydration stream
+        html = (
+            '<html><head><title>Tóm tắt kịch bản</title></head><body>'
+            '<div id="app"><div class="composer">#prompt-textarea</div></div>'
+            '<script>window.__reactRouterContext = {"data": "https://cms.youtube.com SIGN IN to continue to YouTube"};</script>'
+            '</body></html>'
+        )
+        blockers = detect_browser_blockers(
+            url="https://chatgpt.com/g/g-p-sam/c/6abf5f29-4dc4-83ec-8cb1-5ebb58acd9ec",
+            title="Tóm tắt kịch bản",
+            html_text=html,
+        )
+        self.assertEqual(len(blockers), 0)
+
+    def test_detect_session_expired_ignores_conversation_text(self):
+        # Simulates chat text discussing signing in
+        html = (
+            '<html><body>'
+            '<div class="message">Hãy hướng dẫn người dùng cách sign in to continue vào tài khoản YouTube.</div>'
+            '</body></html>'
+        )
+        blockers = detect_browser_blockers(
+            url="https://chatgpt.com/c/active-conversation",
+            title="Hỏi đáp kỹ thuật",
+            html_text=html,
+        )
+        self.assertEqual(len(blockers), 0)
+
 
 class TestDomSanitization(unittest.TestCase):
     def test_strip_base64_data_uri(self):
@@ -104,6 +134,26 @@ class TestDomSanitization(unittest.TestCase):
         sanitized = _sanitize_dom_html(raw_html)
         self.assertIn("data:image/...[TRUNCATED_BASE64]", sanitized)
         self.assertNotIn("iVBORw0KGgo", sanitized)
+
+    def test_strip_non_content_tags(self):
+        raw_html = (
+            '<html><head>'
+            '<style>.hidden { display: none; }</style>'
+            '<script>var secret = "sign in to continue";</script>'
+            '</head><body>'
+            '<!-- Comment with sensitive text -->'
+            '<svg><text>Icon</text></svg>'
+            '<template><div>Template</div></template>'
+            '<h1>Visible Heading</h1>'
+            '</body></html>'
+        )
+        stripped = _strip_non_content_tags(raw_html)
+        self.assertIn("<h1>Visible Heading</h1>", stripped)
+        self.assertNotIn("secret", stripped)
+        self.assertNotIn(".hidden", stripped)
+        self.assertNotIn("Comment with sensitive text", stripped)
+        self.assertNotIn("<svg>", stripped)
+        self.assertNotIn("<template>", stripped)
 
 
 class TestDiagnosticsCapture(unittest.TestCase):
