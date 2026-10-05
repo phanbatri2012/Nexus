@@ -880,6 +880,30 @@ class YouTubePublishPipelineTests(unittest.TestCase):
         selected_utc = dt.datetime.fromisoformat(selected)
         self.assertEqual(selected_utc.date(), dt.date(2026, 4, 5))
 
+    def test_find_next_publication_slot_deduplicates_iso_formats_and_selects_same_day_slot(self):
+        slots = [
+            {"day": 1, "time": "11:00"},
+            {"day": 1, "time": "18:00"},
+        ]
+        # 2026-10-06 is Tuesday (day 1).
+        # Both formats represent 11:00 VN (04:00 UTC).
+        occupied = [
+            "2026-10-06T04:00:00+00:00",
+            "2026-10-06T04:00:00Z",
+            "2026-10-06T04:00:15Z",
+        ]
+        selected = publication_scheduler.find_next_publication_slot(
+            timezone_name="Asia/Ho_Chi_Minh",
+            slots=slots,
+            daily_limit=2,
+            lead_minutes=60,
+            occupied_utc=occupied,
+            now_utc=dt.datetime(2026, 10, 5, 0, 0, tzinfo=dt.timezone.utc),
+        )
+        # Should correctly pick 18:00 VN on 2026-10-06 (11:00 UTC) instead of skipping to next day
+        selected_utc = dt.datetime.fromisoformat(selected)
+        self.assertEqual(selected_utc, dt.datetime(2026, 10, 6, 11, 0, tzinfo=dt.timezone.utc))
+
     def test_processing_poll_is_not_limited_by_network_retry_budget(self):
         job, _channel = self._create_publish_job(schedule=True)
         pending = youtube_publisher.YouTubeProcessingPending(

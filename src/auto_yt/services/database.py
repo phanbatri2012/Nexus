@@ -5851,7 +5851,10 @@ def reserve_youtube_publication_slot(
     workflow_id: str,
     now_utc: datetime.datetime | None = None,
 ) -> str:
-    from auto_yt.services.publication_scheduler import find_next_publication_slot
+    from auto_yt.services.publication_scheduler import (
+        find_next_publication_slot,
+        _parse_utc,
+    )
     conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
     try:
@@ -5938,10 +5941,18 @@ def reserve_youtube_publication_slot(
             (channel["id"],),
         ).fetchall()
 
-        occupied = sorted(
-            set(str(r[0]) for r in res_rows if r[0])
-            | set(str(r[0]) for r in pub_rows if r[0])
-        )
+        occupied_set = set()
+        for r in res_rows:
+            if r[0]:
+                parsed = _parse_utc(r[0])
+                if parsed:
+                    occupied_set.add(parsed.replace(second=0, microsecond=0).isoformat())
+        for r in pub_rows:
+            if r[0]:
+                parsed = _parse_utc(r[0])
+                if parsed:
+                    occupied_set.add(parsed.replace(second=0, microsecond=0).isoformat())
+        occupied = sorted(occupied_set)
 
         timezone_name = channel["publication_timezone"] or "Asia/Ho_Chi_Minh"
         try:

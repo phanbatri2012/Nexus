@@ -84,7 +84,7 @@ def find_next_publication_slot(
     occupied = [parsed for value in occupied_utc if (parsed := _parse_utc(value))]
     occupied_minutes = {item.replace(second=0, microsecond=0) for item in occupied}
     local_counts: dict[dt.date, int] = {}
-    for item in occupied:
+    for item in occupied_minutes:
         local_day = item.astimezone(timezone).date()
         local_counts[local_day] = local_counts.get(local_day, 0) + 1
     start_day = earliest.astimezone(timezone).date()
