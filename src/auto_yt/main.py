@@ -5571,6 +5571,21 @@ def _schedule_youtube_processing_poll(
     return True
 
 
+def _pause_fb_crosspost_browser_job(job: dict, exc: Exception) -> bool:
+    if str(job.get("job_type") or "") != "fb_crosspost":
+        return False
+    payload = job.get("payload") or {}
+    item_id = int(payload.get("item_id") or 0)
+    if not item_id:
+        return False
+    fb_crossposter_service.pause_fb_browser_checkpoint(
+        item_id,
+        exc,
+        sys_job_id=job["id"],
+    )
+    return True
+
+
 def _handle_production_job_error(job: dict, exc: Exception) -> None:
     safe_error = security_logging.redact_sensitive(str(exc))
     workflow = db.get_youtube_publish_workflow_by_job(job["id"])
@@ -5597,6 +5612,8 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
         )
         return
     if isinstance(exc, channel_scanner_service.BrowserAutomationBlocked):
+        if _pause_fb_crosspost_browser_job(job, exc):
+            return
         _pause_youtube_publish_job(
             job,
             message=safe_error,
@@ -5610,6 +5627,8 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
         exc,
         channel_scanner_service.BrowserAutomationTemporarilyUnavailable,
     ):
+        if _pause_fb_crosspost_browser_job(job, exc):
+            return
         if _schedule_youtube_publish_recovery(job, safe_error):
             return
         _pause_youtube_publish_job(
@@ -5723,6 +5742,15 @@ def _execute_fb_crosspost_job(job: dict) -> None:
     item_id = int(payload.get("item_id") or 0)
     task_id = payload.get("task_id")
     if not item_id:
+        target_page_id = payload.get("page_id") or payload.get("target_page_id")
+        days_ahead = int(payload.get("days_ahead") or 0)
+        if target_page_id and days_ahead:
+            fb_crossposter_service.start_schedule_ahead_batch(
+                target_page_id=str(target_page_id),
+                days_ahead=days_ahead,
+                existing_sys_job_id=job["id"],
+            )
+            return
         db.update_system_job(job["id"], status="completed", progress="Không tìm thấy item_id trong payload.")
         return
 
@@ -5760,7 +5788,7 @@ _browser_waiting_last_check_at = 0.0
 def _browser_cdp_blocked_error(error: str) -> bool:
     normalized = str(error or "").strip().lower()
     return (
-        "không có cổng cdp" in normalized
+        ("không có cổng" in normalized and "cdp" in normalized)
         or ("không được bật" in normalized and "cdp" in normalized)
         or "running without cdp" in normalized
     )
@@ -5797,6 +5825,34 @@ def _recover_legacy_browser_cdp_blocked_jobs() -> int:
                 workflow_stage="browser_preflight",
             )
             recovered += 1
+
+    recovered_fb_items: set[int] = set()
+    for job in db.list_system_jobs(limit=500, job_type="fb_crosspost"):
+        if str(job.get("status") or "") not in {"error", "failed"}:
+            continue
+        if not _browser_cdp_blocked_error(str(job.get("error") or "")):
+            continue
+        item_id = int((job.get("payload") or {}).get("item_id") or 0)
+        if not item_id or item_id in recovered_fb_items:
+            continue
+        queue_item = db.get_fb_crossposter_queue_item(item_id)
+        if not fb_crossposter_service.fb_browser_checkpoint_is_safe_to_resume(
+            queue_item
+        ):
+            continue
+        active_job = fb_crossposter_service.get_active_fb_crosspost_job(item_id)
+        if active_job and str(active_job.get("id") or "") != str(job["id"]):
+            recovered_fb_items.add(item_id)
+            continue
+        fb_crossposter_service.pause_fb_browser_checkpoint(
+            item_id,
+            RuntimeError(str(job.get("error") or "Profile browser chưa sẵn sàng cho tự động hóa.")),
+            sys_job_id=job["id"],
+            phase=fb_crossposter_service.FB_BROWSER_CDP_CHECKPOINT,
+            screenshot_path=str((queue_item or {}).get("checkpoint_screenshot") or ""),
+        )
+        recovered_fb_items.add(item_id)
+        recovered += 1
     return recovered
 
 
@@ -5868,6 +5924,57 @@ def _resume_browser_waiting_publish_jobs() -> None:
                         production_progress="Profile đã sẵn sàng; đang chờ tiếp tục upload",
                         blocking_reason="",
                     )
+
+        for job in db.list_system_jobs(limit=500, job_type="fb_crosspost"):
+            result = dict(job.get("result") or {})
+            if (
+                str(job.get("status") or "") != "paused"
+                or result.get("attention_required")
+                != fb_crossposter_service.FB_BROWSER_CDP_ATTENTION
+            ):
+                continue
+            item_id = int((job.get("payload") or {}).get("item_id") or 0)
+            queue_item = db.get_fb_crossposter_queue_item(item_id)
+            if not fb_crossposter_service.fb_browser_checkpoint_is_safe_to_resume(
+                queue_item
+            ):
+                continue
+            settings = db.get_fb_crossposter_runtime_settings(
+                str((queue_item or {}).get("target_page_id") or "")
+            )
+            profile_id = str(
+                settings.get("target_gpm_profile_id")
+                or settings.get("source_gpm_profile_id")
+                or ""
+            ).strip()
+            if not profile_id:
+                continue
+            readiness = channel_scanner_service.inspect_profile_browser_readiness(
+                profile_id
+            )
+            if readiness.get("busy"):
+                continue
+            try:
+                channel_scanner_service.ensure_profile_automation_ready(profile_id)
+            except (
+                channel_scanner_service.BrowserAutomationBlocked,
+                channel_scanner_service.BrowserAutomationTemporarilyUnavailable,
+            ):
+                continue
+
+            result.pop("attention_required", None)
+            result.pop("missing_configuration", None)
+            db.update_system_job(
+                job["id"],
+                status="queued",
+                progress="Profile đã sẵn sàng; đang chờ tiếp tục đăng Facebook",
+                result_json=result,
+                error="",
+                started_at="",
+                finished_at="",
+                next_retry_at="",
+                cancel_requested=0,
+            )
     finally:
         _browser_waiting_check_lock.release()
 
@@ -7065,6 +7172,19 @@ def _run_system_job_center_action(
             "Job không hỗ trợ thao tác này ở trạng thái hiện tại."
         )
     if action == "retry":
+        if str(job.get("job_type") or "") == "fb_crosspost":
+            item_id = int((job.get("payload") or {}).get("item_id") or 0)
+            active_job = None
+            if item_id:
+                active_job = fb_crossposter_service.get_active_fb_crosspost_job(
+                    item_id,
+                    exclude_job_id=job_id,
+                )
+            if active_job:
+                raise JobCenterActionNotAllowedError(
+                    "Queue item Facebook này đã có một job đang chờ hoặc đang chạy. "
+                    "Hãy tiếp tục job hiện có để tránh đăng trùng."
+                )
         updated_job = db.retry_system_job(job_id)
         if str(job.get("job_type")) == "video_generation":
             v_id = job.get("video_id") or (job.get("payload") or {}).get("video_id")
@@ -7073,35 +7193,6 @@ def _run_system_job_center_action(
                     clear_checkpoint(int(v_id))
                 except Exception:
                     pass
-        if str(job.get("job_type")) == "fb_crosspost":
-            try:
-                from auto_yt.services import fb_crossposter_service
-                raw_payload = job.get("payload") or job.get("payload_json") or {}
-                if isinstance(raw_payload, str):
-                    try:
-                        payload = json.loads(raw_payload)
-                    except Exception:
-                        payload = {}
-                else:
-                    payload = dict(raw_payload)
-                page_id = payload.get("page_id") or payload.get("target_page_id")
-                days_ahead = payload.get("days_ahead")
-                item_id = payload.get("item_id")
-                if page_id and days_ahead:
-                    fb_crossposter_service.start_schedule_ahead_batch(
-                        target_page_id=str(page_id),
-                        days_ahead=int(days_ahead),
-                        existing_sys_job_id=job_id,
-                    )
-                elif item_id:
-                    threading.Thread(
-                        target=fb_crossposter_service.process_queue_item_jit,
-                        args=(int(item_id),),
-                        kwargs={"sys_job_id": job_id},
-                        daemon=True,
-                    ).start()
-            except Exception as retry_err:
-                logger.warning("Could not re-trigger fb_crosspost worker on retry: %s", retry_err)
     elif action == "pause":
         updated_job = db.pause_system_job(job_id)
     elif action == "force_stop":
@@ -7111,7 +7202,6 @@ def _run_system_job_center_action(
             process_registry.kill_job_processes(f"video:{v_id}")
         if str(job.get("job_type")) == "fb_crosspost":
             try:
-                from auto_yt.services import fb_crossposter_service
                 task_id = (job.get("payload") or {}).get("task_id")
                 fb_crossposter_service.cancel_schedule_ahead_batch(task_id=task_id)
             except Exception:
@@ -7123,7 +7213,6 @@ def _run_system_job_center_action(
         updated_job = db.request_cancel_system_job(job_id)
         if str(job.get("job_type")) == "fb_crosspost":
             try:
-                from auto_yt.services import fb_crossposter_service
                 task_id = (job.get("payload") or {}).get("task_id")
                 fb_crossposter_service.cancel_schedule_ahead_batch(task_id=task_id)
             except Exception:

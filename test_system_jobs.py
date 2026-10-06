@@ -1,11 +1,12 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from auto_yt import main
 from auto_yt.services import database
 from auto_yt.services import generation_checkpoint
+from auto_yt.services import channel_scanner_service, fb_crossposter_service
 from auto_yt.services.chatgpt_runtime import (
     CHATGPT_LOGIN_REQUIRED_MESSAGE,
     ChatGPTAttentionRequiredError,
@@ -45,6 +46,45 @@ class SystemJobTests(unittest.TestCase):
             main._automatic_login_active = False
             main._automatic_login_job_ids.clear()
             main._automatic_login_last_failure_at = 0.0
+
+    def create_fb_browser_item(self, page_id: str, youtube_id: str) -> int:
+        database.save_fb_crossposter_settings(
+            {
+                "target_fb_page_id": page_id,
+                "target_fb_page_name": "Test Facebook Page",
+                "target_gpm_profile_id": "test-gpm-profile",
+                "upload_mode": "browser",
+                "convert_to_vertical": False,
+            },
+            page_id=page_id,
+        )
+        database.upsert_fb_crossposter_queue_items(
+            [
+                {
+                    "youtube_id": youtube_id,
+                    "youtube_url": f"https://www.youtube.com/watch?v={youtube_id}",
+                    "original_title": "Test Facebook video",
+                }
+            ],
+            target_page_id=page_id,
+        )
+        item = database.get_fb_crossposter_queue(
+            target_page_id=page_id,
+            page_size=1,
+        )["items"][0]
+        database.update_fb_crossposter_queue_item(
+            int(item["id"]),
+            {"scheduled_publish_time": int(main.time.time()) + 3600},
+        )
+        return int(item["id"])
+
+    def create_fb_job(self, job_id: str, item_id: int) -> dict:
+        return database.create_system_job(
+            job_id=job_id,
+            job_type="fb_crosspost",
+            title="Facebook browser upload",
+            payload={"item_id": item_id},
+        )
 
     def test_startup_does_not_activate_comment_jobs_that_can_open_gpm(self):
         with (
@@ -185,6 +225,182 @@ class SystemJobTests(unittest.TestCase):
             database.claim_next_system_job("video_generation")["id"],
             "pausable",
         )
+
+    def test_fb_cdp_block_pauses_queue_and_system_job(self):
+        item_id = self.create_fb_browser_item("page-cdp-pause", "yt-cdp-pause")
+        self.create_fb_job("fb-cdp-pause", item_id)
+        media_directory = Path(self.temp_directory.name) / "fb-media"
+        media_directory.mkdir()
+        (media_directory / f"yt-cdp-pause_{item_id}.mp4").write_bytes(b"video")
+        (media_directory / f"yt-cdp-pause_{item_id}.jpg").write_bytes(b"x" * 1024)
+        blocked = channel_scanner_service.BrowserAutomationBlocked(
+            {
+                "profile_id": "test-gpm-profile",
+                "profile_name": "Test GPM Profile",
+            }
+        )
+
+        with (
+            patch.object(fb_crossposter_service, "TEMP_DOWNLOAD_DIR", media_directory),
+            patch.object(
+                fb_crossposter_service,
+                "is_valid_video_file",
+                return_value=True,
+            ),
+            patch(
+                "auto_yt.services.fb_reels_browser_service.schedule_reel_via_gpm",
+                new=AsyncMock(side_effect=blocked),
+            ),
+        ):
+            result = fb_crossposter_service.process_queue_item_jit(
+                item_id,
+                sys_job_id="fb-cdp-pause",
+            )
+            resumed_result = fb_crossposter_service.resume_fb_crossposter_queue_item(
+                item_id
+            )
+
+        queue_item = database.get_fb_crossposter_queue_item(item_id)
+        system_job = database.get_system_job("fb-cdp-pause")
+        self.assertEqual(result["status"], "checkpoint_paused")
+        self.assertEqual(resumed_result["status"], "checkpoint_paused")
+        self.assertEqual(queue_item["status"], "checkpoint_paused")
+        self.assertEqual(queue_item["checkpoint_phase"], "CP3_CDP_READY")
+        self.assertEqual(system_job["status"], "paused")
+        self.assertEqual(
+            system_job["result"]["attention_required"],
+            "fb_browser_cdp",
+        )
+        self.assertEqual(system_job["finished_at"], "")
+        matching_jobs = [
+            job
+            for job in database.list_system_jobs(job_type="fb_crosspost")
+            if int((job.get("payload") or {}).get("item_id") or 0) == item_id
+        ]
+        self.assertEqual([job["id"] for job in matching_jobs], ["fb-cdp-pause"])
+
+    def test_fb_cdp_wait_auto_resumes_only_safe_checkpoint(self):
+        item_id = self.create_fb_browser_item("page-cdp-resume", "yt-cdp-resume")
+        self.create_fb_job("fb-cdp-resume", item_id)
+        blocked = channel_scanner_service.BrowserAutomationBlocked(
+            {"profile_id": "test-gpm-profile"}
+        )
+        fb_crossposter_service.pause_fb_browser_checkpoint(
+            item_id,
+            blocked,
+            sys_job_id="fb-cdp-resume",
+        )
+        main._browser_waiting_last_check_at = 0.0
+
+        with (
+            patch.object(
+                main.channel_scanner_service,
+                "inspect_profile_browser_readiness",
+                return_value={"busy": False, "automation_ready": True},
+            ),
+            patch.object(
+                main.channel_scanner_service,
+                "ensure_profile_automation_ready",
+                return_value={"automation_ready": True},
+            ),
+        ):
+            main._resume_browser_waiting_publish_jobs()
+
+        resumed = database.get_system_job("fb-cdp-resume")
+        self.assertEqual(resumed["status"], "queued")
+        self.assertEqual(resumed["error"], "")
+        self.assertNotIn("attention_required", resumed["result"])
+
+    def test_legacy_fb_cdp_failure_is_migrated_to_paused(self):
+        item_id = self.create_fb_browser_item("page-cdp-legacy", "yt-cdp-legacy")
+        self.create_fb_job("fb-cdp-legacy", item_id)
+        database.update_fb_checkpoint(
+            item_id,
+            "CP3_CDP_READY",
+            status="checkpoint_paused",
+            can_resume=True,
+            error_message="Trình duyệt đang mở nhưng không có cổng tự động hóa CDP",
+        )
+        database.update_system_job(
+            "fb-cdp-legacy",
+            status="failed",
+            error="Trình duyệt đang mở nhưng không có cổng tự động hóa CDP",
+            finished_at=database.utc_now(),
+        )
+
+        recovered = main._recover_legacy_browser_cdp_blocked_jobs()
+
+        migrated = database.get_system_job("fb-cdp-legacy")
+        self.assertEqual(recovered, 1)
+        self.assertEqual(migrated["status"], "paused")
+        self.assertEqual(
+            migrated["result"]["attention_required"],
+            "fb_browser_cdp",
+        )
+
+    def test_fb_checkpoint_after_cdp_requires_manual_review(self):
+        item_id = self.create_fb_browser_item("page-fb-review", "yt-fb-review")
+        self.create_fb_job("fb-review", item_id)
+        fb_crossposter_service.pause_fb_browser_checkpoint(
+            item_id,
+            RuntimeError("Facebook composer changed"),
+            sys_job_id="fb-review",
+            phase="CP5_ASSET_UPLOADED",
+        )
+        main._browser_waiting_last_check_at = 0.0
+
+        with patch.object(
+            main.channel_scanner_service,
+            "ensure_profile_automation_ready",
+        ) as ensure_ready:
+            main._resume_browser_waiting_publish_jobs()
+
+        paused = database.get_system_job("fb-review")
+        self.assertEqual(paused["status"], "paused")
+        self.assertEqual(
+            paused["result"]["attention_required"],
+            "fb_browser_review",
+        )
+        ensure_ready.assert_not_called()
+
+    def test_fb_retry_is_owned_only_by_production_queue(self):
+        item_id = self.create_fb_browser_item("page-fb-retry", "yt-fb-retry")
+        self.create_fb_job("fb-retry", item_id)
+        database.update_system_job("fb-retry", status="failed", error="old error")
+
+        with (
+            patch.object(main.threading, "Thread") as thread_class,
+            patch.object(main, "_kick_production_queue") as kick_production,
+        ):
+            result = main._run_system_job_center_action(
+                "fb-retry",
+                "retry",
+                kick_queues=True,
+            )
+
+        self.assertEqual(result["status"], "queued")
+        thread_class.assert_not_called()
+        kick_production.assert_called_once_with()
+
+    def test_fb_retry_rejects_duplicate_active_item_job(self):
+        item_id = self.create_fb_browser_item("page-fb-dedup", "yt-fb-dedup")
+        self.create_fb_job("fb-active", item_id)
+        database.update_system_job("fb-active", status="paused")
+        self.create_fb_job("fb-duplicate", item_id)
+        database.update_system_job("fb-duplicate", status="failed")
+
+        with self.assertRaisesRegex(
+            main.JobCenterActionNotAllowedError,
+            "đã có một job đang chờ hoặc đang chạy",
+        ):
+            main._run_system_job_center_action(
+                "fb-duplicate",
+                "retry",
+                kick_queues=False,
+            )
+
+        self.assertEqual(database.get_system_job("fb-active")["status"], "paused")
+        self.assertEqual(database.get_system_job("fb-duplicate")["status"], "failed")
 
     def test_error_video_job_resumes_from_checkpoint_without_clearing_it(self):
         video_id = database.save_video(
@@ -1235,7 +1451,10 @@ class SystemJobTests(unittest.TestCase):
         yt_res = main.list_jobs(job_type="youtube_publish")
         self.assertEqual(len(yt_res["items"]), 1)
         self.assertEqual(yt_res["items"][0]["id"], "job-upload-1")
-        self.assertEqual(yt_res["items"][0]["type_label"], "Upload / đặt lịch YouTube")
+        self.assertEqual(
+            yt_res["items"][0]["type_label"],
+            "Upload YouTube (Trình duyệt GPM)",
+        )
 
         fb_res = main.list_jobs(job_type="fb_crosspost")
         self.assertEqual(len(fb_res["items"]), 1)
@@ -1296,6 +1515,9 @@ class SystemJobTests(unittest.TestCase):
             retried = main.retry_job("fb-crosspost-task_retry1")
             self.assertTrue(retried["success"])
             job = database.get_system_job("fb-crosspost-task_retry1")
+            self.assertEqual(job["status"], "queued")
+            mock_start.assert_not_called()
+            main._execute_fb_crosspost_job(job)
             mock_start.assert_called_once_with(
                 target_page_id="page_123",
                 days_ahead=2,
@@ -1313,6 +1535,10 @@ class SystemJobTests(unittest.TestCase):
         with patch("auto_yt.services.fb_crossposter_service.start_schedule_ahead_batch") as mock_start:
             retried = main.retry_job("fb-crosspost-task_failed1")
             self.assertTrue(retried["success"])
+            job = database.get_system_job("fb-crosspost-task_failed1")
+            self.assertEqual(job["status"], "queued")
+            mock_start.assert_not_called()
+            main._execute_fb_crosspost_job(job)
             mock_start.assert_called_once_with(
                 target_page_id="page_456",
                 days_ahead=3,

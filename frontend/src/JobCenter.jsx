@@ -691,8 +691,10 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                 ? job.automatic_login === 'pending'
                   ? { label: 'Đang Auto Login', color: '#4dd0e1' }
                   : { label: 'Cần xác minh ChatGPT', color: '#f1c40f' }
-                : job.status === 'paused' && job.attention_required === 'youtube_browser_cdp'
+                : job.status === 'paused' && ['youtube_browser_cdp', 'fb_browser_cdp'].includes(job.attention_required)
                   ? { label: 'Chờ Profile CDP', color: '#f1c40f' }
+                : job.status === 'paused' && job.attention_required === 'fb_browser_review'
+                  ? { label: 'Cần kiểm tra Facebook', color: '#f1c40f' }
                 : job.status === 'paused' && job.attention_required?.startsWith('youtube_')
                   ? job.missing_configuration?.length > 0
                     ? { label: 'Cần cấu hình', color: '#f1c40f' }
@@ -827,6 +829,13 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                         )}
                       </div>
                     )}
+                    {job.status === 'paused' && job.attention_required?.startsWith('fb_browser_') && (
+                      <div style={{ color: '#f1c40f', marginTop: '9px', fontSize: '0.84em' }}>
+                        {job.attention_required === 'fb_browser_cdp'
+                          ? 'Profile chưa sẵn sàng cho CDP. Tool giữ nguyên trình duyệt đang mở; khi Profile được đóng thủ công lúc rảnh và mở lại bằng Tool, job sẽ tự tiếp tục từ checkpoint an toàn.'
+                          : 'Tác vụ đã đi qua bước kết nối CDP nên Tool giữ nguyên checkpoint để tránh đăng trùng. Hãy kiểm tra Facebook trước khi bấm “Tiếp tục”.'}
+                      </div>
+                    )}
                   </div>
 
                   <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
@@ -863,7 +872,7 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                     )}
                     {job.can_resume && (
                       <button className="btn-secondary" disabled={Boolean(actionId)} style={{ padding: '8px 12px' }} onClick={() => runAction(job, 'resume')}>
-                        {job.attention_required === 'youtube_browser_cdp' ? 'Kiểm tra lại' : 'Tiếp tục'}
+                        {['youtube_browser_cdp', 'fb_browser_cdp'].includes(job.attention_required) ? 'Kiểm tra lại' : 'Tiếp tục'}
                       </button>
                     )}
                     {job.can_cancel && !job.cancel_requested && (

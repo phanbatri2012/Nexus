@@ -33,7 +33,12 @@ from yt_dlp import YoutubeDL
 from auto_yt.services.youtube_downloader import ensure_ffmpeg_directory
 import auto_yt.services.database as db
 from auto_yt.paths import DATA_DIR
-from auto_yt.services import gpm_service, proxy_utils, security_logging
+from auto_yt.services import (
+    channel_scanner_service,
+    gpm_service,
+    proxy_utils,
+    security_logging,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +54,9 @@ MAX_CUSTOM_LABELS = 8
 MAX_META_CONTENT_TAGS = 10
 META_PROCESSING_STALE_SECONDS = 2 * 60 * 60
 MIN_REPAIR_LEAD_MINUTES = 30
+FB_BROWSER_CDP_CHECKPOINT = "CP3_CDP_READY"
+FB_BROWSER_CDP_ATTENTION = "fb_browser_cdp"
+FB_BROWSER_REVIEW_ATTENTION = "fb_browser_review"
 
 # Concurrency guards for sync
 _sync_lock = threading.Lock()
@@ -138,6 +146,99 @@ def _get_proxy_for_gpm_profile(gpm_profile_id: str) -> str | None:
         raise proxy_utils.ProxyConfigurationError(
             f"Không đọc được proxy cho GPM Profile {clean_profile_id}: {exc}"
         ) from exc
+
+
+def fb_browser_checkpoint_is_safe_to_resume(item: dict | None) -> bool:
+    """Return whether a paused browser upload is still before any Meta write."""
+    if not item:
+        return False
+    return (
+        str(item.get("status") or "") == "checkpoint_paused"
+        and str(item.get("checkpoint_phase") or "") == FB_BROWSER_CDP_CHECKPOINT
+        and int(item.get("can_resume") or 0) == 1
+        and not str(item.get("fb_post_id") or "").strip()
+        and not str(item.get("upload_session_id") or "").strip()
+        and not str(item.get("upload_video_id") or "").strip()
+    )
+
+
+def get_active_fb_crosspost_job(
+    item_id: int,
+    *,
+    exclude_job_id: str = "",
+) -> dict | None:
+    """Find the system job that currently owns one Facebook queue item."""
+    for job in db.list_active_system_jobs(job_type="fb_crosspost"):
+        if str(job.get("id") or "") == exclude_job_id:
+            continue
+        payload = job.get("payload") or {}
+        if int(payload.get("item_id") or 0) == int(item_id):
+            return job
+    return None
+
+
+def pause_fb_browser_checkpoint(
+    item_id: int,
+    error: Exception,
+    *,
+    sys_job_id: str | None = None,
+    phase: str = FB_BROWSER_CDP_CHECKPOINT,
+    screenshot_path: str = "",
+) -> dict[str, Any]:
+    """Persist one recoverable Facebook browser checkpoint across queue and Job Center."""
+    clean_phase = str(phase or FB_BROWSER_CDP_CHECKPOINT).strip()
+    error_message = security_logging.redact_sensitive(error)
+    normalized_error = error_message.lower()
+    is_cdp_error = isinstance(
+        error,
+        (
+            channel_scanner_service.BrowserAutomationBlocked,
+            channel_scanner_service.BrowserAutomationTemporarilyUnavailable,
+        ),
+    ) or (
+        "cdp" in normalized_error
+        and (
+            "không có cổng" in normalized_error
+            or "không được bật" in normalized_error
+            or "không phản hồi" in normalized_error
+            or "running without cdp" in normalized_error
+        )
+    )
+    is_cdp_wait = clean_phase == FB_BROWSER_CDP_CHECKPOINT and is_cdp_error
+    attention_required = (
+        FB_BROWSER_CDP_ATTENTION if is_cdp_wait else FB_BROWSER_REVIEW_ATTENTION
+    )
+    db.update_fb_checkpoint(
+        item_id,
+        phase=clean_phase,
+        status="checkpoint_paused",
+        screenshot_path=screenshot_path,
+        can_resume=True,
+        error_message=error_message,
+    )
+    result = {
+        "success": False,
+        "status": "checkpoint_paused",
+        "item_id": item_id,
+        "checkpoint_phase": clean_phase,
+        "can_resume": True,
+        "attention_required": attention_required,
+        "missing_configuration": ["browser_cdp"] if is_cdp_wait else [],
+    }
+    if screenshot_path:
+        result["checkpoint_screenshot"] = screenshot_path
+    if sys_job_id:
+        db.update_system_job(
+            sys_job_id,
+            status="paused",
+            progress=f"Tạm dừng tại [{clean_phase}]: {error_message[:80]}",
+            result_json=result,
+            error=error_message,
+            next_retry_at="",
+            cancel_requested=0,
+            finished_at="",
+        )
+    return result
 
 
 def sanitize_fb_token(raw_token: str | None) -> str:
@@ -2741,6 +2842,19 @@ def process_queue_item_jit(
     if not item:
         raise ValueError(f"Không tìm thấy video ID #{item_id} trong hàng đợi")
 
+    if not sys_job_id:
+        active_job = get_active_fb_crosspost_job(item_id)
+        if active_job and not parent_task_id and active_job.get("status") == "paused":
+            sys_job_id = str(active_job["id"])
+        elif active_job:
+            return {
+                "success": False,
+                "status": "already_active",
+                "item_id": item_id,
+                "system_job_id": active_job["id"],
+                "message": "Queue item đã được một job Facebook khác xử lý.",
+            }
+
     target_page_id = str(item.get("target_page_id") or "").strip()
     settings = db.get_fb_crossposter_runtime_settings(target_page_id)
     page_id = str(settings.get("target_fb_page_id") or target_page_id).strip()
@@ -3108,35 +3222,22 @@ def process_queue_item_jit(
                 }
             except Exception as browser_err:
                 # STRICT ZERO-FALLBACK: Pause at checkpoint, retain rendered cache, no Graph API fallback!
-                phase = getattr(browser_err, "phase", "CP3_CDP_READY")
+                phase = getattr(browser_err, "phase", FB_BROWSER_CDP_CHECKPOINT)
                 screenshot_path = getattr(browser_err, "screenshot_path", "")
-                err_msg = str(browser_err)
+                err_msg = security_logging.redact_sensitive(browser_err)
                 logger.error(
                     "Upload qua trình duyệt tạm dừng tại Checkpoint [%s] cho video #%d: %s",
                     phase,
                     item_id,
                     err_msg,
                 )
-                db.update_fb_checkpoint(
+                return pause_fb_browser_checkpoint(
                     item_id,
+                    browser_err,
                     phase=phase,
-                    status="checkpoint_paused",
                     screenshot_path=screenshot_path,
-                    can_resume=True,
-                    error_message=err_msg,
+                    sys_job_id=sys_job_id,
                 )
-                if sys_job_id:
-                    try:
-                        db.update_system_job(
-                            sys_job_id,
-                            status="failed",
-                            progress=f"Tạm dừng tại [{phase}]: {err_msg[:80]}",
-                            error=err_msg,
-                            finished_at=db.utc_now(),
-                        )
-                    except Exception:
-                        pass
-                raise RuntimeError(f"Tạm dừng tại Checkpoint [{phase}]: {err_msg}") from browser_err
 
         # API Upload Mode (upload_mode == "api")
         content_tag_ids, skipped_tags = resolve_content_tag_ids(

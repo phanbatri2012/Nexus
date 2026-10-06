@@ -29,6 +29,8 @@ Run browser readiness preflight before reserving a publication slot or selecting
 
 A paused `waiting_for_browser` job may resume automatically only while its workflow is safe to replay: upload offset is zero, no YouTube Video ID is known, and no publication record exists. Legacy failures with the same CDP-blocked signature may be migrated into this state under the same safety guard. Once a remote write may have occurred, require checkpoint reconciliation instead of automatic replay.
 
+Facebook browser crossposts follow the same durable-state rule. A missing or unreachable CDP at `CP3_CDP_READY` must keep both the queue item and its system job paused, and may auto-resume only when there is no Meta post ID or upload session/video ID. Checkpoints after CP3 require manual review because a remote write may already have occurred. Retry and resume actions must return the existing system job to the production queue; they must not launch a second worker thread for the same job.
+
 ChatGPT Browser Service and Google Flow Browser Service are service-owned browsers and retain their dedicated lifecycle managed by the unified Auto_YT start/stop/restart scripts. The persistent channel-browser rule must not weaken their shutdown cleanup.
 
 ### Required regression checks
@@ -41,3 +43,4 @@ ChatGPT Browser Service and Google Flow Browser Service are service-owned browse
 - GPM proxy and fingerprint isolation remain bound to the expected channel profile.
 - A running profile without CDP leaves its PID unchanged and produces a paused, recoverable job instead of `failed_permanent`.
 - Auto-resume never runs for a workflow with uploaded bytes, a YouTube Video ID, or an existing publication.
+- A Facebook CDP wait is displayed as paused in Job Center, not as a failed upload, and retry has one production-queue owner.
