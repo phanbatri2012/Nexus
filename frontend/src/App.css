@@ -106,6 +106,7 @@
 .nav-item[data-view="jobs"]::before { content: '⚡'; }
 .nav-item[data-view="comments"]::before { content: '💬'; }
 .nav-item[data-view="channels"]::before { content: '📺'; }
+.nav-item[data-view="trustbuilder"]::before { content: '🛡️'; }
 .nav-item[data-view="crossposter"]::before { content: '🚀'; }
 .nav-item[data-view="fetcher"]::before { content: '🎬'; }
 .nav-item[data-view="downloader"]::before { content: '📥'; }

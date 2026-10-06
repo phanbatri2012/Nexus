@@ -98,6 +98,8 @@ from auto_yt.services import (
     local_browser_service,
     maintenance_guard,
     security_logging,
+    trust_builder_router,
+    trust_builder_scheduler,
 )
 from auto_yt.services.generation_checkpoint import (
     clear_checkpoint,
@@ -571,6 +573,8 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Accept", "Content-Type", api_security.CSRF_HEADER_NAME],
 )
+
+app.include_router(trust_builder_router.router, prefix="/api/trust-builder")
 
 
 @app.get("/health")

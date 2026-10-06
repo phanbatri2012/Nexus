@@ -36,6 +36,12 @@ export const ROUTE_REGISTRY = {
     aliases: ['/channels', '/channel-hub', '/kenh', '/channel-manager'],
     title: 'Channel Hub'
   },
+  trustbuilder: {
+    id: 'trustbuilder',
+    canonicalPath: '/trust-builder',
+    aliases: ['/trust-builder', '/trustbuilder', '/channel-warmup', '/nuoi-kenh'],
+    title: 'Trust Builder'
+  },
   crossposter: {
     id: 'crossposter',
     canonicalPath: '/Cross-Poster',

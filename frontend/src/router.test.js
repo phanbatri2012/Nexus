@@ -11,7 +11,7 @@ import {
 
 test('registers all 11 primary modules in ROUTE_REGISTRY', () => {
   const expectedKeys = [
-    'dashboard', 'jobs', 'comments', 'channels', 'crossposter',
+    'dashboard', 'jobs', 'comments', 'channels', 'trustbuilder', 'crossposter',
     'fetcher', 'downloader', 'autologin', 'flowlogin', 'tts', 'settings'
   ]
   for (const key of expectedKeys) {
@@ -48,6 +48,8 @@ test('parses primary routes across all 11 menus correctly', () => {
     { url: '/youtube-comments', viewId: 'comments' },
     { url: '/channels', viewId: 'channels' },
     { url: '/channel-hub', viewId: 'channels' },
+    { url: '/trust-builder', viewId: 'trustbuilder' },
+    { url: '/trustbuilder', viewId: 'trustbuilder' },
     { url: '/Cross-Poster', viewId: 'crossposter' },
     { url: '/cross-poster', viewId: 'crossposter' },
     { url: '/crossposter', viewId: 'crossposter' },

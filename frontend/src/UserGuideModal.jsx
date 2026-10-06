@@ -136,6 +136,10 @@ export default function UserGuideModal({ isOpen, onClose }) {
                   <div><b>Tương tác khán giả:</b> Đồng bộ bình luận từ các kênh về một nơi và trả lời tự động để tăng đề xuất cho video.</div>
                 </div>
                 <div className="guide-feature-row">
+                  <span className="guide-feature-tag">Trust Builder</span>
+                  <div><b>Nuôi & Tăng Trust Kênh:</b> Tự động hóa hành vi người xem thật (Search, Watch video đối thủ, Like, Comment, Sub) qua GPM-Login để tích lũy độ uy tín.</div>
+                </div>
+                <div className="guide-feature-row">
                   <span className="guide-feature-tag">Cross-Poster</span>
                   <div><b>Đăng chéo Fanpage:</b> Đẩy video tự động sang Facebook Reels / Fanpage nhằm gia tăng lượng tiếp cận đa nền tảng.</div>
                 </div>

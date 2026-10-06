@@ -1332,6 +1332,55 @@ def init_db():
         )
     """)
 
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS channel_trust_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_db_id INTEGER NOT NULL REFERENCES youtube_channels(id) ON DELETE CASCADE,
+            niche_keywords TEXT NOT NULL DEFAULT '[]',
+            target_channels TEXT NOT NULL DEFAULT '[]',
+            warmup_phase TEXT NOT NULL DEFAULT 'idle',
+            phase_started_at TEXT DEFAULT '',
+            daily_watch_target INTEGER DEFAULT 5,
+            daily_search_target INTEGER DEFAULT 3,
+            daily_like_target INTEGER DEFAULT 3,
+            daily_comment_target INTEGER DEFAULT 1,
+            daily_subscribe_target INTEGER DEFAULT 1,
+            branding_checklist TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'draft',
+            total_videos_watched INTEGER DEFAULT 0,
+            total_searches INTEGER DEFAULT 0,
+            total_likes INTEGER DEFAULT 0,
+            total_comments INTEGER DEFAULT 0,
+            total_subscriptions INTEGER DEFAULT 0,
+            trust_score_estimated INTEGER DEFAULT 0,
+            error_message TEXT DEFAULT '',
+            last_session_at TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(channel_db_id)
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS trust_activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_id INTEGER NOT NULL REFERENCES channel_trust_plans(id) ON DELETE CASCADE,
+            activity_type TEXT NOT NULL,
+            target_url TEXT DEFAULT '',
+            target_title TEXT DEFAULT '',
+            duration_seconds REAL DEFAULT 0,
+            detail_json TEXT DEFAULT '{}',
+            success INTEGER DEFAULT 1,
+            error_message TEXT DEFAULT '',
+            executed_at TEXT NOT NULL
+        )
+    ''')
+
+    c.execute('''
+        CREATE INDEX IF NOT EXISTS idx_trust_activity_plan
+        ON trust_activity_log(plan_id, executed_at DESC)
+    ''')
+
     _migrate_fb_crossposter_queue_composite_unique(conn)
     _migrate_fb_crossposter_meta_state(conn)
     _migrate_channel_schedule_reservations_partial_unique(conn)
@@ -6470,3 +6519,313 @@ def delete_comfyui_workflow_profile(profile_id: str) -> bool:
     conn.commit()
     conn.close()
     return cursor.rowcount > 0
+
+
+# ==============================================================================
+# CHANNEL TRUST PLANS & ACTIVITY LOGS (TRUST BUILDER)
+# ==============================================================================
+
+def _decode_trust_plan(row: sqlite3.Row | dict | None) -> dict | None:
+    if row is None:
+        return None
+    data = dict(row)
+    data["niche_keywords"] = _decode_json_field(data.get("niche_keywords"), [])
+    data["target_channels"] = _decode_json_field(data.get("target_channels"), [])
+    data["branding_checklist"] = _decode_json_field(data.get("branding_checklist"), {})
+    data["total_videos_watched"] = int(data.get("total_videos_watched") or 0)
+    data["total_searches"] = int(data.get("total_searches") or 0)
+    data["total_likes"] = int(data.get("total_likes") or 0)
+    data["total_comments"] = int(data.get("total_comments") or 0)
+    data["total_subscriptions"] = int(data.get("total_subscriptions") or 0)
+    data["trust_score_estimated"] = int(data.get("trust_score_estimated") or 0)
+    data["daily_watch_target"] = int(data.get("daily_watch_target") or 5)
+    data["daily_search_target"] = int(data.get("daily_search_target") or 3)
+    data["daily_like_target"] = int(data.get("daily_like_target") or 3)
+    data["daily_comment_target"] = int(data.get("daily_comment_target") or 1)
+    data["daily_subscribe_target"] = int(data.get("daily_subscribe_target") or 1)
+    return data
+
+
+def _decode_trust_activity_log(row: sqlite3.Row | dict | None) -> dict | None:
+    if row is None:
+        return None
+    data = dict(row)
+    data["detail_json"] = _decode_json_field(data.get("detail_json"), {})
+    data["duration_seconds"] = float(data.get("duration_seconds") or 0.0)
+    data["success"] = bool(data.get("success", 1))
+    return data
+
+
+def create_channel_trust_plan(
+    channel_db_id: int,
+    niche_keywords: list[str] | None = None,
+    target_channels: list[str] | None = None,
+    daily_watch_target: int = 5,
+    daily_search_target: int = 3,
+    daily_like_target: int = 3,
+    daily_comment_target: int = 1,
+    daily_subscribe_target: int = 1,
+    branding_checklist: dict | None = None,
+    status: str = "draft",
+    warmup_phase: str = "idle",
+) -> dict:
+    now = utc_now()
+    keywords_json = json.dumps(niche_keywords or [], ensure_ascii=False)
+    channels_json = json.dumps(target_channels or [], ensure_ascii=False)
+    branding_json = json.dumps(branding_checklist or {}, ensure_ascii=False)
+
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.execute(
+        """
+        INSERT INTO channel_trust_plans (
+            channel_db_id, niche_keywords, target_channels,
+            daily_watch_target, daily_search_target, daily_like_target,
+            daily_comment_target, daily_subscribe_target,
+            branding_checklist, status, warmup_phase,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            channel_db_id, keywords_json, channels_json,
+            daily_watch_target, daily_search_target, daily_like_target,
+            daily_comment_target, daily_subscribe_target,
+            branding_json, status, warmup_phase,
+            now, now
+        )
+    )
+    plan_id = cursor.lastrowid
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM channel_trust_plans WHERE id = ?", (plan_id,)
+    ).fetchone()
+    conn.close()
+    return _decode_trust_plan(row)
+
+
+def get_channel_trust_plan(plan_id: int) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        """
+        SELECT p.*, c.title as channel_title, c.thumbnail_url as channel_thumbnail,
+               c.gpm_profile_id, c.gpm_profile_name, c.gpm_proxy_info,
+               c.publication_timezone
+        FROM channel_trust_plans p
+        LEFT JOIN youtube_channels c ON p.channel_db_id = c.id
+        WHERE p.id = ?
+        """,
+        (plan_id,)
+    ).fetchone()
+    conn.close()
+    return _decode_trust_plan(row)
+
+
+def get_channel_trust_plan_by_channel_id(channel_db_id: int) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        """
+        SELECT p.*, c.title as channel_title, c.thumbnail_url as channel_thumbnail,
+               c.gpm_profile_id, c.gpm_profile_name, c.gpm_proxy_info,
+               c.publication_timezone
+        FROM channel_trust_plans p
+        LEFT JOIN youtube_channels c ON p.channel_db_id = c.id
+        WHERE p.channel_db_id = ?
+        """,
+        (channel_db_id,)
+    ).fetchone()
+    conn.close()
+    return _decode_trust_plan(row)
+
+
+def list_channel_trust_plans() -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT p.*, c.title as channel_title, c.thumbnail_url as channel_thumbnail,
+               c.gpm_profile_id, c.gpm_profile_name, c.gpm_proxy_info,
+               c.publication_timezone
+        FROM channel_trust_plans p
+        LEFT JOIN youtube_channels c ON p.channel_db_id = c.id
+        ORDER BY p.updated_at DESC
+        """
+    ).fetchall()
+    conn.close()
+    return [_decode_trust_plan(row) for row in rows]
+
+
+def update_channel_trust_plan(plan_id: int, **changes) -> dict | None:
+    if not changes:
+        return get_channel_trust_plan(plan_id)
+
+    valid_fields = {
+        "niche_keywords", "target_channels", "warmup_phase", "phase_started_at",
+        "daily_watch_target", "daily_search_target", "daily_like_target",
+        "daily_comment_target", "daily_subscribe_target", "branding_checklist",
+        "status", "total_videos_watched", "total_searches", "total_likes",
+        "total_comments", "total_subscriptions", "trust_score_estimated",
+        "error_message", "last_session_at"
+    }
+
+    set_clauses = []
+    params = []
+    for key, value in changes.items():
+        if key not in valid_fields:
+            continue
+        if key in ("niche_keywords", "target_channels") and isinstance(value, list):
+            value = json.dumps(value, ensure_ascii=False)
+        elif key == "branding_checklist" and isinstance(value, dict):
+            value = json.dumps(value, ensure_ascii=False)
+        set_clauses.append(f"{key} = ?")
+        params.append(value)
+
+    if not set_clauses:
+        return get_channel_trust_plan(plan_id)
+
+    set_clauses.append("updated_at = ?")
+    params.append(utc_now())
+    params.append(plan_id)
+
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        f"UPDATE channel_trust_plans SET {', '.join(set_clauses)} WHERE id = ?",
+        params
+    )
+    conn.commit()
+    row = conn.execute(
+        """
+        SELECT p.*, c.title as channel_title, c.thumbnail_url as channel_thumbnail,
+               c.gpm_profile_id, c.gpm_profile_name, c.gpm_proxy_info,
+               c.publication_timezone
+        FROM channel_trust_plans p
+        LEFT JOIN youtube_channels c ON p.channel_db_id = c.id
+        WHERE p.id = ?
+        """,
+        (plan_id,)
+    ).fetchone()
+    conn.close()
+    return _decode_trust_plan(row)
+
+
+def delete_channel_trust_plan(plan_id: int) -> bool:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    cursor = conn.execute(
+        "DELETE FROM channel_trust_plans WHERE id = ?", (plan_id,)
+    )
+    conn.commit()
+    conn.close()
+    return cursor.rowcount > 0
+
+
+def create_trust_activity_log(
+    plan_id: int,
+    activity_type: str,
+    target_url: str = "",
+    target_title: str = "",
+    duration_seconds: float = 0.0,
+    detail_json: dict | None = None,
+    success: bool = True,
+    error_message: str = "",
+) -> dict:
+    now = utc_now()
+    detail_str = json.dumps(detail_json or {}, ensure_ascii=False)
+
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.execute(
+        """
+        INSERT INTO trust_activity_log (
+            plan_id, activity_type, target_url, target_title,
+            duration_seconds, detail_json, success, error_message, executed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            plan_id, activity_type, target_url, target_title,
+            duration_seconds, detail_str, 1 if success else 0, error_message, now
+        )
+    )
+    log_id = cursor.lastrowid
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM trust_activity_log WHERE id = ?", (log_id,)
+    ).fetchone()
+    conn.close()
+    return _decode_trust_activity_log(row)
+
+
+def list_trust_activity_logs(
+    plan_id: int,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT * FROM trust_activity_log
+        WHERE plan_id = ?
+        ORDER BY executed_at DESC, id DESC
+        LIMIT ? OFFSET ?
+        """,
+        (plan_id, limit, offset)
+    ).fetchall()
+    conn.close()
+    return [_decode_trust_activity_log(row) for row in rows]
+
+
+def get_trust_activity_stats(plan_id: int) -> dict:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    
+    # Total counts by activity_type
+    counts_rows = conn.execute(
+        """
+        SELECT activity_type, COUNT(*) as count, SUM(duration_seconds) as total_duration
+        FROM trust_activity_log
+        WHERE plan_id = ? AND success = 1
+        GROUP BY activity_type
+        """,
+        (plan_id,)
+    ).fetchall()
+    
+    # Total distinct active days
+    days_row = conn.execute(
+        """
+        SELECT COUNT(DISTINCT substr(executed_at, 1, 10)) as active_days
+        FROM trust_activity_log
+        WHERE plan_id = ? AND success = 1
+        """,
+        (plan_id,)
+    ).fetchone()
+    
+    conn.close()
+
+    stats = {
+        "watch_count": 0,
+        "search_count": 0,
+        "like_count": 0,
+        "comment_count": 0,
+        "subscribe_count": 0,
+        "total_watch_seconds": 0.0,
+        "active_days": int(days_row["active_days"]) if days_row else 0,
+    }
+    for row in counts_rows:
+        atype = str(row["activity_type"]).lower()
+        count = int(row["count"] or 0)
+        dur = float(row["total_duration"] or 0.0)
+        if atype == "watch":
+            stats["watch_count"] = count
+            stats["total_watch_seconds"] = dur
+        elif atype == "search":
+            stats["search_count"] = count
+        elif atype == "like":
+            stats["like_count"] = count
+        elif atype == "comment":
+            stats["comment_count"] = count
+        elif atype == "subscribe":
+            stats["subscribe_count"] = count
+
+    return stats
