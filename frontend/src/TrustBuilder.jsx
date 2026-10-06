@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import { useSubRoute } from './router.js'
 import './TrustBuilder.css'
 
 const API_BASE = 'http://127.0.0.1:8080'
@@ -46,6 +47,7 @@ function getActivityIcon(type) {
 }
 
 export default function TrustBuilder() {
+  const [subRoute, setSubRoute] = useSubRoute('trustbuilder', '')
   const [channels, setChannels] = useState([])
   const [plans, setPlans] = useState([])
   const [selectedChannelId, setSelectedChannelId] = useState(null)
@@ -79,6 +81,11 @@ export default function TrustBuilder() {
     setTimeout(() => setFeedback({ message: '', type: '' }), 5000)
   }
 
+  const handleSelectChannel = useCallback((channelId) => {
+    setSelectedChannelId(channelId)
+    setSubRoute(String(channelId), { replace: false })
+  }, [setSubRoute])
+
   // Load channels and trust plans
   const loadInitialData = useCallback(async () => {
     setLoading(true)
@@ -102,8 +109,19 @@ export default function TrustBuilder() {
       setChannels(chList)
       setPlans(planList)
 
-      if (chList.length > 0 && !selectedChannelId) {
-        setSelectedChannelId(chList[0].id)
+      if (chList.length > 0) {
+        let matched = null
+        if (subRoute) {
+          matched = chList.find(c => String(c.id) === String(subRoute) || String(c.channel_id) === String(subRoute))
+        }
+        if (!matched && selectedChannelId) {
+          matched = chList.find(c => c.id === selectedChannelId)
+        }
+        const target = matched || chList[0]
+        setSelectedChannelId(target.id)
+        if (String(subRoute) !== String(target.id)) {
+          setSubRoute(String(target.id), { replace: true })
+        }
       }
     } catch (err) {
       console.error('Error loading trust data:', err)
@@ -111,11 +129,20 @@ export default function TrustBuilder() {
     } finally {
       setLoading(false)
     }
-  }, [apiFetch, selectedChannelId])
+  }, [apiFetch, subRoute, selectedChannelId, setSubRoute])
 
   useEffect(() => {
     loadInitialData()
-  }, [loadInitialData])
+  }, [])
+
+  // Sync state if subRoute changes externally (e.g. browser back/forward or direct link)
+  useEffect(() => {
+    if (!subRoute || channels.length === 0) return
+    const matched = channels.find(c => String(c.id) === String(subRoute) || String(c.channel_id) === String(subRoute))
+    if (matched && matched.id !== selectedChannelId) {
+      setSelectedChannelId(matched.id)
+    }
+  }, [subRoute, channels, selectedChannelId])
 
   // Load plan details & activities when selected channel changes
   const loadPlanDetails = useCallback(async (channelId) => {
@@ -401,7 +428,7 @@ export default function TrustBuilder() {
                   <div
                     key={ch.id}
                     className={`trust-channel-card ${isSelected ? 'active' : ''}`}
-                    onClick={() => setSelectedChannelId(ch.id)}
+                    onClick={() => handleSelectChannel(ch.id)}
                   >
                     <img
                       src={ch.thumbnail_url || '/logoNexus.png'}

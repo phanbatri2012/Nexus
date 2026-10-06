@@ -101,9 +101,24 @@ test('parses sub-routes for Channel Hub tabs (/channels/facebook, /channels/gpm)
   assert.deepEqual(gpmRoute.segments, ['gpm'])
 })
 
+test('parses sub-routes for Trust Builder (/trust-builder/1, /trust-builder/UC12345)', () => {
+  const numRoute = parseRoute('/trust-builder/1')
+  assert.equal(numRoute.viewId, 'trustbuilder')
+  assert.equal(numRoute.subPath, '1')
+  assert.deepEqual(numRoute.segments, ['1'])
+  assert.equal(numRoute.canonicalPath, '/trust-builder/1')
+
+  const channelIdRoute = parseRoute('/trust-builder/UC123456789')
+  assert.equal(channelIdRoute.viewId, 'trustbuilder')
+  assert.equal(channelIdRoute.subPath, 'UC123456789')
+  assert.deepEqual(channelIdRoute.segments, ['UC123456789'])
+  assert.equal(channelIdRoute.canonicalPath, '/trust-builder/UC123456789')
+})
+
 test('builds canonical URLs with sub-paths and query parameters', () => {
   assert.equal(buildPath('crossposter'), '/Cross-Poster')
   assert.equal(buildPath('crossposter', 'abc/xyz'), '/Cross-Poster/abc/xyz')
+  assert.equal(buildPath('trustbuilder', '1'), '/trust-builder/1')
   assert.equal(
     buildPath('jobs', '', { status: 'failed', search: 'reels' }),
     '/jobs?status=failed&search=reels'
