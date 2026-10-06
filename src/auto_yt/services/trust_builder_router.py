@@ -30,6 +30,7 @@ class TrustPlanCreateRequest(BaseModel):
     daily_like_target: int = 3
     daily_comment_target: int = 1
     daily_subscribe_target: int = 1
+    min_watch_minutes: int = 10
     warmup_phase: str = "phase_1_consumer"
 
 
@@ -41,6 +42,7 @@ class TrustPlanUpdateRequest(BaseModel):
     daily_like_target: Optional[int] = None
     daily_comment_target: Optional[int] = None
     daily_subscribe_target: Optional[int] = None
+    min_watch_minutes: Optional[int] = None
     warmup_phase: Optional[str] = None
     status: Optional[str] = None
     branding_checklist: Optional[dict] = None
@@ -85,6 +87,7 @@ def create_plan(req: TrustPlanCreateRequest):
         daily_like_target=req.daily_like_target,
         daily_comment_target=req.daily_comment_target,
         daily_subscribe_target=req.daily_subscribe_target,
+        min_watch_minutes=req.min_watch_minutes,
         warmup_phase=req.warmup_phase,
         status="draft",
     )

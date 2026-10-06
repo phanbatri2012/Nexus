@@ -210,6 +210,7 @@ export default function TrustBuilder() {
           daily_like_target: 3,
           daily_comment_target: 1,
           daily_subscribe_target: 1,
+          min_watch_minutes: 10,
           warmup_phase: 'phase_1_consumer'
         })
       })
@@ -624,6 +625,23 @@ export default function TrustBuilder() {
                         value={selectedPlan.daily_watch_target}
                         onChange={(e) => handleUpdatePlan({ daily_watch_target: Number(e.target.value) })}
                       />
+                    </div>
+
+                    <div className="slider-row">
+                      <div className="slider-label">
+                        <span>⏱️ Thời lượng xem tối thiểu:</span>
+                        <b>{selectedPlan.min_watch_minutes ?? 10} phút / video</b>
+                      </div>
+                      <input
+                        type="range"
+                        min="1"
+                        max="30"
+                        value={selectedPlan.min_watch_minutes ?? 10}
+                        onChange={(e) => handleUpdatePlan({ min_watch_minutes: Number(e.target.value) })}
+                      />
+                      <small style={{ color: '#9ca3af', fontSize: '0.78rem', marginTop: '2px', display: 'block' }}>
+                        * Nếu video ngắn hơn {selectedPlan.min_watch_minutes ?? 10} phút sẽ tự động xem trọn vẹn 100%.
+                      </small>
                     </div>
 
                     <div className="slider-row">

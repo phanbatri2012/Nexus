@@ -1345,6 +1345,7 @@ def init_db():
             daily_like_target INTEGER DEFAULT 3,
             daily_comment_target INTEGER DEFAULT 1,
             daily_subscribe_target INTEGER DEFAULT 1,
+            min_watch_minutes INTEGER DEFAULT 10,
             branding_checklist TEXT NOT NULL DEFAULT '{}',
             status TEXT NOT NULL DEFAULT 'draft',
             total_videos_watched INTEGER DEFAULT 0,
@@ -1360,6 +1361,11 @@ def init_db():
             UNIQUE(channel_db_id)
         )
     ''')
+
+    try:
+        c.execute("ALTER TABLE channel_trust_plans ADD COLUMN min_watch_minutes INTEGER DEFAULT 10")
+    except sqlite3.OperationalError:
+        pass
 
     c.execute('''
         CREATE TABLE IF NOT EXISTS trust_activity_log (
@@ -6543,6 +6549,7 @@ def _decode_trust_plan(row: sqlite3.Row | dict | None) -> dict | None:
     data["daily_like_target"] = int(data.get("daily_like_target") or 3)
     data["daily_comment_target"] = int(data.get("daily_comment_target") or 1)
     data["daily_subscribe_target"] = int(data.get("daily_subscribe_target") or 1)
+    data["min_watch_minutes"] = int(data.get("min_watch_minutes") or 10)
     return data
 
 
@@ -6565,6 +6572,7 @@ def create_channel_trust_plan(
     daily_like_target: int = 3,
     daily_comment_target: int = 1,
     daily_subscribe_target: int = 1,
+    min_watch_minutes: int = 10,
     branding_checklist: dict | None = None,
     status: str = "draft",
     warmup_phase: str = "idle",
@@ -6581,15 +6589,15 @@ def create_channel_trust_plan(
         INSERT INTO channel_trust_plans (
             channel_db_id, niche_keywords, target_channels,
             daily_watch_target, daily_search_target, daily_like_target,
-            daily_comment_target, daily_subscribe_target,
+            daily_comment_target, daily_subscribe_target, min_watch_minutes,
             branding_checklist, status, warmup_phase,
             created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             channel_db_id, keywords_json, channels_json,
             daily_watch_target, daily_search_target, daily_like_target,
-            daily_comment_target, daily_subscribe_target,
+            daily_comment_target, daily_subscribe_target, min_watch_minutes,
             branding_json, status, warmup_phase,
             now, now
         )
@@ -6663,9 +6671,9 @@ def update_channel_trust_plan(plan_id: int, **changes) -> dict | None:
     valid_fields = {
         "niche_keywords", "target_channels", "warmup_phase", "phase_started_at",
         "daily_watch_target", "daily_search_target", "daily_like_target",
-        "daily_comment_target", "daily_subscribe_target", "branding_checklist",
-        "status", "total_videos_watched", "total_searches", "total_likes",
-        "total_comments", "total_subscriptions", "trust_score_estimated",
+        "daily_comment_target", "daily_subscribe_target", "min_watch_minutes",
+        "branding_checklist", "status", "total_videos_watched", "total_searches",
+        "total_likes", "total_comments", "total_subscriptions", "trust_score_estimated",
         "error_message", "last_session_at"
     }
 

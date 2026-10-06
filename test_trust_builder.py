@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from auto_yt.services import database as db, api_security
 from auto_yt.services.trust_builder_actions import (
     action_search_and_pick_video,
+    action_watch_video,
     action_like_video,
     action_comment_video,
     action_subscribe_channel,
@@ -132,3 +133,63 @@ def test_action_subscribe_channel():
         assert mock_btn.click.called
 
     asyncio.run(_run())
+
+
+def test_action_watch_video_duration_short_video():
+    """Short video (< min_watch_seconds, e.g. 240s < 600s) must be watched 100%."""
+    async def _run():
+        mock_page = AsyncMock()
+        mock_page.url = "https://www.youtube.com/watch?v=short123"
+        # Return duration 240s on query, then immediately signal ended
+        mock_page.evaluate.side_effect = [
+            None,   # play
+            240.0,  # duration query
+            True,   # is_ended query
+        ]
+        res = await action_watch_video(
+            mock_page,
+            video_url="https://www.youtube.com/watch?v=short123",
+            min_watch_seconds=600.0,
+            max_watch_seconds=1200.0,
+        )
+        assert res["total_duration"] == 240.0
+        # Retention percentage should be calculated relative to total_duration
+        assert res["retention_percentage"] <= 100.0
+
+    asyncio.run(_run())
+
+
+def test_action_watch_video_duration_long_video():
+    """Long video (e.g. 1800s > 600s) must target at least 600s."""
+    async def _run():
+        mock_page = AsyncMock()
+        mock_page.url = "https://www.youtube.com/watch?v=long123"
+        # First return duration 1800s, then simulate video ending
+        mock_page.evaluate.side_effect = [
+            None,    # play
+            1800.0,  # duration query
+            True,    # is_ended query
+        ]
+        res = await action_watch_video(
+            mock_page,
+            video_url="https://www.youtube.com/watch?v=long123",
+            min_pct=60.0,
+            max_pct=90.0,
+            min_watch_seconds=600.0,
+            max_watch_seconds=1200.0,
+        )
+        assert res["total_duration"] == 1800.0
+
+    asyncio.run(_run())
+
+
+def test_db_trust_plan_min_watch_minutes():
+    """Verify that database stores and returns min_watch_minutes correctly."""
+    db.init_db()
+    # Check that dummy plan decode has min_watch_minutes default
+    decoded = db._decode_trust_plan({"min_watch_minutes": None})
+    assert decoded["min_watch_minutes"] == 10
+
+    decoded_custom = db._decode_trust_plan({"min_watch_minutes": 15})
+    assert decoded_custom["min_watch_minutes"] == 15
+

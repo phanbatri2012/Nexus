@@ -203,7 +203,17 @@ async def run_warmup_session(plan_id: int) -> dict[str, Any]:
                     )
 
                     # 2. Watch Video
-                    watch_res = await action_watch_video(page, video_url=video_url)
+                    min_watch_minutes = int(plan.get("min_watch_minutes") or 10)
+                    min_watch_sec = float(min_watch_minutes * 60)
+                    max_watch_sec = max(min_watch_sec, 1200.0)
+                    watch_res = await action_watch_video(
+                        page,
+                        video_url=video_url,
+                        min_pct=60.0,
+                        max_pct=90.0,
+                        min_watch_seconds=min_watch_sec,
+                        max_watch_seconds=max_watch_sec,
+                    )
                     session_result["watched"] = True
 
                     db.create_trust_activity_log(

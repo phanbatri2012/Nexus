@@ -257,12 +257,17 @@ async def action_search_and_pick_video(
 async def action_watch_video(
     page: Any,
     video_url: str,
-    min_pct: float = 40.0,
-    max_pct: float = 80.0,
-    max_watch_seconds: float = 240.0,
-    min_watch_seconds: float = 30.0,
+    min_pct: float = 60.0,
+    max_pct: float = 90.0,
+    min_watch_seconds: float = 600.0,
+    max_watch_seconds: float = 1200.0,
 ) -> dict[str, Any]:
-    """Watch video naturally with random pauses, seeks, and ad-skipping."""
+    """Watch video naturally with random pauses, scrolls, mouse movements, and ad-skipping.
+    
+    Rule: Minimum watch time is min_watch_seconds (default 10 minutes = 600s).
+    - If total_duration <= min_watch_seconds: Watch 100% of the video to the end.
+    - If total_duration > min_watch_seconds: Watch at least min_watch_seconds (or randomized 60-90% up to max_watch_seconds).
+    """
     logger.info("Bắt đầu xem video: %s", video_url)
     
     current_url = page.url
@@ -291,22 +296,27 @@ async def action_watch_video(
         await asyncio.sleep(1.0)
 
     if total_duration <= 0:
-        total_duration = 300.0  # Fallback 5 minutes
+        total_duration = 600.0  # Fallback 10 minutes
 
     # Calculate target watch duration
-    chosen_pct = random.uniform(min_pct, max_pct) / 100.0
-    calc_seconds = total_duration * chosen_pct
-    target_seconds = min(max_watch_seconds, max(min_watch_seconds, calc_seconds))
+    if total_duration <= min_watch_seconds:
+        target_seconds = total_duration
+        chosen_pct = 1.0
+    else:
+        chosen_pct = random.uniform(min_pct, max_pct) / 100.0
+        calc_seconds = total_duration * chosen_pct
+        effective_max = max(min_watch_seconds, max_watch_seconds)
+        target_seconds = max(min_watch_seconds, min(effective_max, calc_seconds))
 
     logger.info(
-        "Tổng thời lượng: %.1fs | Mục tiêu xem: %.1fs (%.1f%%)",
-        total_duration, target_seconds, chosen_pct * 100
+        "Tổng thời lượng: %.1fs (%.1f phút) | Mục tiêu xem: %.1fs (%.1f phút, %.1f%%)",
+        total_duration, total_duration / 60.0, target_seconds, target_seconds / 60.0, chosen_pct * 100
     )
 
     # Watch loop
     elapsed = 0.0
     step = 5.0
-    has_paused = False
+    last_interaction = 0.0
     
     while elapsed < target_seconds:
         await asyncio.sleep(step)
@@ -315,24 +325,41 @@ async def action_watch_video(
         # Check and handle ads
         await handle_ad_skipping(page)
 
-        # Random human pause (once per watch session, around 40-60% of elapsed time)
-        if not has_paused and elapsed > (target_seconds * 0.4) and random.random() < 0.25:
-            has_paused = True
-            pause_time = random.uniform(3.0, 7.0)
-            logger.debug("Giả lập tạm dừng video trong %.1fs...", pause_time)
-            await page.evaluate("() => document.querySelector('video')?.pause()")
-            # Slight scroll down to mimic reading comments
-            await page.mouse.wheel(0, random.randint(150, 350))
-            await asyncio.sleep(pause_time)
-            # Scroll back up and resume
-            await page.mouse.wheel(0, -random.randint(150, 350))
-            await page.evaluate("() => document.querySelector('video')?.play().catch(() => {})")
+        # Check if video already reached the end
+        try:
+            is_ended = await page.evaluate("() => document.querySelector('video')?.ended || false")
+            if is_ended:
+                logger.info("Video đã phát đến cuối (ended). Hoàn tất xem.")
+                break
+        except Exception:
+            pass
 
-    logger.info("Hoàn tất phiên xem video: %.1fs", elapsed)
+        # Periodic subtle human-like behavior every 70-130s
+        if (elapsed - last_interaction) > random.uniform(70.0, 130.0) and elapsed < (target_seconds - 15.0):
+            last_interaction = elapsed
+            action_choice = random.choice(["scroll_comments", "pause_briefly", "mouse_move"])
+            try:
+                if action_choice == "scroll_comments":
+                    scroll_amount = random.randint(180, 450)
+                    await page.mouse.wheel(0, scroll_amount)
+                    await asyncio.sleep(random.uniform(2.0, 4.5))
+                    await page.mouse.wheel(0, -scroll_amount)
+                elif action_choice == "pause_briefly":
+                    pause_time = random.uniform(2.5, 6.0)
+                    logger.debug("Giả lập tạm dừng video trong %.1fs...", pause_time)
+                    await page.evaluate("() => document.querySelector('video')?.pause()")
+                    await asyncio.sleep(pause_time)
+                    await page.evaluate("() => document.querySelector('video')?.play().catch(() => {})")
+                elif action_choice == "mouse_move":
+                    await page.mouse.move(random.randint(150, 700), random.randint(150, 500))
+            except Exception:
+                pass
+
+    logger.info("Hoàn tất phiên xem video: %.1fs (%.1f phút)", elapsed, elapsed / 60.0)
     return {
         "watched_seconds": elapsed,
         "total_duration": total_duration,
-        "retention_percentage": round((elapsed / total_duration) * 100, 2) if total_duration > 0 else 50.0,
+        "retention_percentage": round((elapsed / total_duration) * 100, 2) if total_duration > 0 else 100.0,
     }
 
 
