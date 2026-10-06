@@ -83,6 +83,17 @@ def _extract_profile_directory(command_line: str) -> str:
     return str(match.group(1) or match.group(2) or "").strip().lower()
 
 
+def _extract_user_data_directory(command_line: str) -> str:
+    match = re.search(
+        r'--user-data-dir=(?:"([^"]+)"|([^\s]+))',
+        str(command_line or ""),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    return str(match.group(1) or match.group(2) or "").replace("/", "\\").strip().lower()
+
+
 def _expand_path(raw_path: str) -> Path:
     return Path(os.path.expandvars(raw_path))
 
@@ -194,13 +205,16 @@ def list_local_browser_profiles() -> list[dict[str, Any]]:
     return results
 
 
-def find_running_local_browser_port(browser_key: str, profile_dir: str) -> dict[str, Any] | None:
-    """Check if the local browser profile is currently running with a CDP port."""
+def find_running_local_browser_process(
+    browser_key: str,
+    profile_dir: str,
+) -> dict[str, Any] | None:
+    """Find the root process for one exact local browser profile."""
     if sys.platform != "win32":
         return None
 
-    _, user_data_path = resolve_browser_paths(browser_key)
-    if not user_data_path:
+    exe_path, user_data_path = resolve_browser_paths(browser_key)
+    if not exe_path or not user_data_path:
         return None
 
     norm_user_data = str(user_data_path).replace("/", "\\").lower()
@@ -209,7 +223,7 @@ def find_running_local_browser_port(browser_key: str, profile_dir: str) -> dict[
     ps_cmd = (
         "$ErrorActionPreference='SilentlyContinue'; "
         "Get-CimInstance Win32_Process | "
-        "Where-Object { $_.CommandLine -like '*--remote-debugging-port=*' } | "
+        f"Where-Object {{ $_.Name -eq '{exe_path.name}' }} | "
         "Select-Object ProcessId, CommandLine | ConvertTo-Json -Compress"
     )
     try:
@@ -227,26 +241,57 @@ def find_running_local_browser_port(browser_key: str, profile_dir: str) -> dict[
         proc_list = [parsed] if isinstance(parsed, dict) else parsed
 
         for proc in proc_list:
-            cmdline = str(proc.get("CommandLine") or "").lower()
-            if norm_user_data in cmdline and _extract_profile_directory(cmdline) == norm_profile:
-                port_match = re.search(r"--remote-debugging-port=(\d+)", cmdline)
-                if port_match:
-                    port = int(port_match.group(1))
-                    try:
-                        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2.0) as vresp:
-                            vdata = json.loads(vresp.read().decode("utf-8"))
-                            return {
-                                "port": port,
-                                "endpoint_url": f"http://127.0.0.1:{port}",
-                                "ws_url": str(vdata.get("webSocketDebuggerUrl") or "").strip(),
-                                "process_id": proc.get("ProcessId"),
-                            }
-                    except Exception:
-                        pass
+            command_line = str(proc.get("CommandLine") or "")
+            normalized_command = command_line.replace("/", "\\").lower()
+            if "--type=" in normalized_command:
+                continue
+            command_user_data = _extract_user_data_directory(command_line)
+            command_profile = _extract_profile_directory(command_line)
+            user_data_matches = command_user_data == norm_user_data or not command_user_data
+            profile_matches = command_profile == norm_profile or (
+                not command_profile and norm_profile == "default"
+            )
+            if not user_data_matches or not profile_matches:
+                continue
+
+            result: dict[str, Any] = {
+                "process_id": proc.get("ProcessId"),
+                "command_line": command_line,
+                "browser_key": browser_key,
+                "profile_dir": profile_dir,
+                "cdp_ready": False,
+            }
+            port_match = re.search(r"--remote-debugging-port=(\d+)", command_line)
+            if not port_match:
+                return result
+            port = int(port_match.group(1))
+            result.update(
+                {
+                    "port": port,
+                    "endpoint_url": f"http://127.0.0.1:{port}",
+                }
+            )
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/json/version",
+                    timeout=2.0,
+                ) as vresp:
+                    vdata = json.loads(vresp.read().decode("utf-8"))
+                result["ws_url"] = str(vdata.get("webSocketDebuggerUrl") or "").strip()
+                result["cdp_ready"] = bool(result["ws_url"])
+            except Exception:
+                pass
+            return result
     except Exception as exc:
         logger.debug("Lỗi khi kiểm tra tiến trình local browser: %s", exc)
 
     return None
+
+
+def find_running_local_browser_port(browser_key: str, profile_dir: str) -> dict[str, Any] | None:
+    """Return CDP coordinates when the exact local profile is automation-ready."""
+    process = find_running_local_browser_process(browser_key, profile_dir)
+    return process if process and process.get("cdp_ready") else None
 
 
 def is_browser_process_running(browser_key: str) -> bool:
@@ -355,9 +400,10 @@ def start_local_browser(
     defn = BROWSER_DEFINITIONS.get(browser_key, {})
     browser_display_name = defn.get("name", browser_key.title())
 
-    # 1. Check if already running with CDP
-    running = find_running_local_browser_port(browser_key, profile_dir)
-    if running:
+    # 1. Inspect only the exact selected profile.
+    running_process = find_running_local_browser_process(browser_key, profile_dir)
+    if running_process and running_process.get("cdp_ready"):
+        running = running_process
         port = running["port"]
         logger.info("Phát hiện %s (Profile %s) đang chạy trên port %s", browser_key, profile_dir, port)
         if target_url:
@@ -380,13 +426,16 @@ def start_local_browser(
             "message": f"Đã mở tab tại {target_url} trên {browser_display_name} (chế độ CDP).",
         }
 
-    # 2. If running without CDP
-    if is_browser_process_running(browser_key):
+    # 2. Preserve an exact profile process that is running without usable CDP.
+    if running_process:
+        cdp_unreachable = bool(running_process.get("port"))
         logger.info(
-            "Trình duyệt %s đang chạy chế độ thông thường. Mở thêm tab mới mà không tắt trình duyệt...",
+            "Trình duyệt %s profile %s đang chạy nhưng CDP %s. Giữ nguyên tiến trình...",
             browser_display_name,
+            profile_dir,
+            "không phản hồi" if cdp_unreachable else "không được bật",
         )
-        if target_url:
+        if target_url and not require_cdp:
             try:
                 subprocess.Popen(
                     [
@@ -409,6 +458,8 @@ def start_local_browser(
             "ws_url": None,
             "already_running": True,
             "already_running_no_cdp": True,
+            "already_running_cdp_unreachable": cdp_unreachable,
+            "process_id": running_process.get("process_id"),
             "browser_key": browser_key,
             "profile_dir": profile_dir,
             "message": f"Đã mở thêm tab '{target_url or 'Trình duyệt'}' trên {browser_display_name} đang chạy.",

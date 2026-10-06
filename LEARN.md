@@ -16,6 +16,19 @@ Browser profiles used for channel operations are persistent. This applies to GPM
 - Manual Open actions always create a new tab and leave it available to the user.
 - Manual Stop remains explicit. For local browsers, target the selected profile process instead of killing every process with the same executable name.
 
+### Browser readiness and durable job recovery
+
+Treat browser process existence and automation readiness as separate states:
+
+- `closed`: the exact assigned profile is not running; Auto_YT may start it once with CDP.
+- `running_cdp_ready`: reconnect and open only a new task-owned tab.
+- `running_without_cdp`: preserve the process, pause the job as `waiting_for_browser`, and require the user to close it manually when idle.
+- `cdp_temporarily_unreachable`: preserve the process and use bounded transient retry; never assume the profile is closed.
+
+Run browser readiness preflight before reserving a publication slot or selecting an upload file. Keep the system job, YouTube publish workflow, and video production state synchronized so a browser-readiness problem is never shown as a permanent upload failure.
+
+A paused `waiting_for_browser` job may resume automatically only while its workflow is safe to replay: upload offset is zero, no YouTube Video ID is known, and no publication record exists. Legacy failures with the same CDP-blocked signature may be migrated into this state under the same safety guard. Once a remote write may have occurred, require checkpoint reconciliation instead of automatic replay.
+
 ChatGPT Browser Service and Google Flow Browser Service are service-owned browsers and retain their dedicated lifecycle managed by the unified Auto_YT start/stop/restart scripts. The persistent channel-browser rule must not weaken their shutdown cleanup.
 
 ### Required regression checks
@@ -26,3 +39,5 @@ ChatGPT Browser Service and Google Flow Browser Service are service-owned browse
 - Every operation creates a new tab and leaves pre-existing tab URLs unchanged.
 - Restarting the backend reconnects to a running profile instead of restarting it.
 - GPM proxy and fingerprint isolation remain bound to the expected channel profile.
+- A running profile without CDP leaves its PID unchanged and produces a paused, recoverable job instead of `failed_permanent`.
+- Auto-resume never runs for a workflow with uploaded bytes, a YouTube Video ID, or an existing publication.

@@ -44,6 +44,7 @@ function videoProductionStatus(video) {
   if (['public', 'published'].includes(video.publish_status) || video.publication_privacy_status === 'public') return { label: 'Đã đăng', color: '#4caf50' }
   if (video.publish_status === 'scheduled') return { label: 'Đã lên lịch', color: '#4dd0e1' }
   if (video.publish_status === 'uploaded_private') return { label: 'Private', color: '#b794f6' }
+  if (video.publish_status === 'waiting_for_browser') return { label: 'Chờ Profile CDP', color: '#f1c40f' }
   if (video.publish_status === 'paused') return { label: 'Tạm dừng đăng', color: '#f1c40f' }
   if (video.publish_status === 'canceled') return { label: 'Đã hủy đăng', color: '#999' }
   if (video.publish_status === 'processing' || video.current_stage === 'processing') return { label: 'YouTube đang xử lý', color: '#4dd0e1' }

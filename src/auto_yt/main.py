@@ -1252,6 +1252,17 @@ def get_gpm_profile_endpoint(profile_id: str, api_url: Optional[str] = Query(Non
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.get("/api/gpm/profiles/{profile_id}/automation-status")
+def get_profile_automation_status_endpoint(profile_id: str):
+    """Inspect browser automation readiness without changing profile state."""
+    try:
+        return channel_scanner_service.inspect_profile_browser_readiness(profile_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @app.post("/api/gpm/profiles/{profile_id}/start")
 def start_gpm_profile_endpoint(
     profile_id: str,
@@ -4756,6 +4767,12 @@ def resume_background_jobs() -> None:
         "fb_crosspost_sync",
     ):
         db.recover_interrupted_system_jobs(prod_job)
+    recovered_browser_jobs = _recover_legacy_browser_cdp_blocked_jobs()
+    if recovered_browser_jobs:
+        logger.info(
+            "Đã chuyển %d job browser thiếu CDP sang trạng thái chờ phục hồi.",
+            recovered_browser_jobs,
+        )
     _reconcile_active_comment_draft_job_duplicates()
     db.pause_queued_attention_jobs()
     _kick_video_queue()
@@ -5449,14 +5466,14 @@ def _pause_youtube_publish_job(
     attention_required: str,
     missing_configuration: list[str],
     workflow_status: str = "paused",
+    workflow_stage: str = "",
 ) -> None:
     workflow = db.get_youtube_publish_workflow_by_job(job["id"])
     if workflow:
-        db.update_youtube_publish_workflow(
-            workflow["id"],
-            status=workflow_status,
-            error=message,
-        )
+        workflow_updates = {"status": workflow_status, "error": message}
+        if workflow_stage:
+            workflow_updates["stage"] = workflow_stage
+        db.update_youtube_publish_workflow(workflow["id"], **workflow_updates)
     result = dict((db.get_system_job(job["id"]) or job).get("result") or {})
     result.update(
         {
@@ -5464,6 +5481,8 @@ def _pause_youtube_publish_job(
             "missing_configuration": list(dict.fromkeys(missing_configuration)),
         }
     )
+    if workflow_stage:
+        result["publish_stage"] = workflow_stage
     db.update_system_job(
         job["id"],
         status="paused",
@@ -5479,6 +5498,7 @@ def _pause_youtube_publish_job(
         db.update_video_production_state(
             int(video_id),
             publish_status=workflow_status,
+            current_stage=workflow_stage or workflow_status,
             production_progress=message,
             blocking_reason=message,
         )
@@ -5511,6 +5531,15 @@ def _schedule_youtube_publish_recovery(job: dict, error: str) -> bool:
     if workflow:
         db.update_youtube_publish_workflow(
             workflow["id"], status="retry_wait", error=error
+        )
+    video_id = job.get("video_id")
+    if video_id:
+        db.update_video_production_state(
+            int(video_id),
+            publish_status="retry_wait",
+            current_stage=str(result.get("publish_stage") or "browser_preflight"),
+            production_progress=f"Lỗi tạm thời; tự thử lại sau {delay_seconds} giây",
+            blocking_reason=error,
         )
     return True
 
@@ -5565,6 +5594,31 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
             message=safe_error,
             attention_required="youtube_publish_config",
             missing_configuration=exc.missing_configuration,
+        )
+        return
+    if isinstance(exc, channel_scanner_service.BrowserAutomationBlocked):
+        _pause_youtube_publish_job(
+            job,
+            message=safe_error,
+            attention_required="youtube_browser_cdp",
+            missing_configuration=["browser_cdp"],
+            workflow_status="waiting_for_browser",
+            workflow_stage="browser_preflight",
+        )
+        return
+    if isinstance(
+        exc,
+        channel_scanner_service.BrowserAutomationTemporarilyUnavailable,
+    ):
+        if _schedule_youtube_publish_recovery(job, safe_error):
+            return
+        _pause_youtube_publish_job(
+            job,
+            message=safe_error,
+            attention_required="youtube_browser_cdp",
+            missing_configuration=[],
+            workflow_status="waiting_for_browser",
+            workflow_stage="browser_preflight",
         )
         return
     if isinstance(exc, browser_youtube_uploader.BrowserUploadNeedsReview):
@@ -5652,6 +5706,14 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
         cancel_requested=0,
         finished_at=db.utc_now(),
     )
+    if workflow and job.get("video_id"):
+        db.update_video_production_state(
+            int(job["video_id"]),
+            publish_status="error",
+            current_stage=str(workflow.get("stage") or "youtube_publish"),
+            production_progress="Tác vụ đăng YouTube thất bại",
+            blocking_reason=safe_error,
+        )
 
 
 def _execute_fb_crosspost_job(job: dict) -> None:
@@ -5690,6 +5752,126 @@ def _execute_fb_crosspost_sync_job(job: dict) -> None:
     )
 
 
+_BROWSER_WAITING_CHECK_INTERVAL_SECONDS = 5.0
+_browser_waiting_check_lock = threading.Lock()
+_browser_waiting_last_check_at = 0.0
+
+
+def _browser_cdp_blocked_error(error: str) -> bool:
+    normalized = str(error or "").strip().lower()
+    return (
+        "không có cổng cdp" in normalized
+        or ("không được bật" in normalized and "cdp" in normalized)
+        or "running without cdp" in normalized
+    )
+
+
+def _browser_workflow_is_safe_to_resume(workflow: dict | None) -> bool:
+    if not workflow:
+        return False
+    return (
+        int(workflow.get("upload_offset") or 0) == 0
+        and not str(workflow.get("youtube_video_id") or "").strip()
+        and not int(workflow.get("publication_id") or 0)
+    )
+
+
+def _recover_legacy_browser_cdp_blocked_jobs() -> int:
+    """Convert pre-readiness CDP failures into recoverable paused jobs."""
+    recovered = 0
+    for job_type in ("youtube_publish", "youtube_upload"):
+        for job in db.list_system_jobs(limit=500, job_type=job_type):
+            if str(job.get("status") or "") not in {"error", "failed"}:
+                continue
+            if not _browser_cdp_blocked_error(str(job.get("error") or "")):
+                continue
+            workflow = db.get_youtube_publish_workflow_by_job(job["id"])
+            if not _browser_workflow_is_safe_to_resume(workflow):
+                continue
+            _pause_youtube_publish_job(
+                job,
+                message=str(job.get("error") or "Profile browser chưa sẵn sàng cho tự động hóa."),
+                attention_required="youtube_browser_cdp",
+                missing_configuration=["browser_cdp"],
+                workflow_status="waiting_for_browser",
+                workflow_stage="browser_preflight",
+            )
+            recovered += 1
+    return recovered
+
+
+def _resume_browser_waiting_publish_jobs() -> None:
+    """Resume safe paused uploads once their assigned profile becomes CDP-ready."""
+    global _browser_waiting_last_check_at
+    now = time.monotonic()
+    if now - _browser_waiting_last_check_at < _BROWSER_WAITING_CHECK_INTERVAL_SECONDS:
+        return
+    if not _browser_waiting_check_lock.acquire(blocking=False):
+        return
+    try:
+        _browser_waiting_last_check_at = now
+        for job_type in ("youtube_publish", "youtube_upload"):
+            for job in db.list_system_jobs(limit=500, job_type=job_type):
+                result = dict(job.get("result") or {})
+                if (
+                    str(job.get("status") or "") != "paused"
+                    or result.get("attention_required") != "youtube_browser_cdp"
+                ):
+                    continue
+                workflow = db.get_youtube_publish_workflow_by_job(job["id"])
+                if not _browser_workflow_is_safe_to_resume(workflow):
+                    continue
+                channel = db.get_youtube_channel(
+                    int((workflow or {}).get("youtube_channel_id") or 0)
+                )
+                profile_id = str((channel or {}).get("gpm_profile_id") or "").strip()
+                if not profile_id:
+                    continue
+                readiness = channel_scanner_service.inspect_profile_browser_readiness(
+                    profile_id
+                )
+                if readiness.get("busy"):
+                    continue
+                try:
+                    channel_scanner_service.ensure_profile_automation_ready(profile_id)
+                except (
+                    channel_scanner_service.BrowserAutomationBlocked,
+                    channel_scanner_service.BrowserAutomationTemporarilyUnavailable,
+                ):
+                    continue
+
+                result.pop("attention_required", None)
+                result.pop("missing_configuration", None)
+                result["publish_stage"] = "browser_preflight"
+                db.update_youtube_publish_workflow(
+                    workflow["id"],
+                    status="reserved",
+                    stage="preflight",
+                    error="",
+                )
+                db.update_system_job(
+                    job["id"],
+                    status="queued",
+                    progress="Profile đã sẵn sàng; đang chờ tiếp tục upload",
+                    result_json=result,
+                    error="",
+                    started_at="",
+                    finished_at="",
+                    next_retry_at="",
+                    cancel_requested=0,
+                )
+                if job.get("video_id"):
+                    db.update_video_production_state(
+                        int(job["video_id"]),
+                        publish_status="queued",
+                        current_stage="preflight",
+                        production_progress="Profile đã sẵn sàng; đang chờ tiếp tục upload",
+                        blocking_reason="",
+                    )
+    finally:
+        _browser_waiting_check_lock.release()
+
+
 _production_coordinator = production_coordinator_service.ProductionCoordinator(
     {
         "visual_scene_plan": _execute_visual_scene_plan_job,
@@ -5700,6 +5882,7 @@ _production_coordinator = production_coordinator_service.ProductionCoordinator(
         "fb_crosspost_sync": _execute_fb_crosspost_sync_job,
     },
     error_handler=_handle_production_job_error,
+    maintenance_handler=_resume_browser_waiting_publish_jobs,
 )
 
 
@@ -6960,7 +7143,10 @@ def _run_system_job_center_action(
             if workflow_status:
                 extra_updates = {}
                 if action in {"resume", "retry"}:
-                    if str(workflow.get("stage") or "") == "needs_review":
+                    if str(workflow.get("stage") or "") in {
+                        "needs_review",
+                        "browser_preflight",
+                    }:
                         extra_updates["stage"] = "preflight"
                     snap = workflow.get("snapshot") or {}
                     if isinstance(snap, dict):
@@ -6976,6 +7162,18 @@ def _run_system_job_center_action(
                 db.update_youtube_publish_workflow(
                     workflow["id"], status=workflow_status, error="", **extra_updates
                 )
+                if action in {"resume", "retry"} and job.get("video_id"):
+                    db.update_video_production_state(
+                        int(job["video_id"]),
+                        publish_status="queued",
+                        current_stage=str(
+                            extra_updates.get("stage")
+                            or workflow.get("stage")
+                            or "preflight"
+                        ),
+                        production_progress="Đang chờ tiếp tục đăng YouTube",
+                        blocking_reason="",
+                    )
     _sync_legacy_job(updated_job)
     if kick_queues:
         _kick_job_queues({str(job["job_type"])})

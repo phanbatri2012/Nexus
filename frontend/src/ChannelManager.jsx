@@ -74,6 +74,7 @@ export default function ChannelManager({
   const [gpmStatus, setGpmStatus] = useState({ online: false, total_profiles: 0, message: '' })
   const [gpmProfiles, setGpmProfiles] = useState([])
   const [gpmBusy, setGpmBusy] = useState(false)
+  const [profileAutomationStatuses, setProfileAutomationStatuses] = useState({})
   const [gpmSearchFilter, setGpmSearchFilter] = useState('')
   const [newChannelGpmProfileId, setNewChannelGpmProfileId] = useState('')
 
@@ -503,9 +504,43 @@ export default function ChannelManager({
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
-      setMessage(`🚀 Đã mở GPM Profile thành công. Bạn có thể thao tác trên trình duyệt.`)
+      let statusData = null
+      try {
+        const statusRes = await fetch(`${API_BASE}/api/gpm/profiles/${encodeURIComponent(profileId)}/automation-status`)
+        statusData = await statusRes.json()
+        if (statusRes.ok) {
+          setProfileAutomationStatuses(current => ({ ...current, [profileId]: statusData }))
+        }
+      } catch {
+        statusData = null
+      }
+      setMessage(statusData?.state === 'running_without_cdp'
+        ? '⚠️ Profile đang mở nhưng thiếu CDP. Tool sẽ không đóng/restart; hãy đóng thủ công rồi mở lại bằng Tool khi không còn tác vụ.'
+        : '🚀 Đã mở GPM Profile thành công. Bạn có thể thao tác trên trình duyệt.')
     } catch (error) {
       setMessage(`❌ Không thể mở Profile GPM: ${error.message}`)
+    } finally {
+      setGpmBusy(false)
+    }
+  }
+
+  const checkProfileAutomationHandler = async (profileId) => {
+    if (!profileId) return
+    setGpmBusy(true)
+    try {
+      const res = await fetch(`${API_BASE}/api/gpm/profiles/${encodeURIComponent(profileId)}/automation-status`)
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      setProfileAutomationStatuses(current => ({ ...current, [profileId]: data }))
+      const labels = {
+        closed: 'Profile đang đóng; Tool sẽ tự mở khi có tác vụ.',
+        running_cdp_ready: 'Profile đang mở và CDP đã sẵn sàng.',
+        running_without_cdp: 'Profile đang mở nhưng thiếu CDP; Tool sẽ không tự đóng hoặc restart.',
+        cdp_temporarily_unreachable: 'Profile có cổng CDP nhưng hiện chưa thể kết nối.'
+      }
+      setMessage(`ℹ️ ${labels[data.state] || data.state}`)
+    } catch (error) {
+      setMessage(`❌ Không thể kiểm tra Profile: ${error.message}`)
     } finally {
       setGpmBusy(false)
     }
@@ -1486,7 +1521,7 @@ export default function ChannelManager({
                   </div>
                 )}
 
-                <div style={{ display: 'grid', gridTemplateColumns: 'minmax(220px, 1fr) auto auto auto auto', gap: 6, marginTop: 10 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'minmax(220px, 1fr) auto auto auto auto auto', gap: 6, marginTop: 10 }}>
                   <select
                     className="version-select"
                     style={{ width: '100%', fontWeight: '500' }}
@@ -1531,6 +1566,15 @@ export default function ChannelManager({
                     className="btn-secondary"
                     type="button"
                     disabled={gpmBusy || !channel.gpm_profile_id}
+                    onClick={() => checkProfileAutomationHandler(channel.gpm_profile_id)}
+                    title="Kiểm tra trạng thái CDP mà không thay đổi trạng thái trình duyệt"
+                  >
+                    🔌 CDP
+                  </button>
+                  <button
+                    className="btn-secondary"
+                    type="button"
+                    disabled={gpmBusy || !channel.gpm_profile_id}
                     onClick={() => stopGpmProfileHandler(channel.gpm_profile_id)}
                     title="Đóng trình duyệt profile GPM này"
                   >
@@ -1549,6 +1593,11 @@ export default function ChannelManager({
                     </span>
                   )}
                 </div>
+                {channel.gpm_profile_id && profileAutomationStatuses[channel.gpm_profile_id] && (
+                  <div className="help-text" style={{ marginTop: 6, color: profileAutomationStatuses[channel.gpm_profile_id].automation_ready ? '#34d399' : '#fbbf24' }}>
+                    CDP: {profileAutomationStatuses[channel.gpm_profile_id].state}
+                  </div>
+                )}
               </div>
 
               {/* Reconnect with OAuth client */}

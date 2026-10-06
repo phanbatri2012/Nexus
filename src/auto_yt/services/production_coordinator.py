@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import threading
 import sqlite3
+import logging
 from collections.abc import Callable
 from pathlib import Path
 
 from auto_yt.services import database as db
 
+logger = logging.getLogger(__name__)
+
 
 JobHandler = Callable[[dict], None]
 ErrorHandler = Callable[[dict, Exception], None]
+MaintenanceHandler = Callable[[], None]
 
 
 class ProductionCoordinator:
@@ -20,10 +24,12 @@ class ProductionCoordinator:
         handlers: dict[str, JobHandler],
         *,
         error_handler: ErrorHandler,
+        maintenance_handler: MaintenanceHandler | None = None,
     ) -> None:
         self._handlers = dict(handlers)
         self._job_types = tuple(handlers)
         self._error_handler = error_handler
+        self._maintenance_handler = maintenance_handler
         self._wake_event = threading.Event()
         self._stop_event = threading.Event()
         self._ready_event = threading.Event()
@@ -100,6 +106,11 @@ class ProductionCoordinator:
                     self._wake_event.clear()
                     continue
                 try:
+                    if self._maintenance_handler is not None:
+                        try:
+                            self._maintenance_handler()
+                        except Exception as exc:
+                            logger.warning("Production maintenance check failed: %s", exc)
                     job = self._claim_next()
                 except sqlite3.OperationalError:
                     self._wake_event.wait(timeout=0.25)

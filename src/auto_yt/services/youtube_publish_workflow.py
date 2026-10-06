@@ -14,6 +14,7 @@ from auto_yt.paths import AUDIO_DIR
 from auto_yt.services import database as db
 from auto_yt.services import (
     browser_youtube_uploader,
+    channel_scanner_service,
     chatgpt_projects,
     publication_scheduler,
     secret_store,
@@ -31,6 +32,7 @@ ACTIVE_WORKFLOW_STATUSES = {
     "paused",
     "retry_wait",
     "reconcile_required",
+    "waiting_for_browser",
 }
 
 
@@ -629,6 +631,8 @@ def execute_browser_publish_workflow(
             ["gpm_profile_id"],
             "Kênh chưa được gán GPM Profile để upload qua trình duyệt.",
         )
+    progress("Đang kiểm tra khả năng tự động hóa của profile...", "browser_preflight", 0)
+    channel_scanner_service.ensure_profile_automation_ready(gpm_profile_id)
     browser_state = dict(
         (workflow.get("snapshot") or context["snapshot"]).get(
             "browser_upload_state"

@@ -25,11 +25,18 @@ class YouTubePublishPipelineTests(unittest.TestCase):
         )
         self.database_patch.start()
         database.init_db()
+        self.browser_readiness_patch = patch.object(
+            youtube_publish_workflow.channel_scanner_service,
+            "ensure_profile_automation_ready",
+            return_value={"state": "running_cdp_ready", "automation_ready": True},
+        )
+        self.browser_readiness_patch.start()
         self.thumbnails_dir = self.root / "thumbnails"
         self.thumbnails_dir.mkdir()
         (self.thumbnails_dir / "publish.png").write_bytes(b"thumbnail")
 
     def tearDown(self):
+        self.browser_readiness_patch.stop()
         self.database_patch.stop()
         self.temporary_directory.cleanup()
 
@@ -1066,6 +1073,125 @@ class YouTubePublishPipelineTests(unittest.TestCase):
         self.assertIsNotNone(publication)
         self.assertEqual(publication["privacy_status"], "private")
 
+    def test_browser_without_cdp_pauses_as_recoverable_waiting_state(self):
+        job, _channel = self._create_publish_job(
+            schedule=False,
+            upload_method="browser",
+        )
+        readiness = {
+            "profile_id": "gpm-profile",
+            "profile_name": "GPM Profile",
+            "state": "running_without_cdp",
+            "automation_ready": False,
+            "requires_user_action": True,
+        }
+        blocked = youtube_publish_workflow.channel_scanner_service.BrowserAutomationBlocked(
+            readiness
+        )
+
+        with patch.object(
+            youtube_publish_workflow.channel_scanner_service,
+            "ensure_profile_automation_ready",
+            side_effect=blocked,
+        ), patch.object(
+            youtube_publish_workflow.browser_youtube_uploader,
+            "upload_video_via_browser",
+        ) as browser_upload:
+            with self.assertRaises(
+                youtube_publish_workflow.channel_scanner_service.BrowserAutomationBlocked
+            ) as error_context:
+                youtube_publish_workflow.execute_publish_job(
+                    job,
+                    progress=lambda *_values: None,
+                    cancel_check=lambda: None,
+                    resolve_default_channel_id=lambda _version: "",
+                    thumbnails_dir=self.thumbnails_dir,
+                )
+
+        browser_upload.assert_not_called()
+        main._handle_production_job_error(job, error_context.exception)
+        paused_job = database.get_system_job(job["id"])
+        workflow = database.get_youtube_publish_workflow_by_job(job["id"])
+        video = database.get_video(job["video_id"])
+        self.assertEqual(paused_job["status"], "paused")
+        self.assertEqual(paused_job["result"]["attention_required"], "youtube_browser_cdp")
+        self.assertEqual(workflow["status"], "waiting_for_browser")
+        self.assertEqual(workflow["stage"], "browser_preflight")
+        self.assertEqual(video["publish_status"], "waiting_for_browser")
+
+        previous_check_at = main._browser_waiting_last_check_at
+        try:
+            main._browser_waiting_last_check_at = 0.0
+            with patch.object(
+                main.channel_scanner_service,
+                "inspect_profile_browser_readiness",
+                return_value={
+                    "state": "running_cdp_ready",
+                    "automation_ready": True,
+                    "busy": False,
+                },
+            ), patch.object(
+                main.channel_scanner_service,
+                "ensure_profile_automation_ready",
+                return_value={
+                    "state": "running_cdp_ready",
+                    "automation_ready": True,
+                },
+            ):
+                main._resume_browser_waiting_publish_jobs()
+        finally:
+            main._browser_waiting_last_check_at = previous_check_at
+
+        resumed_job = database.get_system_job(job["id"])
+        resumed_workflow = database.get_youtube_publish_workflow_by_job(job["id"])
+        resumed_video = database.get_video(job["video_id"])
+        self.assertEqual(resumed_job["status"], "queued")
+        self.assertNotIn("attention_required", resumed_job["result"])
+        self.assertEqual(resumed_workflow["status"], "reserved")
+        self.assertEqual(resumed_workflow["stage"], "preflight")
+        self.assertEqual(resumed_video["publish_status"], "queued")
+        self.assertFalse(
+            main._browser_workflow_is_safe_to_resume(
+                {"upload_offset": 1, "youtube_video_id": "", "publication_id": 0}
+            )
+        )
+
+    def test_legacy_no_cdp_failure_is_migrated_only_when_safe(self):
+        job, channel = self._create_publish_job(
+            schedule=False,
+            upload_method="browser",
+        )
+        workflow, _created = database.reserve_youtube_publish_workflow(
+            video_id=job["video_id"],
+            youtube_channel_id=channel["id"],
+            artifact_id=job["payload"]["artifact_id"],
+            snapshot=job["payload"]["snapshot"],
+            system_job_id=job["id"],
+        )
+        legacy_error = (
+            "Profile GPM đang chạy nhưng không có cổng CDP. "
+            "Hãy đóng profile thủ công."
+        )
+        database.update_youtube_publish_workflow(
+            workflow["id"],
+            status="failed_permanent",
+            error=legacy_error,
+        )
+        database.update_system_job(
+            job["id"],
+            status="error",
+            error=legacy_error,
+        )
+
+        recovered_count = main._recover_legacy_browser_cdp_blocked_jobs()
+
+        recovered_job = database.get_system_job(job["id"])
+        recovered_workflow = database.get_youtube_publish_workflow(workflow["id"])
+        self.assertEqual(recovered_count, 1)
+        self.assertEqual(recovered_job["status"], "paused")
+        self.assertEqual(recovered_workflow["status"], "waiting_for_browser")
+        self.assertEqual(recovered_workflow["stage"], "browser_preflight")
+
     def test_browser_upload_schedule_executes_and_reserves_slot(self):
         job, channel = self._create_publish_job(schedule=True, upload_method="browser")
         fake_browser_result = {
@@ -1430,4 +1556,3 @@ class YouTubePublishPipelineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

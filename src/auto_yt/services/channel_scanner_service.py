@@ -14,6 +14,7 @@ import json
 import logging
 import re
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,11 +25,13 @@ import websocket
 from auto_yt.services import database as db
 from auto_yt.services.gpm_service import (
     find_running_gpm_profile_coordinates,
+    get_cdp_version_info,
     get_gpm_profile_detail,
     gpm_browser_session,
     start_gpm_profile,
 )
 from auto_yt.services.local_browser_service import (
+    find_running_local_browser_process,
     find_running_local_browser_port,
     list_local_browser_profiles,
     local_browser_session,
@@ -36,6 +39,40 @@ from auto_yt.services.local_browser_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+PROFILE_CLOSED = "closed"
+PROFILE_RUNNING_CDP_READY = "running_cdp_ready"
+PROFILE_RUNNING_WITHOUT_CDP = "running_without_cdp"
+PROFILE_CDP_UNREACHABLE = "cdp_temporarily_unreachable"
+
+
+class BrowserAutomationBlocked(RuntimeError):
+    """Raised when a running profile requires explicit user action before automation."""
+
+    def __init__(self, readiness: dict[str, Any]):
+        self.readiness = dict(readiness)
+        profile_name = str(
+            readiness.get("profile_name") or readiness.get("profile_id") or ""
+        )
+        super().__init__(
+            f"Profile '{profile_name}' đang mở nhưng không có cổng CDP. "
+            "Tool giữ nguyên browser. Hãy đóng profile thủ công khi không có tác vụ; "
+            "job sẽ tiếp tục sau khi Tool mở lại profile với CDP."
+        )
+
+
+class BrowserAutomationTemporarilyUnavailable(RuntimeError):
+    """Raised when a profile has CDP coordinates that are temporarily unreachable."""
+
+    def __init__(self, readiness: dict[str, Any]):
+        self.readiness = dict(readiness)
+        profile_name = str(
+            readiness.get("profile_name") or readiness.get("profile_id") or ""
+        )
+        super().__init__(
+            f"CDP của Profile '{profile_name}' đang tạm thời không phản hồi. "
+            "Tool không restart browser và sẽ thử kết nối lại sau."
+        )
 
 _profile_operation_locks: dict[str, threading.Lock] = {}
 _profile_operation_counts: dict[str, int] = {}
@@ -53,6 +90,140 @@ def is_profile_browser_busy(profile_id: str) -> bool:
         return False
     with _profile_operation_guard:
         return _profile_operation_counts.get(clean_id, 0) > 0
+
+
+def inspect_profile_browser_readiness(profile_id: str) -> dict[str, Any]:
+    """Return automation readiness without starting, stopping, or navigating a profile."""
+    parsed = parse_profile_target(profile_id)
+    result = {
+        "profile_id": parsed["id"],
+        "profile_name": parsed.get("profile_name") or parsed["id"],
+        "browser_type": parsed["type"],
+        "busy": is_profile_browser_busy(parsed["id"]),
+        "state": PROFILE_CLOSED,
+        "automation_ready": False,
+        "requires_user_action": False,
+    }
+    if parsed["type"] == "local":
+        process = find_running_local_browser_process(
+            parsed["browser_key"],
+            parsed["profile_dir"],
+        )
+        if not process:
+            return result
+        result.update(
+            {
+                "process_id": process.get("process_id"),
+                "remote_debugging_port": process.get("port"),
+                "browser_name": parsed.get("browser_name"),
+                "profile_dir": parsed.get("profile_dir"),
+            }
+        )
+        if process.get("cdp_ready"):
+            result.update(
+                state=PROFILE_RUNNING_CDP_READY,
+                automation_ready=True,
+                endpoint_url=process.get("endpoint_url"),
+                websocket_debugging_url=process.get("ws_url"),
+            )
+        elif process.get("port"):
+            result["state"] = PROFILE_CDP_UNREACHABLE
+        else:
+            result.update(
+                state=PROFILE_RUNNING_WITHOUT_CDP,
+                requires_user_action=True,
+            )
+        return result
+
+    running = find_running_gpm_profile_coordinates(parsed["id"])
+    if not running:
+        return result
+    result.update(
+        {
+            "process_id": running.get("process_id"),
+            "remote_debugging_port": running.get("remote_debugging_port"),
+            "websocket_debugging_url": running.get("websocket_debugging_url"),
+        }
+    )
+    if running.get("already_running_cdp_unreachable"):
+        result["state"] = PROFILE_CDP_UNREACHABLE
+    elif running.get("remote_debugging_port") or running.get("websocket_debugging_url"):
+        result.update(
+            state=PROFILE_RUNNING_CDP_READY,
+            automation_ready=True,
+        )
+    else:
+        result.update(
+            state=PROFILE_RUNNING_WITHOUT_CDP,
+            requires_user_action=True,
+        )
+    return result
+
+
+def ensure_profile_automation_ready(profile_id: str) -> dict[str, Any]:
+    """Start a closed profile once, or classify why an existing process cannot be used."""
+    readiness = inspect_profile_browser_readiness(profile_id)
+    state = readiness["state"]
+    if state == PROFILE_RUNNING_CDP_READY:
+        return readiness
+    if state == PROFILE_RUNNING_WITHOUT_CDP:
+        raise BrowserAutomationBlocked(readiness)
+    if state == PROFILE_CDP_UNREACHABLE:
+        raise BrowserAutomationTemporarilyUnavailable(readiness)
+
+    parsed = parse_profile_target(profile_id)
+    port = None
+    if parsed["type"] == "local":
+        launch_info = start_local_browser(
+            parsed["browser_key"],
+            parsed["profile_dir"],
+            target_url="",
+            require_cdp=True,
+        )
+        if launch_info.get("already_running_no_cdp"):
+            refreshed = inspect_profile_browser_readiness(profile_id)
+            if refreshed["state"] == PROFILE_CDP_UNREACHABLE:
+                raise BrowserAutomationTemporarilyUnavailable(refreshed)
+            raise BrowserAutomationBlocked(refreshed)
+        port = launch_info.get("port")
+    else:
+        launch_info = start_gpm_profile(parsed["id"], require_cdp=True)
+        if launch_info.get("already_running_no_cdp"):
+            raise BrowserAutomationBlocked(inspect_profile_browser_readiness(profile_id))
+        if launch_info.get("already_running_cdp_unreachable"):
+            raise BrowserAutomationTemporarilyUnavailable(
+                inspect_profile_browser_readiness(profile_id)
+            )
+        port = launch_info.get("remote_debugging_port")
+        ws_url = str(launch_info.get("websocket_debugging_url") or "")
+        if not port and ws_url:
+            port_match = re.search(r":(\d+)", ws_url)
+            if port_match:
+                port = int(port_match.group(1))
+
+    deadline = time.monotonic() + 10.0
+    refreshed = readiness
+    while time.monotonic() < deadline:
+        if port:
+            version = get_cdp_version_info(int(port), timeout=1.0)
+            if version:
+                return {
+                    **readiness,
+                    "state": PROFILE_RUNNING_CDP_READY,
+                    "automation_ready": True,
+                    "requires_user_action": False,
+                    "remote_debugging_port": int(port),
+                    "websocket_debugging_url": str(
+                        version.get("webSocketDebuggerUrl") or ""
+                    ),
+                }
+        refreshed = inspect_profile_browser_readiness(profile_id)
+        if refreshed["state"] == PROFILE_RUNNING_CDP_READY:
+            return refreshed
+        if refreshed["state"] == PROFILE_RUNNING_WITHOUT_CDP:
+            raise BrowserAutomationBlocked(refreshed)
+        time.sleep(0.25)
+    raise BrowserAutomationTemporarilyUnavailable(refreshed)
 
 
 @asynccontextmanager
@@ -471,6 +642,7 @@ async def channel_browser_session(
     """Open a serialized CDP session without closing or restarting the browser."""
     parsed = parse_profile_target(profile_id)
     async with _profile_browser_operation(parsed["id"]):
+        await asyncio.to_thread(ensure_profile_automation_ready, parsed["id"])
         if parsed["type"] == "local":
             async with local_browser_session(
                 parsed["browser_key"],

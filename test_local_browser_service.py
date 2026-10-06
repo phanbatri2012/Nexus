@@ -11,8 +11,7 @@ from auto_yt.services import local_browser_service
 
 class LocalBrowserServiceTests(unittest.TestCase):
     @patch("auto_yt.services.local_browser_service.find_free_port", return_value=9222)
-    @patch("auto_yt.services.local_browser_service.is_browser_process_running", return_value=False)
-    @patch("auto_yt.services.local_browser_service.find_running_local_browser_port", return_value=None)
+    @patch("auto_yt.services.local_browser_service.find_running_local_browser_process", return_value=None)
     @patch("auto_yt.services.local_browser_service.resolve_browser_paths")
     @patch("subprocess.Popen")
     @patch("urllib.request.urlopen")
@@ -21,8 +20,7 @@ class LocalBrowserServiceTests(unittest.TestCase):
         mock_urlopen,
         mock_popen,
         mock_paths,
-        _mock_find_port,
-        _mock_is_running,
+        _mock_running_process,
         _mock_free_port,
     ):
         mock_paths.return_value = (
@@ -83,17 +81,20 @@ class LocalBrowserServiceTests(unittest.TestCase):
         self.assertNotIn("/IM", taskkill_args)
 
     @patch("auto_yt.services.local_browser_service.terminate_local_browser_processes")
-    @patch("auto_yt.services.local_browser_service.is_browser_process_running")
-    @patch("auto_yt.services.local_browser_service.find_running_local_browser_port")
+    @patch("auto_yt.services.local_browser_service.find_running_local_browser_process")
     @patch("auto_yt.services.local_browser_service.resolve_browser_paths")
     @patch("subprocess.Popen")
     @patch("urllib.request.urlopen")
     def test_start_local_browser_when_running_no_cdp_never_restarts_browser(
-        self, mock_urlopen, mock_popen, mock_paths, mock_find_port, mock_is_running, mock_terminate
+        self, mock_urlopen, mock_popen, mock_paths, mock_running_process, mock_terminate
     ):
         mock_paths.return_value = (Path(r"C:\Program Files\CocCoc\browser.exe"), Path(r"C:\User Data"))
-        mock_find_port.return_value = None
-        mock_is_running.side_effect = [True, True, False]
+        mock_running_process.return_value = {
+            "process_id": 1234,
+            "browser_key": "coccoc",
+            "profile_dir": "Default",
+            "cdp_ready": False,
+        }
         mock_terminate.return_value = True
 
         mock_resp = MagicMock()
@@ -109,13 +110,42 @@ class LocalBrowserServiceTests(unittest.TestCase):
         self.assertIn("https://facebook.com", args)
         mock_terminate.assert_not_called()
 
-        # Automation requests preserve the running non-CDP browser.
+        # Automation requests preserve the running non-CDP browser without opening a tab.
         res_cdp = local_browser_service.start_local_browser(
             "coccoc", "Default", target_url="https://facebook.com", require_cdp=True
         )
         self.assertTrue(res_cdp["success"])
         self.assertTrue(res_cdp["already_running_no_cdp"])
+        mock_popen.assert_called_once()
         mock_terminate.assert_not_called()
+
+    @patch("auto_yt.services.local_browser_service.sys.platform", "win32")
+    @patch("auto_yt.services.local_browser_service.resolve_browser_paths")
+    @patch("auto_yt.services.local_browser_service.subprocess.run")
+    def test_running_process_detection_is_scoped_to_exact_profile(
+        self, mock_run, mock_paths
+    ):
+        mock_paths.return_value = (
+            Path(r"C:\Program Files\Google\Chrome\chrome.exe"),
+            Path(r"C:\Chrome Data"),
+        )
+        process_query = MagicMock()
+        process_query.stdout = (
+            '[{"ProcessId":111,"CommandLine":"chrome.exe '
+            '--user-data-dir=\\"C:\\\\Chrome Data\\" '
+            '--profile-directory=\\"Profile 1\\""},'
+            '{"ProcessId":222,"CommandLine":"chrome.exe '
+            '--user-data-dir=\\"C:\\\\Chrome Data\\" '
+            '--profile-directory=\\"Profile 2\\""}]'
+        )
+        mock_run.return_value = process_query
+
+        result = local_browser_service.find_running_local_browser_process(
+            "chrome", "Profile 2"
+        )
+
+        self.assertEqual(result["process_id"], 222)
+        self.assertFalse(result["cdp_ready"])
 
     @patch("auto_yt.services.local_browser_service.start_local_browser")
     @patch("playwright.async_api.async_playwright")

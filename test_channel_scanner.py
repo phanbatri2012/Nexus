@@ -11,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from auto_yt.main import app
-from auto_yt.services import api_security
+from auto_yt.services import api_security, channel_scanner_service
 from auto_yt.services.local_browser_service import (
     list_local_browser_profiles,
 )
@@ -61,6 +61,53 @@ class TestChannelScanner(unittest.TestCase):
         self.assertIn("items", data)
         self.assertIn("total", data)
         self.assertIsInstance(data["items"], list)
+
+    @patch(
+        "auto_yt.services.channel_scanner_service.find_running_gpm_profile_coordinates",
+        return_value={
+            "profile_id": "gpm-no-cdp",
+            "process_id": 4321,
+            "already_running_no_cdp": True,
+            "status": "no_cdp",
+        },
+    )
+    @patch(
+        "auto_yt.services.channel_scanner_service.get_gpm_profile_detail",
+        return_value={"id": "gpm-no-cdp", "name": "No CDP Profile"},
+    )
+    def test_running_profile_without_cdp_requires_user_action(
+        self, _mock_detail, _mock_running
+    ):
+        readiness = channel_scanner_service.inspect_profile_browser_readiness(
+            "gpm-no-cdp"
+        )
+
+        self.assertEqual(
+            readiness["state"],
+            channel_scanner_service.PROFILE_RUNNING_WITHOUT_CDP,
+        )
+        self.assertTrue(readiness["requires_user_action"])
+        with patch.object(channel_scanner_service, "start_gpm_profile") as start_profile:
+            with self.assertRaises(channel_scanner_service.BrowserAutomationBlocked):
+                channel_scanner_service.ensure_profile_automation_ready("gpm-no-cdp")
+        start_profile.assert_not_called()
+
+    @patch("auto_yt.services.channel_scanner_service.inspect_profile_browser_readiness")
+    def test_api_profile_automation_status_is_read_only(self, mock_inspect):
+        mock_inspect.return_value = {
+            "profile_id": "profile-ready",
+            "state": "running_cdp_ready",
+            "automation_ready": True,
+            "requires_user_action": False,
+        }
+
+        response = self.client.get(
+            "/api/gpm/profiles/profile-ready/automation-status"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["automation_ready"])
+        mock_inspect.assert_called_once_with("profile-ready")
 
     @patch("auto_yt.services.channel_scanner_service.open_channel_platform_browser")
     def test_api_open_browser_endpoint(self, mock_open):

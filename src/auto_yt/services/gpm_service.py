@@ -386,6 +386,7 @@ def find_running_gpm_profile_coordinates(
                 parsed = json.loads(stdout)
                 proc_list = [parsed] if isinstance(parsed, dict) else parsed
                 matching_non_cdp_proc = None
+                matching_unreachable_cdp_proc = None
                 for proc in proc_list:
                     cmdline = str(proc.get("CommandLine") or "")
                     if (profile_path and profile_path in cmdline) or (clean_id in cmdline):
@@ -412,10 +413,21 @@ def find_running_gpm_profile_coordinates(
                                     _active_gpm_profiles[clean_id] = info
                                     return info
                             except Exception:
-                                pass
+                                if "--type=" not in cmdline:
+                                    matching_unreachable_cdp_proc = {
+                                        "remote_debugging_port": port,
+                                        "profile_id": clean_id,
+                                        "profile_path": profile_path,
+                                        "process_id": proc.get("ProcessId"),
+                                        "status": "cdp_unreachable",
+                                        "already_running": True,
+                                        "already_running_cdp_unreachable": True,
+                                    }
                         elif not matching_non_cdp_proc and "--type=" not in cmdline:
                             matching_non_cdp_proc = proc
 
+                if matching_unreachable_cdp_proc:
+                    return matching_unreachable_cdp_proc
                 if matching_non_cdp_proc:
                     return {
                         "profile_id": clean_id,

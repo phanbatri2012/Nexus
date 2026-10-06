@@ -48,6 +48,7 @@ const PIPELINE_LABELS = {
 
 const PUBLISH_STAGE_LABELS = {
   preflight: 'Kiểm tra cấu hình',
+  browser_preflight: 'Kiểm tra Profile trình duyệt',
   slot_reserved: 'Đã giữ lịch',
   session_created: 'Đã tạo phiên upload',
   uploading: 'Đang upload',
@@ -77,6 +78,7 @@ const CONFIGURATION_LABELS = {
   gpm_profile_id: 'GPM Profile',
   gpm_profile_exclusive: 'GPM Profile riêng không dùng chung',
   gpm_proxy_info: 'proxy riêng của GPM Profile',
+  browser_cdp: 'kết nối tự động hóa CDP của Profile',
   publication_timezone: 'múi giờ đăng',
   publication_slots: 'khung giờ đăng',
   publication_daily_limit: 'giới hạn video mỗi ngày',
@@ -689,6 +691,8 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                 ? job.automatic_login === 'pending'
                   ? { label: 'Đang Auto Login', color: '#4dd0e1' }
                   : { label: 'Cần xác minh ChatGPT', color: '#f1c40f' }
+                : job.status === 'paused' && job.attention_required === 'youtube_browser_cdp'
+                  ? { label: 'Chờ Profile CDP', color: '#f1c40f' }
                 : job.status === 'paused' && job.attention_required?.startsWith('youtube_')
                   ? job.missing_configuration?.length > 0
                     ? { label: 'Cần cấu hình', color: '#f1c40f' }
@@ -803,7 +807,11 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                     )}
                     {job.status === 'paused' && job.attention_required?.startsWith('youtube_') && (
                       <div style={{ color: job.missing_configuration?.length > 0 ? '#f1c40f' : '#4dd0e1', marginTop: '9px', fontSize: '0.84em' }}>
-                        {job.missing_configuration?.length > 0 ? (
+                        {job.attention_required === 'youtube_browser_cdp' ? (
+                          <div>
+                            Profile chưa sẵn sàng cho tự động hóa CDP. Tool sẽ không đóng hoặc khởi động lại trình duyệt đang chạy. Nếu Profile được mở không có CDP, hãy đóng thủ công khi không còn thao tác rồi mở lại bằng Tool; job sẽ tự tiếp tục khi CDP sẵn sàng.
+                          </div>
+                        ) : job.missing_configuration?.length > 0 ? (
                           <>
                             {job.missing_configuration?.some(item => ['made_for_kids', 'default_youtube_channel_id'].includes(item))
                               ? 'Hãy sửa trong Cài đặt (Settings) hoặc Channel Hub rồi bấm “Tiếp tục”.'
@@ -855,7 +863,7 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                     )}
                     {job.can_resume && (
                       <button className="btn-secondary" disabled={Boolean(actionId)} style={{ padding: '8px 12px' }} onClick={() => runAction(job, 'resume')}>
-                        Tiếp tục
+                        {job.attention_required === 'youtube_browser_cdp' ? 'Kiểm tra lại' : 'Tiếp tục'}
                       </button>
                     )}
                     {job.can_cancel && !job.cancel_requested && (

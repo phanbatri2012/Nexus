@@ -279,6 +279,41 @@ def test_gpm_already_open_handling():
     print("✓ test_gpm_already_open_handling passed")
 
 
+def test_gpm_running_profile_with_unreachable_cdp_is_not_treated_as_closed():
+    process_result = MagicMock()
+    process_result.stdout = json.dumps(
+        [
+            {
+                "ProcessId": 7654,
+                "CommandLine": (
+                    'chrome.exe --user-data-dir="C:\\Profiles\\profile-unreachable" '
+                    "--remote-debugging-port=18889"
+                ),
+            }
+        ]
+    )
+    with patch("auto_yt.services.gpm_service.sys.platform", "win32"), patch(
+        "auto_yt.services.gpm_service.get_gpm_profile_detail",
+        return_value={
+            "id": "profile-unreachable",
+            "profile_path": r"C:\Profiles\profile-unreachable",
+        },
+    ), patch(
+        "auto_yt.services.gpm_service.subprocess.run",
+        return_value=process_result,
+    ), patch(
+        "auto_yt.services.gpm_service.urllib.request.urlopen",
+        side_effect=OSError("CDP is not ready"),
+    ):
+        result = gpm_service.find_running_gpm_profile_coordinates(
+            "profile-unreachable"
+        )
+
+    assert result["already_running_cdp_unreachable"] is True
+    assert result["remote_debugging_port"] == 18889
+    assert result["process_id"] == 7654
+
+
 def test_open_url_preserves_query_parameters_in_cdp_json_new():
     """Test that open_url_in_gpm_profile fully encodes URLs with query params for /json/new."""
     import asyncio
@@ -605,6 +640,7 @@ if __name__ == "__main__":
     test_gpm_list_profiles()
     test_gpm_start_and_stop_profile()
     test_gpm_already_open_handling()
+    test_gpm_running_profile_with_unreachable_cdp_is_not_treated_as_closed()
     test_open_url_preserves_query_parameters_in_cdp_json_new()
     test_open_tab_in_running_gpm_process_preserves_query_parameters()
     test_database_gpm_channel_mapping()
