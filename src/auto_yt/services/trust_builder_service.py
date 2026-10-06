@@ -334,11 +334,13 @@ async def audit_channel_branding_for_plan(plan_id: int) -> dict[str, Any]:
     if not profile_id:
         return {"success": False, "message": "Kênh chưa được gán Profile GPM."}
 
+    channel_ucid = str(plan.get("youtube_channel_ucid") or plan.get("channel_id") or "").strip()
+
     try:
         async with channel_browser_session(profile_id) as (context, _browser, _profile_meta):
             page = await context.new_page()
             try:
-                checklist = await action_audit_channel_branding(page)
+                checklist = await action_audit_channel_branding(page, channel_id=channel_ucid)
             finally:
                 await cleanup_owned_page(context, page)
 

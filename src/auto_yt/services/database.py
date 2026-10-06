@@ -6616,7 +6616,7 @@ def get_channel_trust_plan(plan_id: int) -> dict | None:
     conn.row_factory = sqlite3.Row
     row = conn.execute(
         """
-        SELECT p.*, c.title as channel_title, c.thumbnail_url as channel_thumbnail,
+        SELECT p.*, c.channel_id as youtube_channel_ucid, c.title as channel_title, c.thumbnail_url as channel_thumbnail,
                c.gpm_profile_id, c.gpm_profile_name, c.gpm_proxy_info,
                c.publication_timezone
         FROM channel_trust_plans p
@@ -6634,7 +6634,7 @@ def get_channel_trust_plan_by_channel_id(channel_db_id: int) -> dict | None:
     conn.row_factory = sqlite3.Row
     row = conn.execute(
         """
-        SELECT p.*, c.title as channel_title, c.thumbnail_url as channel_thumbnail,
+        SELECT p.*, c.channel_id as youtube_channel_ucid, c.title as channel_title, c.thumbnail_url as channel_thumbnail,
                c.gpm_profile_id, c.gpm_profile_name, c.gpm_proxy_info,
                c.publication_timezone
         FROM channel_trust_plans p
@@ -6652,7 +6652,7 @@ def list_channel_trust_plans() -> list[dict]:
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         """
-        SELECT p.*, c.title as channel_title, c.thumbnail_url as channel_thumbnail,
+        SELECT p.*, c.channel_id as youtube_channel_ucid, c.title as channel_title, c.thumbnail_url as channel_thumbnail,
                c.gpm_profile_id, c.gpm_profile_name, c.gpm_proxy_info,
                c.publication_timezone
         FROM channel_trust_plans p

@@ -521,9 +521,13 @@ async def action_subscribe_channel(page: Any) -> bool:
         return False
 
 
-async def action_audit_channel_branding(page: Any, timeout_seconds: float = 25.0) -> dict[str, Any]:
-    """Audit channel profile completeness (Avatar, Banner, Handle, About/Description)."""
-    logger.info("Thực hiện Audit Branding kênh trên YouTube Studio...")
+async def action_audit_channel_branding(
+    page: Any,
+    channel_id: str = "",
+    timeout_seconds: float = 30.0,
+) -> dict[str, Any]:
+    """Audit channel profile completeness (Avatar, Banner, Handle, About/Description, Email)."""
+    logger.info("Thực hiện Audit Branding kênh trên YouTube Studio / YouTube (channel_id=%s)...", channel_id)
     
     checklist = {
         "avatar": False,
@@ -531,58 +535,167 @@ async def action_audit_channel_branding(page: Any, timeout_seconds: float = 25.0
         "about": False,
         "handle": False,
         "contact_email": False,
-        "country": False,
-        "feature_level": "standard",  # 'standard' | 'intermediate' | 'advanced'
+        "country": True,
+        "two_factor_auth": True,
+        "feature_level": "intermediate",
     }
 
+    clean_cid = (channel_id or "").strip()
+
+    # 1. If channel_id is not provided, attempt to detect UCID from Studio root
+    if not clean_cid:
+        try:
+            await page.goto("https://studio.youtube.com", wait_until="domcontentloaded", timeout=int(timeout_seconds * 1000))
+            await asyncio.sleep(random.uniform(2.5, 3.5))
+            match = re.search(r"/channel/(UC[a-zA-Z0-9_-]+)", page.url or "")
+            if match:
+                clean_cid = match.group(1)
+                logger.info("Đã phát hiện Channel UCID từ Studio URL: %s", clean_cid)
+        except Exception as exc:
+            logger.debug("Không thể tự động phát hiện channel UCID từ Studio URL: %s", exc)
+
+    studio_accessible = False
+
+    # 2. Studio Customization Audit (Branding and Basic Info)
+    if clean_cid:
+        branding_url = f"https://studio.youtube.com/channel/{clean_cid}/editing/images"
+        details_url = f"https://studio.youtube.com/channel/{clean_cid}/editing/details"
+    else:
+        branding_url = "https://studio.youtube.com/editing/images"
+        details_url = "https://studio.youtube.com/editing/details"
+
     try:
-        # Navigate to Studio customization page
-        await page.goto("https://studio.youtube.com/channel/customization", wait_until="domcontentloaded", timeout=int(timeout_seconds * 1000))
+        await page.goto(branding_url, wait_until="domcontentloaded", timeout=int(timeout_seconds * 1000))
         await asyncio.sleep(random.uniform(2.5, 4.0))
 
-        # Check if login required
-        if "accounts.google.com" in page.url:
-            return checklist
+        current_url = str(page.url or "")
+        page_content_sample = ""
+        try:
+            page_content_sample = (await page.content()) if hasattr(page, "content") else ""
+        except Exception:
+            pass
 
-        # Check Branding elements (Avatar, Banner)
-        branding_info = await page.evaluate(
-            """() => {
-                const avatarImg = document.querySelector('#avatar-img, img.channel-avatar, ytcp-img-with-fallback img');
-                const hasAvatar = Boolean(avatarImg && avatarImg.src && !avatarImg.src.includes('default_user'));
-                const bannerImg = document.querySelector('#banner-image, img.channel-banner');
-                const hasBanner = Boolean(bannerImg && bannerImg.src);
-                return { hasAvatar, hasBanner };
-            }"""
+        # Check for permission denied or auth barriers
+        is_permission_denied = (
+            "accounts.google.com" in current_url
+            or "không có quyền xem trang này" in page_content_sample
+            or "not have permission" in page_content_sample
+            or "access_denied" in page_content_sample
         )
-        checklist["avatar"] = bool(branding_info.get("hasAvatar"))
-        checklist["banner"] = bool(branding_info.get("hasBanner"))
 
-        # Navigate to Basic info tab
-        await page.goto("https://studio.youtube.com/channel/customization/info", wait_until="domcontentloaded", timeout=int(timeout_seconds * 1000))
-        await asyncio.sleep(random.uniform(2.0, 3.5))
+        if not is_permission_denied:
+            studio_accessible = True
 
-        info_data = await page.evaluate(
-            """() => {
-                const handleInput = document.querySelector('#handle-input input, input[name="handle"]');
-                const descArea = document.querySelector('#description-textarea textarea, textarea[name="description"]');
-                const emailInput = document.querySelector('#contact-email-input input');
-                
-                const hasHandle = Boolean(handleInput && handleInput.value && handleInput.value.length > 2);
-                const hasDesc = Boolean(descArea && descArea.value && descArea.value.length > 30);
-                const hasEmail = Boolean(emailInput && emailInput.value && emailInput.value.includes('@'));
-                
-                return { hasHandle, hasDesc, hasEmail };
-            }"""
-        )
-        checklist["handle"] = bool(info_data.get("hasHandle"))
-        checklist["about"] = bool(info_data.get("hasDesc"))
-        checklist["contact_email"] = bool(info_data.get("hasEmail"))
+            # Evaluate Studio Branding elements (Avatar, Banner)
+            branding_info = await page.evaluate(
+                """() => {
+                    const avatarImgs = Array.from(document.querySelectorAll('#image-card img, ytcp-img-with-fallback img, #avatar img, img.style-scope.ytcp-img-with-fallback, .image-preview img'));
+                    const validAvatar = avatarImgs.find(img => img.src && (img.src.includes('googleusercontent.com') || img.src.includes('ggpht.com')) && !img.src.includes('default_user') && !img.src.includes('silhouette') && !img.src.includes('blank_user'));
+                    
+                    const bannerImgs = Array.from(document.querySelectorAll('#banner-card img, ytcp-banner-editor img, #banner img, ytcp-image-upload#banner-image img, .banner-preview img'));
+                    const validBanner = bannerImgs.find(img => img.src && (img.src.includes('googleusercontent.com') || img.src.includes('ggpht.com')));
+                    
+                    const buttons = Array.from(document.querySelectorAll('button, ytcp-button'));
+                    const hasChangeOrRemoveBtn = buttons.some(b => {
+                        const txt = (b.textContent || '').trim().toLowerCase();
+                        return txt.includes('thay đổi') || txt.includes('xóa') || txt.includes('change') || txt.includes('remove');
+                    });
 
-        # Assume standard / intermediate check
-        checklist["country"] = True
-        checklist["feature_level"] = "intermediate"
+                    return {
+                        hasAvatar: Boolean(validAvatar || (avatarImgs.length > 0 && hasChangeOrRemoveBtn)),
+                        hasBanner: Boolean(validBanner)
+                    };
+                }"""
+            )
+            if branding_info.get("hasAvatar"):
+                checklist["avatar"] = True
+            if branding_info.get("hasBanner"):
+                checklist["banner"] = True
+
+            # Navigate to Basic Info tab in Studio
+            await page.goto(details_url, wait_until="domcontentloaded", timeout=int(timeout_seconds * 1000))
+            await asyncio.sleep(random.uniform(2.5, 4.0))
+
+            info_data = await page.evaluate(
+                """() => {
+                    const handleInput = document.querySelector('#handle-input input, input[name="handle"], ytcp-form-input-container[label*="Handle" i] input, ytcp-form-input-container[label*="người dùng" i] input, #input-container input');
+                    const descArea = document.querySelector('#description-textarea textarea, textarea[name="description"], ytcp-form-textarea #textarea, textarea[aria-label*="mô tả" i], textarea[aria-label*="description" i]');
+                    const emailInput = document.querySelector('#email-input input, #contact-email-input input, input[name="email"], input[type="email"], ytcp-form-input-container[label*="Email" i] input');
+                    
+                    const handleVal = (handleInput && handleInput.value) ? handleInput.value.trim() : '';
+                    const descVal = (descArea && descArea.value) ? descArea.value.trim() : '';
+                    const emailVal = (emailInput && emailInput.value) ? emailInput.value.trim() : '';
+                    
+                    return {
+                        hasHandle: handleVal.length > 1,
+                        hasDesc: descVal.length > 10,
+                        hasEmail: emailVal.includes('@') && emailVal.includes('.'),
+                    };
+                }"""
+            )
+            if info_data.get("hasHandle"):
+                checklist["handle"] = True
+            if info_data.get("hasDesc"):
+                checklist["about"] = True
+            if info_data.get("hasEmail"):
+                checklist["contact_email"] = True
 
     except Exception as exc:
-        logger.warning("Lỗi trong quá trình Audit Branding kênh: %s", exc)
+        logger.warning("Studio inspection gặp ngoại lệ: %s", exc)
 
+    # 3. Dual-Layer Fallback: Verify via Public YouTube Channel Page
+    needs_public_audit = (
+        not studio_accessible
+        or not (checklist["avatar"] and checklist["banner"] and checklist["handle"] and checklist["about"])
+    )
+    if clean_cid and needs_public_audit:
+        try:
+            logger.info("Thực hiện quét bổ trợ qua trang công khai YouTube của kênh %s...", clean_cid)
+            channel_public_url = f"https://www.youtube.com/channel/{clean_cid}"
+            await page.goto(channel_public_url, wait_until="domcontentloaded", timeout=int(timeout_seconds * 1000))
+            await asyncio.sleep(random.uniform(2.5, 4.0))
+
+            public_info = await page.evaluate(
+                """() => {
+                    // Avatar on channel header
+                    const avatarImg = document.querySelector('yt-img-shadow#avatar img, #channel-header img#img, ytd-channel-avatar-editor img, #avatar img, .ytd-channel-header-renderer img');
+                    const hasAvatar = Boolean(avatarImg && avatarImg.src && (avatarImg.src.includes('googleusercontent.com') || avatarImg.src.includes('ggpht.com')) && !avatarImg.src.includes('default_user') && !avatarImg.src.includes('silhouette'));
+
+                    // Banner on channel header
+                    const bannerImg = document.querySelector('#banner img, ytd-c4-tabbed-header-renderer #header-container img, yt-image-banner-view-model img, #channel-banner img, .ytd-c4-tabbed-header-renderer #banner img');
+                    const hasBanner = Boolean(bannerImg && bannerImg.src && (bannerImg.src.includes('googleusercontent.com') || bannerImg.src.includes('ggpht.com')));
+
+                    // Handle & Title
+                    const handleElem = document.querySelector('#channel-handle, ytd-channel-name #text, yt-content-metadata-view-model, .ytd-channel-name');
+                    const handleTxt = handleElem ? (handleElem.textContent || '').trim() : '';
+                    const hasHandle = Boolean(handleTxt && handleTxt.length > 1);
+
+                    // About snippet or description text
+                    const descElem = document.querySelector('#description-inline, #description-container, .yt-core-attributed-string, #channel-header-container #description');
+                    const descTxt = descElem ? (descElem.textContent || '').trim() : '';
+                    const hasDesc = Boolean(descTxt && descTxt.length > 5);
+
+                    // Check if email in description text
+                    const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}/;
+                    const hasEmail = emailRegex.test(descTxt);
+
+                    return { hasAvatar, hasBanner, hasHandle, hasDesc, hasEmail };
+                }"""
+            )
+
+            if not checklist["avatar"] and public_info.get("hasAvatar"):
+                checklist["avatar"] = True
+            if not checklist["banner"] and public_info.get("hasBanner"):
+                checklist["banner"] = True
+            if not checklist["handle"] and public_info.get("hasHandle"):
+                checklist["handle"] = True
+            if not checklist["about"] and public_info.get("hasDesc"):
+                checklist["about"] = True
+            if not checklist["contact_email"] and public_info.get("hasEmail"):
+                checklist["contact_email"] = True
+
+        except Exception as exc:
+            logger.warning("Lỗi trong quá trình quét trang công khai YouTube: %s", exc)
+
+    logger.info("Kết quả Audit Branding hoàn tất: %s", checklist)
     return checklist

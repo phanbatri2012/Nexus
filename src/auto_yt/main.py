@@ -4731,7 +4731,7 @@ def _start_google_flow_browser_safely() -> None:
 
 @app.on_event("startup")
 def resume_background_jobs() -> None:
-    global _comment_sync_thread, _tts_preview_cleanup_thread
+    global _comment_sync_thread, _tts_preview_cleanup_thread, _system_cleanup_thread
     # Migrate any legacy plaintext credentials before background workers can
     # consume them. Secrets remain decrypted only in the current process.
     account_store.load_account(migrate=True)

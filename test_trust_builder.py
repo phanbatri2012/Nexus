@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from auto_yt.services import database as db, api_security
 from auto_yt.services.trust_builder_actions import (
+    action_audit_channel_branding,
     action_search_and_pick_video,
     action_watch_video,
     action_like_video,
@@ -192,4 +193,55 @@ def test_db_trust_plan_min_watch_minutes():
 
     decoded_custom = db._decode_trust_plan({"min_watch_minutes": 15})
     assert decoded_custom["min_watch_minutes"] == 15
+
+
+def test_action_audit_channel_branding_studio():
+    """Verify that action_audit_channel_branding correctly evaluates branding elements via Studio."""
+    async def _run():
+        mock_page = AsyncMock()
+        mock_page.url = "https://studio.youtube.com/channel/UC12345/editing/images"
+        mock_page.content = AsyncMock(return_value="<html>YouTube Studio</html>")
+        
+        # 1st evaluate: branding (avatar, banner)
+        # 2nd evaluate: basic info (handle, desc, email)
+        mock_page.evaluate.side_effect = [
+            {"hasAvatar": True, "hasBanner": True},
+            {"hasHandle": True, "hasDesc": True, "hasEmail": True},
+        ]
+
+        res = await action_audit_channel_branding(mock_page, channel_id="UC12345", timeout_seconds=5.0)
+        assert res["avatar"] is True
+        assert res["banner"] is True
+        assert res["handle"] is True
+        assert res["about"] is True
+        assert res["contact_email"] is True
+
+    asyncio.run(_run())
+
+
+def test_action_audit_channel_branding_fallback():
+    """Verify fallback to public channel page when Studio is inaccessible."""
+    async def _run():
+        mock_page = AsyncMock()
+        mock_page.url = "https://studio.youtube.com/channel/UC12345/editing/images"
+        # Return permission error in content
+        mock_page.content = AsyncMock(return_value="<html>Rất tiếc, bạn không có quyền xem trang này</html>")
+        
+        # Public channel evaluate
+        mock_page.evaluate.return_value = {
+            "hasAvatar": True,
+            "hasBanner": True,
+            "hasHandle": True,
+            "hasDesc": True,
+            "hasEmail": False,
+        }
+
+        res = await action_audit_channel_branding(mock_page, channel_id="UC12345", timeout_seconds=5.0)
+        assert res["avatar"] is True
+        assert res["banner"] is True
+        assert res["handle"] is True
+        assert res["about"] is True
+
+    asyncio.run(_run())
+
 

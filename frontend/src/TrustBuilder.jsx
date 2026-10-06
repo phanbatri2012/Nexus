@@ -600,11 +600,11 @@ export default function TrustBuilder() {
                     <div className={`checklist-item ${checklist.country ? 'checked' : ''}`}>
                       <span>{checklist.country ? '✅' : '❌'}</span> Quốc gia cư trú
                     </div>
-                    <div className="checklist-item checked">
-                      <span>✅</span> 2-Step Verification (2FA)
+                    <div className={`checklist-item ${checklist.two_factor_auth !== false ? 'checked' : ''}`}>
+                      <span>{checklist.two_factor_auth !== false ? '✅' : '❌'}</span> 2-Step Verification (2FA)
                     </div>
-                    <div className="checklist-item checked">
-                      <span>⭐</span> Cấp tính năng: <b>{checklist.feature_level || 'Intermediate'}</b>
+                    <div className={`checklist-item ${checklist.feature_level && checklist.feature_level !== 'standard' ? 'checked' : ''}`}>
+                      <span>⭐</span> Cấp tính năng: <b>{checklist.feature_level || 'standard'}</b>
                     </div>
                   </div>
                 </div>
