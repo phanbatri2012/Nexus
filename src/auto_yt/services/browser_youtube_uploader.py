@@ -288,6 +288,7 @@ async def _visible_upload_dialog_elements(page, selector: str) -> list[Any]:
 
 async def _dismiss_active_confirmation_dialogs(page, timeout_seconds: float = 6.0) -> bool:
     """Dismiss any visible confirmation dialog, checks-running dialog ('Đã hiểu' / 'Got it'),
+    feature-access announcement ('Bạn đã hoàn tất' / 'Bạn đã có quyền sử dụng tính năng này rồi'),
     warning modal ('Vẫn lên lịch' / 'Schedule anyway' / 'Vẫn lưu'), or share completion dialog."""
     deadline = time.monotonic() + timeout_seconds
     dismissed_any = False
@@ -297,7 +298,7 @@ async def _dismiss_active_confirmation_dialogs(page, timeout_seconds: float = 6.
         try:
             clicked_via_eval = await page.evaluate('''() => {
                 const dialogs = Array.from(document.querySelectorAll(
-                    "ytcp-confirmation-dialog, ytcp-alert-dialog, ytcp-dialog:not(#video-dialog), tp-yt-paper-dialog, ytcp-video-share-dialog, [role='dialog']"
+                    "ytcp-confirmation-dialog, ytcp-alert-dialog, ytcp-dialog:not(#video-dialog), tp-yt-paper-dialog, ytcp-video-share-dialog, [role='dialog'], .ytcp-dialog"
                 )).filter(d => {
                     const tag = (d.tagName || '').toLowerCase();
                     if (tag === 'ytcp-uploads-dialog' || tag === 'ytcp-video-upload-dialog') return false;
@@ -306,7 +307,7 @@ async def _dismiss_active_confirmation_dialogs(page, timeout_seconds: float = 6.
                 });
 
                 for (const dialog of dialogs) {
-                    const btns = Array.from(dialog.querySelectorAll("ytcp-button, ytcp-button-lit, button, tp-yt-paper-button, [role='button']"))
+                    const btns = Array.from(dialog.querySelectorAll("ytcp-button, ytcp-button-lit, ytcp-button-shape, button, tp-yt-paper-button, [role='button']"))
                         .filter(b => {
                             const rect = b.getBoundingClientRect();
                             return rect.width > 0 && rect.height > 0 && !b.hasAttribute('disabled') && b.getAttribute('aria-disabled') !== 'true';
@@ -343,7 +344,7 @@ async def _dismiss_active_confirmation_dialogs(page, timeout_seconds: float = 6.
         # 2. Direct button search across the entire page for visible 'Đã hiểu' / 'Got it'
         try:
             got_it_clicked = await page.evaluate('''() => {
-                const btns = Array.from(document.querySelectorAll("ytcp-button, ytcp-button-lit, button, tp-yt-paper-button, [role='button']"))
+                const btns = Array.from(document.querySelectorAll("ytcp-button, ytcp-button-lit, ytcp-button-shape, button, tp-yt-paper-button, [role='button']"))
                     .filter(b => {
                         const rect = b.getBoundingClientRect();
                         return rect.width > 0 && rect.height > 0 && !b.hasAttribute('disabled') && b.getAttribute('aria-disabled') !== 'true';
@@ -374,11 +375,17 @@ async def _dismiss_active_confirmation_dialogs(page, timeout_seconds: float = 6.
                     "ytcp-confirmation-dialog #dismiss-button",
                     "ytcp-dialog #confirm-button",
                     "ytcp-dialog #dismiss-button",
+                    "tp-yt-paper-dialog #confirm-button",
+                    "tp-yt-paper-dialog #dismiss-button",
                     "ytcp-alert-dialog #confirm-button",
                     "ytcp-alert-dialog #dismiss-button",
                     "ytcp-video-share-dialog #close-button",
                     "ytcp-button:has-text('Đã hiểu')",
                     "ytcp-button:has-text('Got it')",
+                    "ytcp-button-shape:has-text('Đã hiểu')",
+                    "ytcp-button-shape:has-text('Got it')",
+                    "tp-yt-paper-button:has-text('Đã hiểu')",
+                    "tp-yt-paper-button:has-text('Got it')",
                     "button:has-text('Đã hiểu')",
                     "button:has-text('Got it')",
                     "ytcp-button:has-text('Vẫn lên lịch')",
@@ -477,6 +484,10 @@ async def _require_fill(
     timeout_ms: int = 5000,
 ) -> None:
     if not await _safe_fill(page, selectors, text, timeout_ms=timeout_ms):
+        if await _dismiss_active_confirmation_dialogs(page, timeout_seconds=2.0):
+            logger.info("Đã tự động đóng dialog/popup cản trở và thử điền text lại...")
+            if await _safe_fill(page, selectors, text, timeout_ms=min(3000, timeout_ms)):
+                return
         raise BrowserUploadError(error_message)
 
 
@@ -3197,6 +3208,7 @@ async def upload_video_via_browser(
 
             # 5. Populate Details Tab (Title, Description, Thumbnail, Audience, AI disclosure, Tags)
             progress("Đang điền tiêu đề & mô tả video...", "filling_metadata", 35)
+            await _dismiss_active_confirmation_dialogs(page, timeout_seconds=2.0)
 
             # Title
             await _ensure_resumed_draft_dialog(page, resuming_existing_draft)
@@ -3212,6 +3224,7 @@ async def upload_video_via_browser(
 
             # Description
             if description:
+                await _dismiss_active_confirmation_dialogs(page, timeout_seconds=1.0)
                 await _ensure_resumed_draft_dialog(page, resuming_existing_draft)
                 await _fill_text_if_needed(
                     page,
@@ -3225,6 +3238,7 @@ async def upload_video_via_browser(
 
             # Upload Thumbnail
             if thumbnail_path and thumbnail_path.exists():
+                await _dismiss_active_confirmation_dialogs(page, timeout_seconds=1.5)
                 await _ensure_resumed_draft_dialog(page, resuming_existing_draft)
                 progress("Đang tải lên thumbnail...", "uploading_thumbnail", 45)
                 try:
@@ -3260,7 +3274,28 @@ async def upload_video_via_browser(
                             if await thumb_loc.count() > 0:
                                 await thumb_loc.set_input_files(str(thumbnail_path.resolve()))
                             else:
-                                raise BrowserUploadError("Không tìm thấy input thumbnail trong upload dialog.")
+                                # If feature unlock dialog blocked input, dismiss and reload draft to activate thumbnail permissions
+                                if await _dismiss_active_confirmation_dialogs(page, timeout_seconds=2.0) and youtube_video_id:
+                                    logger.info("Đã đóng popup tính năng mới; reload trang draft để cập nhật quyền thumbnail...")
+                                    draft_url = (
+                                        f"https://studio.youtube.com/channel/{clean_channel_id}/videos/upload?d=ud&udvid={youtube_video_id}"
+                                        if clean_channel_id
+                                        else f"https://studio.youtube.com/videos/upload?d=ud&udvid={youtube_video_id}"
+                                    )
+                                    await page.goto(draft_url, wait_until="domcontentloaded", timeout=60000)
+                                    await asyncio.sleep(3.0)
+                                    await _ensure_resumed_draft_dialog(page, True)
+                                    for t_sel in thumb_selectors:
+                                        try:
+                                            thumb_input = await page.query_selector(t_sel)
+                                            if thumb_input:
+                                                break
+                                        except Exception:
+                                            continue
+                                    if thumb_input:
+                                        await thumb_input.set_input_files(str(thumbnail_path.resolve()))
+                                if not thumb_input and not (await thumb_loc.count() > 0):
+                                    raise BrowserUploadError("Không tìm thấy input thumbnail trong upload dialog.")
                         for _ in range(10):
                             await _dismiss_active_confirmation_dialogs(page, timeout_seconds=0.5)
                             preview = await page.query_selector(UPLOAD_THUMBNAIL_PREVIEW_SELECTOR)

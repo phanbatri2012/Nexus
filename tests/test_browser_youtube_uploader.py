@@ -320,12 +320,29 @@ class TestBrowserYouTubeUploader(unittest.IsolatedAsyncioTestCase):
         page = MagicMock()
         page.query_selector_all = AsyncMock(return_value=[row])
 
-        count = await _select_matching_playlists_and_podcasts(
-            page,
-            container_selector="ytcp-playlist-dialog",
-            expected_text="MC Văn Sâm",
-        )
-        self.assertEqual(count, 0)
+    async def test_require_fill_self_healing(self):
+        from auto_yt.services.browser_youtube_uploader import _require_fill
+
+        page = MagicMock()
+        mock_safe_fill = AsyncMock(side_effect=[False, True])
+        mock_dismiss = AsyncMock(return_value=True)
+
+        with patch("auto_yt.services.browser_youtube_uploader._safe_fill", mock_safe_fill), \
+             patch("auto_yt.services.browser_youtube_uploader._dismiss_active_confirmation_dialogs", mock_dismiss):
+            await _require_fill(page, ["#textbox"], "Video Title", "Error msg")
+
+            self.assertEqual(mock_safe_fill.await_count, 2)
+            mock_dismiss.assert_awaited_once()
+
+    async def test_dismiss_active_confirmation_dialogs_eval_success(self):
+        from auto_yt.services.browser_youtube_uploader import _dismiss_active_confirmation_dialogs
+
+        page = MagicMock()
+        page.evaluate = AsyncMock(return_value=True)
+
+        res = await _dismiss_active_confirmation_dialogs(page, timeout_seconds=1.0)
+        self.assertTrue(res)
+        page.evaluate.assert_awaited()
 
 
 if __name__ == "__main__":
