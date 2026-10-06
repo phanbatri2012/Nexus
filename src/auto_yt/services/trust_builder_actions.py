@@ -158,15 +158,28 @@ async def action_search_and_pick_video(
                 'ytd-video-renderer, ytd-rich-item-renderer, ytd-item-section-renderer, ytd-grid-video-renderer, #contents ytd-video-renderer'
             );
             for (const node of videoNodes) {
-                const titleLink = node.querySelector('a#video-title, a#video-title-link, a#thumbnail[href*="/watch?v="], h3 a, a[href*="/watch?v="]');
+                const titleElem = node.querySelector('a#video-title, a#video-title-link, h3 a, #video-title, .ytd-video-renderer h3 a');
+                const thumbElem = node.querySelector('a#thumbnail[href*="/watch?v="], a[href*="/watch?v="]');
                 const channelNode = node.querySelector('ytd-channel-name a, #channel-info a, #byline a, #text.ytd-channel-name, .ytd-channel-name');
-                if (titleLink && titleLink.href && titleLink.href.includes('/watch?v=')) {
-                    const rawUrl = titleLink.href;
+                
+                let rawUrl = (titleElem && titleElem.href) || (thumbElem && thumbElem.href) || '';
+                if (rawUrl && rawUrl.includes('/watch?v=')) {
                     if (!seen.has(rawUrl)) {
                         seen.add(rawUrl);
-                        const titleText = (titleLink.innerText || titleLink.getAttribute('title') || titleLink.getAttribute('aria-label') || '').trim();
+                        let titleText = '';
+                        if (titleElem) {
+                            titleText = (titleElem.getAttribute('title') || titleElem.innerText || titleElem.getAttribute('aria-label') || '').trim();
+                        }
+                        if (!titleText || /^\\d{1,2}:\\d{2}(:\\d{2})?$/.test(titleText)) {
+                            if (thumbElem) {
+                                const thumbAria = thumbElem.getAttribute('aria-label') || '';
+                                if (thumbAria) {
+                                    titleText = thumbAria.replace(/\\s+bởi\\s+.*$/i, '').replace(/\\s+by\\s+.*$/i, '').replace(/\\s+\\d+(\\.\\d+)?\\s*(triệu|nghìn|lượt xem|views|view).*$/i, '').trim();
+                                }
+                            }
+                        }
                         const channelText = channelNode ? (channelNode.innerText || channelNode.getAttribute('title') || '').trim() : '';
-                        if (titleText) {
+                        if (titleText && !/^\\d{1,2}:\\d{2}(:\\d{2})?$/.test(titleText)) {
                             results.push({
                                 url: rawUrl,
                                 title: titleText,
@@ -177,12 +190,12 @@ async def action_search_and_pick_video(
                 }
             }
             if (results.length === 0) {
-                const allLinks = document.querySelectorAll('a[href*="/watch?v="]');
+                const allLinks = document.querySelectorAll('a#video-title, a[href*="/watch?v="]');
                 for (const link of allLinks) {
                     if (link.href && link.href.includes('/watch?v=') && !seen.has(link.href)) {
                         seen.add(link.href);
-                        const title = (link.innerText || link.getAttribute('title') || link.getAttribute('aria-label') || '').trim();
-                        if (title && title.length > 5) {
+                        const title = (link.getAttribute('title') || link.innerText || link.getAttribute('aria-label') || '').trim();
+                        if (title && title.length > 5 && !/^\\d{1,2}:\\d{2}(:\\d{2})?$/.test(title)) {
                             results.push({
                                 url: link.href,
                                 title: title,
@@ -205,13 +218,13 @@ async def action_search_and_pick_video(
         candidates = await page.evaluate(
             """() => {
                 const list = [];
-                const links = document.querySelectorAll('a[href*="/watch?v="]');
+                const links = document.querySelectorAll('a#video-title, a[href*="/watch?v="]');
                 const seen = new Set();
                 for (const a of links) {
                     if (a.href && !seen.has(a.href)) {
                         seen.add(a.href);
-                        const title = (a.innerText || a.getAttribute('title') || a.getAttribute('aria-label') || '').trim();
-                        if (title && title.length > 5) {
+                        const title = (a.getAttribute('title') || a.innerText || a.getAttribute('aria-label') || '').trim();
+                        if (title && title.length > 5 && !/^\\d{1,2}:\\d{2}(:\\d{2})?$/.test(title)) {
                             list.push({ url: a.href, title, channel: '' });
                         }
                     }
