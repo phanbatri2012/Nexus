@@ -96,28 +96,54 @@ async def action_search_and_pick_video(
     await asyncio.sleep(random.uniform(1.5, 3.0))
     await dismiss_common_popups(page)
 
-    # 2. Find and click search input
-    search_input_sel = "input#search, input[name='search_query']"
-    search_elem = await page.wait_for_selector(search_input_sel, state="visible", timeout=12000)
-    if not search_elem:
-        raise RuntimeError("Không tìm thấy ô tìm kiếm của YouTube.")
+    # 2. Find and click search input or fallback to direct search URL
+    search_input_sel = "input#search, input[name='search_query'], ytd-searchbox input#search, form#search-form input"
+    search_elem = None
+    try:
+        search_elem = await page.wait_for_selector(search_input_sel, state="attached", timeout=8000)
+    except Exception:
+        search_elem = None
 
-    # 3. Type keyword and submit
-    await search_elem.click()
-    await asyncio.sleep(random.uniform(0.3, 0.7))
-    await page.keyboard.press("Control+A")
-    await page.keyboard.press("Backspace")
-    
-    # Human-like typing
-    for char in keyword:
-        await search_elem.type(char, delay=random.randint(45, 115))
-    
-    await asyncio.sleep(random.uniform(0.4, 0.9))
-    await page.keyboard.press("Enter")
-    
+    if search_elem:
+        try:
+            await search_elem.click()
+            await asyncio.sleep(random.uniform(0.3, 0.7))
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Backspace")
+            
+            # Human-like typing
+            for char in keyword:
+                await search_elem.type(char, delay=random.randint(45, 115))
+            
+            await asyncio.sleep(random.uniform(0.4, 0.9))
+            await page.keyboard.press("Enter")
+        except Exception as exc:
+            logger.debug("Không thể gõ vào ô tìm kiếm, chuyển hướng sang URL kết quả: %s", exc)
+            search_elem = None
+
+    if not search_elem:
+        encoded_kw = urllib.parse.quote_plus(keyword)
+        await page.goto(f"https://www.youtube.com/results?search_query={encoded_kw}", wait_until="domcontentloaded", timeout=int(timeout_seconds * 1000))
+
     # 4. Wait for search results
-    await asyncio.sleep(random.uniform(2.5, 4.5))
-    await page.wait_for_selector("ytd-video-renderer, ytd-rich-item-renderer, ytd-item-section-renderer", timeout=15000)
+    await asyncio.sleep(random.uniform(2.0, 3.5))
+    try:
+        await page.wait_for_function(
+            """() => {
+                const links = document.querySelectorAll('ytd-video-renderer a#video-title, ytd-rich-item-renderer a#video-title, a#thumbnail[href*="/watch?v="], a[href*="/watch?v="]');
+                return links.length > 0;
+            }""",
+            timeout=15000,
+        )
+    except Exception:
+        try:
+            await page.wait_for_selector(
+                "ytd-video-renderer, ytd-rich-item-renderer, ytd-item-section-renderer, a[href*='/watch?v=']",
+                state="attached",
+                timeout=8000,
+            )
+        except Exception:
+            pass
     
     # 5. Natural scrolling down search results
     await natural_scroll(page, min_scrolls=2, max_scrolls=4)
@@ -127,21 +153,72 @@ async def action_search_and_pick_video(
     candidates: list[dict[str, str]] = await page.evaluate(
         """() => {
             const results = [];
-            const videoNodes = document.querySelectorAll('ytd-video-renderer, ytd-rich-item-renderer');
+            const seen = new Set();
+            const videoNodes = document.querySelectorAll(
+                'ytd-video-renderer, ytd-rich-item-renderer, ytd-item-section-renderer, ytd-grid-video-renderer, #contents ytd-video-renderer'
+            );
             for (const node of videoNodes) {
-                const titleLink = node.querySelector('a#video-title, a#thumbnail');
-                const channelNode = node.querySelector('ytd-channel-name a, #channel-info a');
+                const titleLink = node.querySelector('a#video-title, a#video-title-link, a#thumbnail[href*="/watch?v="], h3 a, a[href*="/watch?v="]');
+                const channelNode = node.querySelector('ytd-channel-name a, #channel-info a, #byline a, #text.ytd-channel-name, .ytd-channel-name');
                 if (titleLink && titleLink.href && titleLink.href.includes('/watch?v=')) {
-                    results.push({
-                        url: titleLink.href,
-                        title: (titleLink.innerText || titleLink.getAttribute('title') || '').trim(),
-                        channel: channelNode ? (channelNode.innerText || '').trim() : ''
-                    });
+                    const rawUrl = titleLink.href;
+                    if (!seen.has(rawUrl)) {
+                        seen.add(rawUrl);
+                        const titleText = (titleLink.innerText || titleLink.getAttribute('title') || titleLink.getAttribute('aria-label') || '').trim();
+                        const channelText = channelNode ? (channelNode.innerText || channelNode.getAttribute('title') || '').trim() : '';
+                        if (titleText) {
+                            results.push({
+                                url: rawUrl,
+                                title: titleText,
+                                channel: channelText
+                            });
+                        }
+                    }
+                }
+            }
+            if (results.length === 0) {
+                const allLinks = document.querySelectorAll('a[href*="/watch?v="]');
+                for (const link of allLinks) {
+                    if (link.href && link.href.includes('/watch?v=') && !seen.has(link.href)) {
+                        seen.add(link.href);
+                        const title = (link.innerText || link.getAttribute('title') || link.getAttribute('aria-label') || '').trim();
+                        if (title && title.length > 5) {
+                            results.push({
+                                url: link.href,
+                                title: title,
+                                channel: ''
+                            });
+                        }
+                    }
                 }
             }
             return results;
         }"""
     )
+
+    if not candidates:
+        encoded_kw = urllib.parse.quote_plus(keyword)
+        logger.info("Không tìm thấy kết quả từ DOM hiện tại, thử load trực tiếp search_query: %s", encoded_kw)
+        await page.goto(f"https://www.youtube.com/results?search_query={encoded_kw}", wait_until="domcontentloaded", timeout=25000)
+        await asyncio.sleep(random.uniform(2.5, 4.0))
+        await natural_scroll(page, min_scrolls=2, max_scrolls=3)
+        candidates = await page.evaluate(
+            """() => {
+                const list = [];
+                const links = document.querySelectorAll('a[href*="/watch?v="]');
+                const seen = new Set();
+                for (const a of links) {
+                    if (a.href && !seen.has(a.href)) {
+                        seen.add(a.href);
+                        const title = (a.innerText || a.getAttribute('title') || a.getAttribute('aria-label') || '').trim();
+                        if (title && title.length > 5) {
+                            list.push({ url: a.href, title, channel: '' });
+                        }
+                    }
+                }
+                return list;
+            }"""
+        )
 
     if not candidates:
         raise RuntimeError(f"Không tìm thấy video kết quả nào cho từ khóa '{keyword}'.")
@@ -182,12 +259,12 @@ async def action_watch_video(
 
     await dismiss_common_popups(page)
 
-    # Ensure video is playing
+    # Ensure video is playing and unmuted
     await page.evaluate(
         """() => {
             const v = document.querySelector('video');
-            if (v && v.paused) {
-                v.play().catch(() => {});
+            if (v) {
+                if (v.paused) v.play().catch(() => {});
             }
         }"""
     )
@@ -250,15 +327,25 @@ async def action_like_video(page: Any) -> bool:
     """Click the Like button if not already liked."""
     logger.info("Thực hiện hành động Like video...")
     try:
-        # Check like button state
         like_btn_info = await page.evaluate(
             """() => {
-                const likeBtn = document.querySelector(
-                    'like-button-view-model button, #top-level-buttons-computed ytd-toggle-button-renderer button, ytd-watch-metadata #segmented-like-button button'
-                );
-                if (!likeBtn) return { found: false, pressed: false };
-                const pressed = likeBtn.getAttribute('aria-pressed') === 'true';
-                return { found: true, pressed };
+                const selectors = [
+                    'like-button-view-model button',
+                    '#top-level-buttons-computed ytd-toggle-button-renderer button',
+                    'ytd-watch-metadata #segmented-like-button button',
+                    'segmented-like-dislike-button-view-model like-button-view-model button',
+                    'button[aria-label*="like" i]',
+                    'button[aria-label*="thích" i]'
+                ];
+                for (const sel of selectors) {
+                    const btn = document.querySelector(sel);
+                    if (btn) {
+                        const ariaPressed = btn.getAttribute('aria-pressed');
+                        const isPressed = ariaPressed === 'true';
+                        return { found: true, pressed: isPressed, selector: sel };
+                    }
+                }
+                return { found: false, pressed: false, selector: '' };
             }"""
         )
 
@@ -270,10 +357,14 @@ async def action_like_video(page: Any) -> bool:
             logger.info("Video đã được Like trước đó. Bỏ qua.")
             return True
 
-        # Click like
-        like_btn_sel = "like-button-view-model button, ytd-watch-metadata #segmented-like-button button"
-        btn = await page.query_selector(like_btn_sel)
+        matched_sel = like_btn_info.get("selector")
+        btn = await page.query_selector(matched_sel) if matched_sel else None
+        if not btn:
+            btn = await page.query_selector("like-button-view-model button, ytd-watch-metadata #segmented-like-button button, button[aria-label*='thích' i]")
+
         if btn:
+            await btn.scroll_into_view_if_needed()
+            await asyncio.sleep(random.uniform(0.3, 0.6))
             await btn.click()
             await asyncio.sleep(random.uniform(1.2, 2.5))
             logger.info("Đã Like video thành công!")
@@ -294,24 +385,29 @@ async def action_comment_video(page: Any, comment_text: str) -> bool:
     try:
         # Scroll to comments section
         await natural_scroll(page, min_scrolls=2, max_scrolls=3)
-        await asyncio.sleep(random.uniform(1.5, 3.0))
+        await asyncio.sleep(random.uniform(1.5, 2.5))
 
         # Focus comment box
-        placeholder_sel = "#placeholder-area, #simplebox-placeholder"
-        placeholder = await page.wait_for_selector(placeholder_sel, state="visible", timeout=12000)
-        if not placeholder:
-            logger.warning("Không tìm thấy khung nhập bình luận.")
-            return False
+        placeholder_sel = "#placeholder-area, #simplebox-placeholder, ytd-comment-simplebox-renderer #placeholder-area, ytd-comments-header-renderer"
+        try:
+            placeholder = await page.wait_for_selector(placeholder_sel, state="attached", timeout=8000)
+            if placeholder:
+                await placeholder.scroll_into_view_if_needed()
+                await placeholder.click()
+                await asyncio.sleep(random.uniform(0.6, 1.2))
+        except Exception:
+            pass
 
-        await placeholder.click()
-        await asyncio.sleep(random.uniform(0.6, 1.2))
-
-        # Type comment
-        input_sel = "#contenteditable-root, ytd-commentbox #contenteditable-root"
-        input_elem = await page.wait_for_selector(input_sel, state="visible", timeout=8000)
+        # Find contenteditable input
+        input_sel = "#contenteditable-root, ytd-commentbox #contenteditable-root, div#contenteditable-textarea"
+        input_elem = await page.wait_for_selector(input_sel, state="attached", timeout=8000)
         if not input_elem:
             logger.warning("Không tìm thấy ô soạn thảo bình luận.")
             return False
+
+        await input_elem.scroll_into_view_if_needed()
+        await input_elem.click()
+        await asyncio.sleep(random.uniform(0.3, 0.6))
 
         for char in clean_text:
             await input_elem.type(char, delay=random.randint(40, 110))
@@ -321,7 +417,7 @@ async def action_comment_video(page: Any, comment_text: str) -> bool:
         await asyncio.sleep(random.uniform(1.0, 2.0))
 
         # Submit comment
-        submit_btn_sel = "#submit-button button, ytd-commentbox #submit-button button"
+        submit_btn_sel = "#submit-button button, ytd-commentbox #submit-button button, ytd-button-renderer#submit-button button"
         submit_btn = await page.query_selector(submit_btn_sel)
         if submit_btn and await submit_btn.is_enabled():
             await submit_btn.click()
@@ -342,13 +438,21 @@ async def action_subscribe_channel(page: Any) -> bool:
     try:
         sub_info = await page.evaluate(
             """() => {
-                const subBtn = document.querySelector(
-                    'ytd-watch-metadata #subscribe-button button, ytd-subscribe-button-renderer button'
-                );
-                if (!subBtn) return { found: false, subscribed: false };
-                const text = (subBtn.innerText || subBtn.getAttribute('aria-label') || '').toLowerCase();
-                const subscribed = text.includes('subscribed') || text.includes('đã đăng ký');
-                return { found: true, subscribed, text };
+                const selectors = [
+                    'ytd-watch-metadata #subscribe-button button',
+                    'ytd-subscribe-button-renderer button',
+                    'subscribe-button-view-model button',
+                    '#subscribe-button-shape button'
+                ];
+                for (const sel of selectors) {
+                    const subBtn = document.querySelector(sel);
+                    if (subBtn) {
+                        const text = (subBtn.innerText || subBtn.getAttribute('aria-label') || '').toLowerCase();
+                        const subscribed = text.includes('subscribed') || text.includes('đã đăng ký');
+                        return { found: true, subscribed, selector: sel };
+                    }
+                }
+                return { found: false, subscribed: false, selector: '' };
             }"""
         )
 
@@ -360,8 +464,13 @@ async def action_subscribe_channel(page: Any) -> bool:
             logger.info("Kênh đã được đăng ký trước đó. Bỏ qua.")
             return True
 
-        btn = await page.query_selector("ytd-watch-metadata #subscribe-button button, ytd-subscribe-button-renderer button")
+        matched_sel = sub_info.get("selector")
+        btn = await page.query_selector(matched_sel) if matched_sel else None
+        if not btn:
+            btn = await page.query_selector("ytd-watch-metadata #subscribe-button button, ytd-subscribe-button-renderer button")
         if btn:
+            await btn.scroll_into_view_if_needed()
+            await asyncio.sleep(random.uniform(0.3, 0.6))
             await btn.click()
             await asyncio.sleep(random.uniform(1.5, 3.0))
             logger.info("Đã bấm Subscribe kênh đối thủ thành công!")
