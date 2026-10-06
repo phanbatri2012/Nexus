@@ -51,6 +51,7 @@ from auto_yt.services.chatgpt_service import process_prompt_via_chatgpt
 from auto_yt.services.chatgpt_runtime import ChatGPTAttentionRequiredError
 from auto_yt.services.chatgpt_worker import sanitize_generated_script
 from auto_yt.services import process_registry
+from auto_yt.services.system_cleaner import cleaner as system_cleaner
 import auto_yt.services.database as db
 import auto_yt.services.audio_utils as audio_utils
 import auto_yt.services.tts_registry as tts
@@ -129,6 +130,8 @@ _comment_sync_stop_event = threading.Event()
 _comment_sync_thread: threading.Thread | None = None
 _tts_preview_cleanup_stop_event = threading.Event()
 _tts_preview_cleanup_thread: threading.Thread | None = None
+_system_cleanup_stop_event = threading.Event()
+_system_cleanup_thread: threading.Thread | None = None
 _tts_preview_sync_locks: dict[str, threading.Lock] = {}
 _tts_preview_sync_locks_guard = threading.Lock()
 _youtube_oauth_states: dict[str, dict] = {}
@@ -158,6 +161,7 @@ TTS_PREVIEW_MAX_CHARACTERS = 200
 TTS_PREVIEW_REQUEST_MAX_CHARACTERS = 1000
 TTS_PREVIEW_RETENTION = datetime.timedelta(hours=24)
 TTS_PREVIEW_CLEANUP_INTERVAL_SECONDS = 60 * 60
+SYSTEM_CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
 VIDEO_RECOVERY_DELAYS_SECONDS = (30, 120, 300)
 YOUTUBE_RECOVERY_DELAYS_SECONDS = (120, 300, 900)
 TRANSIENT_YOUTUBE_ERROR_MARKERS = (
@@ -4805,6 +4809,17 @@ def resume_background_jobs() -> None:
             name="tts-preview-cleanup",
         )
         _tts_preview_cleanup_thread.start()
+    _system_cleanup_stop_event.clear()
+    if (
+        _system_cleanup_thread is None
+        or not _system_cleanup_thread.is_alive()
+    ):
+        _system_cleanup_thread = threading.Thread(
+            target=_system_cleanup_scheduler,
+            daemon=True,
+            name="system-auto-cleanup",
+        )
+        _system_cleanup_thread.start()
 
 
 @app.on_event("shutdown")
@@ -4817,6 +4832,7 @@ def stop_video_queue_wakeup_timer() -> None:
         _video_queue_wakeup_at = 0.0
     _comment_sync_stop_event.set()
     _tts_preview_cleanup_stop_event.set()
+    _system_cleanup_stop_event.set()
     if _production_coordinator is not None:
         _production_coordinator.stop()
     chatgpt_browser_service.stop_browser_service()
@@ -9869,6 +9885,21 @@ def _tts_preview_cleanup_scheduler() -> None:
             )
 
 
+def _system_cleanup_scheduler() -> None:
+    while not _system_cleanup_stop_event.wait(
+        SYSTEM_CLEANUP_INTERVAL_SECONDS
+    ):
+        try:
+            if not process_registry.is_busy():
+                system_cleaner.run_full_cleanup(dry_run=False, vacuum_db=True)
+        except Exception as exc:
+            print(
+                "System auto cleanup failed: "
+                f"{security_logging.redact_sensitive(exc)}",
+                file=sys.stderr,
+            )
+
+
 def _get_unexpired_tts_preview(preview_id: str) -> dict:
     normalized_id = _normalize_tts_preview_id(preview_id)
     preview = db.get_tts_preview(normalized_id)
@@ -11560,5 +11591,37 @@ def delete_crossposter_campaign(
     return {"success": success, "campaigns": campaigns, "message": f"Đã xóa chiến dịch cho Fanpage: {pid}"}
 
 
+# =========================================================================
+# System Cleanup & Space Management Endpoints
+# =========================================================================
+@app.get("/api/system/cleanup/stats")
+async def get_system_cleanup_stats_endpoint():
+    """Get breakdown of cleanable disk space and files across all categories."""
+    try:
+        summary = system_cleaner.run_full_cleanup(dry_run=True, vacuum_db=False)
+        return {"status": "ok", "summary": summary.to_dict()}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Lỗi quét dung lượng dọn rác: {exc}")
 
 
+@app.post("/api/system/cleanup/run")
+async def run_system_cleanup_endpoint(background_tasks: BackgroundTasks, vacuum: bool = True):
+    """Trigger background system cleanup to reclaim disk space."""
+    if process_registry.is_busy():
+        raise HTTPException(
+            status_code=409,
+            detail="Hệ thống đang bận render hoặc sản xuất video. Vui lòng thử lại khi hoàn tất.",
+        )
+
+    def _do_clean():
+        try:
+            system_cleaner.run_full_cleanup(dry_run=False, vacuum_db=vacuum)
+        except Exception as exc:
+            print(
+                "Manual system cleanup failed: "
+                f"{security_logging.redact_sensitive(exc)}",
+                file=sys.stderr,
+            )
+
+    background_tasks.add_task(_do_clean)
+    return {"status": "ok", "message": "Tiến trình dọn dẹp hệ thống đã được khởi chạy trong nền."}

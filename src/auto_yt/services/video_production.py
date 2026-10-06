@@ -2532,6 +2532,13 @@ def render_video(
     expected_duration = sum(float(scene["duration"]) for scene in scenes)
     details = validate_render(temporary, expected_duration, ffmpeg_exe)
     temporary.replace(target)
+    # Clean up intermediate segment clips to save disk space
+    try:
+        segment_root = SEGMENTS_DIR / str(video_id) / input_hash[:16]
+        if segment_root.exists():
+            shutil.rmtree(segment_root, ignore_errors=True)
+    except Exception:
+        pass
     return db.upsert_video_artifact(
         video_id=video_id,
         artifact_type="final_mp4",
