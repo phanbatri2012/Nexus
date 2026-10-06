@@ -88,7 +88,7 @@ export default function TrustBuilder() {
       let chList = []
       if (chRes.ok) {
         const chData = await chRes.json()
-        chList = Array.isArray(chData) ? chData : (chData.channels || [])
+        chList = Array.isArray(chData) ? chData : (chData.items || chData.channels || [])
       }
 
       // 2. Fetch trust plans
@@ -96,7 +96,7 @@ export default function TrustBuilder() {
       let planList = []
       if (planRes.ok) {
         const planData = await planRes.json()
-        planList = planData.plans || []
+        planList = Array.isArray(planData) ? planData : (planData.plans || planData.items || [])
       }
 
       setChannels(chList)
