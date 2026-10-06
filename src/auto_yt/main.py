@@ -753,7 +753,6 @@ class YouTubeChannelSettingsRequest(BaseModel):
 
 class GpmConfigRequest(BaseModel):
     api_url: Optional[str] = Field(default=None, max_length=500)
-    auto_stop_on_finish: Optional[bool] = None
     timeout_seconds: Optional[float] = Field(default=None, ge=2.0, le=120.0)
 
 
@@ -781,7 +780,6 @@ class GpmChannelMappingRequest(BaseModel):
 class ChannelOpenBrowserRequest(BaseModel):
     profile_id: str = Field(min_length=1, max_length=200)
     platform: str = Field(default="youtube", max_length=50)
-    force_restart: bool = False
 
 
 class ChannelScanYouTubeRequest(BaseModel):
@@ -1186,7 +1184,6 @@ def update_gpm_configuration(request: GpmConfigRequest):
     try:
         return gpm_service.save_gpm_config(
             api_url=request.api_url,
-            auto_stop_on_finish=request.auto_stop_on_finish,
             timeout_seconds=request.timeout_seconds,
         )
     except Exception as exc:
@@ -1297,14 +1294,24 @@ def start_gpm_profile_endpoint(
 def stop_gpm_profile_endpoint(profile_id: str, api_url: Optional[str] = Query(None)):
     """Close/stop a running GPM profile browser or local browser."""
     try:
+        if channel_scanner_service.is_profile_browser_busy(profile_id):
+            raise HTTPException(
+                status_code=409,
+                detail="Profile đang có tác vụ trình duyệt. Hãy chờ tác vụ hoàn tất trước khi đóng.",
+            )
         if profile_id.startswith("local_"):
-            from auto_yt.services import local_browser_service, channel_scanner_service
+            from auto_yt.services import local_browser_service
             parsed = channel_scanner_service.parse_profile_target(profile_id)
-            success = local_browser_service.terminate_local_browser_processes(parsed["browser_key"])
+            success = local_browser_service.terminate_local_browser_processes(
+                parsed["browser_key"],
+                parsed["profile_dir"],
+            )
             return {"success": success, "profile_id": profile_id}
         success = gpm_service.stop_gpm_profile(profile_id, api_url=api_url)
         return {"success": success, "profile_id": profile_id}
     except Exception as exc:
+        if isinstance(exc, HTTPException):
+            raise
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -1460,7 +1467,6 @@ def open_channel_browser_endpoint(request: ChannelOpenBrowserRequest):
         return channel_scanner_service.open_channel_platform_browser(
             profile_id=request.profile_id,
             platform=request.platform,
-            force_restart=request.force_restart,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -4307,7 +4313,6 @@ def _execute_comment_publish_job(job: dict) -> None:
             if video_url:
                 try:
                     db.update_system_job(job["id"], progress="Đang đăng bình luận qua GPM Profile Browser")
-                    has_more_publish_jobs = db.has_claimable_system_jobs("comment_publish")
                     gpm_result = asyncio.run(
                         gpm_youtube_automation.post_comment_reply_via_gpm(
                             gpm_profile_id,
@@ -4315,7 +4320,6 @@ def _execute_comment_publish_job(job: dict) -> None:
                             comment_text=safe_reply,
                             comment_id=comment.get("comment_id") or "",
                             auto_heart=auto_heart,
-                            auto_stop=not has_more_publish_jobs,
                         )
                     )
                     result = {
@@ -4326,9 +4330,13 @@ def _execute_comment_publish_job(job: dict) -> None:
                         **gpm_result,
                     }
                 except Exception as gpm_exc:
-                    logger.warning("Đăng qua GPM CDP thất bại (%s), fallback sang REST API qua proxy...", gpm_exc)
+                    logger.error(
+                        "Đăng qua GPM CDP thất bại (%s); không fallback tự động để tránh đăng trùng.",
+                        gpm_exc,
+                    )
+                    raise
 
-        # Fallback to direct REST API with channel proxy if CDP was not used or failed
+        # Use the REST API only when browser automation was not selected or no video URL is available.
         if result is None:
             result = youtube_comments.publish_reply(
                 access_token,

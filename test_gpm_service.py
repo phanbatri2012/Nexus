@@ -36,23 +36,21 @@ def test_gpm_config_load_and_save(tmp_path=None):
             # Test default config
             cfg = gpm_service.get_gpm_config()
             assert cfg["api_url"] == gpm_service.DEFAULT_GPM_API_URL
-            assert cfg["auto_stop_on_finish"] is False
             assert cfg["timeout_seconds"] == gpm_service.DEFAULT_TIMEOUT_SECONDS
+            assert "auto_stop_on_finish" not in cfg
 
             # Test save config
             saved = gpm_service.save_gpm_config(
                 api_url="http://127.0.0.1:19995",
-                auto_stop_on_finish=False,
                 timeout_seconds=20.0,
             )
             assert saved["api_url"] == "http://127.0.0.1:19995"
-            assert saved["auto_stop_on_finish"] is False
             assert saved["timeout_seconds"] == 20.0
 
             # Verify persisted on disk
             loaded = gpm_service.get_gpm_config()
             assert loaded["api_url"] == "http://127.0.0.1:19995"
-            assert loaded["auto_stop_on_finish"] is False
+            assert "auto_stop_on_finish" not in loaded
     print("✓ test_gpm_config_load_and_save passed")
 
 
@@ -198,7 +196,7 @@ def test_fastapi_gpm_endpoints():
     assert "api_url" in res.json()
 
     # Test POST /api/gpm/config
-    res = client.post("/api/gpm/config", json={"api_url": "http://127.0.0.1:19995", "auto_stop_on_finish": True})
+    res = client.post("/api/gpm/config", json={"api_url": "http://127.0.0.1:19995"})
     assert res.status_code == 200
     assert res.json()["api_url"] == "http://127.0.0.1:19995"
 
@@ -269,33 +267,14 @@ def test_gpm_already_open_handling():
         assert info["status"] == "already_open"
         assert info["already_running_no_cdp"] is True
 
-    # When require_cdp=True, it kills non-CDP process, stops GPM profile, and restarts with CDP
-    mock_success_restart = {
-        "success": True,
-        "data": {
-            "remote_debugging_port": 54321,
-            "websocket_debugging_url": "ws://127.0.0.1:54321/devtools",
-        }
-    }
-    call_count = 0
-    def mock_request_with_recovery(endpoint, *args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        if "stop" in endpoint:
-            return {"success": True, "data": {}}
-        if "start" in endpoint:
-            if call_count == 1:
-                return mock_resp
-            return mock_success_restart
-        return {"success": True, "data": {}}
-
-    with patch("auto_yt.services.gpm_service._request_gpm_api", side_effect=mock_request_with_recovery), \
-         patch("auto_yt.services.gpm_service.kill_gpm_profile_processes", return_value=1), \
+    # Operational code preserves an already-open non-CDP profile.
+    with patch("auto_yt.services.gpm_service._request_gpm_api", return_value=mock_resp) as request_api, \
          patch("auto_yt.services.gpm_service.find_running_gpm_profile_coordinates", return_value=None), \
-         patch("time.sleep", return_value=None):
-        cdp_info = gpm_service.start_gpm_profile("p_recover", require_cdp=True)
-        assert cdp_info["remote_debugging_port"] == 54321
-        assert "ws://127.0.0.1:54321" in cdp_info["websocket_debugging_url"]
+         patch("auto_yt.services.gpm_service.kill_gpm_profile_processes") as kill_processes:
+        cdp_info = gpm_service.start_gpm_profile("p_preserve", require_cdp=True)
+        assert cdp_info["already_running_no_cdp"] is True
+        assert request_api.call_count == 1
+        kill_processes.assert_not_called()
 
     print("✓ test_gpm_already_open_handling passed")
 
@@ -347,6 +326,7 @@ def test_open_url_preserves_query_parameters_in_cdp_json_new():
         # Verify that the URL sent to /json/new has the entire target_url percent-encoded
         new_tab_calls = [u for u in recorded_urls if "/json/new?" in u]
         assert len(new_tab_calls) >= 1
+        assert not any("/json/list" in u for u in recorded_urls)
         expected_encoded = urllib.parse.quote(complex_url, safe="")
         assert f"/json/new?{expected_encoded}" in new_tab_calls[0]
         # Crucial invariant: there should be NO unencoded '&' in the /json/new URL (only 1 query param)
@@ -450,13 +430,15 @@ def test_post_comment_reply_via_gpm_with_auto_heart():
 
     mock_context = AsyncMock()
     mock_context.new_page = AsyncMock(return_value=mock_page)
+    mock_context.pages = [mock_page]
+    mock_page.is_closed = MagicMock(return_value=False)
 
     from contextlib import asynccontextmanager
     @asynccontextmanager
-    async def dummy_session(profile_id, auto_stop=True):
-        yield (mock_context, AsyncMock())
+    async def dummy_session(profile_id):
+        yield (mock_context, AsyncMock(), {"id": profile_id})
 
-    with patch("auto_yt.services.gpm_youtube_automation.gpm_browser_session", side_effect=dummy_session):
+    with patch("auto_yt.services.gpm_youtube_automation.channel_browser_session", side_effect=dummy_session):
         res = asyncio.run(
             gpm_youtube_automation.post_comment_reply_via_gpm(
                 profile_id="p1",
@@ -510,7 +492,7 @@ def test_gpm_session_reuses_running_profile_without_duplicate_window():
         mock_pw_factory.return_value = mock_pw_cm
 
         async def run_session():
-            async with gpm_service.gpm_browser_session("gkvs-profile", auto_stop=True) as (ctx, br):
+            async with gpm_service.gpm_browser_session("gkvs-profile") as (ctx, br):
                 assert ctx is mock_context
 
         asyncio.run(run_session())
@@ -524,8 +506,8 @@ def test_gpm_session_reuses_running_profile_without_duplicate_window():
     print("✓ test_gpm_session_reuses_running_profile_without_duplicate_window passed")
 
 
-def test_gpm_session_stops_profile_when_started_by_session():
-    """Verify that if a profile was started by Auto_YT, it is cleanly stopped when auto_stop=True."""
+def test_gpm_session_keeps_profile_running_when_started_by_session():
+    """A profile started by Auto_YT remains open after the CDP client disconnects."""
     mock_launch_data = {
         "success": True,
         "data": {
@@ -564,12 +546,39 @@ def test_gpm_session_stops_profile_when_started_by_session():
 
         asyncio.run(run_session())
 
-        # Assert start was called, playwright was stopped, and stop was called
+        # The session starts once, disconnects Playwright, and never calls stop.
         assert any("start" in call for call in api_calls), f"Expected start call in {api_calls}"
-        assert any("stop" in call for call in api_calls), f"Expected stop call in {api_calls}"
+        assert not any("stop" in call for call in api_calls), f"Unexpected stop call in {api_calls}"
         mock_playwright.stop.assert_called_once()
 
-    print("✓ test_gpm_session_stops_profile_when_started_by_session passed")
+    print("✓ test_gpm_session_keeps_profile_running_when_started_by_session passed")
+
+
+def test_gpm_session_cdp_failure_never_restarts_profile():
+    launch_info = {
+        "remote_debugging_port": 19996,
+        "websocket_debugging_url": "ws://127.0.0.1:19996/devtools/browser/stale",
+    }
+
+    with patch("auto_yt.services.gpm_service.start_gpm_profile", return_value=launch_info) as start_profile, \
+         patch("auto_yt.services.gpm_service.wait_for_cdp_readiness", AsyncMock(side_effect=RuntimeError("CDP down"))), \
+         patch("auto_yt.services.gpm_service.find_running_gpm_profile_coordinates", return_value=None), \
+         patch("auto_yt.services.gpm_service.stop_gpm_profile") as stop_profile, \
+         patch("auto_yt.services.gpm_service.kill_gpm_profile_processes") as kill_processes:
+        async def run_session():
+            async with gpm_service.gpm_browser_session("stale-profile"):
+                raise AssertionError("Session must not connect")
+
+        try:
+            asyncio.run(run_session())
+        except gpm_service.GpmConnectionError:
+            pass
+        else:
+            raise AssertionError("Expected GpmConnectionError")
+
+        start_profile.assert_called_once()
+        stop_profile.assert_not_called()
+        kill_processes.assert_not_called()
 
 
 def test_wait_for_cdp_readiness():
@@ -602,6 +611,7 @@ if __name__ == "__main__":
     test_fastapi_gpm_endpoints()
     test_post_comment_reply_via_gpm_with_auto_heart()
     test_gpm_session_reuses_running_profile_without_duplicate_window()
-    test_gpm_session_stops_profile_when_started_by_session()
+    test_gpm_session_keeps_profile_running_when_started_by_session()
+    test_gpm_session_cdp_failure_never_restarts_profile()
     test_wait_for_cdp_readiness()
     print("\n🎉 ALL GPM TESTS PASSED SUCCESSFULLY!")

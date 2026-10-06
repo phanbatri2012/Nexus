@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import auto_yt.services.database as db
-from auto_yt.services.channel_scanner_service import channel_browser_session
+from auto_yt.services.channel_scanner_service import channel_browser_session, cleanup_owned_page
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +49,9 @@ async def upload_video_via_gpm(
 
     async with channel_browser_session(
         profile_id,
-        target_url=TIKTOK_UPLOAD_URL,
         timeout_seconds=timeout_seconds,
     ) as (context, _browser, _p_info):
-        page = context.pages[0] if context.pages else await context.new_page()
+        page = await context.new_page()
 
         await page.goto(
             TIKTOK_UPLOAD_URL,
@@ -126,12 +125,14 @@ async def upload_video_via_gpm(
             await asyncio.sleep(4.0)
             logger.info("Đã bấm nút Đăng video lên TikTok!")
 
-        return {
+        result = {
             "success": True,
             "message": "Đã tải và đăng video lên TikTok Creator Center thành công!",
             "profile_id": profile_id,
             "video_name": video_path.name,
         }
+        await cleanup_owned_page(context, page)
+        return result
 
 
 def start_tiktok_publish_job(

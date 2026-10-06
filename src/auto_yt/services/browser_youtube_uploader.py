@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from auto_yt.services.channel_scanner_service import channel_browser_session
+from auto_yt.services.channel_scanner_service import channel_browser_session, cleanup_owned_page
 from auto_yt.services.browser_diagnostics import capture_browser_diagnostics_async
 
 logger = logging.getLogger(__name__)
@@ -2815,7 +2815,6 @@ async def upload_video_via_browser(
     persist_video_id: Callable[[str], None] = lambda _: None,
     persist_checkpoint: Callable[[str, dict[str, Any]], None] = lambda *_: None,
     timeout_seconds: float = 600.0,
-    auto_stop_gpm: bool | None = None,
 ) -> dict[str, Any]:
     """Execute complete end-to-end YouTube Studio upload workflow in GPM Profile via Playwright CDP.
 
@@ -2854,6 +2853,7 @@ async def upload_video_via_browser(
         page.set_default_navigation_timeout(
             int(min(60.0, max(10.0, float(timeout_seconds))) * 1000)
         )
+        preserve_page = True
         try:
             progress("Đang mở YouTube Studio...", "navigating_studio", 10)
             studio_url = (
@@ -4304,6 +4304,7 @@ async def upload_video_via_browser(
             )
 
             progress("Upload qua trình duyệt hoàn tất thành công 100%!", "completed", 100)
+            preserve_page = False
             return {
                 "youtube_video_id": youtube_video_id,
                 "published_url": f"https://www.youtube.com/watch?v={youtube_video_id}",
@@ -4366,13 +4367,7 @@ async def upload_video_via_browser(
                 raise
             raise BrowserUploadError(f"Upload qua trình duyệt thất bại: {exc}") from exc
         finally:
-            try:
-                if len(context.pages) > 1:
-                    await page.close()
-                else:
-                    await page.goto("about:blank")
-            except Exception:
-                pass
+            await cleanup_owned_page(context, page, preserve=preserve_page)
 
 
 async def make_video_public_via_browser(
@@ -4380,7 +4375,6 @@ async def make_video_public_via_browser(
     profile_id: str,
     youtube_video_id: str,
     timeout_seconds: float = 60.0,
-    auto_stop_gpm: bool | None = None,
 ) -> dict[str, Any]:
     """Change visibility of an existing YouTube video to Public in GPM Profile via Playwright CDP."""
     clean_profile = str(profile_id or "").strip()
@@ -4394,6 +4388,7 @@ async def make_video_public_via_browser(
     async with channel_browser_session(clean_profile) as (context, _browser, _profile_meta):
         page = await context.new_page()
         await page.bring_to_front()
+        preserve_page = True
         try:
             edit_url = f"https://studio.youtube.com/video/{clean_vid_id}/edit"
             logger.info("Mở trang chỉnh sửa video YouTube Studio: %s", edit_url)
@@ -4454,6 +4449,7 @@ async def make_video_public_via_browser(
                 await asyncio.sleep(2.0)
 
             logger.info("Đã chuyển video %s sang trạng thái Công khai (Public) thành công.", clean_vid_id)
+            preserve_page = False
             return {
                 "success": True,
                 "youtube_video_id": clean_vid_id,
@@ -4461,10 +4457,4 @@ async def make_video_public_via_browser(
                 "privacy_status": "public",
             }
         finally:
-            try:
-                if len(context.pages) > 1:
-                    await page.close()
-                else:
-                    await page.goto("about:blank")
-            except Exception:
-                pass
+            await cleanup_owned_page(context, page, preserve=preserve_page)

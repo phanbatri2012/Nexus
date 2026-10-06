@@ -72,6 +72,17 @@ BROWSER_DEFINITIONS: dict[str, dict[str, Any]] = {
 }
 
 
+def _extract_profile_directory(command_line: str) -> str:
+    match = re.search(
+        r'--profile-directory=(?:"([^"]+)"|([^\s]+))',
+        str(command_line or ""),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    return str(match.group(1) or match.group(2) or "").strip().lower()
+
+
 def _expand_path(raw_path: str) -> Path:
     return Path(os.path.expandvars(raw_path))
 
@@ -217,7 +228,7 @@ def find_running_local_browser_port(browser_key: str, profile_dir: str) -> dict[
 
         for proc in proc_list:
             cmdline = str(proc.get("CommandLine") or "").lower()
-            if norm_user_data in cmdline and (f"--profile-directory={norm_profile}" in cmdline or norm_profile == "default"):
+            if norm_user_data in cmdline and _extract_profile_directory(cmdline) == norm_profile:
                 port_match = re.search(r"--remote-debugging-port=(\d+)", cmdline)
                 if port_match:
                     port = int(port_match.group(1))
@@ -257,28 +268,68 @@ def is_browser_process_running(browser_key: str) -> bool:
         return False
 
 
-def terminate_local_browser_processes(browser_key: str) -> bool:
-    """Safely terminate existing processes of the browser to allow fresh launch with CDP."""
-    exe_path, _ = resolve_browser_paths(browser_key)
-    if not exe_path:
+def terminate_local_browser_processes(browser_key: str, profile_dir: str) -> bool:
+    """Terminate only the explicitly selected local browser profile process tree."""
+    exe_path, user_data_path = resolve_browser_paths(browser_key)
+    clean_profile = str(profile_dir or "").strip()
+    if not exe_path or not user_data_path or not clean_profile or sys.platform != "win32":
         return False
-    exe_name = exe_path.name
     try:
-        logger.info("Đang đóng các tiến trình %s cũ để kích hoạt cổng kết nối CDP...", exe_name)
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/IM", exe_name],
-            capture_output=True,
-            timeout=5.0,
+        ps_cmd = (
+            "$ErrorActionPreference='SilentlyContinue'; "
+            "Get-CimInstance Win32_Process | "
+            f"Where-Object {{ $_.Name -eq '{exe_path.name}' }} | "
+            "Select-Object ProcessId, CommandLine | ConvertTo-Json -Compress"
         )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            capture_output=True,
+            text=True,
+            timeout=6.0,
+        )
+        raw = result.stdout.strip()
+        if not raw:
+            return False
+        parsed = json.loads(raw)
+        processes = [parsed] if isinstance(parsed, dict) else parsed
+        normalized_user_data = str(user_data_path).replace("/", "\\").lower()
+        normalized_profile = clean_profile.lower()
+        root_pids = []
+        for process in processes:
+            command_line = str(process.get("CommandLine") or "")
+            normalized_command = command_line.replace("/", "\\").lower()
+            if "--type=" in normalized_command:
+                continue
+            if normalized_user_data not in normalized_command:
+                continue
+            if _extract_profile_directory(normalized_command) != normalized_profile:
+                continue
+            process_id = process.get("ProcessId")
+            if process_id:
+                root_pids.append(int(process_id))
+
+        if not root_pids:
+            logger.warning(
+                "Không tìm thấy tiến trình %s thuộc profile %s; không đóng browser theo tên executable.",
+                exe_path.name,
+                clean_profile,
+            )
+            return False
+
+        for process_id in root_pids:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(process_id)],
+                capture_output=True,
+                timeout=5.0,
+            )
         deadline = time.time() + 5.0
         while time.time() < deadline:
-            if not is_browser_process_running(browser_key):
+            if not find_running_local_browser_port(browser_key, clean_profile):
                 break
             time.sleep(0.4)
-        time.sleep(0.5)
         return True
     except Exception as exc:
-        logger.warning("Không thể tắt tiến trình %s: %s", exe_name, exc)
+        logger.warning("Không thể đóng %s profile %s: %s", browser_key, clean_profile, exc)
         return False
 
 
@@ -288,15 +339,13 @@ def start_local_browser(
     target_url: str = "",
     preferred_port: int | None = None,
     require_cdp: bool = False,
-    force_restart: bool = False,
 ) -> dict[str, Any]:
     """Start local browser (Cốc Cốc, Chrome, Edge) with Remote Debugging Port enabled.
 
-    - If force_restart is True: closes running browser processes and launches fresh with CDP.
-    - If already running with CDP: navigates/opens target_url and returns coordinates.
+    - If already running with CDP: opens target_url in a new tab and returns coordinates.
     - If running without CDP:
-        * If require_cdp is True: auto-terminates stale non-CDP processes and relaunches fresh with CDP enabled.
-        * If require_cdp is False: opens target_url in a new tab of the existing browser and returns success.
+        * Never terminates or restarts the existing browser.
+        * Opens target_url only for manual open requests; automation callers fail closed.
     - If not running: launches with remote debugging port enabled.
     """
     exe_path, user_data_path = resolve_browser_paths(browser_key)
@@ -306,11 +355,6 @@ def start_local_browser(
     defn = BROWSER_DEFINITIONS.get(browser_key, {})
     browser_display_name = defn.get("name", browser_key.title())
 
-    # 0. Handle force restart if explicitly requested
-    if force_restart:
-        logger.info("Yêu cầu force_restart=True: Đang đóng %s để kích hoạt CDP...", browser_display_name)
-        terminate_local_browser_processes(browser_key)
-
     # 1. Check if already running with CDP
     running = find_running_local_browser_port(browser_key, profile_dir)
     if running:
@@ -318,32 +362,6 @@ def start_local_browser(
         logger.info("Phát hiện %s (Profile %s) đang chạy trên port %s", browser_key, profile_dir, port)
         if target_url:
             try:
-                # Check /json/list to activate if exists
-                try:
-                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=2.0) as lresp:
-                        tabs = json.loads(lresp.read().decode("utf-8"))
-                        if isinstance(tabs, list):
-                            target_domain = urllib.parse.urlparse(target_url).netloc
-                            for tab in tabs:
-                                tab_url = str(tab.get("url") or "").lower()
-                                if (target_url.lower() in tab_url or (target_domain and target_domain in tab_url)) and tab.get("id"):
-                                    activate_url = f"http://127.0.0.1:{port}/json/activate/{tab['id']}"
-                                    with urllib.request.urlopen(activate_url, timeout=2.0):
-                                        pass
-                                    return {
-                                        "success": True,
-                                        "port": port,
-                                        "endpoint_url": running["endpoint_url"],
-                                        "ws_url": running["ws_url"],
-                                        "already_running": True,
-                                        "already_running_no_cdp": False,
-                                        "browser_key": browser_key,
-                                        "profile_dir": profile_dir,
-                                        "message": f"Đã chuyển đến tab đang mở trên {browser_display_name}.",
-                                    }
-                except Exception:
-                    pass
-
                 encoded = urllib.parse.quote(target_url, safe="")
                 req = urllib.request.Request(f"http://127.0.0.1:{port}/json/new?{encoded}", method="PUT")
                 with urllib.request.urlopen(req, timeout=3.0):
@@ -371,7 +389,12 @@ def start_local_browser(
         if target_url:
             try:
                 subprocess.Popen(
-                    [str(exe_path), target_url],
+                    [
+                        str(exe_path),
+                        f"--user-data-dir={user_data_path}",
+                        f"--profile-directory={profile_dir}",
+                        target_url,
+                    ],
                     shell=False,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
@@ -401,9 +424,6 @@ def start_local_browser(
         "--no-first-run",
         "--no-default-browser-check",
     ]
-    if target_url:
-        args.append(target_url)
-
     logger.info("Khởi chạy %s với cờ debug port %s: %s", browser_key, port, args)
     subprocess.Popen(
         args,
@@ -430,6 +450,15 @@ def start_local_browser(
             f"Không thể kích hoạt cổng gỡ lỗi ({port}) cho trình duyệt {browser_display_name}. "
             f"Vui lòng đóng hoàn toàn trình duyệt {browser_display_name} và bấm nút trên Tool để khởi động lại kèm cổng CDP."
         )
+
+    if target_url:
+        encoded = urllib.parse.quote(target_url, safe="")
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/json/new?{encoded}",
+            method="PUT",
+        )
+        with urllib.request.urlopen(request, timeout=3.0):
+            pass
 
     return {
         "success": True,
@@ -461,7 +490,7 @@ async def local_browser_session(
         start_local_browser,
         browser_key,
         profile_dir,
-        target_url=target_url,
+        target_url="",
         require_cdp=True,
     )
 

@@ -1,7 +1,8 @@
 """Unit and integration tests for Channel Scanner and Local Browser Service."""
 
+import asyncio
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 import sys
 from pathlib import Path
@@ -15,6 +16,7 @@ from auto_yt.services.local_browser_service import (
     list_local_browser_profiles,
 )
 from auto_yt.services.channel_scanner_service import (
+    cleanup_owned_page,
     parse_profile_target,
 )
 
@@ -79,6 +81,40 @@ class TestChannelScanner(unittest.TestCase):
         data = response.json()
         self.assertTrue(data["success"])
         self.assertEqual(data["platform"], "facebook")
+
+    @patch("auto_yt.services.channel_scanner_service.is_profile_browser_busy", return_value=True)
+    @patch("auto_yt.services.gpm_service.stop_gpm_profile")
+    def test_stop_profile_is_blocked_while_browser_job_is_active(self, mock_stop, _mock_busy):
+        response = self.client.post("/api/gpm/profiles/profile-busy/stop")
+        self.assertEqual(response.status_code, 409)
+        mock_stop.assert_not_called()
+
+    def test_cleanup_owned_page_closes_only_task_tab(self):
+        page = MagicMock()
+        page.is_closed.return_value = False
+        page.close = AsyncMock()
+        other_page = MagicMock()
+        other_page.is_closed.return_value = False
+        context = MagicMock()
+        context.pages = [other_page, page]
+
+        asyncio.run(cleanup_owned_page(context, page))
+
+        page.close.assert_awaited_once()
+        other_page.close.assert_not_called()
+
+    def test_cleanup_owned_page_keeps_last_tab_alive(self):
+        page = MagicMock()
+        page.is_closed.return_value = False
+        page.goto = AsyncMock()
+        page.close = AsyncMock()
+        context = MagicMock()
+        context.pages = [page]
+
+        asyncio.run(cleanup_owned_page(context, page))
+
+        page.goto.assert_awaited_once_with("about:blank")
+        page.close.assert_not_called()
 
     @patch("auto_yt.services.channel_scanner_service.scan_youtube_channel")
     def test_api_scan_youtube_endpoint(self, mock_scan):

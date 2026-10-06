@@ -15,10 +15,13 @@ import urllib.parse
 import urllib.request
 
 from auto_yt.services.gpm_service import (
-    gpm_browser_session,
     open_tab_in_running_gpm_process,
     start_gpm_profile,
     wait_for_cdp_readiness,
+)
+from auto_yt.services.channel_scanner_service import (
+    channel_browser_session,
+    cleanup_owned_page,
 )
 
 logger = logging.getLogger(__name__)
@@ -31,7 +34,7 @@ class GpmAutomationError(RuntimeError):
 async def verify_youtube_login(profile_id: str, timeout_seconds: float = 20.0) -> dict[str, Any]:
     """Check if the given GPM profile has an active YouTube Studio session."""
     logger.info("Kiểm tra đăng nhập YouTube trên GPM profile %s", profile_id)
-    async with gpm_browser_session(profile_id, auto_stop=False) as (context, _browser):
+    async with channel_browser_session(profile_id) as (context, _browser, _profile_meta):
         page = await context.new_page()
         await page.bring_to_front()
         try:
@@ -85,13 +88,7 @@ async def verify_youtube_login(profile_id: str, timeout_seconds: float = 20.0) -
                 "message": f"Không thể kết nối YouTube Studio: {exc}",
             }
         finally:
-            try:
-                if len(context.pages) > 1:
-                    await page.close()
-                else:
-                    await page.goto("about:blank")
-            except Exception:
-                pass
+            await cleanup_owned_page(context, page)
 
 
 async def post_comment_reply_via_gpm(
@@ -100,7 +97,6 @@ async def post_comment_reply_via_gpm(
     comment_text: str,
     comment_id: str = "",
     auto_heart: bool = True,
-    auto_stop: bool | None = None,
     timeout_seconds: float = 30.0,
 ) -> dict[str, Any]:
     """Post a comment reply (and optionally give Creator Heart) to a video watch page using the channel's GPM profile."""
@@ -111,15 +107,15 @@ async def post_comment_reply_via_gpm(
         target_url = f"{target_url}{delimiter}lc={clean_comment_id}"
 
     logger.info(
-        "Đăng bình luận qua GPM profile %s trên URL %s (comment_id=%s, auto_heart=%s, auto_stop=%s)",
+        "Đăng bình luận qua GPM profile %s trên URL %s (comment_id=%s, auto_heart=%s)",
         profile_id,
         target_url,
         clean_comment_id,
         auto_heart,
-        auto_stop,
     )
     hearted = False
-    async with gpm_browser_session(profile_id, auto_stop=auto_stop) as (context, _browser):
+    failed = False
+    async with channel_browser_session(profile_id) as (context, _browser, _profile_meta):
         page = await context.new_page()
         await page.bring_to_front()
         try:
@@ -225,16 +221,11 @@ async def post_comment_reply_via_gpm(
                 "message": "Đã đăng câu trả lời và thả tim thành công qua Profile GPM." if hearted else "Đã đăng câu trả lời thành công qua Profile GPM.",
             }
         except Exception as exc:
+            failed = True
             logger.error("Lỗi khi đăng bình luận qua GPM: %s", exc)
             raise GpmAutomationError(f"Không thể đăng bình luận qua GPM: {exc}") from exc
         finally:
-            try:
-                if len(context.pages) > 1:
-                    await page.close()
-                else:
-                    await page.goto("about:blank")
-            except Exception:
-                pass
+            await cleanup_owned_page(context, page, preserve=failed)
 
 
 async def open_url_in_gpm_profile(
@@ -367,4 +358,3 @@ async def open_url_in_gpm_profile(
 
     # 4. Fallback to opening tab via running process IPC
     return await asyncio.to_thread(open_tab_in_running_gpm_process, clean_id, target_url)
-

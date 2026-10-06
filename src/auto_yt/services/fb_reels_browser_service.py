@@ -20,7 +20,7 @@ import re
 from pathlib import Path
 from typing import Any, Callable
 
-from auto_yt.services.channel_scanner_service import channel_browser_session
+from auto_yt.services.channel_scanner_service import channel_browser_session, cleanup_owned_page
 
 logger = logging.getLogger(__name__)
 
@@ -213,7 +213,6 @@ async def schedule_reel_via_gpm(
     publish_now: bool = False,
     page_name: str = "",
     target_page_id: str = "",
-    auto_stop_profile: bool | None = False,
     timeout_seconds: float = 300.0,
     state_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
@@ -276,6 +275,7 @@ async def schedule_reel_via_gpm(
     async with channel_browser_session(clean_profile_id) as (context, _browser, _profile_meta):
         page = await context.new_page()
         await page.bring_to_front()
+        preserve_page = True
         try:
             # Set default timeout for individual actions
             page.set_default_timeout(25000)
@@ -714,6 +714,7 @@ async def schedule_reel_via_gpm(
                     break
 
             notify("CP8_SUBMITTED", f"Thành công! Reels đã được lên lịch lúc {full_schedule_label}.", 100)
+            preserve_page = False
 
             return {
                 "success": True,
@@ -739,11 +740,4 @@ async def schedule_reel_via_gpm(
                 can_resume=True,
             ) from exc
         finally:
-            try:
-                if page and not page.is_closed():
-                    if len(context.pages) > 1:
-                        await page.close()
-                    else:
-                        await page.goto("about:blank")
-            except Exception:
-                pass
+            await cleanup_owned_page(context, page, preserve=preserve_page)

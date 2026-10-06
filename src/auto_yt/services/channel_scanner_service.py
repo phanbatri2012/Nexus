@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import inspect
 import json
 import logging
 import re
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -34,6 +36,78 @@ from auto_yt.services.local_browser_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+_profile_operation_locks: dict[str, threading.Lock] = {}
+_profile_operation_counts: dict[str, int] = {}
+_profile_operation_guard = threading.Lock()
+
+
+def _get_profile_operation_lock(profile_id: str) -> threading.Lock:
+    with _profile_operation_guard:
+        return _profile_operation_locks.setdefault(profile_id, threading.Lock())
+
+
+def is_profile_browser_busy(profile_id: str) -> bool:
+    clean_id = str(profile_id or "").strip()
+    if not clean_id:
+        return False
+    with _profile_operation_guard:
+        return _profile_operation_counts.get(clean_id, 0) > 0
+
+
+@asynccontextmanager
+async def _profile_browser_operation(profile_id: str) -> AsyncGenerator[None, None]:
+    clean_id = str(profile_id or "").strip()
+    lock = _get_profile_operation_lock(clean_id)
+    acquired = False
+    with _profile_operation_guard:
+        _profile_operation_counts[clean_id] = _profile_operation_counts.get(clean_id, 0) + 1
+    try:
+        while not acquired:
+            acquired = lock.acquire(blocking=False)
+            if not acquired:
+                await asyncio.sleep(0.1)
+        yield
+    finally:
+        if acquired:
+            lock.release()
+        with _profile_operation_guard:
+            remaining = _profile_operation_counts.get(clean_id, 1) - 1
+            if remaining > 0:
+                _profile_operation_counts[clean_id] = remaining
+            else:
+                _profile_operation_counts.pop(clean_id, None)
+
+
+async def cleanup_owned_page(context: Any, page: Any, *, preserve: bool = False) -> None:
+    """Clean up only a task-owned page while keeping the browser process alive."""
+    if preserve or page is None:
+        return
+    try:
+        page_closed = page.is_closed()
+        if inspect.isawaitable(page_closed):
+            page_closed = await page_closed
+        if page_closed:
+            return
+    except Exception:
+        return
+
+    try:
+        other_pages = []
+        for candidate in context.pages:
+            if candidate is page:
+                continue
+            candidate_closed = candidate.is_closed()
+            if inspect.isawaitable(candidate_closed):
+                candidate_closed = await candidate_closed
+            if not candidate_closed:
+                other_pages.append(candidate)
+        if other_pages:
+            await page.close()
+        else:
+            await page.goto("about:blank")
+    except Exception as exc:
+        logger.debug("Không thể cleanup tab tác vụ: %s", exc)
 
 
 JS_EXTRACT_YOUTUBE = r"""(() => {
@@ -389,30 +463,31 @@ def parse_profile_target(profile_id: str) -> dict[str, Any]:
 
 
 @asynccontextmanager
-async def channel_browser_session(profile_id: str, target_url: str = "") -> AsyncGenerator[Any, None]:
-    """Unified CDP session context manager supporting both GPM and Local browsers."""
+async def channel_browser_session(
+    profile_id: str,
+    target_url: str = "",
+    timeout_seconds: float | None = None,
+) -> AsyncGenerator[Any, None]:
+    """Open a serialized CDP session without closing or restarting the browser."""
     parsed = parse_profile_target(profile_id)
-    if parsed["type"] == "local":
-        async with local_browser_session(
-            parsed["browser_key"],
-            parsed["profile_dir"],
-            target_url=target_url,
-        ) as (context, browser):
-            yield context, browser, parsed
-    else:
-        async with gpm_browser_session(
-            parsed["id"],
-            auto_stop=False,
-        ) as (context, browser):
-            yield context, browser, parsed
+    async with _profile_browser_operation(parsed["id"]):
+        if parsed["type"] == "local":
+            async with local_browser_session(
+                parsed["browser_key"],
+                parsed["profile_dir"],
+                target_url="",
+            ) as (context, browser):
+                yield context, browser, parsed
+        else:
+            async with gpm_browser_session(parsed["id"]) as (context, browser):
+                yield context, browser, parsed
 
 
 def open_channel_platform_browser(
     profile_id: str,
     platform: str,
-    force_restart: bool = False,
 ) -> dict[str, Any]:
-    """Launch or focus browser window on the specific platform's studio/creator page."""
+    """Start the selected browser if needed and open a new platform tab."""
     parsed = parse_profile_target(profile_id)
     platform_key = platform.lower().strip()
 
@@ -429,7 +504,6 @@ def open_channel_platform_browser(
             parsed["profile_dir"],
             target_url=url,
             require_cdp=False,
-            force_restart=force_restart,
         )
         return {
             "success": True,
@@ -445,10 +519,7 @@ def open_channel_platform_browser(
     else:
         start_gpm_profile(parsed["id"])
         from auto_yt.services.gpm_service import open_tab_in_running_gpm_process
-        try:
-            open_tab_in_running_gpm_process(parsed["id"], url)
-        except Exception:
-            pass
+        open_tab_in_running_gpm_process(parsed["id"], url)
         return {
             "success": True,
             "profile_id": profile_id,
@@ -534,20 +605,12 @@ async def scan_youtube_channel(
     # 2. Engine 2: Playwright CDP Session Fallback with Page Reuse & Safe Retry Loop
     logger.info("Engine 2: Khởi tạo phiên Playwright CDP fallback cho profile %s...", profile_id)
     try:
-        async with channel_browser_session(profile_id, target_url="https://studio.youtube.com") as (context, _browser, p_info):
-            # Check for existing open page first to avoid reloading heavy SPA over slow proxy
-            existing_page = next((p for p in context.pages if "studio.youtube.com" in p.url or "youtube.com" in p.url), None)
-            created_new = False
-            if existing_page:
-                page = existing_page
-                logger.info("Engine 2: Tái sử dụng tab YouTube Studio đang mở (%s)", page.url)
-            else:
-                page = await context.new_page()
-                created_new = True
-                try:
-                    await page.goto("https://studio.youtube.com", wait_until="domcontentloaded", timeout=min(int(timeout_seconds * 1000), 15000))
-                except Exception as nav_exc:
-                    logger.debug("Page goto timeout/error: %s", nav_exc)
+        async with channel_browser_session(profile_id) as (context, _browser, p_info):
+            page = await context.new_page()
+            try:
+                await page.goto("https://studio.youtube.com", wait_until="domcontentloaded", timeout=min(int(timeout_seconds * 1000), 15000))
+            except Exception as nav_exc:
+                logger.debug("Page goto timeout/error: %s", nav_exc)
 
             try:
                 # Safe evaluate loop with retries to absorb in-flight SPA navigations
@@ -639,11 +702,7 @@ async def scan_youtube_channel(
                     "message": f"🟢 Đã quét và liên kết thành công kênh '{title}' ({channel_id})!",
                 }
             finally:
-                if created_new:
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
+                await cleanup_owned_page(context, page)
     except Exception as exc:
         logger.error("Lỗi khi quét kênh YouTube: %s", exc)
         return {
@@ -715,19 +774,12 @@ async def scan_facebook_pages(
     # 2. Engine 2: Playwright Fallback
     logger.info("Engine 2: Khởi tạo phiên Playwright CDP fallback Facebook cho profile %s...", profile_id)
     try:
-        async with channel_browser_session(profile_id, target_url="https://www.facebook.com/pages/?category=your_pages") as (context, _browser, p_info):
-            existing_page = next((p for p in context.pages if "facebook.com" in p.url), None)
-            created_new = False
-            if existing_page:
-                page = existing_page
-                logger.info("Engine 2: Tái sử dụng tab Facebook đang mở (%s)", page.url)
-            else:
-                page = await context.new_page()
-                created_new = True
-                try:
-                    await page.goto("https://www.facebook.com/pages/?category=your_pages", wait_until="domcontentloaded", timeout=min(int(timeout_seconds * 1000), 15000))
-                except Exception:
-                    pass
+        async with channel_browser_session(profile_id) as (context, _browser, p_info):
+            page = await context.new_page()
+            try:
+                await page.goto("https://www.facebook.com/pages/?category=your_pages", wait_until="domcontentloaded", timeout=min(int(timeout_seconds * 1000), 15000))
+            except Exception:
+                pass
 
             try:
                 extracted = None
@@ -799,11 +851,7 @@ async def scan_facebook_pages(
                     "message": f"🟢 Quét thành công! Tìm thấy {len(pages)} Fanpage đang quản lý trong trình duyệt.",
                 }
             finally:
-                if created_new:
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
+                await cleanup_owned_page(context, page)
     except Exception as exc:
         logger.error("Lỗi khi quét Facebook Pages: %s", exc)
         return {
@@ -875,19 +923,12 @@ async def scan_tiktok_account(
     # 2. Engine 2: Playwright Fallback
     logger.info("Engine 2: Khởi tạo phiên Playwright CDP fallback TikTok cho profile %s...", profile_id)
     try:
-        async with channel_browser_session(profile_id, target_url="https://www.tiktok.com/creator-center/upload") as (context, _browser, p_info):
-            existing_page = next((p for p in context.pages if "tiktok.com" in p.url), None)
-            created_new = False
-            if existing_page:
-                page = existing_page
-                logger.info("Engine 2: Tái sử dụng tab TikTok đang mở (%s)", page.url)
-            else:
-                page = await context.new_page()
-                created_new = True
-                try:
-                    await page.goto("https://www.tiktok.com/creator-center/upload", wait_until="domcontentloaded", timeout=min(int(timeout_seconds * 1000), 15000))
-                except Exception:
-                    pass
+        async with channel_browser_session(profile_id) as (context, _browser, p_info):
+            page = await context.new_page()
+            try:
+                await page.goto("https://www.tiktok.com/creator-center/upload", wait_until="domcontentloaded", timeout=min(int(timeout_seconds * 1000), 15000))
+            except Exception:
+                pass
 
             try:
                 extracted = None
@@ -958,11 +999,7 @@ async def scan_tiktok_account(
                     "message": f"🟢 Quét thành công Kênh TikTok '{name}' ({handle})!",
                 }
             finally:
-                if created_new:
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
+                await cleanup_owned_page(context, page)
     except Exception as exc:
         logger.error("Lỗi khi quét TikTok: %s", exc)
         return {
@@ -972,4 +1009,3 @@ async def scan_tiktok_account(
             "profile": parsed,
             "message": f"Lỗi quét TikTok: {exc}",
         }
-

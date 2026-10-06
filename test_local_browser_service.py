@@ -10,13 +10,85 @@ from auto_yt.services import local_browser_service
 
 
 class LocalBrowserServiceTests(unittest.TestCase):
+    @patch("auto_yt.services.local_browser_service.find_free_port", return_value=9222)
+    @patch("auto_yt.services.local_browser_service.is_browser_process_running", return_value=False)
+    @patch("auto_yt.services.local_browser_service.find_running_local_browser_port", return_value=None)
+    @patch("auto_yt.services.local_browser_service.resolve_browser_paths")
+    @patch("subprocess.Popen")
+    @patch("urllib.request.urlopen")
+    def test_closed_browser_launches_once_then_opens_new_tab(
+        self,
+        mock_urlopen,
+        mock_popen,
+        mock_paths,
+        _mock_find_port,
+        _mock_is_running,
+        _mock_free_port,
+    ):
+        mock_paths.return_value = (
+            Path(r"C:\Program Files\CocCoc\browser.exe"),
+            Path(r"C:\User Data"),
+        )
+        version_response = MagicMock()
+        version_response.read.return_value = (
+            b'{"webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/browser/test"}'
+        )
+        new_tab_response = MagicMock()
+        mock_urlopen.return_value.__enter__.side_effect = [
+            version_response,
+            new_tab_response,
+        ]
+
+        result = local_browser_service.start_local_browser(
+            "coccoc",
+            "Default",
+            target_url="https://studio.youtube.com",
+        )
+
+        self.assertTrue(result["success"])
+        launch_args = mock_popen.call_args.args[0]
+        self.assertNotIn("https://studio.youtube.com", launch_args)
+        requested_urls = [
+            call.args[0].full_url if hasattr(call.args[0], "full_url") else str(call.args[0])
+            for call in mock_urlopen.call_args_list
+        ]
+        self.assertTrue(any("/json/new?" in url for url in requested_urls))
+
+    @patch("auto_yt.services.local_browser_service.find_running_local_browser_port", return_value=None)
+    @patch("auto_yt.services.local_browser_service.resolve_browser_paths")
+    @patch("subprocess.run")
+    def test_terminate_local_browser_targets_selected_profile_pid(
+        self, mock_run, mock_paths, _mock_find_port
+    ):
+        mock_paths.return_value = (
+            Path(r"C:\Program Files\CocCoc\browser.exe"),
+            Path(r"C:\User Data"),
+        )
+        process_query = MagicMock()
+        process_query.stdout = (
+            '[{"ProcessId":1234,"CommandLine":"browser.exe '
+            '--user-data-dir=\\"C:\\\\User Data\\" '
+            '--profile-directory=\\"Profile 1\\""}]'
+        )
+        mock_run.side_effect = [process_query, MagicMock()]
+
+        result = local_browser_service.terminate_local_browser_processes(
+            "coccoc", "Profile 1"
+        )
+
+        self.assertTrue(result)
+        taskkill_args = mock_run.call_args_list[1].args[0]
+        self.assertIn("/PID", taskkill_args)
+        self.assertIn("1234", taskkill_args)
+        self.assertNotIn("/IM", taskkill_args)
+
     @patch("auto_yt.services.local_browser_service.terminate_local_browser_processes")
     @patch("auto_yt.services.local_browser_service.is_browser_process_running")
     @patch("auto_yt.services.local_browser_service.find_running_local_browser_port")
     @patch("auto_yt.services.local_browser_service.resolve_browser_paths")
     @patch("subprocess.Popen")
     @patch("urllib.request.urlopen")
-    def test_start_local_browser_when_running_no_cdp_opens_tab_or_restarts_for_cdp(
+    def test_start_local_browser_when_running_no_cdp_never_restarts_browser(
         self, mock_urlopen, mock_popen, mock_paths, mock_find_port, mock_is_running, mock_terminate
     ):
         mock_paths.return_value = (Path(r"C:\Program Files\CocCoc\browser.exe"), Path(r"C:\User Data"))
@@ -37,13 +109,13 @@ class LocalBrowserServiceTests(unittest.TestCase):
         self.assertIn("https://facebook.com", args)
         mock_terminate.assert_not_called()
 
-        # When require_cdp=True (for automated Playwright tasks), should auto-terminate non-CDP and relaunch with remote debugging port
+        # Automation requests preserve the running non-CDP browser.
         res_cdp = local_browser_service.start_local_browser(
             "coccoc", "Default", target_url="https://facebook.com", require_cdp=True
         )
         self.assertTrue(res_cdp["success"])
-        self.assertFalse(res_cdp["already_running_no_cdp"])
-        mock_terminate.assert_called_once_with("coccoc")
+        self.assertTrue(res_cdp["already_running_no_cdp"])
+        mock_terminate.assert_not_called()
 
     @patch("auto_yt.services.local_browser_service.start_local_browser")
     @patch("playwright.async_api.async_playwright")

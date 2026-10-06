@@ -16,7 +16,11 @@ import urllib.request
 from typing import Any
 
 from auto_yt.services import database as db, security_logging
-from auto_yt.services.channel_scanner_service import channel_browser_session, parse_profile_target
+from auto_yt.services.channel_scanner_service import (
+    channel_browser_session,
+    cleanup_owned_page,
+    parse_profile_target,
+)
 from auto_yt.services.fb_crossposter_service import GRAPH_API_BASE, sanitize_fb_token
 from auto_yt.services.proxy_utils import create_proxy_opener
 
@@ -59,7 +63,7 @@ async def extract_permanent_fb_tokens(
         }
 
     try:
-        async with channel_browser_session(profile_id, target_url="https://developers.facebook.com/tools/explorer/") as (context, _browser, p_info):
+        async with channel_browser_session(profile_id) as (context, _browser, p_info):
             page = await context.new_page()
             try:
                 # Navigate to Graph API Explorer
@@ -239,10 +243,7 @@ async def extract_permanent_fb_tokens(
                 }
 
             finally:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
+                await cleanup_owned_page(context, page)
 
     except Exception as exc:
         safe_error = security_logging.redact_sensitive(exc)

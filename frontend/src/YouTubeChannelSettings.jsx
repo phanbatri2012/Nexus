@@ -23,7 +23,6 @@ export default function YouTubeChannelSettings({
   // GPM-Login v3 Local API States
   const [gpmConfig, setGpmConfig] = useState({
     api_url: 'http://127.0.0.1:19995',
-    auto_stop_on_finish: true,
     timeout_seconds: 15
   })
   const [gpmStatus, setGpmStatus] = useState({ online: false, total_profiles: 0, message: '' })
