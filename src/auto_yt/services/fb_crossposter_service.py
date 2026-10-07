@@ -130,22 +130,15 @@ def _get_proxy_for_gpm_profile(gpm_profile_id: str) -> str | None:
     try:
         profile_data = gpm_service.get_gpm_profile_detail(clean_profile_id)
         if not profile_data:
-            raise proxy_utils.ProxyConfigurationError(
-                f"Không tìm thấy GPM Profile {clean_profile_id}"
-            )
+            return None
         raw_proxy = profile_data.get("raw_proxy") or profile_data.get("proxy") or ""
+        if not raw_proxy:
+            return None
         proxy_url = proxy_utils.parse_proxy_url(raw_proxy)
-        if not proxy_url:
-            raise proxy_utils.ProxyConfigurationError(
-                f"GPM Profile {clean_profile_id} chưa có proxy hợp lệ"
-            )
         return proxy_url
-    except proxy_utils.ProxyConfigurationError:
-        raise
     except Exception as exc:
-        raise proxy_utils.ProxyConfigurationError(
-            f"Không đọc được proxy cho GPM Profile {clean_profile_id}: {exc}"
-        ) from exc
+        logger.warning("Không đọc được proxy cho GPM Profile %s: %s", clean_profile_id, exc)
+        return None
 
 
 def fb_browser_checkpoint_is_safe_to_resume(item: dict | None) -> bool:
@@ -2185,6 +2178,71 @@ def reconcile_fb_queue_item(item_id: int, *, dry_run: bool = False) -> dict[str,
     }
 
 
+def _title_matches_meta_post(queue_title: str, meta_title: str) -> bool:
+    if not queue_title or not meta_title:
+        return False
+    q_norm = _normalized_text(queue_title)
+    m_norm = _normalized_text(meta_title)
+    if not q_norm or not m_norm:
+        return False
+    if q_norm == m_norm or q_norm in m_norm or m_norm in q_norm:
+        return True
+    q_core = re.sub(r"gockhuatvietsu.*", "", q_norm)
+    m_core = re.sub(r"gockhuatvietsu.*", "", m_norm)
+    if len(q_core) >= 12 and len(m_core) >= 12 and (q_core in m_core or m_core in q_core):
+        return True
+    return False
+
+
+def _fetch_meta_page_posts_index(target_page_id: str, access_token: str, target_gpm_profile_id: str = "") -> list[dict[str, Any]]:
+    """Fetch recent published feed posts and videos from Meta to construct a title match index."""
+    if not target_page_id or not access_token:
+        return []
+    proxy_url = _get_proxy_for_gpm_profile(target_gpm_profile_id)
+    opener = _build_urllib_opener(proxy_url)
+    meta_posts: list[dict[str, Any]] = []
+
+    # 1. Fetch published feed posts
+    try:
+        feed_url = f"{GRAPH_API_BASE}/{target_page_id}/published_posts?fields=id,message,created_time&limit=100&access_token={urllib.parse.quote(access_token)}"
+        feed_req = urllib.request.Request(feed_url, headers={"User-Agent": "NexusStudio/1.0"})
+        with opener.open(feed_req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            for p in data.get("data", []):
+                msg = str(p.get("message") or "").strip()
+                first_line = msg.split("\n")[0].strip() if msg else ""
+                if first_line and p.get("id"):
+                    meta_posts.append({
+                        "id": str(p["id"]),
+                        "raw_title": first_line,
+                        "created_time": p.get("created_time"),
+                        "published": True,
+                    })
+    except Exception as exc:
+        logger.debug("Could not fetch published_posts for Page %s: %s", target_page_id, exc)
+
+    # 2. Fetch videos
+    try:
+        vid_url = f"{GRAPH_API_BASE}/{target_page_id}/videos?fields=id,title,description,scheduled_publish_time,published,status,created_time&limit=100&access_token={urllib.parse.quote(access_token)}"
+        vid_req = urllib.request.Request(vid_url, headers={"User-Agent": "NexusStudio/1.0"})
+        with opener.open(vid_req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            for v in data.get("data", []):
+                t = str(v.get("title") or (v.get("description", "").split("\n")[0] if v.get("description") else "")).strip()
+                if t and v.get("id"):
+                    meta_posts.append({
+                        "id": str(v["id"]),
+                        "raw_title": t,
+                        "created_time": v.get("created_time"),
+                        "published": v.get("published", True),
+                        "scheduled_publish_time": v.get("scheduled_publish_time"),
+                    })
+    except Exception as exc:
+        logger.debug("Could not fetch videos for Page %s: %s", target_page_id, exc)
+
+    return meta_posts
+
+
 def reconcile_fb_queue(
     target_page_id: str = "",
     limit: int = 100,
@@ -2206,21 +2264,73 @@ def reconcile_fb_queue(
     }
     items_report: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
+
+    page_meta_cache: dict[str, list[dict[str, Any]]] = {}
+
     for item in items:
+        item_id = int(item["id"])
+        pid = str(item.get("target_page_id") or target_page_id or "").strip()
+        video_id = str(item.get("upload_video_id") or item.get("fb_post_id") or "").strip()
+
+        # If item has no fb_post_id/upload_video_id, attempt title matching with live Meta feed
+        if not video_id:
+            if pid not in page_meta_cache:
+                s = db.get_fb_crossposter_runtime_settings(pid)
+                tok = sanitize_fb_token(s.get("target_access_token"))
+                gpm_id = str(s.get("target_gpm_profile_id") or "")
+                page_meta_cache[pid] = _fetch_meta_page_posts_index(pid, tok, gpm_id) if tok else []
+
+            meta_index = page_meta_cache.get(pid) or []
+            item_title = str(item.get("fb_title") or item.get("original_title") or "").strip()
+            matched_meta = None
+            for m in meta_index:
+                if _title_matches_meta_post(item_title, m["raw_title"]):
+                    matched_meta = m
+                    break
+
+            if matched_meta:
+                meta_post_id = matched_meta["id"]
+                created_iso = matched_meta.get("created_time") or db.utc_now()
+                update_fields = {
+                    "fb_post_id": meta_post_id,
+                    "status": "published",
+                    "meta_published": 1,
+                    "meta_video_status": "ready",
+                    "meta_state": "published",
+                    "meta_state_since": created_iso,
+                    "meta_verified_at": created_iso,
+                    "scheduled_publish_time": 0,
+                    "error_message": "",
+                    "meta_error_message": "",
+                }
+                if not dry_run:
+                    db.update_fb_crossposter_queue_item(item_id, update_fields)
+                counts["published"] += 1
+                counts["checked"] += 1
+                items_report.append({
+                    "item_id": item_id,
+                    "fb_post_id": meta_post_id,
+                    "status": "published",
+                    "message": f"Đã khớp với bài đăng thực tế trên Meta: {meta_post_id}",
+                })
+                continue
+
+        # If video_id exists (or item couldn't be matched by title), use individual reconcile
         try:
-            result = reconcile_fb_queue_item(int(item["id"]), dry_run=dry_run)
+            result = reconcile_fb_queue_item(item_id, dry_run=dry_run)
             status = str(result.get("status") or "error")
             counts[status] = counts.get(status, 0) + 1
             items_report.append({
-                "item_id": item["id"],
+                "item_id": item_id,
                 "fb_post_id": result.get("fb_post_id"),
                 "status": status,
                 "message": result.get("message", ""),
             })
         except Exception as exc:
             counts["error"] += 1
-            errors.append({"item_id": item["id"], "error": security_logging.redact_sensitive(exc)})
+            errors.append({"item_id": item_id, "error": security_logging.redact_sensitive(exc)})
         counts["checked"] += 1
+
     return {
         "success": not errors,
         "dry_run": dry_run,

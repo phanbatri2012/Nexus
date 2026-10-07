@@ -6115,8 +6115,7 @@ def get_fb_items_for_meta_reconciliation(
     try:
         now_ts = int(datetime.datetime.now().timestamp())
         where_sql = """
-            WHERE (COALESCE(fb_post_id, '') != '' OR COALESCE(upload_video_id, '') != '')
-              AND (
+            WHERE (
                     status IN (
                         'verifying', 'processing', 'retryable', 'meta_scheduled',
                         'schedule_mismatch', 'stalled', 'meta_failed', 'error'
@@ -6128,6 +6127,7 @@ def get_fb_items_for_meta_reconciliation(
                             OR COALESCE(meta_verified_at, '') = ''
                         )
                     )
+                    OR (COALESCE(fb_post_id, '') != '' OR COALESCE(upload_video_id, '') != '')
                   )
         """
         params: list[object] = [now_ts]
