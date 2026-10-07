@@ -6127,6 +6127,7 @@ def get_fb_items_for_meta_reconciliation(
                         'verifying', 'processing', 'retryable', 'meta_scheduled',
                         'schedule_mismatch', 'stalled', 'meta_failed', 'error'
                     )
+                    OR checkpoint_phase = 'CP8_SUBMITTED'
                     OR (
                         status = 'published'
                         AND (
@@ -6134,10 +6135,16 @@ def get_fb_items_for_meta_reconciliation(
                             OR COALESCE(meta_verified_at, '') = ''
                         )
                     )
+                    OR (
+                        status = 'scheduled'
+                        AND scheduled_publish_time > 0
+                        AND scheduled_publish_time <= ?
+                    )
                     OR (COALESCE(fb_post_id, '') != '' OR COALESCE(upload_video_id, '') != '')
                   )
         """
-        params: list[object] = [now_ts]
+        future_horizon_ts = now_ts + (30 * 86400)
+        params: list[object] = [now_ts, future_horizon_ts]
         target_pid = (target_page_id or "").strip()
         if target_pid:
             where_sql += " AND target_page_id = ?"

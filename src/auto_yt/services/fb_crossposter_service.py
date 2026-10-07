@@ -1892,11 +1892,22 @@ def inspect_facebook_publication(
                 fields,
                 "Meta nhận video ở chế độ published=true nhưng không lưu lịch đăng đã yêu cầu",
             )
+        # If published is False (e.g. scheduled Reel where Meta doesn't expose scheduled_publish_time)
+        if published is False and metadata.get("id"):
+            if requested_schedule > now_ts:
+                return "meta_scheduled", fields, ""
+            if requested_schedule >= now_ts - 3600:
+                return "processing", fields, "Đang trong quá trình phát hành trên Meta"
+            return "stalled", fields, "Đã quá giờ hẹn phát sóng nhưng chưa thấy xuất hiện trên feed Facebook"
+        if published is True and metadata.get("id"):
+            return "published", fields, ""
         if metadata.get("id"):
-            return "processing", fields, "Meta chưa xác nhận scheduled_publish_time cho video"
+            return "processing", fields, "Meta chưa xác nhận trạng thái cho video"
         return "missing", fields, "Meta không trả về Video ID hợp lệ"
 
     if published is True and is_ready:
+        return "published", fields, ""
+    if published is True and metadata.get("id"):
         return "published", fields, ""
     if is_in_processing_phase:
         return "processing", fields, "Meta đang xử lý video chưa có lịch"
@@ -2064,26 +2075,50 @@ def reconcile_fb_queue_item(item_id: int, *, dry_run: bool = False) -> dict[str,
         if matched_meta:
             meta_post_id = matched_meta["id"]
             created_iso = matched_meta.get("created_time") or db.utc_now()
-            fields = {
-                "fb_post_id": meta_post_id,
-                "status": "published",
-                "meta_published": 1,
-                "meta_video_status": "ready",
-                "meta_state": "published",
-                "meta_state_since": created_iso,
-                "meta_verified_at": created_iso,
-                "scheduled_publish_time": 0,
-                "error_message": "",
-                "meta_error_message": "",
-            }
-            if not dry_run:
-                db.update_fb_crossposter_queue_item(item_id, fields)
-            return {
-                "item_id": item_id,
-                "fb_post_id": meta_post_id,
-                "status": "published",
-                "message": f"Đã khớp với bài đăng thực tế trên Meta: {meta_post_id}",
-            }
+            is_pub = matched_meta.get("published", True)
+            if is_pub:
+                fields = {
+                    "fb_post_id": meta_post_id,
+                    "status": "published",
+                    "meta_published": 1,
+                    "meta_video_status": "ready",
+                    "meta_state": "published",
+                    "meta_state_since": created_iso,
+                    "meta_verified_at": created_iso,
+                    "scheduled_publish_time": 0,
+                    "error_message": "",
+                    "meta_error_message": "",
+                }
+                if not dry_run:
+                    db.update_fb_crossposter_queue_item(item_id, fields)
+                return {
+                    "item_id": item_id,
+                    "fb_post_id": meta_post_id,
+                    "status": "published",
+                    "message": f"Đã khớp với bài đăng thực tế trên Meta: {meta_post_id}",
+                }
+            else:
+                sched_str = datetime.datetime.fromtimestamp(requested_schedule).strftime('%d/%m/%Y %H:%M') if requested_schedule else ""
+                fields = {
+                    "fb_post_id": meta_post_id,
+                    "upload_video_id": meta_post_id,
+                    "status": "meta_scheduled",
+                    "meta_published": 0,
+                    "meta_video_status": "ready",
+                    "meta_state": "scheduled",
+                    "meta_state_since": created_iso,
+                    "meta_verified_at": db.utc_now(),
+                    "error_message": "",
+                    "meta_error_message": "",
+                }
+                if not dry_run:
+                    db.update_fb_crossposter_queue_item(item_id, fields)
+                return {
+                    "item_id": item_id,
+                    "fb_post_id": meta_post_id,
+                    "status": "meta_scheduled",
+                    "message": f"Đã khớp với video đã lên lịch trên Meta: {meta_post_id}" + (f" (lịch {sched_str})" if sched_str else ""),
+                }
 
         # If not matched on published feed, check if it is still scheduled in the future
         is_browser_submitted = bool(
@@ -2391,25 +2426,35 @@ def reconcile_fb_queue(
         now_ts = int(time.time())
         sched_ts = int(item.get("scheduled_publish_time") or 0)
 
-        # If item has no fb_post_id/upload_video_id, attempt title matching with live Meta feed
-        if not video_id:
-            if pid not in page_meta_cache:
-                s = db.get_fb_crossposter_runtime_settings(pid)
-                tok = sanitize_fb_token(s.get("target_access_token"))
-                gpm_id = str(s.get("target_gpm_profile_id") or "")
-                page_meta_cache[pid] = _fetch_meta_page_posts_index(pid, tok, gpm_id) if tok else []
+        # Look up item in cached meta_index by video_id, post_id, or title
+        if pid not in page_meta_cache:
+            s = db.get_fb_crossposter_runtime_settings(pid)
+            tok = sanitize_fb_token(s.get("target_access_token"))
+            gpm_id = str(s.get("target_gpm_profile_id") or "")
+            page_meta_cache[pid] = _fetch_meta_page_posts_index(pid, tok, gpm_id) if tok else []
 
-            meta_index = page_meta_cache.get(pid) or []
-            item_title = str(item.get("fb_title") or item.get("original_title") or "").strip()
-            matched_meta = None
+        meta_index = page_meta_cache.get(pid) or []
+        item_title = str(item.get("fb_title") or item.get("original_title") or "").strip()
+        matched_meta = None
+
+        if video_id:
             for m in meta_index:
-                if _title_matches_meta_post(item_title, m["raw_title"]):
+                mid = str(m.get("id") or "")
+                if mid == video_id or video_id.endswith(mid) or mid.endswith(video_id):
                     matched_meta = m
                     break
 
-            if matched_meta:
-                meta_post_id = matched_meta["id"]
-                created_iso = matched_meta.get("created_time") or db.utc_now()
+        if not matched_meta and item_title:
+            for m in meta_index:
+                if _title_matches_meta_post(item_title, m.get("raw_title", "")):
+                    matched_meta = m
+                    break
+
+        if matched_meta:
+            meta_post_id = matched_meta["id"]
+            created_iso = matched_meta.get("created_time") or db.utc_now()
+            is_pub = matched_meta.get("published", True)
+            if is_pub:
                 update_fields = {
                     "fb_post_id": meta_post_id,
                     "status": "published",
@@ -2433,18 +2478,16 @@ def reconcile_fb_queue(
                     "message": f"Đã khớp với bài đăng thực tế trên Meta: {meta_post_id}",
                 })
                 continue
-
-            # If not matched on published feed, check if it's a browser-submitted / meta_scheduled future item
-            is_browser_submitted = bool(
-                item.get("checkpoint_phase") == "CP8_SUBMITTED"
-                or item.get("status") in {"meta_scheduled", "verifying", "processing"}
-            )
-            if is_browser_submitted and sched_ts and sched_ts > (now_ts + 60):
-                sched_str = datetime.datetime.fromtimestamp(sched_ts).strftime('%d/%m/%Y %H:%M')
+            else:
+                sched_str = datetime.datetime.fromtimestamp(sched_ts).strftime('%d/%m/%Y %H:%M') if sched_ts else ""
                 update_fields = {
+                    "fb_post_id": meta_post_id,
+                    "upload_video_id": meta_post_id,
                     "status": "meta_scheduled",
-                    "meta_state": "scheduled",
+                    "meta_published": 0,
                     "meta_video_status": "ready",
+                    "meta_state": "scheduled",
+                    "meta_state_since": created_iso,
                     "meta_verified_at": db.utc_now(),
                     "error_message": "",
                     "meta_error_message": "",
@@ -2455,56 +2498,84 @@ def reconcile_fb_queue(
                 counts["checked"] += 1
                 items_report.append({
                     "item_id": item_id,
-                    "fb_post_id": "",
+                    "fb_post_id": meta_post_id,
                     "status": "meta_scheduled",
-                    "message": f"Meta đã nhận lịch phát sóng lúc {sched_str}",
+                    "message": f"Đã khớp với video đã lên lịch trên Meta: {meta_post_id}" + (f" (lịch {sched_str})" if sched_str else ""),
                 })
                 continue
 
-            if is_browser_submitted and sched_ts and (now_ts - sched_ts) < 3600:
-                counts["processing"] += 1
-                counts["checked"] += 1
-                items_report.append({
-                    "item_id": item_id,
-                    "fb_post_id": "",
-                    "status": "processing",
-                    "message": "Đang trong quá trình phát hành trên Meta",
-                })
-                continue
-
-            if is_browser_submitted and sched_ts and (now_ts - sched_ts) >= 3600:
-                update_fields = {
-                    "status": "stalled",
-                    "meta_state": "stalled",
-                    "meta_error_message": "Đã quá giờ hẹn phát sóng nhưng chưa thấy xuất hiện trên feed Facebook",
-                }
-                if not dry_run:
-                    db.update_fb_crossposter_queue_item(item_id, update_fields)
-                counts["stalled"] += 1
-                counts["checked"] += 1
-                items_report.append({
-                    "item_id": item_id,
-                    "fb_post_id": "",
-                    "status": "stalled",
-                    "message": "Đã quá giờ hẹn phát sóng nhưng chưa thấy xuất hiện trên feed Facebook",
-                })
-                continue
-
-        # If video_id exists (or item couldn't be matched by title), use individual reconcile
-        try:
-            result = reconcile_fb_queue_item(item_id, dry_run=dry_run)
-            status = str(result.get("status") or "error")
-            counts[status] = counts.get(status, 0) + 1
+        # If not matched on Meta index, check browser-submitted lifecycle
+        is_browser_submitted = bool(
+            item.get("checkpoint_phase") == "CP8_SUBMITTED"
+            or item.get("status") in {"meta_scheduled", "verifying", "processing"}
+        )
+        if is_browser_submitted and sched_ts and sched_ts > (now_ts + 60):
+            sched_str = datetime.datetime.fromtimestamp(sched_ts).strftime('%d/%m/%Y %H:%M')
+            update_fields = {
+                "status": "meta_scheduled",
+                "meta_state": "scheduled",
+                "meta_video_status": "ready",
+                "meta_verified_at": db.utc_now(),
+                "error_message": "",
+                "meta_error_message": "",
+            }
+            if not dry_run:
+                db.update_fb_crossposter_queue_item(item_id, update_fields)
+            counts["meta_scheduled"] += 1
+            counts["checked"] += 1
             items_report.append({
                 "item_id": item_id,
-                "fb_post_id": result.get("fb_post_id"),
-                "status": status,
-                "message": result.get("message", ""),
+                "fb_post_id": "",
+                "status": "meta_scheduled",
+                "message": f"Meta đã nhận lịch phát sóng lúc {sched_str}",
             })
-        except Exception as exc:
-            counts["error"] += 1
-            errors.append({"item_id": item_id, "error": security_logging.redact_sensitive(exc)})
-        counts["checked"] += 1
+            continue
+
+        if is_browser_submitted and sched_ts and (now_ts - sched_ts) < 3600:
+            counts["processing"] += 1
+            counts["checked"] += 1
+            items_report.append({
+                "item_id": item_id,
+                "fb_post_id": "",
+                "status": "processing",
+                "message": "Đang trong quá trình phát hành trên Meta",
+            })
+            continue
+
+        if is_browser_submitted and sched_ts and (now_ts - sched_ts) >= 3600:
+            update_fields = {
+                "status": "stalled",
+                "meta_state": "stalled",
+                "meta_error_message": "Đã quá giờ hẹn phát sóng nhưng chưa thấy xuất hiện trên feed Facebook",
+            }
+            if not dry_run:
+                db.update_fb_crossposter_queue_item(item_id, update_fields)
+            counts["stalled"] += 1
+            counts["checked"] += 1
+            items_report.append({
+                "item_id": item_id,
+                "fb_post_id": "",
+                "status": "stalled",
+                "message": "Đã quá giờ hẹn phát sóng nhưng chưa thấy xuất hiện trên feed Facebook",
+            })
+            continue
+
+        # If video_id exists and was not found in meta_index, use individual reconcile
+        if video_id:
+            try:
+                result = reconcile_fb_queue_item(item_id, dry_run=dry_run)
+                status = str(result.get("status") or "error")
+                counts[status] = counts.get(status, 0) + 1
+                items_report.append({
+                    "item_id": item_id,
+                    "fb_post_id": result.get("fb_post_id"),
+                    "status": status,
+                    "message": result.get("message", ""),
+                })
+            except Exception as exc:
+                counts["error"] += 1
+                errors.append({"item_id": item_id, "error": security_logging.redact_sensitive(exc)})
+            counts["checked"] += 1
 
     return {
         "success": not errors,

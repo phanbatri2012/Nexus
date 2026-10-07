@@ -1940,6 +1940,57 @@ Câu chuyện về vị tướng quả cảm.
         self.assertEqual(item2_after["meta_state"], "scheduled")
         self.assertEqual(item2_after["scheduled_publish_time"], meta_target_time)
 
+    def test_reconcile_unpublished_scheduled_video_match(self):
+        page_id = "page_unpub_sched"
+        now_ts = int(datetime.datetime.now().timestamp())
+        future_sched = now_ts + 86400
+        items = [
+            {"youtube_id": "yt_unpub_1", "original_title": "Chiến dịch Lam Sơn 719: Thất bại thảm hại", "target_page_id": page_id},
+        ]
+        db.upsert_fb_crossposter_queue_items(items, target_page_id=page_id)
+        queue = db.get_fb_crossposter_queue(target_page_id=page_id)["items"]
+        item_id = queue[0]["id"]
+        db.update_fb_crossposter_queue_item(item_id, {"scheduled_publish_time": future_sched, "status": "scheduled"})
+
+        meta_feed = [
+            {
+                "id": "vid_unpub_9876",
+                "raw_title": "Chiến dịch Lam Sơn 719: Thất bại thảm hại của Mỹ",
+                "created_time": "2026-10-07T07:00:00+0000",
+                "published": False,
+                "scheduled_publish_time": None,
+            }
+        ]
+
+        with (
+            patch.object(db, "get_fb_crossposter_runtime_settings", return_value={"target_access_token": "valid_token", "target_gpm_profile_id": ""}),
+            patch.object(fb_crossposter_service, "_get_proxy_for_gpm_profile", return_value=None),
+            patch.object(fb_crossposter_service, "_fetch_meta_page_posts_index", return_value=meta_feed),
+        ):
+            batch_res = fb_crossposter_service.reconcile_fb_queue(page_id, limit=10)
+            self.assertTrue(batch_res["success"])
+            self.assertEqual(batch_res["counts"]["meta_scheduled"], 1)
+            updated_item = db.get_fb_crossposter_queue_item(item_id)
+            self.assertEqual(updated_item["status"], "meta_scheduled")
+            self.assertEqual(updated_item["meta_state"], "scheduled")
+            self.assertEqual(updated_item["upload_video_id"], "vid_unpub_9876")
+            self.assertEqual(updated_item["scheduled_publish_time"], future_sched)
+
+    def test_inspect_facebook_publication_unpublished_future(self):
+        now_ts = int(datetime.datetime.now().timestamp())
+        future_sched = now_ts + 86400
+        metadata = {
+            "id": "vid_12345",
+            "published": False,
+            "status": {
+                "video_status": "ready",
+                "publishing_phase": {"publish_status": "published"},
+            },
+            "scheduled_publish_time": None,
+        }
+        status, fields, msg = fb_crossposter_service.inspect_facebook_publication(metadata, future_sched)
+        self.assertEqual(status, "meta_scheduled")
+
 
 if __name__ == "__main__":
     unittest.main()
