@@ -1841,6 +1841,106 @@ Câu chuyện về vị tướng quả cảm.
             self.assertEqual(res["status"], "meta_scheduled")
             self.assertEqual(res["fb_post_id"], "meta_vid_12345")
 
+    def test_reconcile_browser_submitted_future_schedule(self):
+        page_id = "page_browser_future"
+        now_ts = int(datetime.datetime.now().timestamp())
+        items = [{
+            "youtube_id": "yt_cp8_future",
+            "original_title": "Video Thuoc CP8 Dat Lich Tuong Lai",
+            "sort_order": 1,
+            "target_page_id": page_id,
+        }]
+        db.upsert_fb_crossposter_queue_items(items, target_page_id=page_id)
+        item_id = db.get_fb_crossposter_queue(target_page_id=page_id)["items"][0]["id"]
+        db.update_fb_crossposter_queue_item(item_id, {
+            "checkpoint_phase": "CP8_SUBMITTED",
+            "status": "meta_scheduled",
+            "meta_state": "scheduled",
+            "scheduled_publish_time": now_ts + 86400,
+        })
+
+        with (
+            patch.object(db, "get_fb_crossposter_runtime_settings", return_value={"target_access_token": "token", "target_gpm_profile_id": ""}),
+            patch.object(fb_crossposter_service, "_fetch_meta_page_posts_index", return_value=[]),
+        ):
+            res = fb_crossposter_service.reconcile_fb_queue_item(item_id)
+            self.assertEqual(res["status"], "meta_scheduled")
+            self.assertIn("Meta đã nhận lịch phát sóng", res["message"])
+
+            batch_res = fb_crossposter_service.reconcile_fb_queue(page_id, limit=10)
+            self.assertTrue(batch_res["success"])
+            self.assertEqual(batch_res["counts"]["meta_scheduled"], 1)
+            self.assertEqual(batch_res["counts"]["error"], 0)
+
+    def test_reconcile_browser_submitted_published_match(self):
+        page_id = "page_browser_pub"
+        items = [{
+            "youtube_id": "yt_cp8_pub",
+            "original_title": "Video Khop Tieu De Da Dang",
+            "sort_order": 1,
+            "target_page_id": page_id,
+        }]
+        db.upsert_fb_crossposter_queue_items(items, target_page_id=page_id)
+        item_id = db.get_fb_crossposter_queue(target_page_id=page_id)["items"][0]["id"]
+        db.update_fb_crossposter_queue_item(item_id, {
+            "checkpoint_phase": "CP8_SUBMITTED",
+            "status": "meta_scheduled",
+            "scheduled_publish_time": 1700000000,
+        })
+
+        meta_feed = [{
+            "id": "post_live_9999",
+            "raw_title": "Video Khop Tieu De Da Dang",
+            "created_time": "2026-10-07T08:00:00+00:00",
+            "published": True,
+        }]
+
+        with (
+            patch.object(db, "get_fb_crossposter_runtime_settings", return_value={"target_access_token": "token", "target_gpm_profile_id": ""}),
+            patch.object(fb_crossposter_service, "_fetch_meta_page_posts_index", return_value=meta_feed),
+        ):
+            batch_res = fb_crossposter_service.reconcile_fb_queue(page_id, limit=10)
+            self.assertTrue(batch_res["success"])
+            self.assertEqual(batch_res["counts"]["published"], 1)
+            updated_item = db.get_fb_crossposter_queue_item(item_id)
+            self.assertEqual(updated_item["status"], "published")
+            self.assertEqual(updated_item["fb_post_id"], "post_live_9999")
+
+    def test_recalculate_schedule_never_overwrites_meta_scheduled_or_cp8(self):
+        page_id = "page_recalc_protect"
+        now_ts = int(datetime.datetime.now().timestamp())
+        items = [
+            {"youtube_id": "yt_1", "original_title": "Video 1 Normal Scheduled", "sort_order": 1, "target_page_id": page_id},
+            {"youtube_id": "yt_2", "original_title": "Video 2 CP8 Meta Scheduled", "sort_order": 2, "target_page_id": page_id},
+            {"youtube_id": "yt_3", "original_title": "Video 3 Normal Pending", "sort_order": 3, "target_page_id": page_id},
+        ]
+        db.upsert_fb_crossposter_queue_items(items, target_page_id=page_id)
+        queue = db.get_fb_crossposter_queue(target_page_id=page_id)["items"]
+        item1_id = queue[0]["id"]
+        item2_id = queue[1]["id"]
+        item3_id = queue[2]["id"]
+
+        meta_target_time = now_ts + 86400
+        db.update_fb_crossposter_queue_item(item2_id, {
+            "status": "meta_scheduled",
+            "meta_state": "scheduled",
+            "checkpoint_phase": "CP8_SUBMITTED",
+            "scheduled_publish_time": meta_target_time,
+        })
+
+        db.recalculate_fb_queue_schedule(
+            target_page_id=page_id,
+            daily_quota=2,
+            times_list=["11:00", "19:00"],
+            sort_order_mode="oldest_first",
+        )
+
+        item2_after = db.get_fb_crossposter_queue_item(item2_id)
+        self.assertEqual(item2_after["status"], "meta_scheduled")
+        self.assertEqual(item2_after["meta_state"], "scheduled")
+        self.assertEqual(item2_after["scheduled_publish_time"], meta_target_time)
+
 
 if __name__ == "__main__":
     unittest.main()
+

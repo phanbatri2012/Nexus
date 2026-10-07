@@ -5075,7 +5075,14 @@ def recalculate_fb_queue_schedule(
     try:
         conn.execute("BEGIN IMMEDIATE")
         target_pid = (target_page_id or "").strip()
-        where_sql = "WHERE status IN ('pending', 'scheduled') AND (fb_post_id IS NULL OR fb_post_id = '')"
+        where_sql = """
+            WHERE status IN ('pending', 'scheduled') 
+              AND (fb_post_id IS NULL OR fb_post_id = '')
+              AND (upload_video_id IS NULL OR upload_video_id = '')
+              AND (checkpoint_phase IS NULL OR checkpoint_phase != 'CP8_SUBMITTED')
+              AND status != 'meta_scheduled'
+              AND (meta_state IS NULL OR meta_state != 'scheduled')
+        """
         params = []
         if target_pid:
             where_sql += " AND target_page_id = ?"

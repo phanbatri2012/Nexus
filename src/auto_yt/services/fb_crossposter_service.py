@@ -1731,13 +1731,20 @@ def get_facebook_video_metadata(
     if not clean_video_id or not clean_token:
         raise ValueError("Video ID hoặc Access Token Facebook không hợp lệ")
 
-    query = urllib.parse.urlencode({
-        "fields": (
-            "id,title,description,content_tags,custom_labels,scheduled_publish_time,published,status,"
-            "created_time,updated_time,"
-            "thumbnails.limit(100){id,is_preferred,uri}"
-        ),
-    })
+    is_post_id = bool(re.match(r"^\d+_\d+$", clean_video_id))
+    if is_post_id:
+        query = urllib.parse.urlencode({
+            "fields": "id,message,created_time,is_published",
+        })
+    else:
+        query = urllib.parse.urlencode({
+            "fields": (
+                "id,title,description,content_tags,custom_labels,scheduled_publish_time,published,status,"
+                "created_time,updated_time,"
+                "thumbnails.limit(100){id,is_preferred,uri}"
+            ),
+        })
+
     request = urllib.request.Request(
         f"{GRAPH_API_BASE}/{clean_video_id}?{query}",
         headers={
@@ -1749,9 +1756,34 @@ def get_facebook_video_metadata(
     opener = _build_urllib_opener(proxy_url)
     try:
         with opener.open(request, timeout=30) as response:
-            return json.loads(response.read().decode("utf-8"))
+            data = json.loads(response.read().decode("utf-8"))
+            if is_post_id:
+                data["published"] = data.get("is_published", True)
+                data["description"] = data.get("description") or data.get("message", "")
+                data["status"] = {"video_status": "ready"}
+            return data
     except urllib.error.HTTPError as error:
         err_body = error.read().decode("utf-8", errors="ignore")
+        if "Tried accessing nonexisting field (title)" in err_body and not is_post_id:
+            # Fallback to querying as a post object
+            post_query = urllib.parse.urlencode({"fields": "id,message,created_time,is_published"})
+            post_req = urllib.request.Request(
+                f"{GRAPH_API_BASE}/{clean_video_id}?{post_query}",
+                headers={
+                    "User-Agent": "NexusStudio/1.0",
+                    "Authorization": f"Bearer {clean_token}",
+                },
+            )
+            try:
+                with opener.open(post_req, timeout=30) as post_resp:
+                    data = json.loads(post_resp.read().decode("utf-8"))
+                    data["published"] = data.get("is_published", True)
+                    data["description"] = data.get("message", "")
+                    data["status"] = {"video_status": "ready"}
+                    return data
+            except Exception:
+                pass
+
         if (
             "Unsupported get request" in err_body
             or "does not exist" in err_body
@@ -2011,14 +2043,99 @@ def reconcile_fb_queue_item(item_id: int, *, dry_run: bool = False) -> dict[str,
     if not item:
         raise ValueError(f"Không tìm thấy video ID #{item_id} trong hàng đợi")
     video_id = str(item.get("upload_video_id") or item.get("fb_post_id") or "").strip()
-    if not video_id:
-        raise ValueError("Queue item chưa có Facebook Video ID để đồng bộ")
     target_page_id = str(item.get("target_page_id") or "").strip()
     settings = db.get_fb_crossposter_runtime_settings(target_page_id)
     access_token = sanitize_fb_token(settings.get("target_access_token"))
+    requested_schedule = int(item.get("scheduled_publish_time") or 0) or None
+    now_ts = int(time.time())
+
+    if not video_id:
+        # Check if browser submitted (CP8_SUBMITTED) or marked meta_scheduled/verifying
+        item_title = str(item.get("fb_title") or item.get("original_title") or "").strip()
+        matched_meta = None
+        if access_token:
+            gpm_id = str(settings.get("target_gpm_profile_id") or "")
+            meta_index = _fetch_meta_page_posts_index(target_page_id, access_token, gpm_id)
+            for m in meta_index:
+                if _title_matches_meta_post(item_title, m["raw_title"]):
+                    matched_meta = m
+                    break
+
+        if matched_meta:
+            meta_post_id = matched_meta["id"]
+            created_iso = matched_meta.get("created_time") or db.utc_now()
+            fields = {
+                "fb_post_id": meta_post_id,
+                "status": "published",
+                "meta_published": 1,
+                "meta_video_status": "ready",
+                "meta_state": "published",
+                "meta_state_since": created_iso,
+                "meta_verified_at": created_iso,
+                "scheduled_publish_time": 0,
+                "error_message": "",
+                "meta_error_message": "",
+            }
+            if not dry_run:
+                db.update_fb_crossposter_queue_item(item_id, fields)
+            return {
+                "item_id": item_id,
+                "fb_post_id": meta_post_id,
+                "status": "published",
+                "message": f"Đã khớp với bài đăng thực tế trên Meta: {meta_post_id}",
+            }
+
+        # If not matched on published feed, check if it is still scheduled in the future
+        is_browser_submitted = bool(
+            item.get("checkpoint_phase") == "CP8_SUBMITTED"
+            or item.get("status") in {"meta_scheduled", "verifying", "processing"}
+        )
+        if is_browser_submitted and requested_schedule and requested_schedule > (now_ts + 60):
+            sched_str = datetime.datetime.fromtimestamp(requested_schedule).strftime('%d/%m/%Y %H:%M')
+            fields = {
+                "status": "meta_scheduled",
+                "meta_state": "scheduled",
+                "meta_video_status": "ready",
+                "meta_verified_at": db.utc_now(),
+                "error_message": "",
+                "meta_error_message": "",
+            }
+            if not dry_run:
+                db.update_fb_crossposter_queue_item(item_id, fields)
+            return {
+                "item_id": item_id,
+                "fb_post_id": "",
+                "status": "meta_scheduled",
+                "message": f"Meta đã nhận lịch phát sóng lúc {sched_str}",
+            }
+
+        if is_browser_submitted and requested_schedule and (now_ts - requested_schedule) < 3600:
+            return {
+                "item_id": item_id,
+                "fb_post_id": "",
+                "status": "processing",
+                "message": "Đang trong quá trình phát hành trên Meta",
+            }
+
+        if is_browser_submitted and requested_schedule and (now_ts - requested_schedule) >= 3600:
+            fields = {
+                "status": "stalled",
+                "meta_state": "stalled",
+                "meta_error_message": "Đã quá giờ hẹn phát sóng nhưng chưa thấy xuất hiện trên feed Facebook",
+            }
+            if not dry_run:
+                db.update_fb_crossposter_queue_item(item_id, fields)
+            return {
+                "item_id": item_id,
+                "fb_post_id": "",
+                "status": "stalled",
+                "message": "Đã quá giờ hẹn phát sóng nhưng chưa thấy xuất hiện trên feed Facebook",
+            }
+
+        raise ValueError("Queue item chưa có Facebook Video ID để đồng bộ")
+
     if not access_token:
         raise ValueError("Page Access Token Facebook đang trống hoặc không hợp lệ")
-    requested_schedule = int(item.get("scheduled_publish_time") or 0) or None
     try:
         metadata = get_facebook_video_metadata(
             video_id,
@@ -2271,6 +2388,8 @@ def reconcile_fb_queue(
         item_id = int(item["id"])
         pid = str(item.get("target_page_id") or target_page_id or "").strip()
         video_id = str(item.get("upload_video_id") or item.get("fb_post_id") or "").strip()
+        now_ts = int(time.time())
+        sched_ts = int(item.get("scheduled_publish_time") or 0)
 
         # If item has no fb_post_id/upload_video_id, attempt title matching with live Meta feed
         if not video_id:
@@ -2312,6 +2431,62 @@ def reconcile_fb_queue(
                     "fb_post_id": meta_post_id,
                     "status": "published",
                     "message": f"Đã khớp với bài đăng thực tế trên Meta: {meta_post_id}",
+                })
+                continue
+
+            # If not matched on published feed, check if it's a browser-submitted / meta_scheduled future item
+            is_browser_submitted = bool(
+                item.get("checkpoint_phase") == "CP8_SUBMITTED"
+                or item.get("status") in {"meta_scheduled", "verifying", "processing"}
+            )
+            if is_browser_submitted and sched_ts and sched_ts > (now_ts + 60):
+                sched_str = datetime.datetime.fromtimestamp(sched_ts).strftime('%d/%m/%Y %H:%M')
+                update_fields = {
+                    "status": "meta_scheduled",
+                    "meta_state": "scheduled",
+                    "meta_video_status": "ready",
+                    "meta_verified_at": db.utc_now(),
+                    "error_message": "",
+                    "meta_error_message": "",
+                }
+                if not dry_run:
+                    db.update_fb_crossposter_queue_item(item_id, update_fields)
+                counts["meta_scheduled"] += 1
+                counts["checked"] += 1
+                items_report.append({
+                    "item_id": item_id,
+                    "fb_post_id": "",
+                    "status": "meta_scheduled",
+                    "message": f"Meta đã nhận lịch phát sóng lúc {sched_str}",
+                })
+                continue
+
+            if is_browser_submitted and sched_ts and (now_ts - sched_ts) < 3600:
+                counts["processing"] += 1
+                counts["checked"] += 1
+                items_report.append({
+                    "item_id": item_id,
+                    "fb_post_id": "",
+                    "status": "processing",
+                    "message": "Đang trong quá trình phát hành trên Meta",
+                })
+                continue
+
+            if is_browser_submitted and sched_ts and (now_ts - sched_ts) >= 3600:
+                update_fields = {
+                    "status": "stalled",
+                    "meta_state": "stalled",
+                    "meta_error_message": "Đã quá giờ hẹn phát sóng nhưng chưa thấy xuất hiện trên feed Facebook",
+                }
+                if not dry_run:
+                    db.update_fb_crossposter_queue_item(item_id, update_fields)
+                counts["stalled"] += 1
+                counts["checked"] += 1
+                items_report.append({
+                    "item_id": item_id,
+                    "fb_post_id": "",
+                    "status": "stalled",
+                    "message": "Đã quá giờ hẹn phát sóng nhưng chưa thấy xuất hiện trên feed Facebook",
                 })
                 continue
 
