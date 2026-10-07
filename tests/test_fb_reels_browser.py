@@ -182,6 +182,34 @@ class TestFbReelsBrowser(unittest.TestCase):
         for kw in expected_keywords:
             self.assertIn(f'has-text("{kw}")', selector_string)
 
+    def test_verify_video_attachment_present_none_or_closed_page(self):
+        from auto_yt.services.fb_reels_browser_service import _verify_video_attachment_present
+        import asyncio
+
+        class ClosedPageMock:
+            def is_closed(self):
+                return True
+
+        async def _test():
+            self.assertFalse(await _verify_video_attachment_present(None))
+            self.assertFalse(await _verify_video_attachment_present(ClosedPageMock()))
+
+        asyncio.run(_test())
+
+    def test_thumbnail_tab_regex_patterns(self):
+        import re
+        pattern = re.compile(
+            r"^(Tải hình ảnh lên|Tải ảnh lên|Tải lên hình ảnh|Upload image|Add image|Thêm hình ảnh)$",
+            re.IGNORECASE,
+        )
+        self.assertTrue(pattern.match("Tải hình ảnh lên"))
+        self.assertTrue(pattern.match("Tải ảnh lên"))
+        self.assertTrue(pattern.match("Upload image"))
+        self.assertTrue(pattern.match("add image"))
+        self.assertFalse(pattern.match("Tải video lên"))
+        self.assertFalse(pattern.match("Chọn khung hình từ video"))
+
 
 if __name__ == "__main__":
     unittest.main()
+

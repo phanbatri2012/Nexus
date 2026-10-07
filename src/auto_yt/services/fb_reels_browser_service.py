@@ -239,6 +239,33 @@ def _schedule_values_match(
         return False
 
 
+async def _verify_video_attachment_present(page: Any) -> bool:
+    """Verify that a video asset is currently attached and active in Meta Reels Composer."""
+    try:
+        if page is None or page.is_closed():
+            return False
+        # 1. Check video tag in DOM
+        if await page.locator("video").count() > 0:
+            return True
+        # 2. Check for video indicators in composer
+        indicators = page.locator(
+            'div:has-text("100%"), div:has-text("Video của bạn an toàn"), '
+            'div:has-text("an toàn để đăng"), span:has-text(".mp4"), div[aria-label*="video" i]'
+        )
+        if await indicators.count() > 0:
+            for idx in range(await indicators.count()):
+                if await indicators.nth(idx).is_visible():
+                    return True
+        # 3. Quick fallback check of page HTML
+        content = await page.content()
+        if "<video" in content or "Video của bạn an toàn" in content or "an toàn để đăng" in content:
+            return True
+        return False
+    except Exception as exc:
+        logger.debug("Kiểm tra đính kèm video gặp lỗi: %s", exc)
+        return True
+
+
 async def _visible_locators(locator: Any) -> list[Any]:
     visible: list[Any] = []
     for index in range(await locator.count()):
@@ -692,28 +719,41 @@ async def schedule_reel_via_gpm(
             if t_path and t_path.is_file():
                 notify("CP6_METADATA_FILLED", f"Đang tải lên hình thu nhỏ {t_path.name}...", 60)
                 try:
-                    # Click tab / radio "Tải hình ảnh lên"
-                    upload_img_tab = page.locator(
-                        'div[role="tab"]:has-text("Tải hình ảnh lên"), div[role="radio"]:has-text("Tải hình ảnh lên"), '
-                        'button:has-text("Tải hình ảnh lên"), span:has-text("Tải hình ảnh lên"), '
-                        'div:has-text("Tải hình ảnh lên")'
-                    ).first
+                    # Select tab / radio "Tải hình ảnh lên" / "Tải ảnh lên" / "Upload image"
+                    upload_tab_pattern = re.compile(
+                        r"^(Tải hình ảnh lên|Tải ảnh lên|Tải lên hình ảnh|Upload image|Add image|Thêm hình ảnh)$",
+                        re.IGNORECASE,
+                    )
+                    upload_img_tab = (
+                        page.locator('div[role="tab"], div[role="radio"], button, label, span')
+                        .filter(has_text=upload_tab_pattern)
+                        .first
+                    )
                     if await upload_img_tab.is_visible():
                         await upload_img_tab.click()
-                        await asyncio.sleep(1.0)
+                        await asyncio.sleep(1.2)
 
-                    upload_thumb_btn = page.locator(
-                        'div:has-text("Hình thu nhỏ") ~ div div[role="button"]:has-text("Tải hình ảnh lên"), '
-                        'div:has-text("Hình thu nhỏ") ~ div div[role="button"]:has-text("Thêm ảnh"), '
-                        'div[role="button"]:has-text("Tải hình ảnh lên"), button:has-text("Tải hình ảnh lên"), '
-                        'div[role="button"]:has-text("Thêm ảnh"), button:has-text("Thêm ảnh"), '
-                        'div[role="button"]:has-text("Upload image"), button:has-text("Upload image")'
-                    ).last
+                    upload_thumb_btn = (
+                        page.locator(
+                            'div:has-text("Hình thu nhỏ") ~ div div[role="button"]:has-text("Tải hình ảnh lên"), '
+                            'div:has-text("Hình thu nhỏ") ~ div div[role="button"]:has-text("Tải ảnh lên"), '
+                            'div:has-text("Hình thu nhỏ") ~ div div[role="button"]:has-text("Thêm ảnh"), '
+                            'div:has-text("Hình thu nhỏ") ~ div button:has-text("Tải hình ảnh lên"), '
+                            'div:has-text("Hình thu nhỏ") ~ div button:has-text("Tải ảnh lên"), '
+                            'div:has-text("Hình thu nhỏ") ~ div button:has-text("Thêm ảnh"), '
+                            'div:has-text("Ảnh bìa") ~ div div[role="button"], '
+                            'div[role="button"]:has-text("Tải hình ảnh lên"), button:has-text("Tải hình ảnh lên"), '
+                            'div[role="button"]:has-text("Tải ảnh lên"), button:has-text("Tải ảnh lên"), '
+                            'div[role="button"]:has-text("Thêm ảnh"), button:has-text("Thêm ảnh"), '
+                            'div[role="button"]:has-text("Upload image"), button:has-text("Upload image")'
+                        ).last
+                    )
 
+                    # Strictly use image input selector (NEVER fallback to generic input[type="file"] to avoid corrupting video)
                     await upload_file_via_cdp(
                         page,
                         t_path,
-                        input_selector='input[type="file"][accept*="image"], input[type="file"]',
+                        input_selector='input[type="file"][accept*="image"], input[accept*="image"]',
                         trigger_button_locator=upload_thumb_btn,
                         timeout_seconds=10.0,
                     )
@@ -722,13 +762,19 @@ async def schedule_reel_via_gpm(
                     # Handle crop / confirmation dialog if present
                     crop_save_btn = page.locator(
                         'div[role="dialog"] button:has-text("Lưu"), div[role="dialog"] div[role="button"]:has-text("Lưu"), '
-                        'div[role="dialog"] button:has-text("Save"), div[role="dialog"] button:has-text("Áp dụng")'
+                        'div[role="dialog"] button:has-text("Save"), div[role="dialog"] button:has-text("Áp dụng"), '
+                        'div[role="dialog"] button:has-text("Xong"), div[role="dialog"] button:has-text("Done")'
                     ).first
                     if await crop_save_btn.is_visible():
                         await crop_save_btn.click()
                         await asyncio.sleep(1.0)
+                    logger.info("Custom thumbnail đã tải lên thành công: %s", t_path.name)
                 except Exception as thumb_err:
-                    logger.debug("Lỗi khi tải thumbnail lên: %s", thumb_err)
+                    logger.warning(
+                        "Không thể nạp custom thumbnail (%s), tiếp tục với khung hình video mặc định: %s",
+                        t_path.name,
+                        thumb_err,
+                    )
 
             # 6. Add Tags (Thẻ)
             tag_list = list(tags or [])
@@ -757,6 +803,16 @@ async def schedule_reel_via_gpm(
                         await asyncio.sleep(0.5)
                 except Exception as tag_err:
                     logger.debug("Lỗi khi điền tags: %s", tag_err)
+
+            # GUARD 1: Verify Video Integrity before moving to Step 2
+            if not await _verify_video_attachment_present(page):
+                ss_file = await _capture_error_screenshot(page)
+                raise FbBrowserAutomationError(
+                    "Đính kèm video bị mất trong trình soạn thảo Meta (có thể do lỗi nạp file). Dừng lại để tránh tạo bài viết text rác.",
+                    phase="CP5_ASSET_UPLOADED",
+                    screenshot_path=ss_file,
+                    can_resume=True,
+                )
 
             # 7. Move from Step 1 (Tạo) -> Step 2 (Chỉnh sửa)
             notify("CP6_METADATA_FILLED", "Chờ xử lý video và chuyển sang bước Chỉnh sửa...", 70)
@@ -908,6 +964,16 @@ async def schedule_reel_via_gpm(
                 raise FbBrowserAutomationError(
                     "Tác vụ đã được yêu cầu dừng trước khi gửi lên Meta",
                     phase="CP7_SCHEDULE_SET",
+                    can_resume=True,
+                )
+
+            # GUARD 2: Verify Video Integrity before final submission
+            if not await _verify_video_attachment_present(page):
+                ss_file = await _capture_error_screenshot(page)
+                raise FbBrowserAutomationError(
+                    "Đính kèm video không còn tồn tại trước khi gửi lên Meta. Dừng lại để tránh tạo bài viết text rác.",
+                    phase="CP7_SCHEDULE_SET",
+                    screenshot_path=ss_file,
                     can_resume=True,
                 )
 
