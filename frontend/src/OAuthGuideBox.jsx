@@ -35,7 +35,7 @@ export default function OAuthGuideBox({ defaultOpen = false }) {
         title="Bấm để mở rộng hoặc thu gọn hướng dẫn"
       >
         <div className="oauth-guide-title">
-          <span>📖 Hướng dẫn lấy Client ID & Secret Google OAuth</span>
+          <span>📖 Hướng dẫn cấu hình Google OAuth (Chuẩn Google Auth Platform mới nhất)</span>
           <span className="oauth-guide-badge">Dành cho người mới</span>
         </div>
         <div className="oauth-guide-toggle-btn">
@@ -47,15 +47,15 @@ export default function OAuthGuideBox({ defaultOpen = false }) {
         <div className="oauth-guide-content">
           <div className="oauth-guide-topbar">
             <div>
-              <b>Quy trình nhanh:</b> Tạo Project ➔ Bật YouTube Data API v3 ➔ Thêm Test User ➔ Tạo OAuth Client (Web app) ➔ Dán ID & Secret.
+              <b>Quy trình nhanh:</b> Tạo Project ➔ Bật YouTube Data API v3 ➔ Cấu hình Google Auth Platform (Get started) ➔ Thêm Test Users ➔ Tạo Client (Web app) ➔ Dán ID & Secret.
             </div>
             <a
-              href="https://console.cloud.google.com/apis/credentials"
+              href="https://console.cloud.google.com/auth/overview"
               target="_blank"
               rel="noopener noreferrer"
               className="oauth-guide-link-btn"
             >
-              🚀 Mở Google Cloud Console ↗
+              🚀 Mở Google Auth Platform ↗
             </a>
           </div>
 
@@ -67,7 +67,7 @@ export default function OAuthGuideBox({ defaultOpen = false }) {
                 <span>Tạo Project trên Google Cloud</span>
               </div>
               <div className="oauth-step-body">
-                Truy cập <a href="https://console.cloud.google.com/" target="_blank" rel="noopener noreferrer" style={{ color: '#38bdf8' }}>Google Cloud Console</a>, chọn menu dự án trên cùng ➔ Bấm <b>New Project</b> (ví dụ đặt tên: <code>Auto-YT</code>) ➔ Bấm <b>Create</b> và chọn dự án vừa tạo.
+                Truy cập <a href="https://console.cloud.google.com/" target="_blank" rel="noopener noreferrer" style={{ color: '#38bdf8' }}>Google Cloud Console</a> ➔ Nhấp menu chọn dự án ở thanh trên cùng ➔ Bấm <b>New Project</b> (ví dụ: <code>Nexus Studio</code> hoặc <code>Auto Content</code>) ➔ Bấm <b>Create</b> và chọn dự án vừa tạo.
               </div>
             </div>
 
@@ -78,7 +78,7 @@ export default function OAuthGuideBox({ defaultOpen = false }) {
                 <span>Bật YouTube Data API v3</span>
               </div>
               <div className="oauth-step-body">
-                Vào menu <b>APIs & Services</b> ➔ <b>Library</b> ➔ Tìm kiếm từ khóa <code>YouTube Data API v3</code> ➔ Nhấn vào kết quả và bấm <b>ENABLE (Bật)</b>.
+                Trên thanh tìm kiếm trên cùng, gõ <code>YouTube Data API v3</code> ➔ Chọn kết quả tương ứng ➔ Nhấn nút <b>ENABLE (Bật)</b> để kích hoạt quyền gọi API YouTube.
               </div>
             </div>
 
@@ -86,12 +86,13 @@ export default function OAuthGuideBox({ defaultOpen = false }) {
             <div className="oauth-step-box">
               <div className="oauth-step-box-header">
                 <span className="oauth-step-num">3</span>
-                <span>OAuth Consent Screen & Test Users</span>
+                <span>Cấu hình Google Auth Platform</span>
               </div>
               <div className="oauth-step-body">
-                <div>• Chọn <b>External</b> (Bên ngoài) ➔ Nhập tên app & email hỗ trợ.</div>
-                <div>• Thêm phạm vi (Scope): <code>.../auth/youtube.force-ssl</code>.</div>
-                <div>• <b>Test users:</b> Bấm <i>+ Add Users</i> ➔ Nhập đúng <b>Gmail quản lý kênh YouTube</b> cần kết nối.</div>
+                <div>Menu trái chọn <b>Google Auth Platform</b> (hoặc <i>OAuth consent screen</i>) ➔ Bấm <b>Get started</b>:</div>
+                <div>• <b>App Information:</b> Đặt tên ứng dụng (ví dụ: <code>Nexus Studio</code> — ⚠️ <i>Không dùng chữ "YouTube" / "Google"</i>) và chọn Email hỗ trợ.</div>
+                <div>• <b>Audience:</b> Google tự để <i>External</i>. Kéo xuống phần <b>Test Users</b> ➔ Bấm <b>+ Add Users</b> ➔ Nhập chính xác <b>Gmail của kênh YouTube</b>.</div>
+                <div>• <b>Data Access:</b> Thêm Scope <code>.../auth/youtube.force-ssl</code> ➔ Bấm <b>Finish</b>.</div>
               </div>
             </div>
 
@@ -99,12 +100,12 @@ export default function OAuthGuideBox({ defaultOpen = false }) {
             <div className="oauth-step-box">
               <div className="oauth-step-box-header">
                 <span className="oauth-step-num">4</span>
-                <span>Tạo OAuth Client ID</span>
+                <span>Tạo OAuth Client ID (Web app)</span>
               </div>
               <div className="oauth-step-body">
-                <div>• Vào mục <b>Credentials</b> ➔ <b>Create Credentials</b> ➔ <b>OAuth client ID</b>.</div>
-                <div>• Application type: Chọn <b>Web application</b>.</div>
-                <div>• Mục <b>Authorized redirect URIs</b>: Thêm chính xác URL bên dưới:</div>
+                <div>• Menu bên trái chọn <b>Clients</b> (hoặc vào <i>Credentials</i> ➔ <i>Create Credentials</i> ➔ <i>OAuth client ID</i>).</div>
+                <div>• Bấm <b>Create Client</b> ➔ Application type chọn: <b>Web application</b>.</div>
+                <div>• Mục <b>Authorized redirect URIs</b>: Bấm <i>+ ADD URI</i> và dán URL:</div>
                 <div className="oauth-copy-row">
                   <span className="oauth-copy-text">{REDIRECT_URI_DEFAULT}</span>
                   <button
@@ -125,7 +126,7 @@ export default function OAuthGuideBox({ defaultOpen = false }) {
                 <span>Lấy Client ID & Secret dán vào Form bên dưới</span>
               </div>
               <div className="oauth-step-body">
-                Sao chép <b>Client ID</b> và <b>Client Secret</b> từ popup vừa tạo, dán vào các ô tương ứng bên dưới ➔ Nhập tên gợi nhớ (ví dụ: <code>THVN</code>) ➔ Bấm <b>💾 Lưu OAuth Client</b> ➔ Bấm <b>➕ Kết nối qua Google OAuth</b> để cấp quyền cho kênh.
+                Sao chép <b>Client ID</b> (dạng <code>...apps.googleusercontent.com</code>) và <b>Client Secret</b> từ popup Google, dán vào 2 ô tương ứng bên dưới ➔ Nhập Tên gợi nhớ (ví dụ: <code>THVN</code>) ➔ Bấm <b>💾 Lưu OAuth Client</b> ➔ Bấm <b>➕ Kết nối qua Google OAuth</b> để đăng nhập và cấp quyền cho kênh.
               </div>
             </div>
           </div>
@@ -133,7 +134,10 @@ export default function OAuthGuideBox({ defaultOpen = false }) {
           <div className="oauth-warning-callout">
             <span className="warn-icon">⚠️</span>
             <div>
-              <b>Lưu ý quan trọng:</b> Nếu ứng dụng ở chế độ <i>Testing</i>, chỉ các Gmail đã được thêm vào danh sách <b>Test users</b> ở Bước 3 mới có thể đăng nhập. Token trong chế độ Testing có thời hạn 7 ngày (chỉ cần bấm lại <i>Kết nối qua Google OAuth</i> để gia hạn).
+              <b>Lưu ý quan trọng:</b>
+              <div>1. <b>Quy định đặt tên (Brand Policy):</b> Không được chứa từ khóa thương hiệu độc quyền của Google như <code>YouTube</code>, <code>Google</code>, <code>Gmail</code> trong App Name, nếu không Google sẽ báo lỗi <i>"app name does not comply with Google's requirements"</i>.</div>
+              <div>2. <b>Tránh lỗi 403 (Access Denied):</b> Trong chế độ <i>Testing</i>, bắt buộc phải thêm Gmail của kênh YouTube vào danh sách <b>Test users</b> ở mục <b>Audience</b>.</div>
+              <div>3. <b>Thời hạn Token:</b> Ở chế độ Testing, token có hạn 7 ngày. Khi hết hạn chỉ cần bấm lại <i>Kết nối qua Google OAuth</i> để gia hạn tức thì.</div>
             </div>
           </div>
         </div>
