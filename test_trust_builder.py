@@ -5,11 +5,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 import asyncio
+import datetime
+import sqlite3
 from unittest.mock import patch, MagicMock, AsyncMock
+import pytest
 from fastapi.testclient import TestClient
 
 from auto_yt.services import database as db, api_security
 from auto_yt.services.trust_builder_actions import (
+    ACTION_ALREADY_DONE,
+    ACTION_PERFORMED,
     action_audit_channel_branding,
     action_search_and_pick_video,
     action_watch_video,
@@ -22,7 +27,14 @@ from auto_yt.services.trust_builder_actions import (
 from auto_yt.services.trust_builder_service import (
     calculate_trust_score,
     generate_contextual_comment,
+    validate_plan_browser_configuration,
 )
+from auto_yt.services.trust_builder_router import (
+    TrustPlanCreateRequest,
+    TrustPlanUpdateRequest,
+    _public_plan,
+)
+from auto_yt.services import trust_builder_scheduler
 from auto_yt.main import app
 
 client = TestClient(app)
@@ -108,6 +120,30 @@ def test_action_search_and_pick_video_success():
     asyncio.run(_run())
 
 
+def test_action_search_does_not_fallback_when_target_channel_is_missing():
+    async def _run():
+        mock_page = AsyncMock()
+        mock_page.wait_for_selector.return_value = AsyncMock()
+        mock_page.wait_for_function = AsyncMock()
+        mock_page.evaluate.return_value = [
+            {
+                "url": "https://www.youtube.com/watch?v=other123",
+                "title": "Unrelated result",
+                "channel": "@other-channel",
+            }
+        ]
+
+        with pytest.raises(RuntimeError, match="kênh mục tiêu"):
+            await action_search_and_pick_video(
+                mock_page,
+                keyword="channel topic",
+                target_channel="@required-channel",
+                timeout_seconds=5.0,
+            )
+
+    asyncio.run(_run())
+
+
 def test_action_like_video():
     async def _run():
         mock_page = AsyncMock()
@@ -116,7 +152,7 @@ def test_action_like_video():
         mock_page.query_selector.return_value = mock_btn
 
         liked = await action_like_video(mock_page)
-        assert liked is True
+        assert liked == ACTION_PERFORMED
         assert mock_btn.click.called
 
     asyncio.run(_run())
@@ -130,8 +166,31 @@ def test_action_subscribe_channel():
         mock_page.query_selector.return_value = mock_btn
 
         subscribed = await action_subscribe_channel(mock_page)
-        assert subscribed is True
+        assert subscribed == ACTION_PERFORMED
         assert mock_btn.click.called
+
+    asyncio.run(_run())
+
+
+def test_already_done_engagement_is_not_performed():
+    async def _run():
+        like_page = AsyncMock()
+        like_page.evaluate.return_value = {
+            "found": True,
+            "pressed": True,
+            "selector": "like-button-view-model button",
+        }
+        assert await action_like_video(like_page) == ACTION_ALREADY_DONE
+        like_page.query_selector.assert_not_called()
+
+        subscribe_page = AsyncMock()
+        subscribe_page.evaluate.return_value = {
+            "found": True,
+            "subscribed": True,
+            "selector": "ytd-watch-metadata #subscribe-button button",
+        }
+        assert await action_subscribe_channel(subscribe_page) == ACTION_ALREADY_DONE
+        subscribe_page.query_selector.assert_not_called()
 
     asyncio.run(_run())
 
@@ -141,21 +200,21 @@ def test_action_watch_video_duration_short_video():
     async def _run():
         mock_page = AsyncMock()
         mock_page.url = "https://www.youtube.com/watch?v=short123"
-        # Return duration 240s on query, then immediately signal ended
+        mock_page.query_selector.return_value = None
         mock_page.evaluate.side_effect = [
-            None,   # play
-            240.0,  # duration query
-            True,   # is_ended query
+            None,
+            {"duration": 4.0, "currentTime": 0.0, "paused": False, "ended": False, "readyState": 4, "adShowing": False, "videoId": "short123"},
+            {"duration": 4.0, "currentTime": 4.0, "paused": False, "ended": True, "readyState": 4, "adShowing": False, "videoId": "short123"},
         ]
-        res = await action_watch_video(
-            mock_page,
-            video_url="https://www.youtube.com/watch?v=short123",
-            min_watch_seconds=600.0,
-            max_watch_seconds=1200.0,
-        )
-        assert res["total_duration"] == 240.0
-        # Retention percentage should be calculated relative to total_duration
-        assert res["retention_percentage"] <= 100.0
+        with patch("auto_yt.services.trust_builder_actions.asyncio.sleep", new=AsyncMock()):
+            res = await action_watch_video(
+                mock_page,
+                video_url="https://www.youtube.com/watch?v=short123",
+                min_watch_seconds=5.0,
+                max_watch_seconds=10.0,
+            )
+        assert res["total_duration"] == 4.0
+        assert res["retention_percentage"] == 100.0
 
     asyncio.run(_run())
 
@@ -165,21 +224,26 @@ def test_action_watch_video_duration_long_video():
     async def _run():
         mock_page = AsyncMock()
         mock_page.url = "https://www.youtube.com/watch?v=long123"
-        # First return duration 1800s, then simulate video ending
+        mock_page.query_selector.return_value = None
         mock_page.evaluate.side_effect = [
-            None,    # play
-            1800.0,  # duration query
-            True,    # is_ended query
+            None,
+            {"duration": 20.0, "currentTime": 0.0, "paused": False, "ended": False, "readyState": 4, "adShowing": False, "videoId": "long123"},
+            {"duration": 20.0, "currentTime": 5.0, "paused": False, "ended": False, "readyState": 4, "adShowing": False, "videoId": "long123"},
         ]
-        res = await action_watch_video(
-            mock_page,
-            video_url="https://www.youtube.com/watch?v=long123",
-            min_pct=60.0,
-            max_pct=90.0,
-            min_watch_seconds=600.0,
-            max_watch_seconds=1200.0,
-        )
-        assert res["total_duration"] == 1800.0
+        with patch(
+            "auto_yt.services.trust_builder_actions.asyncio.sleep",
+            new=AsyncMock(),
+        ), patch("auto_yt.services.trust_builder_actions.random.uniform", return_value=0.25):
+            res = await action_watch_video(
+                mock_page,
+                video_url="https://www.youtube.com/watch?v=long123",
+                min_pct=20.0,
+                max_pct=30.0,
+                min_watch_seconds=5.0,
+                max_watch_seconds=5.0,
+            )
+        assert res["total_duration"] == 20.0
+        assert res["watched_seconds"] == 5.0
 
     asyncio.run(_run())
 
@@ -193,6 +257,119 @@ def test_db_trust_plan_min_watch_minutes():
 
     decoded_custom = db._decode_trust_plan({"min_watch_minutes": 15})
     assert decoded_custom["min_watch_minutes"] == 15
+
+
+def test_db_trust_plan_preserves_zero_engagement_targets():
+    decoded = db._decode_trust_plan({
+        "daily_like_target": 0,
+        "daily_comment_target": 0,
+        "daily_subscribe_target": 0,
+    })
+    assert decoded["daily_like_target"] == 0
+    assert decoded["daily_comment_target"] == 0
+    assert decoded["daily_subscribe_target"] == 0
+
+
+def test_trust_plan_request_validation_and_safe_defaults():
+    request = TrustPlanCreateRequest(channel_db_id=1)
+    assert request.daily_comment_target == 0
+    assert request.daily_subscribe_target == 0
+
+    with pytest.raises(ValueError):
+        TrustPlanUpdateRequest(daily_comment_target=6)
+    with pytest.raises(ValueError):
+        TrustPlanUpdateRequest(min_watch_minutes=0)
+
+
+def test_validate_plan_browser_configuration_rejects_local_and_direct():
+    base_plan = {"channel_db_id": 1, "gpm_profile_id": "local_coccoc_Default"}
+    with pytest.raises(ValueError, match="Profile GPM"):
+        validate_plan_browser_configuration(base_plan)
+
+    direct_plan = {
+        "channel_db_id": 1,
+        "gpm_profile_id": "gpm-profile",
+        "gpm_proxy_info": "Direct",
+    }
+    with patch(
+        "auto_yt.services.trust_builder_service.parse_profile_target",
+        return_value={"type": "gpm", "proxy_info": "Direct"},
+    ):
+        with pytest.raises(ValueError, match="proxy"):
+            validate_plan_browser_configuration(direct_plan)
+
+    invalid_proxy_plan = {
+        "channel_db_id": 1,
+        "gpm_profile_id": "gpm-profile",
+        "gpm_proxy_info": "not-a-proxy",
+    }
+    with patch(
+        "auto_yt.services.trust_builder_service.parse_profile_target",
+        return_value={"type": "gpm", "proxy_info": "not-a-proxy"},
+    ):
+        with pytest.raises(ValueError, match="proxy"):
+            validate_plan_browser_configuration(invalid_proxy_plan)
+
+
+def test_validate_plan_browser_configuration_rejects_shared_profile():
+    plan = {
+        "channel_db_id": 1,
+        "gpm_profile_id": "gpm-profile",
+        "gpm_proxy_info": "127.0.0.1:9000:user:password",
+    }
+    with patch(
+        "auto_yt.services.trust_builder_service.parse_profile_target",
+        return_value={"type": "gpm"},
+    ), patch(
+        "auto_yt.services.trust_builder_service.db.list_youtube_channels",
+        return_value=[{"id": 2, "gpm_profile_id": "gpm-profile"}],
+    ):
+        with pytest.raises(ValueError, match="kênh khác"):
+            validate_plan_browser_configuration(plan)
+
+
+def test_public_plan_hides_proxy_credentials():
+    plan = _public_plan(
+        {
+            "id": 7,
+            "gpm_proxy_info": "127.0.0.1:9000:proxy-user:proxy-password",
+        }
+    )
+
+    assert "gpm_proxy_info" not in plan
+    assert plan["gpm_proxy_configured"] is True
+
+
+def test_scheduler_uses_channel_timezone_and_next_run():
+    plan = {
+        "publication_timezone": "Asia/Bangkok",
+        "next_run_at": "2026-10-07T02:00:00+00:00",
+    }
+    before_start = datetime.datetime(2026, 10, 7, 0, 30, tzinfo=datetime.timezone.utc)
+    active_time = datetime.datetime(2026, 10, 7, 3, 0, tzinfo=datetime.timezone.utc)
+    assert trust_builder_scheduler._is_plan_due(plan, before_start) is False
+    assert trust_builder_scheduler._is_plan_due(plan, active_time) is True
+
+
+def test_delete_trust_plan_removes_activity_logs_atomically(tmp_path, monkeypatch):
+    database_path = tmp_path / "trust.db"
+    conn = sqlite3.connect(database_path)
+    conn.executescript(
+        """
+        CREATE TABLE channel_trust_plans (id INTEGER PRIMARY KEY);
+        CREATE TABLE trust_activity_log (id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL);
+        INSERT INTO channel_trust_plans(id) VALUES (7);
+        INSERT INTO trust_activity_log(id, plan_id) VALUES (1, 7), (2, 7);
+        """
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(db, "DB_PATH", database_path)
+
+    assert db.delete_channel_trust_plan(7) is True
+    verify_conn = sqlite3.connect(database_path)
+    assert verify_conn.execute("SELECT COUNT(*) FROM trust_activity_log").fetchone()[0] == 0
+    verify_conn.close()
 
 
 def test_action_audit_channel_branding_studio():
@@ -243,5 +420,3 @@ def test_action_audit_channel_branding_fallback():
         assert res["about"] is True
 
     asyncio.run(_run())
-
-

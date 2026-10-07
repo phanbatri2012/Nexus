@@ -5,6 +5,7 @@ import re
 import unicodedata
 import uuid
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # Fix the path to point correctly from where the app runs
 # Since main.py is run from the project root usually, we can resolve relative to this file
@@ -1343,8 +1344,8 @@ def init_db():
             daily_watch_target INTEGER DEFAULT 5,
             daily_search_target INTEGER DEFAULT 3,
             daily_like_target INTEGER DEFAULT 3,
-            daily_comment_target INTEGER DEFAULT 1,
-            daily_subscribe_target INTEGER DEFAULT 1,
+            daily_comment_target INTEGER DEFAULT 0,
+            daily_subscribe_target INTEGER DEFAULT 0,
             min_watch_minutes INTEGER DEFAULT 10,
             branding_checklist TEXT NOT NULL DEFAULT '{}',
             status TEXT NOT NULL DEFAULT 'draft',
@@ -1356,16 +1357,23 @@ def init_db():
             trust_score_estimated INTEGER DEFAULT 0,
             error_message TEXT DEFAULT '',
             last_session_at TEXT DEFAULT '',
+            last_attempt_at TEXT DEFAULT '',
+            next_run_at TEXT DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             UNIQUE(channel_db_id)
         )
     ''')
 
-    try:
-        c.execute("ALTER TABLE channel_trust_plans ADD COLUMN min_watch_minutes INTEGER DEFAULT 10")
-    except sqlite3.OperationalError:
-        pass
+    for column_definition in (
+        "min_watch_minutes INTEGER DEFAULT 10",
+        "last_attempt_at TEXT DEFAULT ''",
+        "next_run_at TEXT DEFAULT ''",
+    ):
+        try:
+            c.execute(f"ALTER TABLE channel_trust_plans ADD COLUMN {column_definition}")
+        except sqlite3.OperationalError:
+            pass
 
     c.execute('''
         CREATE TABLE IF NOT EXISTS trust_activity_log (
@@ -1385,6 +1393,17 @@ def init_db():
     c.execute('''
         CREATE INDEX IF NOT EXISTS idx_trust_activity_plan
         ON trust_activity_log(plan_id, executed_at DESC)
+    ''')
+    c.execute('''
+        CREATE INDEX IF NOT EXISTS idx_trust_activity_daily
+        ON trust_activity_log(plan_id, success, executed_at, activity_type)
+    ''')
+    c.execute('''
+        DELETE FROM trust_activity_log
+        WHERE NOT EXISTS (
+            SELECT 1 FROM channel_trust_plans
+            WHERE channel_trust_plans.id = trust_activity_log.plan_id
+        )
     ''')
 
     _migrate_fb_crossposter_queue_composite_unique(conn)
@@ -6544,12 +6563,12 @@ def _decode_trust_plan(row: sqlite3.Row | dict | None) -> dict | None:
     data["total_comments"] = int(data.get("total_comments") or 0)
     data["total_subscriptions"] = int(data.get("total_subscriptions") or 0)
     data["trust_score_estimated"] = int(data.get("trust_score_estimated") or 0)
-    data["daily_watch_target"] = int(data.get("daily_watch_target") or 5)
-    data["daily_search_target"] = int(data.get("daily_search_target") or 3)
-    data["daily_like_target"] = int(data.get("daily_like_target") or 3)
-    data["daily_comment_target"] = int(data.get("daily_comment_target") or 1)
-    data["daily_subscribe_target"] = int(data.get("daily_subscribe_target") or 1)
-    data["min_watch_minutes"] = int(data.get("min_watch_minutes") or 10)
+    data["daily_watch_target"] = int(5 if data.get("daily_watch_target") is None else data["daily_watch_target"])
+    data["daily_search_target"] = int(3 if data.get("daily_search_target") is None else data["daily_search_target"])
+    data["daily_like_target"] = int(3 if data.get("daily_like_target") is None else data["daily_like_target"])
+    data["daily_comment_target"] = int(0 if data.get("daily_comment_target") is None else data["daily_comment_target"])
+    data["daily_subscribe_target"] = int(0 if data.get("daily_subscribe_target") is None else data["daily_subscribe_target"])
+    data["min_watch_minutes"] = int(10 if data.get("min_watch_minutes") is None else data["min_watch_minutes"])
     return data
 
 
@@ -6570,8 +6589,8 @@ def create_channel_trust_plan(
     daily_watch_target: int = 5,
     daily_search_target: int = 3,
     daily_like_target: int = 3,
-    daily_comment_target: int = 1,
-    daily_subscribe_target: int = 1,
+    daily_comment_target: int = 0,
+    daily_subscribe_target: int = 0,
     min_watch_minutes: int = 10,
     branding_checklist: dict | None = None,
     status: str = "draft",
@@ -6674,7 +6693,7 @@ def update_channel_trust_plan(plan_id: int, **changes) -> dict | None:
         "daily_comment_target", "daily_subscribe_target", "min_watch_minutes",
         "branding_checklist", "status", "total_videos_watched", "total_searches",
         "total_likes", "total_comments", "total_subscriptions", "trust_score_estimated",
-        "error_message", "last_session_at"
+        "error_message", "last_session_at", "last_attempt_at", "next_run_at"
     }
 
     set_clauses = []
@@ -6719,13 +6738,20 @@ def update_channel_trust_plan(plan_id: int, **changes) -> dict | None:
 
 
 def delete_channel_trust_plan(plan_id: int) -> bool:
-    conn = sqlite3.connect(str(DB_PATH), timeout=30)
-    cursor = conn.execute(
-        "DELETE FROM channel_trust_plans WHERE id = ?", (plan_id,)
-    )
-    conn.commit()
-    conn.close()
-    return cursor.rowcount > 0
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("DELETE FROM trust_activity_log WHERE plan_id = ?", (plan_id,))
+        cursor = conn.execute(
+            "DELETE FROM channel_trust_plans WHERE id = ?", (plan_id,)
+        )
+        conn.execute("COMMIT")
+        return cursor.rowcount > 0
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
 
 
 def create_trust_activity_log(
@@ -6784,19 +6810,33 @@ def list_trust_activity_logs(
     return [_decode_trust_activity_log(row) for row in rows]
 
 
-def get_trust_activity_stats(plan_id: int) -> dict:
+def get_trust_activity_stats(
+    plan_id: int,
+    *,
+    start_at: str = "",
+    end_at: str = "",
+) -> dict:
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
+    filters = ["plan_id = ?", "success = 1"]
+    params: list = [plan_id]
+    if start_at:
+        filters.append("executed_at >= ?")
+        params.append(start_at)
+    if end_at:
+        filters.append("executed_at < ?")
+        params.append(end_at)
+    where_clause = " AND ".join(filters)
     
     # Total counts by activity_type
     counts_rows = conn.execute(
         """
         SELECT activity_type, COUNT(*) as count, SUM(duration_seconds) as total_duration
         FROM trust_activity_log
-        WHERE plan_id = ? AND success = 1
+        WHERE {where_clause}
         GROUP BY activity_type
-        """,
-        (plan_id,)
+        """.format(where_clause=where_clause),
+        params,
     ).fetchall()
     
     # Total distinct active days
@@ -6804,9 +6844,9 @@ def get_trust_activity_stats(plan_id: int) -> dict:
         """
         SELECT COUNT(DISTINCT substr(executed_at, 1, 10)) as active_days
         FROM trust_activity_log
-        WHERE plan_id = ? AND success = 1
-        """,
-        (plan_id,)
+        WHERE {where_clause}
+        """.format(where_clause=where_clause),
+        params,
     ).fetchone()
     
     conn.close()
@@ -6837,3 +6877,27 @@ def get_trust_activity_stats(plan_id: int) -> dict:
             stats["subscribe_count"] = count
 
     return stats
+
+
+def get_trust_daily_activity_stats(
+    plan_id: int,
+    timezone_name: str,
+    *,
+    now_utc: datetime.datetime | None = None,
+) -> dict:
+    clean_timezone = str(timezone_name or "Asia/Ho_Chi_Minh").strip()
+    try:
+        timezone = ZoneInfo(clean_timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        timezone = ZoneInfo("Asia/Ho_Chi_Minh")
+    current_utc = now_utc or datetime.datetime.now(datetime.timezone.utc)
+    if current_utc.tzinfo is None:
+        current_utc = current_utc.replace(tzinfo=datetime.timezone.utc)
+    local_day = current_utc.astimezone(timezone).date()
+    local_start = datetime.datetime.combine(local_day, datetime.time.min, tzinfo=timezone)
+    local_end = local_start + datetime.timedelta(days=1)
+    return get_trust_activity_stats(
+        plan_id,
+        start_at=local_start.astimezone(datetime.timezone.utc).isoformat(),
+        end_at=local_end.astimezone(datetime.timezone.utc).isoformat(),
+    )

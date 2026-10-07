@@ -12,9 +12,17 @@ import logging
 import random
 import re
 import urllib.parse
+from collections.abc import Callable
 from typing import Any
 
+from auto_yt.services import security_logging
+
 logger = logging.getLogger(__name__)
+
+ACTION_PERFORMED = "performed"
+ACTION_ALREADY_DONE = "already_done"
+ACTION_NOT_FOUND = "not_found"
+ACTION_FAILED = "failed"
 
 
 async def human_type(page: Any, selector: str, text: str, min_delay_ms: int = 40, max_delay_ms: int = 120) -> None:
@@ -86,6 +94,7 @@ async def action_search_and_pick_video(
     page: Any,
     keyword: str,
     target_channel: str = "",
+    excluded_video_ids: set[str] | None = None,
     timeout_seconds: float = 30.0,
 ) -> dict[str, Any]:
     """Search YouTube for a niche keyword, scroll naturally, and pick a competitor video."""
@@ -118,7 +127,10 @@ async def action_search_and_pick_video(
             await asyncio.sleep(random.uniform(0.4, 0.9))
             await page.keyboard.press("Enter")
         except Exception as exc:
-            logger.debug("Không thể gõ vào ô tìm kiếm, chuyển hướng sang URL kết quả: %s", exc)
+            logger.debug(
+                "Không thể gõ vào ô tìm kiếm, chuyển hướng sang URL kết quả: %s",
+                security_logging.redact_sensitive(exc),
+            )
             search_elem = None
 
     if not search_elem:
@@ -236,16 +248,33 @@ async def action_search_and_pick_video(
     if not candidates:
         raise RuntimeError(f"Không tìm thấy video kết quả nào cho từ khóa '{keyword}'.")
 
-    # 7. Select video: filter by target_channel if specified, else pick random from Top 10
+    excluded_ids = excluded_video_ids or set()
+    if excluded_ids:
+        candidates = [
+            candidate
+            for candidate in candidates
+            if not (
+                (match := re.search(r"[?&]v=([a-zA-Z0-9_-]+)", candidate["url"]))
+                and match.group(1) in excluded_ids
+            )
+        ]
+        if not candidates:
+            raise RuntimeError("Không còn video mới phù hợp sau khi loại các video đã xem.")
+
+    # 7. Select video: an explicit target must match; never engage a fallback channel.
     selected_video: dict[str, str] | None = None
     if target_channel:
-        clean_target = target_channel.lower().replace("@", "").strip()
+        clean_target = target_channel.casefold().lstrip("@").strip()
         for cand in candidates:
-            if clean_target in cand["channel"].lower():
+            candidate_channel = str(cand.get("channel") or "").casefold().lstrip("@").strip()
+            if candidate_channel == clean_target:
                 selected_video = cand
                 break
-
-    if not selected_video:
+        if not selected_video:
+            raise RuntimeError(
+                f"Không tìm thấy video thuộc đúng kênh mục tiêu '{target_channel}'."
+            )
+    else:
         # Pick from top min(8, len(candidates))
         pool = candidates[:min(8, len(candidates))]
         selected_video = random.choice(pool)
@@ -261,44 +290,67 @@ async def action_watch_video(
     max_pct: float = 90.0,
     min_watch_seconds: float = 600.0,
     max_watch_seconds: float = 1200.0,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
-    """Watch video naturally with random pauses, scrolls, mouse movements, and ad-skipping.
-    
-    Rule: Minimum watch time is min_watch_seconds (default 10 minutes = 600s).
-    - If total_duration <= min_watch_seconds: Watch 100% of the video to the end.
-    - If total_duration > min_watch_seconds: Watch at least min_watch_seconds (or randomized 60-90% up to max_watch_seconds).
-    """
+    """Watch a video and count only observed main-video playback progress."""
     logger.info("Bắt đầu xem video: %s", video_url)
-    
+
     current_url = page.url
     if not (video_url and video_url in current_url):
         await page.goto(video_url, wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(random.uniform(2.0, 3.5))
 
     await dismiss_common_popups(page)
+    try:
+        await page.wait_for_selector("video.html5-main-video, video", state="attached", timeout=15000)
+    except Exception as exc:
+        raise RuntimeError("Không tìm thấy trình phát video YouTube.") from exc
 
-    # Ensure video is playing and unmuted
+    expected_video_id = ""
+    match = re.search(r"[?&]v=([a-zA-Z0-9_-]+)", video_url)
+    if match:
+        expected_video_id = match.group(1)
+
+    snapshot_script = """() => {
+        const video = document.querySelector('video.html5-main-video, video');
+        const params = new URL(window.location.href).searchParams;
+        return {
+            duration: Number(video?.duration || 0),
+            currentTime: Number(video?.currentTime || 0),
+            paused: Boolean(video?.paused),
+            ended: Boolean(video?.ended),
+            readyState: Number(video?.readyState || 0),
+            adShowing: Boolean(document.querySelector('.ad-showing, .ytp-ad-player-overlay')),
+            videoId: params.get('v') || ''
+        };
+    }"""
+
     await page.evaluate(
         """() => {
-            const v = document.querySelector('video');
+            const v = document.querySelector('video.html5-main-video, video');
             if (v) {
                 if (v.paused) v.play().catch(() => {});
             }
         }"""
     )
 
-    # Get total video duration
-    total_duration = 0.0
-    for _ in range(6):
-        total_duration = float(await page.evaluate("() => document.querySelector('video')?.duration || 0") or 0.0)
-        if total_duration > 0:
+    initial_snapshot: dict[str, Any] = {}
+    for _ in range(15):
+        if cancel_check and cancel_check():
+            raise asyncio.CancelledError
+        initial_snapshot = await page.evaluate(snapshot_script) or {}
+        if initial_snapshot.get("adShowing"):
+            await handle_ad_skipping(page)
+        elif float(initial_snapshot.get("duration") or 0.0) > 0:
             break
         await asyncio.sleep(1.0)
 
+    total_duration = float(initial_snapshot.get("duration") or 0.0)
     if total_duration <= 0:
-        total_duration = 600.0  # Fallback 10 minutes
+        raise RuntimeError("Không đọc được thời lượng video chính.")
+    if expected_video_id and initial_snapshot.get("videoId") not in {"", expected_video_id}:
+        raise RuntimeError("YouTube đã điều hướng sang video khác với video được chọn.")
 
-    # Calculate target watch duration
     if total_duration <= min_watch_seconds:
         target_seconds = total_duration
         chosen_pct = 1.0
@@ -313,30 +365,43 @@ async def action_watch_video(
         total_duration, total_duration / 60.0, target_seconds, target_seconds / 60.0, chosen_pct * 100
     )
 
-    # Watch loop
-    elapsed = 0.0
+    watched_seconds = 0.0
+    wall_seconds = 0.0
     step = 5.0
     last_interaction = 0.0
-    
-    while elapsed < target_seconds:
+    previous_time = float(initial_snapshot.get("currentTime") or 0.0)
+    max_wall_seconds = max(target_seconds * 2.0, target_seconds + 300.0)
+
+    while watched_seconds < target_seconds and wall_seconds < max_wall_seconds:
+        if cancel_check and cancel_check():
+            raise asyncio.CancelledError
         await asyncio.sleep(step)
-        elapsed += step
-        
-        # Check and handle ads
+        wall_seconds += step
         await handle_ad_skipping(page)
-
-        # Check if video already reached the end
         try:
-            is_ended = await page.evaluate("() => document.querySelector('video')?.ended || false")
-            if is_ended:
-                logger.info("Video đã phát đến cuối (ended). Hoàn tất xem.")
+            snapshot = await page.evaluate(snapshot_script) or {}
+            current_time = float(snapshot.get("currentTime") or 0.0)
+            current_video_id = str(snapshot.get("videoId") or "")
+            if expected_video_id and current_video_id not in {"", expected_video_id}:
+                raise RuntimeError("YouTube đã tự chuyển sang video khác trong lúc xem.")
+            if not snapshot.get("adShowing") and not snapshot.get("paused") and int(snapshot.get("readyState") or 0) >= 2:
+                progress = max(0.0, min(current_time - previous_time, step * 1.5))
+                watched_seconds += progress
+            previous_time = current_time
+            if snapshot.get("ended") or current_time >= max(0.0, total_duration - 1.0):
+                watched_seconds = min(total_duration, max(watched_seconds, current_time))
+                logger.info("Video đã phát đến cuối. Hoàn tất xem.")
                 break
-        except Exception:
-            pass
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            logger.debug(
+                "Không đọc được trạng thái phát video: %s",
+                security_logging.redact_sensitive(exc),
+            )
 
-        # Periodic subtle human-like behavior every 70-130s
-        if (elapsed - last_interaction) > random.uniform(70.0, 130.0) and elapsed < (target_seconds - 15.0):
-            last_interaction = elapsed
+        if (watched_seconds - last_interaction) > random.uniform(70.0, 130.0) and watched_seconds < (target_seconds - 15.0):
+            last_interaction = watched_seconds
             action_choice = random.choice(["scroll_comments", "pause_briefly", "mouse_move"])
             try:
                 if action_choice == "scroll_comments":
@@ -347,23 +412,34 @@ async def action_watch_video(
                 elif action_choice == "pause_briefly":
                     pause_time = random.uniform(2.5, 6.0)
                     logger.debug("Giả lập tạm dừng video trong %.1fs...", pause_time)
-                    await page.evaluate("() => document.querySelector('video')?.pause()")
+                    await page.evaluate("() => document.querySelector('video.html5-main-video, video')?.pause()")
                     await asyncio.sleep(pause_time)
-                    await page.evaluate("() => document.querySelector('video')?.play().catch(() => {})")
+                    await page.evaluate("() => document.querySelector('video.html5-main-video, video')?.play().catch(() => {})")
                 elif action_choice == "mouse_move":
                     await page.mouse.move(random.randint(150, 700), random.randint(150, 500))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug(
+                    "Không thể thực hiện tương tác xem tự nhiên: %s",
+                    security_logging.redact_sensitive(exc),
+                )
 
-    logger.info("Hoàn tất phiên xem video: %.1fs (%.1f phút)", elapsed, elapsed / 60.0)
+    if watched_seconds < min(target_seconds, total_duration) - 1.0:
+        raise RuntimeError(
+            f"Video chỉ phát thực tế {watched_seconds:.1f}s, chưa đạt mục tiêu {target_seconds:.1f}s."
+        )
+    logger.info(
+        "Hoàn tất phiên xem video: %.1fs phát thực tế (%.1f phút)",
+        watched_seconds,
+        watched_seconds / 60.0,
+    )
     return {
-        "watched_seconds": elapsed,
+        "watched_seconds": round(watched_seconds, 2),
         "total_duration": total_duration,
-        "retention_percentage": round((elapsed / total_duration) * 100, 2) if total_duration > 0 else 100.0,
+        "retention_percentage": round(min(100.0, (watched_seconds / total_duration) * 100), 2),
     }
 
 
-async def action_like_video(page: Any) -> bool:
+async def action_like_video(page: Any) -> str:
     """Click the Like button if not already liked."""
     logger.info("Thực hiện hành động Like video...")
     try:
@@ -374,15 +450,25 @@ async def action_like_video(page: Any) -> bool:
                     '#top-level-buttons-computed ytd-toggle-button-renderer button',
                     'ytd-watch-metadata #segmented-like-button button',
                     'segmented-like-dislike-button-view-model like-button-view-model button',
-                    'button[aria-label*="like" i]',
-                    'button[aria-label*="thích" i]'
+                    'button[aria-label^="Like" i]',
+                    'button[aria-label^="Thích" i]'
                 ];
                 for (const sel of selectors) {
-                    const btn = document.querySelector(sel);
+                    const btn = Array.from(document.querySelectorAll(sel)).find(node => {
+                        const rect = node.getBoundingClientRect();
+                        const label = (node.getAttribute('aria-label') || '').toLowerCase();
+                        return rect.width > 0 && rect.height > 0
+                            && !label.includes('dislike') && !label.includes('không thích');
+                    });
                     if (btn) {
                         const ariaPressed = btn.getAttribute('aria-pressed');
                         const isPressed = ariaPressed === 'true';
-                        return { found: true, pressed: isPressed, selector: sel };
+                        btn.setAttribute('data-trust-builder-action', 'like');
+                        return {
+                            found: true,
+                            pressed: isPressed,
+                            selector: '[data-trust-builder-action="like"]'
+                        };
                     }
                 }
                 return { found: false, pressed: false, selector: '' };
@@ -391,35 +477,35 @@ async def action_like_video(page: Any) -> bool:
 
         if not like_btn_info.get("found"):
             logger.warning("Không tìm thấy nút Like trên giao diện video.")
-            return False
+            return ACTION_NOT_FOUND
 
         if like_btn_info.get("pressed"):
             logger.info("Video đã được Like trước đó. Bỏ qua.")
-            return True
+            return ACTION_ALREADY_DONE
 
         matched_sel = like_btn_info.get("selector")
         btn = await page.query_selector(matched_sel) if matched_sel else None
-        if not btn:
-            btn = await page.query_selector("like-button-view-model button, ytd-watch-metadata #segmented-like-button button, button[aria-label*='thích' i]")
-
         if btn:
             await btn.scroll_into_view_if_needed()
             await asyncio.sleep(random.uniform(0.3, 0.6))
             await btn.click()
             await asyncio.sleep(random.uniform(1.2, 2.5))
             logger.info("Đã Like video thành công!")
-            return True
-        return False
+            return ACTION_PERFORMED
+        return ACTION_NOT_FOUND
     except Exception as exc:
-        logger.warning("Lỗi khi click Like video: %s", exc)
-        return False
+        logger.warning(
+            "Lỗi khi click Like video: %s",
+            security_logging.redact_sensitive(exc),
+        )
+        return ACTION_FAILED
 
 
-async def action_comment_video(page: Any, comment_text: str) -> bool:
+async def action_comment_video(page: Any, comment_text: str) -> str:
     """Add a contextual comment to the current video."""
     clean_text = comment_text.strip()
     if not clean_text:
-        return False
+        return ACTION_FAILED
 
     logger.info("Thực hiện bình luận video: '%s'", clean_text)
     try:
@@ -443,7 +529,7 @@ async def action_comment_video(page: Any, comment_text: str) -> bool:
         input_elem = await page.wait_for_selector(input_sel, state="attached", timeout=8000)
         if not input_elem:
             logger.warning("Không tìm thấy ô soạn thảo bình luận.")
-            return False
+            return ACTION_NOT_FOUND
 
         await input_elem.scroll_into_view_if_needed()
         await input_elem.click()
@@ -463,16 +549,19 @@ async def action_comment_video(page: Any, comment_text: str) -> bool:
             await submit_btn.click()
             await asyncio.sleep(random.uniform(1.5, 3.0))
             logger.info("Đã gửi bình luận thành công!")
-            return True
+            return ACTION_PERFORMED
 
         logger.warning("Nút Gửi bình luận không kích hoạt.")
-        return False
+        return ACTION_FAILED
     except Exception as exc:
-        logger.warning("Lỗi khi đăng bình luận: %s", exc)
-        return False
+        logger.warning(
+            "Lỗi khi đăng bình luận: %s",
+            security_logging.redact_sensitive(exc),
+        )
+        return ACTION_FAILED
 
 
-async def action_subscribe_channel(page: Any) -> bool:
+async def action_subscribe_channel(page: Any) -> str:
     """Subscribe to the channel of the current video if not subscribed."""
     logger.info("Thực hiện hành động Đăng ký kênh (Subscribe)...")
     try:
@@ -487,9 +576,16 @@ async def action_subscribe_channel(page: Any) -> bool:
                 for (const sel of selectors) {
                     const subBtn = document.querySelector(sel);
                     if (subBtn) {
+                        const rect = subBtn.getBoundingClientRect();
+                        if (rect.width <= 0 || rect.height <= 0) continue;
                         const text = (subBtn.innerText || subBtn.getAttribute('aria-label') || '').toLowerCase();
                         const subscribed = text.includes('subscribed') || text.includes('đã đăng ký');
-                        return { found: true, subscribed, selector: sel };
+                        subBtn.setAttribute('data-trust-builder-action', 'subscribe');
+                        return {
+                            found: true,
+                            subscribed,
+                            selector: '[data-trust-builder-action="subscribe"]'
+                        };
                     }
                 }
                 return { found: false, subscribed: false, selector: '' };
@@ -498,27 +594,28 @@ async def action_subscribe_channel(page: Any) -> bool:
 
         if not sub_info.get("found"):
             logger.warning("Không tìm thấy nút Subscribe trên trang.")
-            return False
+            return ACTION_NOT_FOUND
 
         if sub_info.get("subscribed"):
             logger.info("Kênh đã được đăng ký trước đó. Bỏ qua.")
-            return True
+            return ACTION_ALREADY_DONE
 
         matched_sel = sub_info.get("selector")
         btn = await page.query_selector(matched_sel) if matched_sel else None
-        if not btn:
-            btn = await page.query_selector("ytd-watch-metadata #subscribe-button button, ytd-subscribe-button-renderer button")
         if btn:
             await btn.scroll_into_view_if_needed()
             await asyncio.sleep(random.uniform(0.3, 0.6))
             await btn.click()
             await asyncio.sleep(random.uniform(1.5, 3.0))
             logger.info("Đã bấm Subscribe kênh đối thủ thành công!")
-            return True
-        return False
+            return ACTION_PERFORMED
+        return ACTION_NOT_FOUND
     except Exception as exc:
-        logger.warning("Lỗi khi bấm Subscribe: %s", exc)
-        return False
+        logger.warning(
+            "Lỗi khi bấm Subscribe: %s",
+            security_logging.redact_sensitive(exc),
+        )
+        return ACTION_FAILED
 
 
 async def action_audit_channel_branding(
@@ -535,9 +632,9 @@ async def action_audit_channel_branding(
         "about": False,
         "handle": False,
         "contact_email": False,
-        "country": True,
-        "two_factor_auth": True,
-        "feature_level": "intermediate",
+        "country": None,
+        "two_factor_auth": None,
+        "feature_level": "unknown",
     }
 
     clean_cid = (channel_id or "").strip()
@@ -552,7 +649,10 @@ async def action_audit_channel_branding(
                 clean_cid = match.group(1)
                 logger.info("Đã phát hiện Channel UCID từ Studio URL: %s", clean_cid)
         except Exception as exc:
-            logger.debug("Không thể tự động phát hiện channel UCID từ Studio URL: %s", exc)
+            logger.debug(
+                "Không thể tự động phát hiện channel UCID từ Studio URL: %s",
+                security_logging.redact_sensitive(exc),
+            )
 
     studio_accessible = False
 
@@ -641,7 +741,10 @@ async def action_audit_channel_branding(
                 checklist["contact_email"] = True
 
     except Exception as exc:
-        logger.warning("Studio inspection gặp ngoại lệ: %s", exc)
+        logger.warning(
+            "Studio inspection gặp ngoại lệ: %s",
+            security_logging.redact_sensitive(exc),
+        )
 
     # 3. Dual-Layer Fallback: Verify via Public YouTube Channel Page
     needs_public_audit = (
@@ -695,7 +798,73 @@ async def action_audit_channel_branding(
                 checklist["contact_email"] = True
 
         except Exception as exc:
-            logger.warning("Lỗi trong quá trình quét trang công khai YouTube: %s", exc)
+            logger.warning(
+                "Lỗi trong quá trình quét trang công khai YouTube: %s",
+                security_logging.redact_sensitive(exc),
+            )
 
     logger.info("Kết quả Audit Branding hoàn tất: %s", checklist)
     return checklist
+
+
+async def action_audit_feature_eligibility(
+    page: Any,
+    channel_id: str,
+    timeout_seconds: float = 30.0,
+) -> dict[str, Any]:
+    """Read feature eligibility conservatively; unknown is never treated as verified."""
+    clean_channel_id = str(channel_id or "").strip()
+    if not clean_channel_id:
+        return {"feature_level": "unknown", "verified": False}
+
+    target_url = (
+        f"https://studio.youtube.com/channel/{clean_channel_id}/feature-eligibility"
+    )
+    try:
+        await page.goto(
+            target_url,
+            wait_until="domcontentloaded",
+            timeout=int(timeout_seconds * 1000),
+        )
+        await asyncio.sleep(random.uniform(2.5, 4.0))
+        result = await page.evaluate(
+            r"""() => {
+                const normalize = value => (value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                const enabledTerms = ['enabled', 'eligible', 'đã bật', 'đủ điều kiện'];
+                const nodes = Array.from(document.querySelectorAll(
+                    'ytcp-feature-eligibility-card, ytcp-feature-eligibility-item, '
+                    + '[class*="feature-eligibility"], [id*="feature-eligibility"]'
+                ));
+                const bodyText = normalize(document.body?.innerText || '');
+                const readLevel = terms => {
+                    const node = nodes.find(item => {
+                        const text = normalize(item.innerText || item.textContent || '');
+                        return terms.some(term => text.includes(term));
+                    });
+                    if (!node) return false;
+                    const text = normalize(node.innerText || node.textContent || '');
+                    return enabledTerms.some(term => text.includes(term));
+                };
+                const advanced = readLevel(['advanced features', 'tính năng nâng cao']);
+                const intermediate = readLevel(['intermediate features', 'tính năng trung cấp']);
+                const pageRecognized = bodyText.includes('feature eligibility')
+                    || bodyText.includes('điều kiện sử dụng tính năng')
+                    || nodes.length > 0;
+                return { advanced, intermediate, pageRecognized };
+            }"""
+        ) or {}
+        if result.get("advanced"):
+            return {"feature_level": "advanced", "verified": True}
+        if result.get("intermediate"):
+            return {"feature_level": "intermediate", "verified": True}
+        return {
+            "feature_level": "unknown",
+            "verified": False,
+            "page_recognized": bool(result.get("pageRecognized")),
+        }
+    except Exception as exc:
+        logger.warning(
+            "Không thể đọc Feature Eligibility: %s",
+            security_logging.redact_sensitive(exc),
+        )
+        return {"feature_level": "unknown", "verified": False}

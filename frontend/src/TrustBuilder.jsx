@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useSubRoute } from './router.js'
 import './TrustBuilder.css'
 
@@ -33,6 +33,23 @@ function getScoreColor(score) {
   return '#ef4444' // Red
 }
 
+function getStatusLabel(status) {
+  const labels = {
+    active: '🟢 Đang chạy',
+    paused: '🟡 Tạm dừng',
+    completed: '✅ Hoàn tất',
+    error: '🔴 Lỗi cấu hình',
+    draft: '⚪ Bản nháp'
+  }
+  return labels[status] || `⚪ ${status || 'Bản nháp'}`
+}
+
+function getChecklistState(value) {
+  if (value === true) return { icon: '✅', className: 'checked' }
+  if (value === false) return { icon: '❌', className: '' }
+  return { icon: '❔', className: 'unknown' }
+}
+
 function getActivityIcon(type) {
   switch (type) {
     case 'search': return '🔍'
@@ -54,7 +71,8 @@ export default function TrustBuilder() {
   const [selectedPlan, setSelectedPlan] = useState(null)
   const [activities, setActivities] = useState([])
   const [stats, setStats] = useState(null)
-  const [loading, setLoading] = useState(false)
+  const [dailyStats, setDailyStats] = useState(null)
+  const [activeJob, setActiveJob] = useState(null)
   const [actionBusy, setActionBusy] = useState(false)
   const [feedback, setFeedback] = useState({ message: '', type: '' })
   
@@ -88,7 +106,6 @@ export default function TrustBuilder() {
 
   // Load channels and trust plans
   const loadInitialData = useCallback(async () => {
-    setLoading(true)
     try {
       // 1. Fetch channels
       const chRes = await apiFetch(`${API_BASE}/api/youtube-comments/channels`)
@@ -114,9 +131,6 @@ export default function TrustBuilder() {
         if (subRoute) {
           matched = chList.find(c => String(c.id) === String(subRoute) || String(c.channel_id) === String(subRoute))
         }
-        if (!matched && selectedChannelId) {
-          matched = chList.find(c => c.id === selectedChannelId)
-        }
         const target = matched || chList[0]
         setSelectedChannelId(target.id)
         if (String(subRoute) !== String(target.id)) {
@@ -126,14 +140,12 @@ export default function TrustBuilder() {
     } catch (err) {
       console.error('Error loading trust data:', err)
       showFeedback('Không thể kết nối API Trust Builder.', 'error')
-    } finally {
-      setLoading(false)
     }
-  }, [apiFetch, subRoute, selectedChannelId, setSubRoute])
+  }, [apiFetch, subRoute, setSubRoute])
 
   useEffect(() => {
     loadInitialData()
-  }, [])
+  }, [loadInitialData])
 
   // Sync state if subRoute changes externally (e.g. browser back/forward or direct link)
   useEffect(() => {
@@ -150,6 +162,8 @@ export default function TrustBuilder() {
       setSelectedPlan(null)
       setActivities([])
       setStats(null)
+      setDailyStats(null)
+      setActiveJob(null)
       return
     }
 
@@ -158,6 +172,8 @@ export default function TrustBuilder() {
       setSelectedPlan(null)
       setActivities([])
       setStats(null)
+      setDailyStats(null)
+      setActiveJob(null)
       return
     }
 
@@ -168,6 +184,8 @@ export default function TrustBuilder() {
         const data = await res.json()
         setSelectedPlan(data.plan)
         setStats(data.stats)
+        setDailyStats(data.daily_stats || null)
+        setActiveJob(data.active_job || null)
       }
 
       // Activities
@@ -185,14 +203,15 @@ export default function TrustBuilder() {
     loadPlanDetails(selectedChannelId)
   }, [selectedChannelId, loadPlanDetails])
 
-  // Periodic polling for active plan activities (every 8s)
+  // Poll faster while a session is running and slower while waiting for schedule.
   useEffect(() => {
-    if (!selectedPlan || selectedPlan.status !== 'active') return
+    if (!selectedPlan || (selectedPlan.status !== 'active' && !activeJob)) return
+    const pollMilliseconds = activeJob?.status === 'running' ? 5000 : 15000
     const interval = setInterval(() => {
       loadPlanDetails(selectedChannelId)
-    }, 8000)
+    }, pollMilliseconds)
     return () => clearInterval(interval)
-  }, [selectedPlan, selectedChannelId, loadPlanDetails])
+  }, [selectedPlan, activeJob, selectedChannelId, loadPlanDetails])
 
   // Create Plan for selected channel
   const handleCreatePlan = async () => {
@@ -208,8 +227,8 @@ export default function TrustBuilder() {
           daily_watch_target: 5,
           daily_search_target: 3,
           daily_like_target: 3,
-          daily_comment_target: 1,
-          daily_subscribe_target: 1,
+          daily_comment_target: 0,
+          daily_subscribe_target: 0,
           min_watch_minutes: 10,
           warmup_phase: 'phase_1_consumer'
         })
@@ -218,10 +237,11 @@ export default function TrustBuilder() {
       if (res.ok) {
         showFeedback('Đã khởi tạo Kế hoạch nuôi kênh thành công!', 'success')
         await loadInitialData()
+        await loadPlanDetails(selectedChannelId)
       } else {
         showFeedback(data.detail || 'Không thể tạo Kế hoạch.', 'error')
       }
-    } catch (err) {
+    } catch {
       showFeedback('Lỗi kết nối khi tạo plan.', 'error')
     } finally {
       setActionBusy(false)
@@ -236,14 +256,24 @@ export default function TrustBuilder() {
         method: 'PATCH',
         body: JSON.stringify(changes)
       })
+      const data = await res.json()
       if (res.ok) {
-        const data = await res.json()
         setSelectedPlan(data.plan)
         showFeedback('Đã lưu cấu hình nuôi kênh.', 'success')
+      } else {
+        showFeedback(data.detail || 'Không thể lưu cấu hình.', 'error')
       }
-    } catch (err) {
+    } catch {
       showFeedback('Lỗi khi lưu cấu hình.', 'error')
     }
+  }
+
+  const handleTargetDraftChange = (field, value) => {
+    setSelectedPlan((current) => current ? { ...current, [field]: value } : current)
+  }
+
+  const handleTargetCommit = (field, value) => {
+    handleUpdatePlan({ [field]: Number(value) })
   }
 
   // Plan lifecycle actions (Start, Pause, Resume, Run Now)
@@ -257,7 +287,8 @@ export default function TrustBuilder() {
       const data = await res.json()
       if (res.ok) {
         if (actionType === 'run-session') {
-          showFeedback('Đã kích hoạt 1 Session nuôi kênh trong nền! Hãy theo dõi Activity Log.', 'success')
+          setActiveJob(data.job || null)
+          showFeedback(data.message || 'Đã xếp Trust Builder session vào hàng đợi.', 'success')
         } else {
           showFeedback(`Đã cập nhật trạng thái: ${actionType.toUpperCase()}`, 'success')
         }
@@ -265,7 +296,7 @@ export default function TrustBuilder() {
       } else {
         showFeedback(data.detail || data.message || 'Thao tác không thành công.', 'error')
       }
-    } catch (err) {
+    } catch {
       showFeedback(`Lỗi khi thực hiện ${actionType}.`, 'error')
     } finally {
       setActionBusy(false)
@@ -286,7 +317,7 @@ export default function TrustBuilder() {
         setSelectedPlan(null)
         await loadInitialData()
       }
-    } catch (err) {
+    } catch {
       showFeedback('Lỗi khi xóa plan.', 'error')
     } finally {
       setActionBusy(false)
@@ -299,7 +330,9 @@ export default function TrustBuilder() {
     setActionBusy(true)
     showFeedback('Đang mở Profile GPM để Audit Branding kênh, vui lòng đợi...', 'info')
     try {
-      const res = await apiFetch(`${API_BASE}/api/trust-builder/plans/${selectedPlan.id}/branding-audit`)
+      const res = await apiFetch(`${API_BASE}/api/trust-builder/plans/${selectedPlan.id}/branding-audit`, {
+        method: 'POST'
+      })
       const data = await res.json()
       if (res.ok) {
         showFeedback(`Audit hoàn tất! Điểm Trust mới: ${data.trust_score}/100`, 'success')
@@ -307,7 +340,7 @@ export default function TrustBuilder() {
       } else {
         showFeedback(data.detail || 'Không thể audit kênh.', 'error')
       }
-    } catch (err) {
+    } catch {
       showFeedback('Lỗi khi kết nối audit.', 'error')
     } finally {
       setActionBusy(false)
@@ -324,10 +357,15 @@ export default function TrustBuilder() {
       })
       const data = await res.json()
       if (res.ok) {
-        showFeedback(`Đã xác minh tính năng! Điểm Trust: ${data.trust_score}/100`, 'success')
+        const featureMessage = data.verified
+          ? `Đã xác minh cấp tính năng: ${data.feature_level}. Readiness: ${data.trust_score}/100`
+          : 'Studio chưa cung cấp đủ bằng chứng để xác minh; trạng thái được giữ là unknown.'
+        showFeedback(featureMessage, data.verified ? 'success' : 'info')
         await loadPlanDetails(selectedChannelId)
+      } else {
+        showFeedback(data.detail || 'Không thể kiểm tra cấp tính năng.', 'error')
       }
-    } catch (err) {
+    } catch {
       showFeedback('Lỗi khi xác minh tính năng.', 'error')
     } finally {
       setActionBusy(false)
@@ -382,6 +420,20 @@ export default function TrustBuilder() {
   const trustScore = selectedPlan ? (selectedPlan.trust_score_estimated || 0) : 0
   const phaseInfo = getPhaseLabel(selectedPlan?.warmup_phase)
   const checklist = selectedPlan?.branding_checklist || {}
+  const checklistStates = {
+    avatar: getChecklistState(checklist.avatar),
+    banner: getChecklistState(checklist.banner),
+    about: getChecklistState(checklist.about),
+    handle: getChecklistState(checklist.handle),
+    contact_email: getChecklistState(checklist.contact_email),
+    country: getChecklistState(checklist.country),
+    two_factor_auth: getChecklistState(checklist.two_factor_auth)
+  }
+  const profileIsReady = Boolean(
+    currentChannel?.gpm_profile_id &&
+    !String(currentChannel.gpm_profile_id).startsWith('local_') &&
+    selectedPlan?.gpm_proxy_configured
+  )
 
   return (
     <div className="trust-builder-container">
@@ -390,7 +442,7 @@ export default function TrustBuilder() {
         <div className="trust-title-group">
           <h1 className="trust-main-title">🛡️ Channel Trust Builder</h1>
           <p className="trust-subtitle">
-            Tự động nuôi kênh YouTube mới qua GPM-Login &amp; Playwright CDP để tăng độ uy tín trước khi xuất bản video.
+            Warm-up kênh qua GPM-Login &amp; Playwright CDP. Điểm hiển thị là chỉ số readiness nội bộ, không phải Trust Score chính thức của YouTube.
           </p>
         </div>
         {feedback.message && (
@@ -488,14 +540,14 @@ export default function TrustBuilder() {
                       {trustScore}
                       <span className="score-denom">/100</span>
                     </div>
-                    <div className="score-label">Điểm Tín Nhiệm (Trust Score)</div>
+                    <div className="score-label">Internal Readiness Score</div>
                   </div>
 
                   <div className="score-status-group">
                     <div className="phase-badge-line">
                       <span className={`trust-phase-pill ${phaseInfo.badge}`}>{phaseInfo.label}</span>
                       <span className={`trust-status-pill status-${selectedPlan.status}`}>
-                        {selectedPlan.status === 'active' ? '🟢 Đang chạy' : selectedPlan.status === 'paused' ? '🟡 Tạm dừng' : '⚪ Bản nháp'}
+                        {getStatusLabel(selectedPlan.status)}
                       </span>
                     </div>
                     <div className="trust-progress-bar-bg">
@@ -508,7 +560,7 @@ export default function TrustBuilder() {
                       />
                     </div>
                     <div className="score-hint">
-                      {trustScore >= 70 ? '🎉 Kênh đã đạt mức độ uy tín cao, sẵn sàng xuất bản video đều đặn!' : '💡 Tiếp tục duy trì xem video và tương tác để nâng điểm Trust lên ≥ 70.'}
+                      {trustScore >= 70 ? 'Readiness nội bộ đã đạt ngưỡng hoàn tất warm-up.' : 'Tiếp tục hoạt động đúng quota để nâng chỉ số readiness nội bộ.'}
                     </div>
                   </div>
                 </div>
@@ -520,9 +572,9 @@ export default function TrustBuilder() {
                       type="button"
                       className="trust-btn start-btn"
                       onClick={() => handlePlanAction(selectedPlan.status === 'paused' ? 'resume' : 'start')}
-                      disabled={actionBusy}
+                      disabled={actionBusy || selectedPlan.status === 'completed' || !profileIsReady}
                     >
-                      ▶ {selectedPlan.status === 'paused' ? 'Tiếp tục Nuôi Kênh' : 'Bắt đầu Nuôi Kênh'}
+                      ▶ {selectedPlan.status === 'completed' ? 'Warm-up đã hoàn tất' : selectedPlan.status === 'paused' ? 'Tiếp tục Nuôi Kênh' : 'Bắt đầu Nuôi Kênh'}
                     </button>
                   ) : (
                     <button
@@ -539,11 +591,17 @@ export default function TrustBuilder() {
                     type="button"
                     className="trust-btn run-now-btn"
                     onClick={() => handlePlanAction('run-session')}
-                    disabled={actionBusy}
+                    disabled={actionBusy || Boolean(activeJob) || !profileIsReady || selectedPlan.status === 'completed'}
                     title="Chạy ngay 1 lượt Search -> Watch -> Like trên GPM Profile"
                   >
                     🔄 Chạy ngay 1 Session
                   </button>
+
+                  {activeJob && (
+                    <span className="trust-status-pill status-active">
+                      Job: {activeJob.status} · {activeJob.progress || 'đang chuẩn bị'}
+                    </span>
+                  )}
 
                   <button
                     type="button"
@@ -582,29 +640,29 @@ export default function TrustBuilder() {
                     </button>
                   </div>
                   <div className="checklist-grid">
-                    <div className={`checklist-item ${checklist.avatar ? 'checked' : ''}`}>
-                      <span>{checklist.avatar ? '✅' : '❌'}</span> Avatar Kênh
+                    <div className={`checklist-item ${checklistStates.avatar.className}`}>
+                      <span>{checklistStates.avatar.icon}</span> Avatar Kênh
                     </div>
-                    <div className={`checklist-item ${checklist.banner ? 'checked' : ''}`}>
-                      <span>{checklist.banner ? '✅' : '❌'}</span> Banner Kênh (Art)
+                    <div className={`checklist-item ${checklistStates.banner.className}`}>
+                      <span>{checklistStates.banner.icon}</span> Banner Kênh (Art)
                     </div>
-                    <div className={`checklist-item ${checklist.about ? 'checked' : ''}`}>
-                      <span>{checklist.about ? '✅' : '❌'}</span> Mô tả kênh (About)
+                    <div className={`checklist-item ${checklistStates.about.className}`}>
+                      <span>{checklistStates.about.icon}</span> Mô tả kênh (About)
                     </div>
-                    <div className={`checklist-item ${checklist.handle ? 'checked' : ''}`}>
-                      <span>{checklist.handle ? '✅' : '❌'}</span> Handle (@kenh)
+                    <div className={`checklist-item ${checklistStates.handle.className}`}>
+                      <span>{checklistStates.handle.icon}</span> Handle (@kenh)
                     </div>
-                    <div className={`checklist-item ${checklist.contact_email ? 'checked' : ''}`}>
-                      <span>{checklist.contact_email ? '✅' : '❌'}</span> Email liên hệ
+                    <div className={`checklist-item ${checklistStates.contact_email.className}`}>
+                      <span>{checklistStates.contact_email.icon}</span> Email liên hệ
                     </div>
-                    <div className={`checklist-item ${checklist.country ? 'checked' : ''}`}>
-                      <span>{checklist.country ? '✅' : '❌'}</span> Quốc gia cư trú
+                    <div className={`checklist-item ${checklistStates.country.className}`}>
+                      <span>{checklistStates.country.icon}</span> Quốc gia cư trú
                     </div>
-                    <div className={`checklist-item ${checklist.two_factor_auth !== false ? 'checked' : ''}`}>
-                      <span>{checklist.two_factor_auth !== false ? '✅' : '❌'}</span> 2-Step Verification (2FA)
+                    <div className={`checklist-item ${checklistStates.two_factor_auth.className}`}>
+                      <span>{checklistStates.two_factor_auth.icon}</span> 2-Step Verification (2FA)
                     </div>
-                    <div className={`checklist-item ${checklist.feature_level && checklist.feature_level !== 'standard' ? 'checked' : ''}`}>
-                      <span>⭐</span> Cấp tính năng: <b>{checklist.feature_level || 'standard'}</b>
+                    <div className={`checklist-item ${['intermediate', 'advanced'].includes(checklist.feature_level) ? 'checked' : 'unknown'}`}>
+                      <span>{['intermediate', 'advanced'].includes(checklist.feature_level) ? '✅' : '❔'}</span> Cấp tính năng: <b>{checklist.feature_level || 'unknown'}</b>
                     </div>
                   </div>
                 </div>
@@ -623,7 +681,9 @@ export default function TrustBuilder() {
                         min="1"
                         max="15"
                         value={selectedPlan.daily_watch_target}
-                        onChange={(e) => handleUpdatePlan({ daily_watch_target: Number(e.target.value) })}
+                        onChange={(e) => handleTargetDraftChange('daily_watch_target', Number(e.target.value))}
+                        onPointerUp={(e) => e.currentTarget.blur()}
+                        onBlur={(e) => handleTargetCommit('daily_watch_target', e.currentTarget.value)}
                       />
                     </div>
 
@@ -637,7 +697,9 @@ export default function TrustBuilder() {
                         min="1"
                         max="30"
                         value={selectedPlan.min_watch_minutes ?? 10}
-                        onChange={(e) => handleUpdatePlan({ min_watch_minutes: Number(e.target.value) })}
+                        onChange={(e) => handleTargetDraftChange('min_watch_minutes', Number(e.target.value))}
+                        onPointerUp={(e) => e.currentTarget.blur()}
+                        onBlur={(e) => handleTargetCommit('min_watch_minutes', e.currentTarget.value)}
                       />
                       <small style={{ color: '#9ca3af', fontSize: '0.78rem', marginTop: '2px', display: 'block' }}>
                         * Nếu video ngắn hơn {selectedPlan.min_watch_minutes ?? 10} phút sẽ tự động xem trọn vẹn 100%.
@@ -654,7 +716,9 @@ export default function TrustBuilder() {
                         min="1"
                         max="10"
                         value={selectedPlan.daily_search_target}
-                        onChange={(e) => handleUpdatePlan({ daily_search_target: Number(e.target.value) })}
+                        onChange={(e) => handleTargetDraftChange('daily_search_target', Number(e.target.value))}
+                        onPointerUp={(e) => e.currentTarget.blur()}
+                        onBlur={(e) => handleTargetCommit('daily_search_target', e.currentTarget.value)}
                       />
                     </div>
 
@@ -668,7 +732,9 @@ export default function TrustBuilder() {
                         min="0"
                         max="10"
                         value={selectedPlan.daily_like_target}
-                        onChange={(e) => handleUpdatePlan({ daily_like_target: Number(e.target.value) })}
+                        onChange={(e) => handleTargetDraftChange('daily_like_target', Number(e.target.value))}
+                        onPointerUp={(e) => e.currentTarget.blur()}
+                        onBlur={(e) => handleTargetCommit('daily_like_target', e.currentTarget.value)}
                       />
                     </div>
 
@@ -682,7 +748,9 @@ export default function TrustBuilder() {
                         min="0"
                         max="5"
                         value={selectedPlan.daily_comment_target}
-                        onChange={(e) => handleUpdatePlan({ daily_comment_target: Number(e.target.value) })}
+                        onChange={(e) => handleTargetDraftChange('daily_comment_target', Number(e.target.value))}
+                        onPointerUp={(e) => e.currentTarget.blur()}
+                        onBlur={(e) => handleTargetCommit('daily_comment_target', e.currentTarget.value)}
                       />
                     </div>
 
@@ -696,7 +764,9 @@ export default function TrustBuilder() {
                         min="0"
                         max="5"
                         value={selectedPlan.daily_subscribe_target}
-                        onChange={(e) => handleUpdatePlan({ daily_subscribe_target: Number(e.target.value) })}
+                        onChange={(e) => handleTargetDraftChange('daily_subscribe_target', Number(e.target.value))}
+                        onPointerUp={(e) => e.currentTarget.blur()}
+                        onBlur={(e) => handleTargetCommit('daily_subscribe_target', e.currentTarget.value)}
                       />
                     </div>
                   </div>
@@ -797,6 +867,17 @@ export default function TrustBuilder() {
               </div>
 
               {/* Weekly Aggregated Stats Banner */}
+              {dailyStats && (
+                <div className="trust-stats-footer">
+                  <div className="stat-pill">Hôm nay · Search: <b>{dailyStats.search_count}/{selectedPlan.daily_search_target}</b></div>
+                  <div className="stat-pill">Watch: <b>{dailyStats.watch_count}/{selectedPlan.daily_watch_target}</b></div>
+                  <div className="stat-pill">Like: <b>{dailyStats.like_count}/{selectedPlan.daily_like_target}</b></div>
+                  <div className="stat-pill">Comment: <b>{dailyStats.comment_count}/{selectedPlan.daily_comment_target}</b></div>
+                  <div className="stat-pill">Sub: <b>{dailyStats.subscribe_count}/{selectedPlan.daily_subscribe_target}</b></div>
+                  <div className="stat-pill">Lần chạy kế tiếp: <b>{selectedPlan.next_run_at ? new Date(selectedPlan.next_run_at).toLocaleString() : 'đang chờ lịch'}</b></div>
+                </div>
+              )}
+
               {stats && (
                 <div className="trust-stats-footer">
                   <div className="stat-pill">👁️ Đã xem: <b>{stats.watch_count} video ({formatSeconds(stats.total_watch_seconds)})</b></div>

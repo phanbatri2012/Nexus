@@ -592,6 +592,9 @@ def get_health():
         "status": "ok",
         "ready": bool(coordinator.get("ready")),
         "production_coordinator": coordinator,
+        "trust_builder_scheduler": (
+            trust_builder_scheduler.get_trust_builder_scheduler_status()
+        ),
     }
 
 
@@ -3528,10 +3531,15 @@ PRODUCTION_JOB_LABELS = {
     "thumbnail_generation": "Sinh ảnh Thumbnail",
     "tiktok_publish": "Đăng video TikTok",
 }
+TRUST_BUILDER_JOB_TYPES = ("trust_builder_session",)
+TRUST_BUILDER_JOB_LABELS = {
+    "trust_builder_session": "Trust Builder",
+}
 ALL_JOB_LABELS = {
     "video_generation": "Tạo video",
     **COMMENT_JOB_LABELS,
     **PRODUCTION_JOB_LABELS,
+    **TRUST_BUILDER_JOB_LABELS,
 }
 
 
@@ -4775,6 +4783,7 @@ def resume_background_jobs() -> None:
         "fb_crosspost_sync",
     ):
         db.recover_interrupted_system_jobs(prod_job)
+    db.recover_interrupted_system_jobs("trust_builder_session")
     recovered_browser_jobs = _recover_legacy_browser_cdp_blocked_jobs()
     if recovered_browser_jobs:
         logger.info(
@@ -4820,6 +4829,7 @@ def resume_background_jobs() -> None:
             name="system-auto-cleanup",
         )
         _system_cleanup_thread.start()
+    trust_builder_scheduler.start_trust_builder_scheduler()
 
 
 @app.on_event("shutdown")
@@ -4833,6 +4843,7 @@ def stop_video_queue_wakeup_timer() -> None:
     _comment_sync_stop_event.set()
     _tts_preview_cleanup_stop_event.set()
     _system_cleanup_stop_event.set()
+    trust_builder_scheduler.stop_trust_builder_scheduler()
     if _production_coordinator is not None:
         _production_coordinator.stop()
     chatgpt_browser_service.stop_browser_service()
@@ -6679,7 +6690,7 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
         ),
         "can_cancel": (
             status in {"queued", "retry_wait", "paused"}
-            or (job_type in {"video_generation", "video_render", "visual_scene_plan", "youtube_upload", "youtube_publish", "fb_crosspost", "fb_crosspost_sync", "thumbnail_generation", "tiktok_publish"} and status == "running")
+            or (job_type in {"video_generation", "video_render", "visual_scene_plan", "youtube_upload", "youtube_publish", "fb_crosspost", "fb_crosspost_sync", "thumbnail_generation", "tiktok_publish", "trust_builder_session"} and status == "running")
         ),
         "can_retry": (
             status in {"error", "canceled"}
@@ -6946,6 +6957,7 @@ JOB_CENTER_SYSTEM_JOB_TYPES = (
     "video_generation",
     *COMMENT_JOB_TYPES,
     *PRODUCTION_JOB_TYPES,
+    *TRUST_BUILDER_JOB_TYPES,
 )
 
 
@@ -7171,6 +7183,8 @@ def _kick_job_queues(job_types: set[str]) -> None:
         _kick_comment_queue()
     if any(job_type in PRODUCTION_JOB_TYPES for job_type in job_types):
         _kick_production_queue()
+    if any(job_type in TRUST_BUILDER_JOB_TYPES for job_type in job_types):
+        trust_builder_scheduler.trigger_queue_drain()
 
 
 def _run_system_job_center_action(

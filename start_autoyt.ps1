@@ -246,7 +246,9 @@ function Test-BackendReady {
         return (
             $health.status -eq "ok" -and
             $null -ne $health.production_coordinator -and
-            [bool]$health.production_coordinator.ready
+            [bool]$health.production_coordinator.ready -and
+            $null -ne $health.trust_builder_scheduler -and
+            [bool]$health.trust_builder_scheduler.ready
         )
     }
     catch {
@@ -870,6 +872,7 @@ try {
     Write-Host "=================================================================" -ForegroundColor Green
     Write-Host " [OK] Backend API Server:     $backendUrl" -ForegroundColor Green
     Write-Host " [OK] Production Coordinator: Ready (render + YouTube publish)" -ForegroundColor Green
+    Write-Host " [OK] Trust Builder Scheduler: Ready (delayed first run, no startup GPM launch)" -ForegroundColor Green
     Write-Host " [OK] Frontend Web UI:        $frontendUrl" -ForegroundColor Green
     if ($omniVoiceReady) {
         Write-Host " [OK] OmniVoice TTS Server:   $omniVoiceUrl" -ForegroundColor Green

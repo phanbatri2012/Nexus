@@ -584,6 +584,7 @@ function JobCenter({ onOpenVideo, refreshKey }) {
           <option value="fb_crosspost_sync">Đồng bộ video Facebook</option>
           <option value="thumbnail_generation">Sinh ảnh Thumbnail</option>
           <option value="tiktok_publish">Đăng video TikTok</option>
+          <option value="trust_builder_session">Trust Builder</option>
         </select>
         <select
           aria-label="Sắp xếp danh sách job"
