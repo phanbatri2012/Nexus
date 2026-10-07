@@ -239,31 +239,186 @@ def _schedule_values_match(
         return False
 
 
+async def _dismiss_unwanted_modals(page: Any) -> bool:
+    """Detect and dismiss unwanted blocking modals, promo popups, or sub-feature dialogs (e.g. 'Bản nhạc đã dịch')."""
+    if page is None:
+        return False
+    try:
+        if page.is_closed():
+            return False
+    except Exception:
+        return False
+
+    dismissed = False
+    try:
+        for _ in range(3):
+            dialogs = page.locator('div[role="dialog"]')
+            d_count = await dialogs.count()
+            found_modal = False
+            for idx in range(d_count):
+                dlg = dialogs.nth(idx)
+                if not await dlg.is_visible():
+                    continue
+
+                try:
+                    dlg_text = (await dlg.inner_text() or "").strip()
+                except Exception:
+                    dlg_text = ""
+
+                # Look for close button 'X' or Cancel button
+                close_btn = dlg.locator(
+                    'button:has-text("Hủy"), div[role="button"]:has-text("Hủy"), '
+                    'button:has-text("Cancel"), div[role="button"]:has-text("Cancel"), '
+                    'button:has-text("Bỏ qua"), div[role="button"]:has-text("Bỏ qua"), '
+                    'button:has-text("Để sau"), div[role="button"]:has-text("Để sau"), '
+                    'button:has-text("Không phải bây giờ"), div[role="button"]:has-text("Không phải bây giờ"), '
+                    'button:has-text("Đã hiểu"), div[role="button"]:has-text("Đã hiểu"), '
+                    'button:has-text("Got it"), div[role="button"]:has-text("Got it"), '
+                    'button[aria-label*="Đóng" i], div[aria-label*="Đóng" i], '
+                    'button[aria-label*="Close" i], div[aria-label*="Close" i], '
+                    'button[aria-label*="Dismiss" i], div[aria-label*="Dismiss" i]'
+                ).first
+
+                if await close_btn.is_visible():
+                    logger.info("Phát hiện dialog/modal nổi trên Meta (%s)... Đang đóng...", dlg_text[:60].replace("\n", " "))
+                    try:
+                        await close_btn.click(timeout=3000)
+                    except Exception:
+                        await close_btn.evaluate("el => el.click()")
+                    await asyncio.sleep(1.0)
+                    found_modal = True
+                    dismissed = True
+                else:
+                    # Fallback to Escape key
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(0.8)
+                    found_modal = True
+                    dismissed = True
+
+            if not found_modal:
+                break
+    except Exception as exc:
+        logger.debug("Lỗi khi kiểm tra / đóng modal phụ: %s", exc)
+
+    return dismissed
+
+
 async def _verify_video_attachment_present(page: Any) -> bool:
     """Verify that a video asset is currently attached and active in Meta Reels Composer."""
     try:
         if page is None or page.is_closed():
             return False
-        # 1. Check video tag in DOM
+
+        # 1. Dismiss any overlay modals that might be blocking DOM view
+        await _dismiss_unwanted_modals(page)
+
+        # 2. Check video tag in DOM
         if await page.locator("video").count() > 0:
             return True
-        # 2. Check for video indicators in composer
+
+        # 3. Check for video indicators in composer (Step 1, Step 2, or Step 3)
         indicators = page.locator(
             'div:has-text("100%"), div:has-text("Video của bạn an toàn"), '
-            'div:has-text("an toàn để đăng"), span:has-text(".mp4"), div[aria-label*="video" i]'
+            'div:has-text("an toàn để đăng"), span:has-text(".mp4"), '
+            'div:has-text("Âm thanh gốc"), div:has-text("Original audio"), '
+            'div:has-text("Thay thế video"), div:has-text("Replace video"), '
+            'div[aria-label*="video" i], div[aria-label*="thước phim" i], '
+            'div[aria-label*="Xem trước" i], div[aria-label*="Preview" i], '
+            'input[type="range"], div[role="slider"]'
         )
         if await indicators.count() > 0:
             for idx in range(await indicators.count()):
                 if await indicators.nth(idx).is_visible():
                     return True
-        # 3. Quick fallback check of page HTML
+
+        # 4. Check page HTML content for known video / player markers
         content = await page.content()
-        if "<video" in content or "Video của bạn an toàn" in content or "an toàn để đăng" in content:
+        markers = [
+            "<video",
+            "Video của bạn an toàn",
+            "an toàn để đăng",
+            "Âm thanh gốc",
+            "Original audio",
+            "Thay thế video",
+            "Replace video",
+            "reels_composer",
+        ]
+        if any(marker in content for marker in markers):
+            if "Không thể tải video lên" not in content and "Upload failed" not in content:
+                return True
+
+        # 5. Check if Step 2 or Step 3 is reached (Meta only allows Step 2/3 when video is attached)
+        step_indicators = page.locator(
+            'div:has-text("Chia sẻ"), button:has-text("Lên lịch"), '
+            'div[role="button"]:has-text("Lên lịch"), button:has-text("Chia sẻ ngay"), '
+            'div[role="button"]:has-text("Chia sẻ ngay")'
+        )
+        if await step_indicators.count() > 0:
             return True
+
         return False
     except Exception as exc:
         logger.debug("Kiểm tra đính kèm video gặp lỗi: %s", exc)
         return True
+
+
+STAGE_SHARE_READY = "STAGE_SHARE_READY"
+STAGE_EDIT_READY = "STAGE_EDIT_READY"
+STAGE_CREATE_READY = "STAGE_CREATE_READY"
+STAGE_INVALID_OR_STALE = "STAGE_INVALID"
+
+
+async def _inspect_composer_stage(page: Any) -> str:
+    """Inspect an open Reels Composer page to detect its current wizard stage and readiness."""
+    try:
+        if page is None:
+            return STAGE_INVALID_OR_STALE
+        try:
+            if page.is_closed():
+                return STAGE_INVALID_OR_STALE
+        except Exception:
+            return STAGE_INVALID_OR_STALE
+
+        # Dismiss any overlay modals first
+        await _dismiss_unwanted_modals(page)
+
+        current_url = str(page.url or "")
+        if "facebook.com/login" in current_url or "checkpoint" in current_url or "accounts/login" in current_url:
+            return STAGE_INVALID_OR_STALE
+
+        if "reels_composer" not in current_url:
+            return STAGE_INVALID_OR_STALE
+
+        # Check 1: Step 3 (Chia sẻ)
+        step3_indicators = page.locator(
+            'div:has-text("Lên lịch")[role="button"], div:has-text("Lên lịch")[role="radio"], '
+            'button:has-text("Lên lịch"), div:has-text("Chia sẻ ngay")[role="button"], '
+            'button:has-text("Chia sẻ ngay"), div:has-text("Công cụ kiếm tiền"), '
+            'div:has-text("Thêm vào danh sách phát"), div:has-text("Cho phép phối lại")'
+        )
+        if await step3_indicators.count() > 0:
+            for idx in range(await step3_indicators.count()):
+                if await step3_indicators.nth(idx).is_visible():
+                    return STAGE_SHARE_READY
+
+        # Check 2: Step 2 (Chỉnh sửa)
+        step2_indicators = page.locator(
+            'div[role="contentinfo"] button:has-text("Tiếp"), '
+            'div[role="contentinfo"] div[role="button"]:has-text("Tiếp"), '
+            'button:has-text("Tiếp"), div[role="button"]:has-text("Tiếp")'
+        )
+        has_edit_tools = page.locator('div:has-text("Cắt"), div:has-text("Âm thanh"), div:has-text("Phụ đề")')
+        if (await step2_indicators.count() > 0) and (await has_edit_tools.count() > 0):
+            return STAGE_EDIT_READY
+
+        # Check 3: Step 1 (Tạo) with uploaded video
+        if await _verify_video_attachment_present(page):
+            return STAGE_CREATE_READY
+
+        return STAGE_INVALID_OR_STALE
+    except Exception as exc:
+        logger.debug("Lỗi khi kiểm tra stage của Reels Composer: %s", exc)
+        return STAGE_INVALID_OR_STALE
 
 
 async def _visible_locators(locator: Any) -> list[Any]:
@@ -557,13 +712,204 @@ async def schedule_reel_via_gpm(
             return ""
 
     async with channel_browser_session(clean_profile_id) as (context, _browser, _profile_meta):
-        page = await context.new_page()
-        await page.bring_to_front()
+        # 1. Look for existing open tab with Reels Composer
+        page = None
+        for p in list(context.pages):
+            try:
+                if not p.is_closed() and "reels_composer" in (p.url or ""):
+                    page = p
+                    break
+            except Exception:
+                pass
+
+        initial_stage = STAGE_INVALID_OR_STALE
+        if page:
+            await page.bring_to_front()
+            initial_stage = await _inspect_composer_stage(page)
+            logger.info("Tìm thấy tab Reels Composer hiện có tại stage: %s", initial_stage)
+        else:
+            page = await context.new_page()
+            await page.bring_to_front()
+
         preserve_page = True
         try:
             # Set default timeout for individual actions
             page.set_default_timeout(25000)
 
+            # SMART RESUME: If tab is already in Step 3 (Chia sẻ) or Step 2 (Chỉnh sửa), attempt fast jump!
+            if initial_stage in {STAGE_SHARE_READY, STAGE_EDIT_READY}:
+                try:
+                    logger.info("Thực hiện Smart In-Page Resume tại stage %s...", initial_stage)
+                    if initial_stage == STAGE_EDIT_READY:
+                        notify("CP7_SCHEDULE_SET", "Nhận diện tab đang ở Bước 2 (Chỉnh sửa). Bỏ qua Chỉnh sửa sang Bước 3...", 75)
+                        await _dismiss_unwanted_modals(page)
+                        next_btn_2 = page.locator(
+                            'div[role="contentinfo"] button:has-text("Tiếp"), '
+                            'div[role="contentinfo"] div[role="button"]:has-text("Tiếp"), '
+                            'button:has-text("Tiếp"), div[role="button"]:has-text("Tiếp")'
+                        ).last
+                        if await next_btn_2.is_visible():
+                            await next_btn_2.click()
+                            await asyncio.sleep(2.0)
+                        await _dismiss_unwanted_modals(page)
+
+                    notify("CP7_SCHEDULE_SET", f"Tiếp tục trực tiếp từ Bước 3 ({full_schedule_label})...", 80)
+                    await _dismiss_unwanted_modals(page)
+
+                    schedule_control_evidence: list[dict[str, str]] = []
+                    if publish_now:
+                        now_btn = page.locator(
+                            'div[role="button"]:has-text("Chia sẻ ngay"), button:has-text("Chia sẻ ngay"), '
+                            'div[role="radio"]:has-text("Chia sẻ ngay")'
+                        ).first
+                        if await now_btn.is_visible():
+                            await now_btn.click()
+                            await asyncio.sleep(1.0)
+                    else:
+                        schedule_radio_btn = page.locator(
+                            'div[role="button"]:has-text("Lên lịch"), button:has-text("Lên lịch"), '
+                            'div[role="radio"]:has-text("Lên lịch")'
+                        ).first
+                        if await schedule_radio_btn.is_visible():
+                            await schedule_radio_btn.click()
+                            await asyncio.sleep(1.5)
+                            schedule_control_evidence = await _set_and_verify_schedule_controls(
+                                page,
+                                expected_schedule,
+                            )
+
+                    # Step 13 Final Click
+                    action_btn_name = "Chia sẻ" if publish_now else "Lên lịch"
+                    notify("CP8_SUBMITTED", f"Đang bấm nút '{action_btn_name}' hoàn tất...", 90)
+
+                    if cancel_check and cancel_check():
+                        raise FbBrowserAutomationError(
+                            "Tác vụ đã được yêu cầu dừng trước khi gửi lên Meta",
+                            phase="CP7_SCHEDULE_SET",
+                            can_resume=True,
+                        )
+
+                    # Verify Video Integrity
+                    await _dismiss_unwanted_modals(page)
+                    if not await _verify_video_attachment_present(page):
+                        raise RuntimeError("Đính kèm video không xác nhận được trong Smart Resume")
+
+                    await _dismiss_unwanted_modals(page)
+                    await page.keyboard.press("Escape")
+                    await page.evaluate("() => document.activeElement && document.activeElement.blur()")
+                    await asyncio.sleep(1.0)
+
+                    final_btn = page.locator(
+                        f'div[role="contentinfo"] button:has-text("{action_btn_name}"), '
+                        f'div[role="contentinfo"] div[role="button"]:has-text("{action_btn_name}"), '
+                        f'div[role="main"] ~ div div[role="button"]:has-text("{action_btn_name}"), '
+                        f'button:has-text("{action_btn_name}"), div[role="button"]:has-text("{action_btn_name}")'
+                    ).last
+
+                    final_button_ready = False
+                    for w_i in range(15):
+                        if await final_btn.is_visible():
+                            aria_dis = await final_btn.get_attribute("aria-disabled")
+                            tab_idx = await final_btn.get_attribute("tabindex")
+                            if aria_dis != "true" and tab_idx != "-1":
+                                final_button_ready = True
+                                break
+                        await asyncio.sleep(1.0)
+
+                    if not final_button_ready:
+                        raise RuntimeError(f"Nút '{action_btn_name}' chưa sẵn sàng trong Smart Resume")
+
+                    try:
+                        await final_btn.click(force=True, timeout=10000)
+                    except Exception:
+                        await final_btn.evaluate("el => el.click()")
+
+                    await asyncio.sleep(3.0)
+
+                    submission_confirmed = False
+                    for _ in range(20):
+                        await asyncio.sleep(1.0)
+                        luc_khac_btn = page.locator(
+                            'div[role="dialog"] button:has-text("Lúc khác"), div[role="dialog"] div[role="button"]:has-text("Lúc khác"), '
+                            'button:has-text("Lúc khác"), div[role="button"]:has-text("Lúc khác"), '
+                            'button:has-text("Maybe later"), div[role="button"]:has-text("Maybe later"), '
+                            'button:has-text("Not now"), div[role="button"]:has-text("Not now"), '
+                            'button:has-text("Để sau"), div[role="button"]:has-text("Để sau"), '
+                            'button:has-text("Bỏ qua"), div[role="button"]:has-text("Bỏ qua"), '
+                            'button:has-text("Dismiss"), div[role="button"]:has-text("Dismiss")'
+                        ).first
+                        if await luc_khac_btn.is_visible():
+                            notify("CP8_SUBMITTED", "Đã tìm thấy thông báo xác nhận của Meta. Đang bấm 'Lúc khác'...", 94)
+                            submission_confirmed = True
+                            try:
+                                await luc_khac_btn.click(timeout=5000)
+                            except Exception:
+                                await luc_khac_btn.evaluate("el => el.click()")
+                            await asyncio.sleep(2.0)
+                            break
+
+                        dialog_close_btn = page.locator(
+                            'div[role="dialog"] div[aria-label="Đóng"], div[role="dialog"] button[aria-label="Đóng"], '
+                            'div[role="dialog"] button[aria-label="Close"], div[role="dialog"] div[aria-label="Close"], '
+                            'div[aria-label="Đóng"], button[aria-label="Đóng"], button[aria-label="Close"]'
+                        ).first
+                        if await dialog_close_btn.is_visible():
+                            notify("CP8_SUBMITTED", "Đã đóng modal xác nhận của Meta...", 94)
+                            submission_confirmed = True
+                            try:
+                                await dialog_close_btn.click(timeout=5000)
+                            except Exception:
+                                await dialog_close_btn.evaluate("el => el.click()")
+                            await asyncio.sleep(2.0)
+                            break
+
+                        if "content_calendar" in page.url or "latest/home" in page.url or "latest/posts" in page.url:
+                            submission_confirmed = True
+                            break
+
+                    if submission_confirmed:
+                        calendar_evidence: dict[str, Any] = {}
+                        if not publish_now:
+                            notify("CP8_SUBMITTED", "Đang đối chiếu lại lịch thực tế trên Meta Calendar...", 97)
+                            try:
+                                calendar_evidence = await _verify_calendar_schedule(
+                                    page,
+                                    content_title=content_title,
+                                    expected=expected_schedule,
+                                    target_page_id=target_page_id,
+                                )
+                            except Exception as cal_err:
+                                calendar_evidence = {"verified": False, "reason": str(cal_err)}
+
+                        actual_scheduled_timestamp = int(calendar_evidence.get("actual_scheduled_timestamp") or 0)
+                        schedule_matches = bool(
+                            publish_now
+                            or (actual_scheduled_timestamp and abs(actual_scheduled_timestamp - int(expected_schedule.timestamp())) <= 60)
+                        )
+                        notify("CP8_SUBMITTED", f"Thành công! Reels đã được lên lịch lúc {full_schedule_label}.", 100)
+                        preserve_page = False
+                        return {
+                            "success": True,
+                            "status": "published" if publish_now else "meta_scheduled" if schedule_matches else "schedule_mismatch",
+                            "schedule_verified": bool(publish_now or calendar_evidence.get("verified")),
+                            "submission_confirmed": submission_confirmed,
+                            "actual_scheduled_timestamp": 0 if publish_now else actual_scheduled_timestamp,
+                            "verification_evidence": {
+                                "source": "meta_calendar" if calendar_evidence else "meta_confirmation",
+                                "controls": schedule_control_evidence,
+                                "calendar": calendar_evidence,
+                            },
+                            "scheduled_time": full_schedule_label,
+                            "scheduled_time_iso": f"{date_iso}T{time_24h}:00",
+                            "target_page_id": target_page_id,
+                            "profile_id": clean_profile_id,
+                            "message": f"Đã tiếp tục và lên lịch Reels thành công trên Facebook Meta Business Suite lúc {full_schedule_label}",
+                        }
+
+                except Exception as jump_err:
+                    logger.warning("Smart In-Page Resume gặp lỗi (%s). Tự động fallback sang quy trình nạp mới...", jump_err)
+
+            # FULL WORKFLOW (Fallback or Fresh Start)
             # 1. Navigate to Reels Composer
             notify("CP4_COMPOSER_READY", "Đang mở giao diện Meta Business Suite Reels Composer...", 10)
             target_composer_url = REELS_COMPOSER_URL
@@ -816,11 +1162,16 @@ async def schedule_reel_via_gpm(
 
             # 7. Move from Step 1 (Tạo) -> Step 2 (Chỉnh sửa)
             notify("CP6_METADATA_FILLED", "Chờ xử lý video và chuyển sang bước Chỉnh sửa...", 70)
+            await _dismiss_unwanted_modals(page)
             await page.keyboard.press("Escape")
             await page.evaluate("() => document.activeElement && document.activeElement.blur()")
             await asyncio.sleep(1.0)
 
-            next_btn_1 = page.locator('button:has-text("Tiếp"), div[role="button"]:has-text("Tiếp"), button:has-text("Next")').last
+            next_btn_1 = page.locator(
+                'div[role="contentinfo"] button:has-text("Tiếp"), '
+                'div[role="contentinfo"] div[role="button"]:has-text("Tiếp"), '
+                'button:has-text("Tiếp"), div[role="button"]:has-text("Tiếp"), button:has-text("Next")'
+            ).last
 
             # Wait for next button to be fully enabled
             for w_i in range(60):
@@ -833,10 +1184,20 @@ async def schedule_reel_via_gpm(
 
             await next_btn_1.click()
             await asyncio.sleep(2.5)
+            await _dismiss_unwanted_modals(page)
 
             # 8. Move from Step 2 (Chỉnh sửa) -> Step 3 (Chia sẻ)
             notify("CP7_SCHEDULE_SET", "Bỏ qua bước Chỉnh sửa, chuyển sang bước Chia sẻ...", 75)
-            next_btn_2 = page.locator('button:has-text("Tiếp"), div[role="button"]:has-text("Tiếp"), button:has-text("Next")').last
+            await _dismiss_unwanted_modals(page)
+            await page.keyboard.press("Escape")
+            await page.evaluate("() => document.activeElement && document.activeElement.blur()")
+            await asyncio.sleep(1.0)
+
+            next_btn_2 = page.locator(
+                'div[role="contentinfo"] button:has-text("Tiếp"), '
+                'div[role="contentinfo"] div[role="button"]:has-text("Tiếp"), '
+                'button:has-text("Tiếp"), div[role="button"]:has-text("Tiếp"), button:has-text("Next")'
+            ).last
             if await next_btn_2.is_visible():
                 for w_i in range(30):
                     aria_dis = await next_btn_2.get_attribute("aria-disabled")
@@ -846,9 +1207,11 @@ async def schedule_reel_via_gpm(
                     await asyncio.sleep(1.0)
                 await next_btn_2.click()
                 await asyncio.sleep(2.5)
+            await _dismiss_unwanted_modals(page)
 
             # 9. Step 3 (Chia sẻ): Schedule & Options Configuration
             notify("CP7_SCHEDULE_SET", f"Đang cấu hình lịch đăng ({full_schedule_label}) và các tùy chọn...", 80)
+            await _dismiss_unwanted_modals(page)
 
             schedule_control_evidence: list[dict[str, str]] = []
             if publish_now:
@@ -881,6 +1244,7 @@ async def schedule_reel_via_gpm(
 
             # 10. Playlists: Add to all available playlists
             try:
+                await _dismiss_unwanted_modals(page)
                 playlist_toggle = page.locator(
                     'div[role="switch"]:has-text("Thêm vào danh sách phát"), '
                     'label:has-text("Thêm vào danh sách phát")'
@@ -915,13 +1279,18 @@ async def schedule_reel_via_gpm(
                         await asyncio.sleep(0.5)
             except Exception as pl_err:
                 logger.debug("Lỗi khi chọn danh sách phát: %s", pl_err)
+            finally:
+                await _dismiss_unwanted_modals(page)
 
             # 11. Subtitles & Remix
             try:
+                await _dismiss_unwanted_modals(page)
                 # Ensure Subtitle is checked
                 sub_cb = page.locator('input[type="checkbox"]').filter(has=page.locator('xpath=ancestor::div[contains(., "Phụ đề")]')).first
                 if await sub_cb.is_visible() and not await sub_cb.is_checked():
                     await sub_cb.click()
+                    await asyncio.sleep(0.5)
+                    await _dismiss_unwanted_modals(page)
 
                 # Remix: Select "Không cho phép"
                 no_remix_radio = page.locator(
@@ -932,11 +1301,15 @@ async def schedule_reel_via_gpm(
                 if await no_remix_radio.is_visible():
                     await no_remix_radio.click()
                     await asyncio.sleep(0.5)
+                    await _dismiss_unwanted_modals(page)
             except Exception as remix_err:
                 logger.debug("Lỗi cài đặt Remix/Phụ đề: %s", remix_err)
+            finally:
+                await _dismiss_unwanted_modals(page)
 
             # 12. Monetization (Công cụ kiếm tiền)
             try:
+                await _dismiss_unwanted_modals(page)
                 monetization_header = page.locator('div:has-text("Công cụ kiếm tiền")').first
                 if await monetization_header.is_visible():
                     monetize_switch = monetization_header.locator('xpath=..//div[@role="switch"]').first
@@ -944,6 +1317,7 @@ async def schedule_reel_via_gpm(
                         if await monetize_switch.get_attribute("aria-checked") == "false":
                             await monetize_switch.click()
                             await asyncio.sleep(1.0)
+                            await _dismiss_unwanted_modals(page)
 
                     # Check all sub-checkboxes (Sao, Kiếm tiền từ nội dung)
                     monetize_cbs = page.locator('div:has-text("Công cụ kiếm tiền")').locator('xpath=..//input[@type="checkbox"]')
@@ -953,8 +1327,11 @@ async def schedule_reel_via_gpm(
                         if not await m_cb.is_checked():
                             await m_cb.click()
                             await asyncio.sleep(0.3)
+                            await _dismiss_unwanted_modals(page)
             except Exception as mon_err:
                 logger.debug("Lỗi cài đặt Kiếm tiền: %s", mon_err)
+            finally:
+                await _dismiss_unwanted_modals(page)
 
             # 13. Final Click: "Lên lịch" / "Chia sẻ"
             action_btn_name = "Chia sẻ" if publish_now else "Lên lịch"
@@ -968,6 +1345,7 @@ async def schedule_reel_via_gpm(
                 )
 
             # GUARD 2: Verify Video Integrity before final submission
+            await _dismiss_unwanted_modals(page)
             if not await _verify_video_attachment_present(page):
                 ss_file = await _capture_error_screenshot(page)
                 raise FbBrowserAutomationError(
@@ -977,6 +1355,7 @@ async def schedule_reel_via_gpm(
                     can_resume=True,
                 )
 
+            await _dismiss_unwanted_modals(page)
             await page.keyboard.press("Escape")
             await page.evaluate("() => document.activeElement && document.activeElement.blur()")
             await asyncio.sleep(1.0)

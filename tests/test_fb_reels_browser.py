@@ -196,6 +196,58 @@ class TestFbReelsBrowser(unittest.TestCase):
 
         asyncio.run(_test())
 
+    def test_dismiss_unwanted_modals_none_or_closed_page(self):
+        from auto_yt.services.fb_reels_browser_service import _dismiss_unwanted_modals
+        import asyncio
+
+        class ClosedPageMock:
+            def is_closed(self):
+                return True
+
+        async def _test():
+            self.assertFalse(await _dismiss_unwanted_modals(None))
+            self.assertFalse(await _dismiss_unwanted_modals(ClosedPageMock()))
+
+        asyncio.run(_test())
+
+    def test_inspect_composer_stage_none_or_closed_page(self):
+        from auto_yt.services.fb_reels_browser_service import (
+            _inspect_composer_stage,
+            STAGE_INVALID_OR_STALE,
+            STAGE_SHARE_READY,
+            STAGE_EDIT_READY,
+            STAGE_CREATE_READY,
+        )
+        import asyncio
+
+        self.assertEqual(STAGE_SHARE_READY, "STAGE_SHARE_READY")
+        self.assertEqual(STAGE_EDIT_READY, "STAGE_EDIT_READY")
+        self.assertEqual(STAGE_CREATE_READY, "STAGE_CREATE_READY")
+        self.assertEqual(STAGE_INVALID_OR_STALE, "STAGE_INVALID")
+
+        class ClosedPageMock:
+            def is_closed(self):
+                return True
+
+            @property
+            def url(self):
+                return "https://business.facebook.com/latest/reels_composer"
+
+        class NonComposerPageMock:
+            def is_closed(self):
+                return False
+
+            @property
+            def url(self):
+                return "https://www.facebook.com/login"
+
+        async def _test():
+            self.assertEqual(await _inspect_composer_stage(None), STAGE_INVALID_OR_STALE)
+            self.assertEqual(await _inspect_composer_stage(ClosedPageMock()), STAGE_INVALID_OR_STALE)
+            self.assertEqual(await _inspect_composer_stage(NonComposerPageMock()), STAGE_INVALID_OR_STALE)
+
+        asyncio.run(_test())
+
     def test_thumbnail_tab_regex_patterns(self):
         import re
         pattern = re.compile(
