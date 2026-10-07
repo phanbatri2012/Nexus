@@ -3155,12 +3155,16 @@ def process_queue_item_jit(
                         )
                     except Exception:
                         pass
-                for f in (video_file, vertical_video_file, thumb_file):
-                    if f.exists():
-                        try:
-                            f.unlink()
-                        except Exception:
-                            pass
+                if video_file.exists():
+                    try:
+                        video_file.unlink()
+                    except Exception:
+                        pass
+                if thumb_file.exists():
+                    try:
+                        thumb_file.unlink()
+                    except Exception:
+                        pass
                 raise RuntimeError(safe_error) from cvt_err
 
         db.update_fb_checkpoint(
@@ -3447,6 +3451,7 @@ def process_queue_item_jit(
         )
         db.update_fb_crossposter_queue_item(item_id, {
             "status": "retryable" if is_retryable_finish else "error",
+            "can_resume": 1 if is_retryable_finish else 0,
             "error_message": safe_error,
             "meta_state": "processing" if is_retryable_finish else str(current_item.get("meta_state") or ""),
             "meta_state_since": str(current_item.get("meta_state_since") or db.utc_now()),

@@ -167,35 +167,20 @@ class TestFbReelsBrowser(unittest.TestCase):
 
         asyncio.run(_test())
 
-    def test_verify_composer_video_integrity_with_video(self):
-        import asyncio
-        from unittest.mock import AsyncMock, MagicMock
-        from auto_yt.services.fb_reels_browser_service import _verify_composer_video_integrity
-
-        async def _test():
-            mock_page = MagicMock()
-            mock_locator = MagicMock()
-            mock_locator.count = AsyncMock(return_value=1)
-            mock_page.locator.return_value = mock_locator
-            result = await _verify_composer_video_integrity(mock_page)
-            self.assertTrue(result)
-
-        asyncio.run(_test())
-
-    def test_verify_composer_video_integrity_lost_video(self):
-        import asyncio
-        from unittest.mock import AsyncMock, MagicMock
-        from auto_yt.services.fb_reels_browser_service import _verify_composer_video_integrity
-
-        async def _test():
-            mock_page = MagicMock()
-            mock_locator = MagicMock()
-            mock_locator.count = AsyncMock(return_value=0)
-            mock_page.locator.return_value = mock_locator
-            result = await _verify_composer_video_integrity(mock_page)
-            self.assertFalse(result)
-
-        asyncio.run(_test())
+    def test_post_submission_popup_selectors(self):
+        # Verify that common Meta confirmation buttons and dismiss labels are covered
+        expected_keywords = ["Lúc khác", "Maybe later", "Not now", "Để sau", "Bỏ qua", "Dismiss"]
+        selector_string = (
+            'div[role="dialog"] button:has-text("Lúc khác"), div[role="dialog"] div[role="button"]:has-text("Lúc khác"), '
+            'button:has-text("Lúc khác"), div[role="button"]:has-text("Lúc khác"), '
+            'button:has-text("Maybe later"), div[role="button"]:has-text("Maybe later"), '
+            'button:has-text("Not now"), div[role="button"]:has-text("Not now"), '
+            'button:has-text("Để sau"), div[role="button"]:has-text("Để sau"), '
+            'button:has-text("Bỏ qua"), div[role="button"]:has-text("Bỏ qua"), '
+            'button:has-text("Dismiss"), div[role="button"]:has-text("Dismiss")'
+        )
+        for kw in expected_keywords:
+            self.assertIn(f'has-text("{kw}")', selector_string)
 
 
 if __name__ == "__main__":

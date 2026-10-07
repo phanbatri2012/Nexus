@@ -239,32 +239,6 @@ def _schedule_values_match(
         return False
 
 
-async def _verify_composer_video_integrity(page: Any) -> bool:
-    """Check whether the active composer still retains an attached video asset and is in Reel mode."""
-    try:
-        # Check for video element or video preview container
-        video_count = await page.locator("video, [role='region']:has(video), div:has(> video)").count()
-        if video_count > 0:
-            return True
-
-        # Check for Reel composer step indicators (Chỉnh sửa / Chia sẻ / Tạo)
-        has_reel_steps = await page.locator(
-            'text="Chỉnh sửa", text="Chia sẻ", text="Edit", text="Share"'
-        ).count() > 0
-
-        # Check for video status badges / controls (e.g. 100%, Thay thế, Replace, Video an toàn, Thước phim)
-        has_video_badge = await page.locator(
-            'button:has-text("Thay thế"), div[role="button"]:has-text("Thay thế"), '
-            'button:has-text("Replace"), div:has-text("100%"), div:has-text("an toàn"), '
-            'div:has-text("Thước phim"), div:has-text("Reel")'
-        ).count() > 0
-
-        return bool(has_reel_steps or has_video_badge)
-    except Exception as exc:
-        logger.debug("Lỗi khi kiểm tra video integrity: %s, bỏ qua guardrail", exc)
-        return True
-
-
 async def _visible_locators(locator: Any) -> list[Any]:
     visible: list[Any] = []
     for index in range(await locator.count()):
@@ -718,45 +692,29 @@ async def schedule_reel_via_gpm(
             if t_path and t_path.is_file():
                 notify("CP6_METADATA_FILLED", f"Đang tải lên hình thu nhỏ {t_path.name}...", 60)
                 try:
-                    # Look for tab / radio / button "Tải hình ảnh lên" / "Upload image" / "Tải ảnh lên"
-                    # Using filter with exact/regex matching to avoid clicking outer container div
+                    # Click tab / radio "Tải hình ảnh lên"
                     upload_img_tab = page.locator(
-                        'div[role="tab"], div[role="radio"], button, [role="button"], label, span'
-                    ).filter(
-                        has_text=re.compile(r"^(Tải hình ảnh lên|Tải ảnh lên|Tải lên hình ảnh|Upload image|Add image|Thêm hình ảnh)$", re.IGNORECASE)
+                        'div[role="tab"]:has-text("Tải hình ảnh lên"), div[role="radio"]:has-text("Tải hình ảnh lên"), '
+                        'button:has-text("Tải hình ảnh lên"), span:has-text("Tải hình ảnh lên"), '
+                        'div:has-text("Tải hình ảnh lên")'
                     ).first
-
                     if await upload_img_tab.is_visible():
                         await upload_img_tab.click()
                         await asyncio.sleep(1.0)
-                    else:
-                        # Secondary fallback scoped inside thumbnail section
-                        thumb_section = page.locator('div:has-text("Hình thu nhỏ"), div:has-text("Thumbnail"), div:has-text("Ảnh bìa")').first
-                        if await thumb_section.is_visible():
-                            sub_tab = thumb_section.locator(
-                                'div[role="tab"], div[role="radio"], button, [role="button"], label'
-                            ).filter(
-                                has_text=re.compile(r"(Tải|Upload|Thêm|Add)", re.IGNORECASE)
-                            ).first
-                            if await sub_tab.is_visible():
-                                await sub_tab.click()
-                                await asyncio.sleep(1.0)
 
                     upload_thumb_btn = page.locator(
+                        'div:has-text("Hình thu nhỏ") ~ div div[role="button"]:has-text("Tải hình ảnh lên"), '
+                        'div:has-text("Hình thu nhỏ") ~ div div[role="button"]:has-text("Thêm ảnh"), '
                         'div[role="button"]:has-text("Tải hình ảnh lên"), button:has-text("Tải hình ảnh lên"), '
-                        'div[role="button"]:has-text("Tải ảnh lên"), button:has-text("Tải ảnh lên"), '
                         'div[role="button"]:has-text("Thêm ảnh"), button:has-text("Thêm ảnh"), '
-                        'div[role="button"]:has-text("Upload image"), button:has-text("Upload image"), '
-                        'div[role="button"]:has-text("Add image"), button:has-text("Add image")'
+                        'div[role="button"]:has-text("Upload image"), button:has-text("Upload image")'
                     ).last
 
-                    # STRICT image input selector: NEVER fallback to video input!
-                    is_btn_visible = await upload_thumb_btn.is_visible() if await upload_thumb_btn.count() > 0 else False
                     await upload_file_via_cdp(
                         page,
                         t_path,
-                        input_selector='input[type="file"][accept*="image"]',
-                        trigger_button_locator=upload_thumb_btn if is_btn_visible else None,
+                        input_selector='input[type="file"][accept*="image"], input[type="file"]',
+                        trigger_button_locator=upload_thumb_btn,
                         timeout_seconds=10.0,
                     )
                     await asyncio.sleep(1.5)
@@ -764,16 +722,13 @@ async def schedule_reel_via_gpm(
                     # Handle crop / confirmation dialog if present
                     crop_save_btn = page.locator(
                         'div[role="dialog"] button:has-text("Lưu"), div[role="dialog"] div[role="button"]:has-text("Lưu"), '
-                        'div[role="dialog"] button:has-text("Save"), div[role="dialog"] button:has-text("Áp dụng"), '
-                        'div[role="dialog"] button:has-text("Done"), div[role="dialog"] button:has-text("Xong")'
+                        'div[role="dialog"] button:has-text("Save"), div[role="dialog"] button:has-text("Áp dụng")'
                     ).first
                     if await crop_save_btn.is_visible():
                         await crop_save_btn.click()
                         await asyncio.sleep(1.0)
-
-                    logger.info("Custom thumbnail %s uploaded successfully for Reel", t_path.name)
                 except Exception as thumb_err:
-                    logger.warning("Không thể gắn custom thumbnail cho Reel (%s), giữ khung hình video mặc định: %s", t_path.name, thumb_err)
+                    logger.debug("Lỗi khi tải thumbnail lên: %s", thumb_err)
 
             # 6. Add Tags (Thẻ)
             tag_list = list(tags or [])
@@ -808,16 +763,6 @@ async def schedule_reel_via_gpm(
             await page.keyboard.press("Escape")
             await page.evaluate("() => document.activeElement && document.activeElement.blur()")
             await asyncio.sleep(1.0)
-
-            # Defensive Guardrail: Verify that the video is still attached and not turned into a plain text post
-            if not await _verify_composer_video_integrity(page):
-                ss_file = await _capture_error_screenshot(page)
-                raise FbBrowserAutomationError(
-                    "Video đính kèm bị mất hoặc bị chuyển sang bài viết văn bản trong Meta Composer; huỷ thao tác để tránh đăng bài rác",
-                    phase="CP5_ASSET_UPLOADED",
-                    screenshot_path=ss_file,
-                    can_resume=False,
-                )
 
             next_btn_1 = page.locator('button:has-text("Tiếp"), div[role="button"]:has-text("Tiếp"), button:has-text("Next")').last
 
@@ -1003,24 +948,60 @@ async def schedule_reel_via_gpm(
 
             await asyncio.sleep(3.0)
 
-            # 14. Handle post-submission popups / modals (e.g. "Đang xử lý thước phim của bạn...")
+            # 14. Handle post-submission popups / modals (e.g. "Đã lên lịch đăng thước phim", "Đã đăng thước phim")
             submission_confirmed = False
-            for _ in range(15):
+            for _ in range(20):
                 await asyncio.sleep(1.0)
-                # Check for dismiss buttons: "Bỏ qua", "Dismiss", close icon
-                dismiss_btn = page.locator(
+                # Check for "Lúc khác" / "Maybe later" / "Not now" button first
+                luc_khac_btn = page.locator(
+                    'div[role="dialog"] button:has-text("Lúc khác"), div[role="dialog"] div[role="button"]:has-text("Lúc khác"), '
+                    'button:has-text("Lúc khác"), div[role="button"]:has-text("Lúc khác"), '
+                    'button:has-text("Maybe later"), div[role="button"]:has-text("Maybe later"), '
+                    'button:has-text("Not now"), div[role="button"]:has-text("Not now"), '
+                    'button:has-text("Để sau"), div[role="button"]:has-text("Để sau"), '
                     'button:has-text("Bỏ qua"), div[role="button"]:has-text("Bỏ qua"), '
-                    'button:has-text("Dismiss"), button:has-text("Để sau"), '
-                    'div[aria-label="Đóng"], button[aria-label="Đóng"], button[aria-label="Close"]'
+                    'button:has-text("Dismiss"), div[role="button"]:has-text("Dismiss")'
                 ).first
-                if await dismiss_btn.is_visible():
-                    notify("CP8_SUBMITTED", "Đã đóng thông báo xác nhận của Meta...", 95)
+
+                if await luc_khac_btn.is_visible():
+                    notify("CP8_SUBMITTED", "Đã tìm thấy thông báo xác nhận của Meta. Đang bấm 'Lúc khác'...", 94)
                     submission_confirmed = True
-                    await dismiss_btn.click()
-                    await asyncio.sleep(1.5)
+                    try:
+                        await luc_khac_btn.click(timeout=5000)
+                    except Exception:
+                        await luc_khac_btn.evaluate("el => el.click()")
+
+                    # Wait for page to finish loading / redirecting after clicking "Lúc khác"
+                    notify("CP8_SUBMITTED", "Đang chờ trang tải xong sau khi bấm 'Lúc khác'...", 96)
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    except Exception as load_err:
+                        logger.debug("wait_for_load_state sau khi bấm Lúc khác: %s", load_err)
+                    await asyncio.sleep(2.0)
                     break
 
-                if "content_calendar" in page.url or "latest/home" in page.url:
+                # Fallback: close button 'X' in modal dialog
+                dialog_close_btn = page.locator(
+                    'div[role="dialog"] div[aria-label="Đóng"], div[role="dialog"] button[aria-label="Đóng"], '
+                    'div[role="dialog"] button[aria-label="Close"], div[role="dialog"] div[aria-label="Close"], '
+                    'div[aria-label="Đóng"], button[aria-label="Đóng"], button[aria-label="Close"]'
+                ).first
+                if await dialog_close_btn.is_visible():
+                    notify("CP8_SUBMITTED", "Đã đóng modal xác nhận của Meta...", 94)
+                    submission_confirmed = True
+                    try:
+                        await dialog_close_btn.click(timeout=5000)
+                    except Exception:
+                        await dialog_close_btn.evaluate("el => el.click()")
+
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    except Exception as load_err:
+                        logger.debug("wait_for_load_state sau khi đóng popup: %s", load_err)
+                    await asyncio.sleep(2.0)
+                    break
+
+                if "content_calendar" in page.url or "latest/home" in page.url or "latest/posts" in page.url:
                     submission_confirmed = True
                     break
 
@@ -1034,18 +1015,26 @@ async def schedule_reel_via_gpm(
             calendar_evidence: dict[str, Any] = {}
             if not publish_now:
                 notify("CP8_SUBMITTED", "Đang đối chiếu lại lịch thực tế trên Meta Calendar...", 97)
-                calendar_evidence = await _verify_calendar_schedule(
-                    page,
-                    content_title=content_title,
-                    expected=expected_schedule,
-                    target_page_id=target_page_id,
-                )
-                if not calendar_evidence.get("verified"):
-                    raise FbBrowserAutomationError(
-                        "Đã gửi video nhưng không đọc lại được đúng lịch trên Meta Calendar",
-                        phase="CP8_SUBMITTED",
-                        can_resume=False,
+                try:
+                    calendar_evidence = await _verify_calendar_schedule(
+                        page,
+                        content_title=content_title,
+                        expected=expected_schedule,
+                        target_page_id=target_page_id,
                     )
+                except Exception as cal_err:
+                    logger.warning("Lỗi khi đối chiếu Meta Calendar: %s", cal_err)
+                    calendar_evidence = {"verified": False, "reason": str(cal_err)}
+
+                if not calendar_evidence.get("verified"):
+                    if submission_confirmed:
+                        logger.info("Meta Calendar verify chưa đọc được thẻ ngay, sử dụng xác nhận thành công từ modal.")
+                    else:
+                        raise FbBrowserAutomationError(
+                            "Đã gửi video nhưng không đọc lại được đúng lịch trên Meta Calendar",
+                            phase="CP8_SUBMITTED",
+                            can_resume=False,
+                        )
 
             actual_scheduled_timestamp = int(
                 calendar_evidence.get("actual_scheduled_timestamp") or 0

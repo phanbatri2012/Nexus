@@ -907,13 +907,17 @@ class FBCrossPosterUnitTests(unittest.TestCase):
                 output_path.write_bytes(b"thumbnail")
                 return True
 
+            state = dict(item)
+            def _mock_update(_id, fields):
+                state.update(fields)
+
             with (
                 patch.object(fb_crossposter_service, "TEMP_DOWNLOAD_DIR", temp_path),
                 patch.object(fb_crossposter_service, "YoutubeDL", return_value=downloader),
                 patch.object(fb_crossposter_service, "ensure_ffmpeg_directory", return_value=""),
-                patch.object(db, "get_fb_crossposter_queue_item", return_value=dict(item)),
+                patch.object(db, "get_fb_crossposter_queue_item", side_effect=lambda _id: dict(state)),
                 patch.object(db, "get_fb_crossposter_runtime_settings", return_value=settings),
-                patch.object(db, "update_fb_crossposter_queue_item") as update_item,
+                patch.object(db, "update_fb_crossposter_queue_item", side_effect=_mock_update) as update_item,
                 patch.object(fb_crossposter_service, "_get_proxy_for_gpm_profile", return_value=None),
                 patch.object(fb_crossposter_service, "download_thumbnail", side_effect=save_thumb),
                 patch.object(
