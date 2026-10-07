@@ -94,24 +94,12 @@ export default function TrustBuilder() {
   const [newRuleType, setNewRuleType] = useState('channel')
   const [newRuleReason, setNewRuleReason] = useState('')
   const [syncBusy, setSyncBusy] = useState(false)
+  const [blockedChannelsMap, setBlockedChannelsMap] = useState({})
 
   const showFeedback = (msg, type = 'info') => {
     setFeedback({ message: msg, type })
-    setTimeout(() => setFeedback({ message: '', type: '' }), 5000)
+    setTimeout(() => setFeedback({ message: '', type: '' }), 4500)
   }
-
-  const loadSafetyConfig = useCallback(async () => {
-    try {
-      const res = await fetch(`${API_BASE}/api/trust-builder/safety/config`)
-      if (res.ok) {
-        const data = await res.json()
-        setSafetyConfig(data.config)
-        setSafetyCounts(data.counts)
-      }
-    } catch (err) {
-      console.warn('Lỗi tải cấu hình Safety Shield:', err)
-    }
-  }, [])
 
   const loadBlacklistRules = useCallback(async (type = '', search = '') => {
     setBlacklistLoading(true)
@@ -132,6 +120,19 @@ export default function TrustBuilder() {
     }
   }, [])
 
+  const loadSafetyConfig = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/trust-builder/safety/config`)
+      if (res.ok) {
+        const data = await res.json()
+        setSafetyConfig(data.config)
+        setSafetyCounts(data.counts)
+      }
+    } catch (err) {
+      console.warn('Lỗi tải cấu hình Safety Shield:', err)
+    }
+  }, [])
+
   const handleTriggerSync = async () => {
     setSyncBusy(true)
     try {
@@ -139,10 +140,7 @@ export default function TrustBuilder() {
       const data = await res.json().catch(() => ({}))
       if (res.ok) {
         showFeedback(data.message || 'Đồng bộ Core Blacklist thành công!', 'success')
-        await loadSafetyConfig()
-        if (safetyModalOpen) {
-          await loadBlacklistRules(blacklistTypeFilter, blacklistSearch)
-        }
+        await Promise.all([loadSafetyConfig(), loadBlacklistRules(blacklistTypeFilter, blacklistSearch)])
       } else {
         showFeedback(extractErrorMessage(data, 'Không thể đồng bộ Blacklist.'), 'error')
       }
@@ -176,6 +174,7 @@ export default function TrustBuilder() {
     if (!channelVal) return
     const clean = String(channelVal).trim()
     if (!clean) return
+    setBlockedChannelsMap(prev => ({ ...prev, [clean]: 'loading' }))
     try {
       const res = await fetch(`${API_BASE}/api/trust-builder/safety/blacklist`, {
         method: 'POST',
@@ -190,15 +189,15 @@ export default function TrustBuilder() {
       })
       const data = await res.json().catch(() => ({}))
       if (res.ok) {
+        setBlockedChannelsMap(prev => ({ ...prev, [clean]: 'blocked' }))
         showFeedback(`Đã chặn kênh '${clean}' thành công vào Blacklist!`, 'success')
-        await loadSafetyConfig()
-        if (safetyModalOpen) {
-          await loadBlacklistRules(blacklistTypeFilter, blacklistSearch)
-        }
+        await Promise.all([loadSafetyConfig(), loadBlacklistRules(blacklistTypeFilter, blacklistSearch)])
       } else {
+        setBlockedChannelsMap(prev => ({ ...prev, [clean]: 'error' }))
         showFeedback(extractErrorMessage(data, 'Không thể chặn kênh.'), 'error')
       }
     } catch {
+      setBlockedChannelsMap(prev => ({ ...prev, [clean]: 'error' }))
       showFeedback('Lỗi khi thêm quy tắc chặn kênh.', 'error')
     }
   }
@@ -331,6 +330,7 @@ export default function TrustBuilder() {
   useEffect(() => {
     let cancelled = false
     loadSafetyConfig()
+    loadBlacklistRules()
     loadInitialData().then(({ chList, planList }) => {
       if (cancelled || chList.length === 0) return
       let matched = null
@@ -342,7 +342,7 @@ export default function TrustBuilder() {
       loadPlanDetails(target.id, planList)
     })
     return () => { cancelled = true }
-  }, [loadInitialData, loadSafetyConfig])
+  }, [loadInitialData, loadSafetyConfig, loadBlacklistRules])
 
   // Sync state if subRoute changes externally (e.g. browser back/forward or direct link)
   useEffect(() => {
@@ -602,6 +602,24 @@ export default function TrustBuilder() {
 
   return (
     <div className="trust-builder-container">
+      {/* Floating HUD Toast Notification (Always Visible) */}
+      {feedback.message && (
+        <div className={`trust-floating-toast ${feedback.type}`}>
+          <span className="toast-icon">
+            {feedback.type === 'success' ? '✅' : feedback.type === 'error' ? '❌' : 'ℹ️'}
+          </span>
+          <span className="toast-text">{feedback.message}</span>
+          <button
+            type="button"
+            className="toast-close-btn"
+            onClick={() => setFeedback({ message: '', type: '' })}
+            title="Đóng thông báo"
+          >
+            ×
+          </button>
+        </div>
+      )}
+
       {/* Header */}
       <div className="trust-header">
         <div className="trust-title-group">
@@ -641,12 +659,6 @@ export default function TrustBuilder() {
             </button>
           </div>
         </div>
-
-        {feedback.message && (
-          <div className={`trust-feedback-toast ${feedback.type}`}>
-            {feedback.message}
-          </div>
-        )}
       </div>
 
       {/* Main Two-Column Layout */}
@@ -1058,16 +1070,35 @@ export default function TrustBuilder() {
                           {log.duration_seconds > 0 && (
                             <div className="activity-duration">⏱️ {formatSeconds(log.duration_seconds)}</div>
                           )}
-                          {matchedChannel && (
-                            <button
-                              type="button"
-                              className="activity-quick-block-btn"
-                              title={`Chặn ngay kênh '${matchedChannel}' vào Blacklist an toàn`}
-                              onClick={() => handleQuickBlockChannel(matchedChannel, `Chặn nhanh từ log: ${log.target_title || ''}`)}
-                            >
-                              🚫 Chặn kênh
-                            </button>
-                          )}
+                          {matchedChannel && (() => {
+                            const isBlocked = blockedChannelsMap[matchedChannel] === 'blocked' ||
+                              blacklistEntries.some(b => b.entry_type === 'channel' && (
+                                b.entry_value?.toLowerCase() === matchedChannel.toLowerCase() ||
+                                b.normalized_value?.toLowerCase() === matchedChannel.toLowerCase().replace(/[\s\W_]+/g, '')
+                              ))
+                            const isLoading = blockedChannelsMap[matchedChannel] === 'loading'
+                            if (isBlocked) {
+                              return (
+                                <span
+                                  className="activity-quick-block-btn blocked"
+                                  title={`Kênh '${matchedChannel}' đã có trong Blacklist an toàn`}
+                                >
+                                  ✓ Đã chặn
+                                </span>
+                              )
+                            }
+                            return (
+                              <button
+                                type="button"
+                                className={`activity-quick-block-btn ${isLoading ? 'loading' : ''}`}
+                                disabled={isLoading}
+                                title={`Chặn ngay kênh '${matchedChannel}' vào Blacklist an toàn`}
+                                onClick={() => handleQuickBlockChannel(matchedChannel, `Chặn nhanh từ log: ${log.target_title || ''}`)}
+                              >
+                                {isLoading ? '⏳ Đang chặn...' : '🚫 Chặn kênh'}
+                              </button>
+                            )
+                          })()}
                           <div className="activity-time">{log.executed_at ? log.executed_at.slice(11, 19) : ''}</div>
                         </div>
                       )
