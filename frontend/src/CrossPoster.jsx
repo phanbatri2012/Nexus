@@ -714,10 +714,9 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
       return
     }
     try {
-      const res = await fetch(`${API_BASE}/api/fb-crossposter/schedule-ahead/cancel`, {
+      const query = selectedPageId ? `?page_id=${encodeURIComponent(selectedPageId)}` : ''
+      const res = await fetch(`${API_BASE}/api/fb-crossposter/schedule-ahead/cancel${query}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ page_id: selectedPageId })
       })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       setMessage('Đã gửi yêu cầu dừng tác vụ đặt lịch trước.')

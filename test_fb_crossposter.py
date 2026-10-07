@@ -760,6 +760,7 @@ class FBCrossPosterUnitTests(unittest.TestCase):
             "post_template": "{title}\n\n{clean_description}\n\n{hashtags}",
             "convert_to_vertical": True,
             "default_tags": ["Thương hiệu", "lịch sử"],
+            "upload_mode": "api",
         }
         source_info = {
             "title": "Tiêu đề",
@@ -875,6 +876,7 @@ class FBCrossPosterUnitTests(unittest.TestCase):
             "fb_description": "",
             "fb_description_source": "auto",
             "scheduled_publish_time": 0,
+            "status": "pending",
         }
         settings = {
             "target_fb_page_id": "page",
@@ -1424,6 +1426,67 @@ Câu chuyện về vị tướng quả cảm.
         )
         self.assertEqual(status, "meta_scheduled")
         self.assertEqual(fields["meta_scheduled_publish_time"], scheduled_time)
+
+    def test_browser_submission_without_remote_verification_is_not_success(self):
+        requested = int(
+            (datetime.datetime.now() + datetime.timedelta(days=2)).timestamp()
+        )
+        status, fields = fb_crossposter_service.classify_browser_publication(
+            {
+                "success": True,
+                "status": "verification_pending",
+                "schedule_verified": False,
+                "verification_evidence": {"source": "composer"},
+            },
+            requested,
+            publish_now=False,
+        )
+
+        self.assertEqual(status, "verifying")
+        self.assertEqual(fields["meta_scheduled_publish_time"], 0)
+        self.assertEqual(fields["meta_verified_at"], "")
+
+    def test_browser_verified_schedule_uses_actual_meta_time(self):
+        requested = int(
+            (datetime.datetime.now() + datetime.timedelta(days=2)).timestamp()
+        )
+        status, fields = fb_crossposter_service.classify_browser_publication(
+            {
+                "success": True,
+                "status": "meta_scheduled",
+                "schedule_verified": True,
+                "submission_confirmed": True,
+                "actual_scheduled_timestamp": requested,
+                "verification_evidence": {"source": "meta_response"},
+            },
+            requested,
+            publish_now=False,
+        )
+
+        self.assertEqual(status, "meta_scheduled")
+        self.assertEqual(fields["meta_scheduled_publish_time"], requested)
+        self.assertTrue(fields["meta_verified_at"])
+
+    def test_browser_verified_schedule_mismatch_is_actionable(self):
+        requested = int(
+            (datetime.datetime.now() + datetime.timedelta(days=2)).timestamp()
+        )
+        actual = requested + 3600
+        status, fields = fb_crossposter_service.classify_browser_publication(
+            {
+                "success": True,
+                "status": "meta_scheduled",
+                "schedule_verified": True,
+                "submission_confirmed": True,
+                "actual_scheduled_timestamp": actual,
+                "verification_evidence": {"source": "meta_response"},
+            },
+            requested,
+            publish_now=False,
+        )
+
+        self.assertEqual(status, "schedule_mismatch")
+        self.assertEqual(fields["meta_scheduled_publish_time"], actual)
 
     def test_meta_object_still_uploading_is_not_a_scheduled_success(self):
         scheduled_time = int(

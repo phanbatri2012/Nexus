@@ -8,6 +8,9 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from auto_yt.services.fb_reels_browser_service import (
+    _calendar_week_position,
+    _parse_meta_date_value,
+    _schedule_values_match,
     _format_schedule_time,
     FbBrowserAutomationError,
 )
@@ -31,6 +34,50 @@ class TestFbReelsBrowser(unittest.TestCase):
         self.assertEqual(slash, "29/9/2026")
         self.assertEqual(iso, "2026-09-29")
         self.assertEqual(time_str, "19:30")
+
+    def test_parse_meta_localized_date_value(self):
+        self.assertEqual(
+            _parse_meta_date_value("7 Tháng 10, 2026"),
+            datetime.date(2026, 10, 7),
+        )
+        self.assertEqual(
+            _parse_meta_date_value("07/10/2026"),
+            datetime.date(2026, 10, 7),
+        )
+
+    def test_schedule_values_match_separate_hour_and_minute_controls(self):
+        self.assertTrue(
+            _schedule_values_match(
+                "7 Tháng 10, 2026",
+                "19",
+                "00",
+                datetime.datetime(2026, 10, 7, 19, 0),
+            )
+        )
+        self.assertFalse(
+            _schedule_values_match(
+                "7 Tháng 10, 2026",
+                "12",
+                "24",
+                datetime.datetime(2026, 10, 7, 19, 0),
+            )
+        )
+
+    def test_calendar_week_position_uses_sunday_columns(self):
+        self.assertEqual(
+            _calendar_week_position(
+                datetime.date(2026, 10, 7),
+                datetime.date(2026, 10, 7),
+            ),
+            (0, 3),
+        )
+        self.assertEqual(
+            _calendar_week_position(
+                datetime.date(2026, 10, 11),
+                datetime.date(2026, 10, 7),
+            ),
+            (1, 0),
+        )
 
     def test_db_fb_crossposter_settings_upload_mode(self):
         test_page_id = "test_page_upload_mode_123"
@@ -117,6 +164,36 @@ class TestFbReelsBrowser(unittest.TestCase):
         async def _test():
             with self.assertRaises(FileNotFoundError):
                 await upload_file_via_cdp(None, "non_existent_file_path_xyz_123.mp4")
+
+        asyncio.run(_test())
+
+    def test_verify_composer_video_integrity_with_video(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from auto_yt.services.fb_reels_browser_service import _verify_composer_video_integrity
+
+        async def _test():
+            mock_page = MagicMock()
+            mock_locator = MagicMock()
+            mock_locator.count = AsyncMock(return_value=1)
+            mock_page.locator.return_value = mock_locator
+            result = await _verify_composer_video_integrity(mock_page)
+            self.assertTrue(result)
+
+        asyncio.run(_test())
+
+    def test_verify_composer_video_integrity_lost_video(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from auto_yt.services.fb_reels_browser_service import _verify_composer_video_integrity
+
+        async def _test():
+            mock_page = MagicMock()
+            mock_locator = MagicMock()
+            mock_locator.count = AsyncMock(return_value=0)
+            mock_page.locator.return_value = mock_locator
+            result = await _verify_composer_video_integrity(mock_page)
+            self.assertFalse(result)
 
         asyncio.run(_test())
 

@@ -201,6 +201,284 @@ def _format_schedule_time(dt_val: datetime.datetime | str | int | None) -> tuple
     return date_str_slash, date_str_iso, time_str
 
 
+def _parse_meta_date_value(value: str) -> datetime.date | None:
+    """Parse the localized date value rendered by Meta's date control."""
+    clean = str(value or "").strip()
+    for pattern in (
+        r"^(\d{1,2})/(\d{1,2})/(\d{4})$",
+        r"^(\d{1,2})\s+Tháng\s+(\d{1,2}),?\s+(\d{4})$",
+        r"^(\d{4})-(\d{1,2})-(\d{1,2})$",
+    ):
+        match = re.match(pattern, clean, flags=re.IGNORECASE)
+        if not match:
+            continue
+        first, second, third = (int(part) for part in match.groups())
+        try:
+            if pattern.startswith("^(\\d{4})"):
+                return datetime.date(first, second, third)
+            return datetime.date(third, second, first)
+        except ValueError:
+            return None
+    return None
+
+
+def _schedule_values_match(
+    date_value: str,
+    hour_value: str | int,
+    minute_value: str | int,
+    expected: datetime.datetime,
+) -> bool:
+    """Compare Meta's separate date/hour/minute controls with the requested time."""
+    try:
+        return (
+            _parse_meta_date_value(date_value) == expected.date()
+            and int(hour_value) == expected.hour
+            and int(minute_value) == expected.minute
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+async def _verify_composer_video_integrity(page: Any) -> bool:
+    """Check whether the active composer still retains an attached video asset and is in Reel mode."""
+    try:
+        # Check for video element or video preview container
+        video_count = await page.locator("video, [role='region']:has(video), div:has(> video)").count()
+        if video_count > 0:
+            return True
+
+        # Check for Reel composer step indicators (Chỉnh sửa / Chia sẻ / Tạo)
+        has_reel_steps = await page.locator(
+            'text="Chỉnh sửa", text="Chia sẻ", text="Edit", text="Share"'
+        ).count() > 0
+
+        # Check for video status badges / controls (e.g. 100%, Thay thế, Replace, Video an toàn, Thước phim)
+        has_video_badge = await page.locator(
+            'button:has-text("Thay thế"), div[role="button"]:has-text("Thay thế"), '
+            'button:has-text("Replace"), div:has-text("100%"), div:has-text("an toàn"), '
+            'div:has-text("Thước phim"), div:has-text("Reel")'
+        ).count() > 0
+
+        return bool(has_reel_steps or has_video_badge)
+    except Exception as exc:
+        logger.debug("Lỗi khi kiểm tra video integrity: %s, bỏ qua guardrail", exc)
+        return True
+
+
+async def _visible_locators(locator: Any) -> list[Any]:
+    visible: list[Any] = []
+    for index in range(await locator.count()):
+        candidate = locator.nth(index)
+        if await candidate.is_visible():
+            visible.append(candidate)
+    return visible
+
+
+async def _set_and_verify_schedule_controls(
+    page: Any,
+    expected: datetime.datetime,
+) -> list[dict[str, str]]:
+    """Set every visible Facebook/Instagram date and time control, then read it back."""
+    date_inputs = await _visible_locators(
+        page.locator('input[placeholder="dd/mm/yyyy"], input[type="date"]')
+    )
+    hour_inputs = await _visible_locators(
+        page.locator('input[role="spinbutton"][aria-label="giờ" i], input[aria-label="hour" i]')
+    )
+    minute_inputs = await _visible_locators(
+        page.locator('input[role="spinbutton"][aria-label="phút" i], input[aria-label="minute" i]')
+    )
+    if not date_inputs or len(date_inputs) != len(hour_inputs) or len(date_inputs) != len(minute_inputs):
+        raise FbBrowserAutomationError(
+            "Không tìm thấy đầy đủ bộ chọn ngày, giờ và phút của Meta",
+            phase="CP7_SCHEDULE_SET",
+            can_resume=True,
+        )
+
+    requested_date = expected.strftime("%d/%m/%Y")
+    requested_hour = f"{expected.hour:02d}"
+    requested_minute = f"{expected.minute:02d}"
+    evidence: list[dict[str, str]] = []
+
+    for index, (date_input, hour_input, minute_input) in enumerate(
+        zip(date_inputs, hour_inputs, minute_inputs)
+    ):
+        date_value = ""
+        hour_value = ""
+        minute_value = ""
+        for attempt in range(2):
+            for control, value in (
+                (date_input, requested_date),
+                (hour_input, requested_hour),
+                (minute_input, requested_minute),
+            ):
+                await control.click()
+                await control.press("Control+A")
+                await control.press_sequentially(value, delay=35)
+                await control.press("Tab")
+                await asyncio.sleep(0.2)
+
+            date_value = (await date_input.input_value() or "").strip()
+            hour_value = str(await hour_input.get_attribute("aria-valuenow") or "").strip()
+            minute_value = str(await minute_input.get_attribute("aria-valuenow") or "").strip()
+            if _schedule_values_match(date_value, hour_value, minute_value, expected):
+                break
+            if attempt == 0:
+                await asyncio.sleep(0.5)
+        else:
+            raise FbBrowserAutomationError(
+                f"Meta không giữ đúng lịch đã nhập cho nhóm #{index + 1}: "
+                f"{date_value} {hour_value}:{minute_value}",
+                phase="CP7_SCHEDULE_SET",
+                can_resume=True,
+            )
+        evidence.append(
+            {
+                "date": expected.strftime("%Y-%m-%d"),
+                "time": expected.strftime("%H:%M"),
+            }
+        )
+
+    return evidence
+
+
+def _calendar_week_position(
+    target_date: datetime.date,
+    today: datetime.date | None = None,
+) -> tuple[int, int]:
+    """Return the Sunday-based week offset and column index used by Meta Calendar."""
+    current_date = today or datetime.date.today()
+    current_week_start = current_date - datetime.timedelta(
+        days=(current_date.weekday() + 1) % 7
+    )
+    target_week_start = target_date - datetime.timedelta(
+        days=(target_date.weekday() + 1) % 7
+    )
+    return (
+        (target_week_start - current_week_start).days // 7,
+        (target_date.weekday() + 1) % 7,
+    )
+
+
+async def _verify_calendar_schedule(
+    page: Any,
+    *,
+    content_title: str,
+    expected: datetime.datetime,
+    target_page_id: str,
+) -> dict[str, Any]:
+    """Read Meta Calendar after submission and verify the Facebook card's day and time."""
+    clean_title = str(content_title or "").strip()
+    if not clean_title:
+        return {"verified": False, "reason": "missing_content_title"}
+
+    calendar_url = CALENDAR_URL
+    if target_page_id:
+        calendar_url = f"{CALENDAR_URL}/?asset_id={target_page_id}"
+    await page.goto(calendar_url, wait_until="domcontentloaded", timeout=45000)
+    await asyncio.sleep(3.0)
+
+    week_button = page.locator('button:has-text("Tuần"), [role="button"]:has-text("Tuần")').first
+    if await week_button.is_visible():
+        await week_button.click()
+        await asyncio.sleep(0.8)
+    today_button = page.locator('[role="button"]:has-text("Hôm nay"), button:has-text("Hôm nay")').first
+    if await today_button.is_visible():
+        await today_button.click()
+        await asyncio.sleep(0.8)
+
+    week_offset, expected_column = _calendar_week_position(expected.date())
+    direction = "Right" if week_offset > 0 else "Left"
+    for _ in range(abs(week_offset)):
+        navigation_button = page.locator(
+            f'[role="button"]:has-text("{direction}"), button:has-text("{direction}")'
+        ).first
+        if not await navigation_button.is_visible():
+            return {"verified": False, "reason": f"missing_{direction.lower()}_navigation"}
+        await navigation_button.click()
+        await asyncio.sleep(0.8)
+
+    expected_time = expected.strftime("%H:%M")
+    observed: list[dict[str, Any]] = []
+    for verification_attempt in range(4):
+        await asyncio.sleep(2.0 if verification_attempt == 0 else 3.0)
+        candidates = page.locator("[aria-label]")
+        observed = []
+        for index in range(await candidates.count()):
+            card = candidates.nth(index)
+            aria_label = str(await card.get_attribute("aria-label") or "")
+            if not aria_label.startswith(clean_title) or not await card.is_visible():
+                continue
+            card_time = (await card.inner_text() or "").strip()
+            platforms = await card.locator("img").evaluate_all(
+                "els => els.map(el => el.alt).filter(Boolean)"
+            )
+            column_index = await card.evaluate(
+                """el => {
+                    let node = el;
+                    while (node && node.parentElement) {
+                        const parent = node.parentElement;
+                        const siblings = Array.from(parent.children).filter(child => {
+                            const rect = child.getBoundingClientRect();
+                            return rect.width > 100 && rect.height > 100;
+                        });
+                        if (siblings.length === 7 && siblings.includes(node)) {
+                            return siblings.indexOf(node);
+                        }
+                        node = parent;
+                    }
+                    return -1;
+                }"""
+            )
+            evidence = {
+                "time": card_time,
+                "platforms": platforms,
+                "column_index": int(column_index),
+            }
+            observed.append(evidence)
+            if (
+                card_time == expected_time
+                and "Facebook" in platforms
+                and int(column_index) == expected_column
+            ):
+                return {
+                    "verified": True,
+                    "matches_requested": True,
+                    "source": "meta_calendar",
+                    "date": expected.strftime("%Y-%m-%d"),
+                    "actual_scheduled_timestamp": int(expected.timestamp()),
+                    **evidence,
+                }
+
+    target_week_start = expected.date() - datetime.timedelta(days=expected_column)
+    for evidence in observed:
+        if "Facebook" not in evidence["platforms"] or not 0 <= evidence["column_index"] <= 6:
+            continue
+        try:
+            actual_time = datetime.datetime.strptime(evidence["time"], "%H:%M").time()
+        except ValueError:
+            continue
+        actual_date = target_week_start + datetime.timedelta(days=evidence["column_index"])
+        actual_datetime = datetime.datetime.combine(actual_date, actual_time)
+        return {
+            "verified": True,
+            "matches_requested": False,
+            "source": "meta_calendar",
+            "date": actual_date.isoformat(),
+            "actual_scheduled_timestamp": int(actual_datetime.timestamp()),
+            **evidence,
+        }
+
+    return {
+        "verified": False,
+        "reason": "matching_facebook_card_not_found",
+        "expected_date": expected.strftime("%Y-%m-%d"),
+        "expected_time": expected_time,
+        "expected_column": expected_column,
+        "observed": observed,
+    }
+
+
 async def schedule_reel_via_gpm(
     profile_id: str,
     video_path: Path | str,
@@ -211,10 +489,12 @@ async def schedule_reel_via_gpm(
     tags: list[str] | None = None,
     schedule_datetime: datetime.datetime | str | int | None = None,
     publish_now: bool = False,
+    content_title: str = "",
     page_name: str = "",
     target_page_id: str = "",
     timeout_seconds: float = 300.0,
     state_callback: Callable[[dict[str, Any]], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Automate scheduling or publishing a Facebook Reel via Meta Business Suite inside a GPM profile session."""
     clean_profile_id = str(profile_id or "").strip()
@@ -233,6 +513,9 @@ async def schedule_reel_via_gpm(
             t_path = None
 
     date_slash, date_iso, time_24h = _format_schedule_time(schedule_datetime)
+    expected_schedule = datetime.datetime.strptime(
+        f"{date_iso} {time_24h}", "%Y-%m-%d %H:%M"
+    )
     full_schedule_label = f"{date_slash} {time_24h}"
 
     current_checkpoint = "CP3_CDP_READY"
@@ -435,29 +718,45 @@ async def schedule_reel_via_gpm(
             if t_path and t_path.is_file():
                 notify("CP6_METADATA_FILLED", f"Đang tải lên hình thu nhỏ {t_path.name}...", 60)
                 try:
-                    # Click tab / radio "Tải hình ảnh lên"
+                    # Look for tab / radio / button "Tải hình ảnh lên" / "Upload image" / "Tải ảnh lên"
+                    # Using filter with exact/regex matching to avoid clicking outer container div
                     upload_img_tab = page.locator(
-                        'div[role="tab"]:has-text("Tải hình ảnh lên"), div[role="radio"]:has-text("Tải hình ảnh lên"), '
-                        'button:has-text("Tải hình ảnh lên"), span:has-text("Tải hình ảnh lên"), '
-                        'div:has-text("Tải hình ảnh lên")'
+                        'div[role="tab"], div[role="radio"], button, [role="button"], label, span'
+                    ).filter(
+                        has_text=re.compile(r"^(Tải hình ảnh lên|Tải ảnh lên|Tải lên hình ảnh|Upload image|Add image|Thêm hình ảnh)$", re.IGNORECASE)
                     ).first
+
                     if await upload_img_tab.is_visible():
                         await upload_img_tab.click()
                         await asyncio.sleep(1.0)
+                    else:
+                        # Secondary fallback scoped inside thumbnail section
+                        thumb_section = page.locator('div:has-text("Hình thu nhỏ"), div:has-text("Thumbnail"), div:has-text("Ảnh bìa")').first
+                        if await thumb_section.is_visible():
+                            sub_tab = thumb_section.locator(
+                                'div[role="tab"], div[role="radio"], button, [role="button"], label'
+                            ).filter(
+                                has_text=re.compile(r"(Tải|Upload|Thêm|Add)", re.IGNORECASE)
+                            ).first
+                            if await sub_tab.is_visible():
+                                await sub_tab.click()
+                                await asyncio.sleep(1.0)
 
                     upload_thumb_btn = page.locator(
-                        'div:has-text("Hình thu nhỏ") ~ div div[role="button"]:has-text("Tải hình ảnh lên"), '
-                        'div:has-text("Hình thu nhỏ") ~ div div[role="button"]:has-text("Thêm ảnh"), '
                         'div[role="button"]:has-text("Tải hình ảnh lên"), button:has-text("Tải hình ảnh lên"), '
+                        'div[role="button"]:has-text("Tải ảnh lên"), button:has-text("Tải ảnh lên"), '
                         'div[role="button"]:has-text("Thêm ảnh"), button:has-text("Thêm ảnh"), '
-                        'div[role="button"]:has-text("Upload image"), button:has-text("Upload image")'
+                        'div[role="button"]:has-text("Upload image"), button:has-text("Upload image"), '
+                        'div[role="button"]:has-text("Add image"), button:has-text("Add image")'
                     ).last
 
+                    # STRICT image input selector: NEVER fallback to video input!
+                    is_btn_visible = await upload_thumb_btn.is_visible() if await upload_thumb_btn.count() > 0 else False
                     await upload_file_via_cdp(
                         page,
                         t_path,
-                        input_selector='input[type="file"][accept*="image"], input[type="file"]',
-                        trigger_button_locator=upload_thumb_btn,
+                        input_selector='input[type="file"][accept*="image"]',
+                        trigger_button_locator=upload_thumb_btn if is_btn_visible else None,
                         timeout_seconds=10.0,
                     )
                     await asyncio.sleep(1.5)
@@ -465,13 +764,16 @@ async def schedule_reel_via_gpm(
                     # Handle crop / confirmation dialog if present
                     crop_save_btn = page.locator(
                         'div[role="dialog"] button:has-text("Lưu"), div[role="dialog"] div[role="button"]:has-text("Lưu"), '
-                        'div[role="dialog"] button:has-text("Save"), div[role="dialog"] button:has-text("Áp dụng")'
+                        'div[role="dialog"] button:has-text("Save"), div[role="dialog"] button:has-text("Áp dụng"), '
+                        'div[role="dialog"] button:has-text("Done"), div[role="dialog"] button:has-text("Xong")'
                     ).first
                     if await crop_save_btn.is_visible():
                         await crop_save_btn.click()
                         await asyncio.sleep(1.0)
+
+                    logger.info("Custom thumbnail %s uploaded successfully for Reel", t_path.name)
                 except Exception as thumb_err:
-                    logger.debug("Lỗi khi tải thumbnail lên: %s", thumb_err)
+                    logger.warning("Không thể gắn custom thumbnail cho Reel (%s), giữ khung hình video mặc định: %s", t_path.name, thumb_err)
 
             # 6. Add Tags (Thẻ)
             tag_list = list(tags or [])
@@ -507,6 +809,16 @@ async def schedule_reel_via_gpm(
             await page.evaluate("() => document.activeElement && document.activeElement.blur()")
             await asyncio.sleep(1.0)
 
+            # Defensive Guardrail: Verify that the video is still attached and not turned into a plain text post
+            if not await _verify_composer_video_integrity(page):
+                ss_file = await _capture_error_screenshot(page)
+                raise FbBrowserAutomationError(
+                    "Video đính kèm bị mất hoặc bị chuyển sang bài viết văn bản trong Meta Composer; huỷ thao tác để tránh đăng bài rác",
+                    phase="CP5_ASSET_UPLOADED",
+                    screenshot_path=ss_file,
+                    can_resume=False,
+                )
+
             next_btn_1 = page.locator('button:has-text("Tiếp"), div[role="button"]:has-text("Tiếp"), button:has-text("Next")').last
 
             # Wait for next button to be fully enabled
@@ -537,6 +849,7 @@ async def schedule_reel_via_gpm(
             # 9. Step 3 (Chia sẻ): Schedule & Options Configuration
             notify("CP7_SCHEDULE_SET", f"Đang cấu hình lịch đăng ({full_schedule_label}) và các tùy chọn...", 80)
 
+            schedule_control_evidence: list[dict[str, str]] = []
             if publish_now:
                 # Option: Chia sẻ ngay
                 now_btn = page.locator(
@@ -552,39 +865,18 @@ async def schedule_reel_via_gpm(
                     'div[role="button"]:has-text("Lên lịch"), button:has-text("Lên lịch"), '
                     'div[role="radio"]:has-text("Lên lịch")'
                 ).first
-                if await schedule_radio_btn.is_visible():
-                    await schedule_radio_btn.click()
-                    await asyncio.sleep(1.5)
-
-                # Set Date and Time
-                try:
-                    # Find date inputs
-                    date_inputs = page.locator('input[type="text"]').filter(has=page.locator('xpath=ancestor::div[contains(., "Facebook") or contains(., "Instagram") or contains(., "Lên lịch")]'))
-                    # Fallback find inputs matching date pattern or calendar icon
-                    all_text_inputs = page.locator('div[role="main"] input[type="text"], form input[type="text"]')
-                    input_count = await all_text_inputs.count()
-
-                    for idx in range(input_count):
-                        inp = all_text_inputs.nth(idx)
-                        val = (await inp.input_value() or "").strip()
-                        # If matches date like 29/9/2026 or DD/MM/YYYY
-                        if re.search(r"\d{1,2}/\d{1,2}/\d{4}", val) or re.search(r"Tháng", val):
-                            await inp.click()
-                            await page.keyboard.press("Control+A")
-                            await page.keyboard.press("Backspace")
-                            await inp.fill(date_slash)
-                            await page.keyboard.press("Enter")
-                            await asyncio.sleep(0.5)
-                        # If matches time like 18:16 or HH:MM
-                        elif re.search(r"^\d{1,2}:\d{2}$", val):
-                            await inp.click()
-                            await page.keyboard.press("Control+A")
-                            await page.keyboard.press("Backspace")
-                            await inp.fill(time_24h)
-                            await page.keyboard.press("Enter")
-                            await asyncio.sleep(0.5)
-                except Exception as dt_err:
-                    logger.warning("Lỗi khi nhập ngày giờ lên lịch: %s", dt_err)
+                if not await schedule_radio_btn.is_visible():
+                    raise FbBrowserAutomationError(
+                        "Không tìm thấy tùy chọn Lên lịch trên Meta",
+                        phase="CP7_SCHEDULE_SET",
+                        can_resume=True,
+                    )
+                await schedule_radio_btn.click()
+                await asyncio.sleep(1.5)
+                schedule_control_evidence = await _set_and_verify_schedule_controls(
+                    page,
+                    expected_schedule,
+                )
 
             # 10. Playlists: Add to all available playlists
             try:
@@ -667,6 +959,13 @@ async def schedule_reel_via_gpm(
             action_btn_name = "Chia sẻ" if publish_now else "Lên lịch"
             notify("CP8_SUBMITTED", f"Đang bấm nút '{action_btn_name}' hoàn tất...", 90)
 
+            if cancel_check and cancel_check():
+                raise FbBrowserAutomationError(
+                    "Tác vụ đã được yêu cầu dừng trước khi gửi lên Meta",
+                    phase="CP7_SCHEDULE_SET",
+                    can_resume=True,
+                )
+
             await page.keyboard.press("Escape")
             await page.evaluate("() => document.activeElement && document.activeElement.blur()")
             await asyncio.sleep(1.0)
@@ -679,13 +978,22 @@ async def schedule_reel_via_gpm(
             ).last
 
             # Wait for final button to be enabled (up to 30s)
+            final_button_ready = False
             for w_i in range(30):
                 if await final_btn.is_visible():
                     aria_dis = await final_btn.get_attribute("aria-disabled")
                     tab_idx = await final_btn.get_attribute("tabindex")
                     if aria_dis != "true" and tab_idx != "-1":
+                        final_button_ready = True
                         break
                 await asyncio.sleep(1.0)
+
+            if not final_button_ready:
+                raise FbBrowserAutomationError(
+                    f"Nút '{action_btn_name}' không sẵn sàng để gửi",
+                    phase="CP7_SCHEDULE_SET",
+                    can_resume=True,
+                )
 
             try:
                 await final_btn.click(force=True, timeout=10000)
@@ -696,6 +1004,7 @@ async def schedule_reel_via_gpm(
             await asyncio.sleep(3.0)
 
             # 14. Handle post-submission popups / modals (e.g. "Đang xử lý thước phim của bạn...")
+            submission_confirmed = False
             for _ in range(15):
                 await asyncio.sleep(1.0)
                 # Check for dismiss buttons: "Bỏ qua", "Dismiss", close icon
@@ -706,19 +1015,70 @@ async def schedule_reel_via_gpm(
                 ).first
                 if await dismiss_btn.is_visible():
                     notify("CP8_SUBMITTED", "Đã đóng thông báo xác nhận của Meta...", 95)
+                    submission_confirmed = True
                     await dismiss_btn.click()
                     await asyncio.sleep(1.5)
                     break
 
                 if "content_calendar" in page.url or "latest/home" in page.url:
+                    submission_confirmed = True
                     break
 
-            notify("CP8_SUBMITTED", f"Thành công! Reels đã được lên lịch lúc {full_schedule_label}.", 100)
+            if not submission_confirmed:
+                raise FbBrowserAutomationError(
+                    "Meta chưa trả về xác nhận sau khi gửi; không ghi nhận là đã lên lịch để tránh sai lệch",
+                    phase="CP8_SUBMITTED",
+                    can_resume=False,
+                )
+
+            calendar_evidence: dict[str, Any] = {}
+            if not publish_now:
+                notify("CP8_SUBMITTED", "Đang đối chiếu lại lịch thực tế trên Meta Calendar...", 97)
+                calendar_evidence = await _verify_calendar_schedule(
+                    page,
+                    content_title=content_title,
+                    expected=expected_schedule,
+                    target_page_id=target_page_id,
+                )
+                if not calendar_evidence.get("verified"):
+                    raise FbBrowserAutomationError(
+                        "Đã gửi video nhưng không đọc lại được đúng lịch trên Meta Calendar",
+                        phase="CP8_SUBMITTED",
+                        can_resume=False,
+                    )
+
+            actual_scheduled_timestamp = int(
+                calendar_evidence.get("actual_scheduled_timestamp") or 0
+            )
+            schedule_matches = bool(
+                publish_now
+                or (
+                    actual_scheduled_timestamp
+                    and abs(actual_scheduled_timestamp - int(expected_schedule.timestamp())) <= 60
+                )
+            )
+            if schedule_matches:
+                notify("CP8_SUBMITTED", f"Thành công! Reels đã được lên lịch lúc {full_schedule_label}.", 100)
+            else:
+                notify("CP8_SUBMITTED", "Meta đã nhận video nhưng lịch thực tế khác lịch yêu cầu.", 100)
             preserve_page = False
+            result_status = (
+                "published"
+                if publish_now
+                else "meta_scheduled" if schedule_matches else "schedule_mismatch"
+            )
 
             return {
                 "success": True,
-                "status": "published" if publish_now else "meta_scheduled",
+                "status": result_status,
+                "schedule_verified": bool(publish_now or calendar_evidence.get("verified")),
+                "submission_confirmed": submission_confirmed,
+                "actual_scheduled_timestamp": 0 if publish_now else actual_scheduled_timestamp,
+                "verification_evidence": {
+                    "source": "meta_calendar" if calendar_evidence else "meta_confirmation",
+                    "controls": schedule_control_evidence,
+                    "calendar": calendar_evidence,
+                },
                 "scheduled_time": full_schedule_label,
                 "scheduled_time_iso": f"{date_iso}T{time_24h}:00",
                 "target_page_id": target_page_id,

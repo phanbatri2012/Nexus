@@ -25,7 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from PIL import Image, ImageFilter, ImageOps, UnidentifiedImageError
 from yt_dlp import YoutubeDL
@@ -1891,6 +1891,62 @@ def classify_facebook_publication(
     raise RuntimeError(message)
 
 
+def classify_browser_publication(
+    browser_result: dict[str, Any],
+    requested_schedule: int | None,
+    *,
+    publish_now: bool,
+) -> tuple[str, dict[str, Any]]:
+    """Persist browser submissions only when Meta and the composer both confirmed them."""
+    evidence = browser_result.get("verification_evidence")
+    if not isinstance(evidence, dict):
+        evidence = {}
+    fields: dict[str, Any] = {
+        "meta_published": 0,
+        "meta_video_status": "submitted",
+        "meta_scheduled_publish_time": 0,
+        "meta_status_json": json.dumps(
+            {
+                "browser_status": browser_result.get("status", ""),
+                "schedule_verified": bool(browser_result.get("schedule_verified")),
+                "submission_confirmed": bool(browser_result.get("submission_confirmed")),
+                "evidence": evidence,
+            },
+            ensure_ascii=False,
+        ),
+        "meta_verified_at": "",
+        "meta_error_message": "",
+    }
+
+    if publish_now:
+        if browser_result.get("submission_confirmed"):
+            fields.update({
+                "meta_published": 1,
+                "meta_video_status": "ready",
+                "meta_verified_at": db.utc_now(),
+            })
+            return "published", fields
+        fields["meta_error_message"] = "Meta chưa xác nhận đã nhận yêu cầu đăng ngay"
+        return "verifying", fields
+
+    actual_schedule = int(browser_result.get("actual_scheduled_timestamp") or 0)
+    if not browser_result.get("schedule_verified") or not browser_result.get("submission_confirmed") or not actual_schedule:
+        fields["meta_error_message"] = "Meta chưa xác nhận lịch đăng thực tế"
+        return "verifying", fields
+
+    fields.update({
+        "meta_video_status": "ready",
+        "meta_scheduled_publish_time": actual_schedule,
+        "meta_verified_at": db.utc_now(),
+    })
+    if requested_schedule and abs(actual_schedule - int(requested_schedule)) > 60:
+        fields["meta_error_message"] = (
+            f"Meta lưu sai lịch đăng: yêu cầu {requested_schedule}, nhận {actual_schedule}"
+        )
+        return "schedule_mismatch", fields
+    return "meta_scheduled", fields
+
+
 def verify_facebook_publication(
     video_id: str,
     access_token: str,
@@ -2836,6 +2892,7 @@ def process_queue_item_jit(
     sys_job_id: str | None = None,
     force: bool = False,
     publish_now: bool = False,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Execute Just-in-Time download, metadata prep, Facebook upload, and cleanup for one queue item."""
     item = db.get_fb_crossposter_queue_item(item_id)
@@ -3072,11 +3129,39 @@ def process_queue_item_jit(
                     )
                 except Exception:
                     pass
-            upload_video_file = convert_video_to_vertical(
-                video_file,
-                vertical_video_file,
-            )
-            convert_thumbnail_to_vertical(thumb_file)
+            try:
+                upload_video_file = convert_video_to_vertical(
+                    video_file,
+                    vertical_video_file,
+                )
+                convert_thumbnail_to_vertical(thumb_file)
+            except Exception as cvt_err:
+                safe_error = security_logging.redact_sensitive(cvt_err)
+                logger.error("Chuyển đổi video/thumbnail 9:16 thất bại cho video #%d: %s", item_id, safe_error)
+                db.update_fb_crossposter_queue_item(item_id, {
+                    "status": "error",
+                    "can_resume": 0,
+                    "error_message": safe_error,
+                    "meta_error_message": safe_error,
+                })
+                if sys_job_id:
+                    try:
+                        db.update_system_job(
+                            sys_job_id,
+                            status="failed",
+                            progress=f"Lỗi chuyển video 9:16: {safe_error[:100]}",
+                            error=safe_error,
+                            finished_at=db.utc_now(),
+                        )
+                    except Exception:
+                        pass
+                for f in (video_file, vertical_video_file, thumb_file):
+                    if f.exists():
+                        try:
+                            f.unlink()
+                        except Exception:
+                            pass
+                raise RuntimeError(safe_error) from cvt_err
 
         db.update_fb_checkpoint(
             item_id,
@@ -3164,9 +3249,11 @@ def process_queue_item_jit(
                                 tags=tags,
                                 schedule_datetime=scheduled_time,
                                 publish_now=publish_now,
+                                content_title=title,
                                 page_name=page_name,
                                 target_page_id=page_id,
                                 state_callback=persist_browser_state,
+                                cancel_check=cancel_check,
                             )
                         ).result()
                 else:
@@ -3180,43 +3267,58 @@ def process_queue_item_jit(
                             tags=tags,
                             schedule_datetime=scheduled_time,
                             publish_now=publish_now,
+                            content_title=title,
                             page_name=page_name,
                             target_page_id=page_id,
                             state_callback=persist_browser_state,
+                            cancel_check=cancel_check,
                         )
                     )
 
-                final_status = "published" if publish_now else "meta_scheduled"
+                final_status, verification_fields = classify_browser_publication(
+                    browser_res,
+                    scheduled_time,
+                    publish_now=publish_now,
+                )
                 db.update_fb_crossposter_queue_item(item_id, {
                     "status": final_status,
                     "meta_state": final_status,
-                    "meta_video_status": "ready",
-                    "meta_published": 1 if publish_now else 0,
-                    "meta_scheduled_publish_time": scheduled_time if not publish_now else 0,
-                    "meta_verified_at": db.utc_now(),
                     "checkpoint_phase": "CP8_SUBMITTED",
                     "can_resume": 0,
-                    "error_message": "",
-                    "meta_error_message": "",
+                    "error_message": verification_fields.get("meta_error_message", ""),
+                    **verification_fields,
                 })
 
                 if sys_job_id:
                     try:
                         db.update_system_job(
                             sys_job_id,
-                            status="completed",
-                            progress=f"Đã lên lịch Reels thành công trên Facebook Meta Business Suite ({browser_res.get('scheduled_time', '')})",
-                            finished_at=db.utc_now(),
+                            status="completed" if final_status in {"meta_scheduled", "published"} else "paused",
+                            progress=(
+                                f"Meta đã xác nhận lịch Reels ({browser_res.get('scheduled_time', '')})"
+                                if final_status in {"meta_scheduled", "published"}
+                                else "Đã gửi video nhưng Meta chưa xác nhận lịch thực tế; cần đối chiếu"
+                            ),
+                            result_json=(
+                                {}
+                                if final_status in {"meta_scheduled", "published"}
+                                else {
+                                    "attention_required": FB_BROWSER_REVIEW_ATTENTION,
+                                    "item_id": item_id,
+                                    "status": final_status,
+                                }
+                            ),
+                            finished_at=db.utc_now() if final_status in {"meta_scheduled", "published"} else "",
                         )
                     except Exception:
                         pass
 
                 return {
-                    "success": True,
+                    "success": final_status in {"meta_scheduled", "published"},
                     "item_id": item_id,
                     "title": v_title,
                     "status": final_status,
-                    "scheduled_publish_time": scheduled_time,
+                    "scheduled_publish_time": verification_fields.get("meta_scheduled_publish_time", 0),
                     "upload_mode": "browser",
                     "message": browser_res.get("message", "Thành công"),
                 }
@@ -3598,7 +3700,23 @@ def _run_schedule_ahead_worker(
             try:
                 with _schedule_ahead_lock:
                     _schedule_ahead_tasks[task_id]["phase"] = "uploading"
-                result = process_queue_item_jit(item["id"], parent_task_id=task_id)
+                def is_cancel_requested() -> bool:
+                    system_job = db.get_system_job(sys_job_id) if hasattr(db, "get_system_job") else None
+                    with _schedule_ahead_lock:
+                        task_cancelled = bool(
+                            _schedule_ahead_tasks.get(task_id, {}).get("cancel_requested")
+                        )
+                    return bool(
+                        task_cancelled
+                        or (system_job and system_job.get("cancel_requested") == 1)
+                        or (system_job and system_job.get("status") == "canceled")
+                    )
+
+                result = process_queue_item_jit(
+                    item["id"],
+                    parent_task_id=task_id,
+                    cancel_check=is_cancel_requested,
+                )
                 if result.get("status") not in {"meta_scheduled", "published"}:
                     raise RuntimeError(
                         f"Meta chưa xác nhận lịch đăng (trạng thái: {result.get('status') or 'unknown'})"
