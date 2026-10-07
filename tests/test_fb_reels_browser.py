@@ -3,17 +3,26 @@
 import datetime
 from pathlib import Path
 import unittest
+from unittest.mock import AsyncMock, patch
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from auto_yt.services.fb_reels_browser_service import (
+    THUMBNAIL_DEFAULT_PATTERN,
+    THUMBNAIL_SECTION_PATTERN,
+    THUMBNAIL_UPLOAD_PATTERN,
     _calendar_week_position,
+    _find_thumbnail_upload_trigger,
     _parse_meta_date_value,
     _schedule_values_match,
+    _set_scoped_thumbnail_input,
+    _thumbnail_upload_verified,
+    _upload_optional_thumbnail,
     _format_schedule_time,
     FbBrowserAutomationError,
 )
+import auto_yt.services.fb_reels_browser_service as fb_browser
 from auto_yt.services.fb_crossposter_service import (
     reset_fb_crossposter_checkpoint,
     TEMP_DOWNLOAD_DIR,
@@ -249,19 +258,172 @@ class TestFbReelsBrowser(unittest.TestCase):
         asyncio.run(_test())
 
     def test_thumbnail_tab_regex_patterns(self):
-        import re
-        pattern = re.compile(
-            r"^(Tải hình ảnh lên|Tải ảnh lên|Tải lên hình ảnh|Upload image|Add image|Thêm hình ảnh)$",
-            re.IGNORECASE,
+        self.assertTrue(THUMBNAIL_SECTION_PATTERN.match("Hình thu nhỏ"))
+        self.assertTrue(THUMBNAIL_SECTION_PATTERN.match("Thumbnail"))
+        self.assertTrue(THUMBNAIL_UPLOAD_PATTERN.match("Tải hình ảnh lên"))
+        self.assertTrue(THUMBNAIL_UPLOAD_PATTERN.match("Upload image"))
+        self.assertTrue(THUMBNAIL_DEFAULT_PATTERN.match("Chọn hình thu nhỏ gợi ý"))
+        self.assertTrue(THUMBNAIL_DEFAULT_PATTERN.match("Choose suggested thumbnail"))
+        self.assertFalse(THUMBNAIL_UPLOAD_PATTERN.match("Tải video lên"))
+        self.assertFalse(THUMBNAIL_UPLOAD_PATTERN.match("Chọn khung hình từ video"))
+
+    def test_thumbnail_upload_verification_accepts_new_preview_or_file_name(self):
+        before = {
+            "images": ["https://example.test/default.jpg"],
+            "backgrounds": [],
+            "fileNames": [],
+            "visibleCanvases": 0,
+        }
+        self.assertTrue(
+            _thumbnail_upload_verified(
+                before,
+                {**before, "fileNames": ["custom.jpg"]},
+                "custom.jpg",
+                crop_confirmed=False,
+            )
         )
-        self.assertTrue(pattern.match("Tải hình ảnh lên"))
-        self.assertTrue(pattern.match("Tải ảnh lên"))
-        self.assertTrue(pattern.match("Upload image"))
-        self.assertTrue(pattern.match("add image"))
-        self.assertFalse(pattern.match("Tải video lên"))
-        self.assertFalse(pattern.match("Chọn khung hình từ video"))
+        self.assertTrue(
+            _thumbnail_upload_verified(
+                before,
+                {**before, "images": [*before["images"], "blob:custom-preview"]},
+                "custom.jpg",
+                crop_confirmed=False,
+            )
+        )
+        self.assertFalse(
+            _thumbnail_upload_verified(
+                before,
+                dict(before),
+                "custom.jpg",
+                crop_confirmed=False,
+            )
+        )
+
+    def test_thumbnail_trigger_skips_duplicate_tab_and_uses_cta(self):
+        class Candidate:
+            def __init__(self, text, role="", inside_selector=False):
+                self.text = text
+                self.role = role
+                self.inside_selector = inside_selector
+
+            async def is_visible(self):
+                return True
+
+            async def inner_text(self):
+                return self.text
+
+            async def get_attribute(self, name):
+                if name == "role":
+                    return self.role
+                if name == "aria-selected":
+                    return "true" if self.role == "tab" else None
+                return None
+
+            async def evaluate(self, _expression):
+                return self.inside_selector
+
+        class Collection:
+            def __init__(self, candidates):
+                self.candidates = candidates
+
+            def filter(self, **_kwargs):
+                return self
+
+            async def count(self):
+                return len(self.candidates)
+
+            def nth(self, index):
+                return self.candidates[index]
+
+        class Section:
+            def __init__(self, candidates):
+                self.candidates = candidates
+
+            def locator(self, _selector):
+                return Collection(self.candidates)
+
+        tab = Candidate("Tải hình ảnh lên", role="tab", inside_selector=True)
+        cta = Candidate("Tải hình ảnh lên")
+
+        async def _test():
+            selected = await _find_thumbnail_upload_trigger(Section([tab, cta]))
+            self.assertIs(selected, cta)
+
+        import asyncio
+        asyncio.run(_test())
+
+    def test_scoped_thumbnail_input_ignores_video_and_accepts_generic(self):
+        class FileInput:
+            def __init__(self, accept):
+                self.accept = accept
+                self.files = []
+
+            async def get_attribute(self, name):
+                return self.accept if name == "accept" else None
+
+            async def set_input_files(self, path):
+                self.files.append(path)
+
+        class Collection:
+            def __init__(self, inputs):
+                self.inputs = inputs
+
+            async def count(self):
+                return len(self.inputs)
+
+            def nth(self, index):
+                return self.inputs[index]
+
+        class Section:
+            def __init__(self, inputs):
+                self.inputs = inputs
+
+            def locator(self, _selector):
+                return Collection(self.inputs)
+
+        video_input = FileInput("video/mp4")
+        generic_thumbnail_input = FileInput("")
+
+        async def _test():
+            selected = await _set_scoped_thumbnail_input(
+                Section([video_input, generic_thumbnail_input]),
+                Path("custom.jpg"),
+            )
+            self.assertTrue(selected)
+            self.assertEqual(video_input.files, [])
+            self.assertEqual(len(generic_thumbnail_input.files), 1)
+
+        import asyncio
+        asyncio.run(_test())
+
+    def test_optional_thumbnail_failure_restores_default_without_raising(self):
+        section = object()
+        upload_tab = AsyncMock()
+        upload_tab.click = AsyncMock()
+        primary_error = RuntimeError("image input not found")
+
+        async def _test():
+            with (
+                patch.object(fb_browser, "_find_thumbnail_section", AsyncMock(return_value=section)),
+                patch.object(fb_browser, "_thumbnail_preview_signature", AsyncMock(return_value={})),
+                patch.object(fb_browser, "_visible_exact_text_candidates", AsyncMock(return_value=[upload_tab])),
+                patch.object(fb_browser, "_find_thumbnail_upload_trigger", AsyncMock(return_value=None)),
+                patch.object(
+                    fb_browser,
+                    "_set_scoped_thumbnail_input",
+                    AsyncMock(side_effect=primary_error),
+                ),
+                patch.object(fb_browser, "_restore_default_thumbnail", AsyncMock(return_value=True)),
+                patch.object(fb_browser.asyncio, "sleep", AsyncMock()),
+            ):
+                result = await _upload_optional_thumbnail(None, Path("custom.jpg"))
+            self.assertEqual(result["status"], "fallback_default")
+            self.assertTrue(result["fallback_restored"])
+            self.assertIn("image input not found", result["warning"])
+
+        import asyncio
+        asyncio.run(_test())
 
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -30,6 +30,16 @@ CALENDAR_URL = "https://business.facebook.com/latest/content_calendar"
 
 SCREENSHOTS_DIR = Path("data/logs/crossposter")
 
+THUMBNAIL_SECTION_PATTERN = re.compile(r"^(Hình thu nhỏ|Ảnh bìa|Thumbnail|Cover)$", re.IGNORECASE)
+THUMBNAIL_UPLOAD_PATTERN = re.compile(
+    r"^(Tải hình ảnh lên|Tải ảnh lên|Tải lên hình ảnh|Upload image|Add image|Thêm hình ảnh)$",
+    re.IGNORECASE,
+)
+THUMBNAIL_DEFAULT_PATTERN = re.compile(
+    r"^(Chọn hình thu nhỏ gợi ý|Hình thu nhỏ gợi ý|Chọn khung|Suggested thumbnails?|Choose suggested thumbnail|Choose frame)$",
+    re.IGNORECASE,
+)
+
 
 async def upload_file_via_cdp(
     page: Any,
@@ -428,6 +438,220 @@ async def _visible_locators(locator: Any) -> list[Any]:
         if await candidate.is_visible():
             visible.append(candidate)
     return visible
+
+
+def _normalize_ui_text(value: Any) -> str:
+    return " ".join(str(value or "").split())
+
+
+async def _find_thumbnail_section(page: Any) -> Any | None:
+    """Return the smallest visible composer card that owns thumbnail controls."""
+    headings = page.get_by_text(THUMBNAIL_SECTION_PATTERN, exact=True)
+    for heading_index in range(await headings.count()):
+        heading = headings.nth(heading_index)
+        if not await heading.is_visible():
+            continue
+        for depth in range(1, 8):
+            container = heading.locator(
+                f"xpath=ancestor::*[self::section or self::div][{depth}]"
+            )
+            if await container.count() == 0:
+                continue
+            text = _normalize_ui_text(await container.inner_text())
+            if len(text) > 4000:
+                break
+            upload_controls = container.get_by_text(THUMBNAIL_UPLOAD_PATTERN, exact=True)
+            default_controls = container.get_by_text(THUMBNAIL_DEFAULT_PATTERN, exact=True)
+            if await upload_controls.count() or await default_controls.count():
+                return container
+    return None
+
+
+async def _visible_exact_text_candidates(scope: Any, pattern: re.Pattern[str]) -> list[Any]:
+    candidates = scope.locator(
+        'button, [role="button"], [role="tab"], [role="radio"], a, label, span, div'
+    ).filter(has_text=pattern)
+    exact: list[Any] = []
+    for index in range(await candidates.count()):
+        candidate = candidates.nth(index)
+        if not await candidate.is_visible():
+            continue
+        if pattern.fullmatch(_normalize_ui_text(await candidate.inner_text())):
+            exact.append(candidate)
+    return exact
+
+
+async def _find_thumbnail_upload_trigger(section: Any) -> Any | None:
+    """Prefer the upload CTA over the identically named upload tab."""
+    candidates = await _visible_exact_text_candidates(section, THUMBNAIL_UPLOAD_PATTERN)
+    for candidate in reversed(candidates):
+        if await _is_thumbnail_selector(candidate):
+            continue
+        return candidate
+    return None
+
+
+async def _is_thumbnail_selector(candidate: Any) -> bool:
+    role = str(await candidate.get_attribute("role") or "").casefold()
+    aria_selected = str(await candidate.get_attribute("aria-selected") or "").casefold()
+    inside_selector = await candidate.evaluate(
+        "el => Boolean(el.closest('[role=tab], [role=radio]'))"
+    )
+    return role in {"tab", "radio"} or aria_selected in {"true", "false"} or inside_selector
+
+
+async def _thumbnail_preview_signature(section: Any) -> dict[str, Any]:
+    return await section.evaluate(
+        """root => {
+            const visible = element => {
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            };
+            const images = Array.from(root.querySelectorAll('img'))
+                .filter(visible)
+                .map(image => image.currentSrc || image.src || '')
+                .filter(Boolean);
+            const backgrounds = Array.from(root.querySelectorAll('*'))
+                .filter(visible)
+                .map(element => window.getComputedStyle(element).backgroundImage)
+                .filter(value => value && value !== 'none');
+            const fileNames = Array.from(root.querySelectorAll('input[type=file]'))
+                .flatMap(input => Array.from(input.files || []).map(file => file.name));
+            return {
+                images: [...new Set(images)],
+                backgrounds: [...new Set(backgrounds)],
+                fileNames,
+            };
+        }"""
+    )
+
+
+def _thumbnail_upload_verified(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    file_name: str,
+    *,
+    crop_confirmed: bool,
+) -> bool:
+    if crop_confirmed:
+        return True
+    if file_name in set(after.get("fileNames") or []):
+        return True
+    for key in ("images", "backgrounds"):
+        if set(after.get(key) or []) - set(before.get(key) or []):
+            return True
+    return False
+
+
+async def _set_scoped_thumbnail_input(section: Any, thumbnail_path: Path) -> bool:
+    """Set a generic file input only when it belongs to the thumbnail card."""
+    inputs = section.locator('input[type="file"]')
+    preferred: list[Any] = []
+    generic: list[Any] = []
+    for index in range(await inputs.count()):
+        candidate = inputs.nth(index)
+        accept = str(await candidate.get_attribute("accept") or "").casefold()
+        if "video" in accept:
+            continue
+        if "image" in accept:
+            preferred.append(candidate)
+        elif not accept:
+            generic.append(candidate)
+    for candidate in preferred + generic:
+        try:
+            await candidate.set_input_files(str(thumbnail_path.resolve()))
+            return True
+        except Exception:
+            continue
+    return False
+
+
+async def _restore_default_thumbnail(page: Any, section: Any | None) -> bool:
+    """Leave Meta in its automatic-frame mode after an optional thumbnail failure."""
+    try:
+        await page.keyboard.press("Escape")
+    except Exception:
+        pass
+    if section is None:
+        return False
+    candidates = await _visible_exact_text_candidates(section, THUMBNAIL_DEFAULT_PATTERN)
+    for candidate in candidates:
+        try:
+            await candidate.click(timeout=5000)
+            await asyncio.sleep(0.8)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+async def _upload_optional_thumbnail(page: Any, thumbnail_path: Path) -> dict[str, Any]:
+    """Best-effort custom thumbnail upload that never falls back to the video input."""
+    section = await _find_thumbnail_section(page)
+    if section is None:
+        return {
+            "status": "thumbnail_unavailable",
+            "warning": "Không tìm thấy khu vực hình thu nhỏ của Meta",
+            "fallback_restored": False,
+        }
+
+    before = await _thumbnail_preview_signature(section)
+    try:
+        upload_candidates = await _visible_exact_text_candidates(section, THUMBNAIL_UPLOAD_PATTERN)
+        for candidate in upload_candidates:
+            if await _is_thumbnail_selector(candidate):
+                await candidate.click(timeout=5000)
+                await asyncio.sleep(1.0)
+                break
+
+        trigger = await _find_thumbnail_upload_trigger(section)
+        try:
+            if trigger is None:
+                raise RuntimeError("Không tìm thấy nút mở trình chọn thumbnail")
+            async with page.expect_file_chooser(timeout=10000) as chooser_info:
+                await trigger.click()
+            chooser = await chooser_info.value
+            await chooser.set_files(str(thumbnail_path.resolve()))
+        except Exception as exc:
+            if not await _set_scoped_thumbnail_input(section, thumbnail_path):
+                raise exc
+
+        crop_confirmed = False
+        crop_save_btn = page.locator(
+            'div[role="dialog"] button:has-text("Lưu"), div[role="dialog"] div[role="button"]:has-text("Lưu"), '
+            'div[role="dialog"] button:has-text("Save"), div[role="dialog"] button:has-text("Áp dụng"), '
+            'div[role="dialog"] button:has-text("Xong"), div[role="dialog"] button:has-text("Done")'
+        ).first
+        try:
+            await crop_save_btn.wait_for(state="visible", timeout=5000)
+            await crop_save_btn.click()
+            crop_confirmed = True
+        except Exception:
+            pass
+
+        for _ in range(15):
+            await asyncio.sleep(1.0)
+            after = await _thumbnail_preview_signature(section)
+            if _thumbnail_upload_verified(
+                before,
+                after,
+                thumbnail_path.name,
+                crop_confirmed=crop_confirmed,
+            ):
+                return {
+                    "status": "custom_uploaded",
+                    "warning": "",
+                    "fallback_restored": False,
+                }
+        raise RuntimeError("Meta chưa hiển thị bằng chứng thumbnail tùy chỉnh đã được gắn")
+    except Exception as exc:
+        restored = await _restore_default_thumbnail(page, section)
+        return {
+            "status": "fallback_default" if restored else "thumbnail_unavailable",
+            "warning": str(exc),
+            "fallback_restored": restored,
+        }
 
 
 async def _set_and_verify_schedule_controls(
@@ -1061,65 +1285,32 @@ async def schedule_reel_via_gpm(
                 except Exception as cap_err:
                     logger.warning("Lỗi khi điền caption: %s", cap_err)
 
-            # 5. Upload Custom Thumbnail
+            # 5. Upload Custom Thumbnail (optional)
+            thumbnail_result: dict[str, Any] = {
+                "status": "not_requested",
+                "warning": "",
+                "fallback_restored": False,
+            }
             if t_path and t_path.is_file():
                 notify("CP6_METADATA_FILLED", f"Đang tải lên hình thu nhỏ {t_path.name}...", 60)
-                try:
-                    # Select tab / radio "Tải hình ảnh lên" / "Tải ảnh lên" / "Upload image"
-                    upload_tab_pattern = re.compile(
-                        r"^(Tải hình ảnh lên|Tải ảnh lên|Tải lên hình ảnh|Upload image|Add image|Thêm hình ảnh)$",
-                        re.IGNORECASE,
-                    )
-                    upload_img_tab = (
-                        page.locator('div[role="tab"], div[role="radio"], button, label, span')
-                        .filter(has_text=upload_tab_pattern)
-                        .first
-                    )
-                    if await upload_img_tab.is_visible():
-                        await upload_img_tab.click()
-                        await asyncio.sleep(1.2)
-
-                    upload_thumb_btn = (
-                        page.locator(
-                            'div:has-text("Hình thu nhỏ") ~ div div[role="button"]:has-text("Tải hình ảnh lên"), '
-                            'div:has-text("Hình thu nhỏ") ~ div div[role="button"]:has-text("Tải ảnh lên"), '
-                            'div:has-text("Hình thu nhỏ") ~ div div[role="button"]:has-text("Thêm ảnh"), '
-                            'div:has-text("Hình thu nhỏ") ~ div button:has-text("Tải hình ảnh lên"), '
-                            'div:has-text("Hình thu nhỏ") ~ div button:has-text("Tải ảnh lên"), '
-                            'div:has-text("Hình thu nhỏ") ~ div button:has-text("Thêm ảnh"), '
-                            'div:has-text("Ảnh bìa") ~ div div[role="button"], '
-                            'div[role="button"]:has-text("Tải hình ảnh lên"), button:has-text("Tải hình ảnh lên"), '
-                            'div[role="button"]:has-text("Tải ảnh lên"), button:has-text("Tải ảnh lên"), '
-                            'div[role="button"]:has-text("Thêm ảnh"), button:has-text("Thêm ảnh"), '
-                            'div[role="button"]:has-text("Upload image"), button:has-text("Upload image")'
-                        ).last
-                    )
-
-                    # Strictly use image input selector (NEVER fallback to generic input[type="file"] to avoid corrupting video)
-                    await upload_file_via_cdp(
-                        page,
-                        t_path,
-                        input_selector='input[type="file"][accept*="image"], input[accept*="image"]',
-                        trigger_button_locator=upload_thumb_btn,
-                        timeout_seconds=10.0,
-                    )
-                    await asyncio.sleep(1.5)
-
-                    # Handle crop / confirmation dialog if present
-                    crop_save_btn = page.locator(
-                        'div[role="dialog"] button:has-text("Lưu"), div[role="dialog"] div[role="button"]:has-text("Lưu"), '
-                        'div[role="dialog"] button:has-text("Save"), div[role="dialog"] button:has-text("Áp dụng"), '
-                        'div[role="dialog"] button:has-text("Xong"), div[role="dialog"] button:has-text("Done")'
-                    ).first
-                    if await crop_save_btn.is_visible():
-                        await crop_save_btn.click()
-                        await asyncio.sleep(1.0)
+                thumbnail_result = await _upload_optional_thumbnail(page, t_path)
+                if thumbnail_result["status"] == "custom_uploaded":
                     logger.info("Custom thumbnail đã tải lên thành công: %s", t_path.name)
-                except Exception as thumb_err:
+                else:
+                    screenshot_path = await _capture_error_screenshot(page)
                     logger.warning(
-                        "Không thể nạp custom thumbnail (%s), tiếp tục với khung hình video mặc định: %s",
+                        "Không thể xác minh custom thumbnail (%s); status=%s, fallback_restored=%s. "
+                        "Tiếp tục với khung hình video mặc định: %s",
                         t_path.name,
-                        thumb_err,
+                        thumbnail_result["status"],
+                        thumbnail_result["fallback_restored"],
+                        thumbnail_result["warning"],
+                    )
+                    notify(
+                        "CP6_METADATA_FILLED",
+                        "Thumbnail tùy chỉnh không khả dụng; tiếp tục với khung hình mặc định của Facebook.",
+                        62,
+                        screenshot=screenshot_path,
                     )
 
             # 6. Add Tags (Thẻ)
@@ -1512,12 +1703,20 @@ async def schedule_reel_via_gpm(
                     "source": "meta_calendar" if calendar_evidence else "meta_confirmation",
                     "controls": schedule_control_evidence,
                     "calendar": calendar_evidence,
+                    "thumbnail": thumbnail_result,
                 },
                 "scheduled_time": full_schedule_label,
                 "scheduled_time_iso": f"{date_iso}T{time_24h}:00",
                 "target_page_id": target_page_id,
                 "profile_id": clean_profile_id,
-                "message": f"Đã lên lịch Reels thành công trên Facebook Meta Business Suite lúc {full_schedule_label}",
+                "message": (
+                    f"Đã lên lịch Reels thành công trên Facebook Meta Business Suite lúc {full_schedule_label}"
+                    + (
+                        " (dùng khung hình mặc định của Facebook)"
+                        if thumbnail_result["status"] in {"fallback_default", "thumbnail_unavailable"}
+                        else ""
+                    )
+                ),
             }
 
         except Exception as exc:
