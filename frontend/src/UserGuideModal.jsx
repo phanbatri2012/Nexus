@@ -69,8 +69,8 @@ export default function UserGuideModal({ isOpen, onClose }) {
                 </div>
                 <div className="guide-step-card">
                   <div className="guide-step-badge">Bước 3</div>
-                  <h5>Kết nối Kênh & Proxy</h5>
-                  <p>Vào <b>Channel Hub</b>, thêm Kênh YouTube với <b>GPM Profile ID</b> và <b>Proxy riêng</b> nhằm bảo vệ tài khoản tuyệt đối.</p>
+                  <h5>Kết nối Kênh & OAuth</h5>
+                  <p>Vào <b>Channel Hub</b>, mở mục <i>Cấu hình Google OAuth</i> (có hướng dẫn 5 bước lấy Client ID/Secret) và gán <b>GPM Profile</b> để cô lập mạng.</p>
                 </div>
               </div>
             </div>

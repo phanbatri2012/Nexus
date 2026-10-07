@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import OAuthGuideBox from './OAuthGuideBox'
 
 const API_BASE = 'http://127.0.0.1:8080'
 const WEEKDAYS = ['Thứ Hai', 'Thứ Ba', 'Thứ Tư', 'Thứ Năm', 'Thứ Sáu', 'Thứ Bảy', 'Chủ Nhật']
@@ -578,6 +579,7 @@ export default function YouTubeChannelSettings({
       </div>
 
       {/* OAuth Client Section */}
+      <OAuthGuideBox />
       <div style={{ display: 'grid', gap: 10, marginTop: 14 }}>
         <label>
           OAuth Client dùng để kết nối kênh

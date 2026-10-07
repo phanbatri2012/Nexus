@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState, useMemo } from 'react'
 import './ChannelManager.css'
 import { useSubRoute } from './router.js'
 import './Settings.css'
+import OAuthGuideBox from './OAuthGuideBox'
 
 const API_BASE = 'http://127.0.0.1:8080'
 const WEEKDAYS = ['Thứ Hai', 'Thứ Ba', 'Thứ Tư', 'Thứ Năm', 'Thứ Sáu', 'Thứ Bảy', 'Chủ Nhật']
@@ -1346,6 +1347,7 @@ export default function ChannelManager({
 
             {showAdvancedOAuth && (
               <div className="collapsible-accordion-body">
+                <OAuthGuideBox />
                 <div style={{ display: 'grid', gap: 10 }}>
                   <label>
                     OAuth Client dùng để kết nối kênh
