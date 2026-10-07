@@ -8,14 +8,16 @@ All actions execute strictly inside an authenticated GPM-Login profile session v
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import random
 import re
+import unicodedata
 import urllib.parse
 from collections.abc import Callable
 from typing import Any
 
-from auto_yt.services import security_logging
+from auto_yt.services import database as db, security_logging, trust_builder_safety as safety
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +174,7 @@ async def action_search_and_pick_video(
             for (const node of videoNodes) {
                 const titleElem = node.querySelector('a#video-title, a#video-title-link, h3 a, #video-title, .ytd-video-renderer h3 a');
                 const thumbElem = node.querySelector('a#thumbnail[href*="/watch?v="], a[href*="/watch?v="]');
-                const channelNode = node.querySelector('ytd-channel-name a, #channel-info a, #byline a, #text.ytd-channel-name, .ytd-channel-name');
+                const channelNode = node.querySelector('ytd-channel-name a, #channel-info a, #byline a, #text.ytd-channel-name, .ytd-channel-name, a[href*="/@"], a[href*="/channel/"]');
                 
                 let rawUrl = (titleElem && titleElem.href) || (thumbElem && thumbElem.href) || '';
                 if (rawUrl && rawUrl.includes('/watch?v=')) {
@@ -191,11 +193,13 @@ async def action_search_and_pick_video(
                             }
                         }
                         const channelText = channelNode ? (channelNode.innerText || channelNode.getAttribute('title') || '').trim() : '';
+                        const channelHref = (channelNode && channelNode.href) ? channelNode.href : '';
                         if (titleText && !/^\\d{1,2}:\\d{2}(:\\d{2})?$/.test(titleText)) {
                             results.push({
                                 url: rawUrl,
                                 title: titleText,
-                                channel: channelText
+                                channel: channelText,
+                                channel_href: channelHref
                             });
                         }
                     }
@@ -211,7 +215,8 @@ async def action_search_and_pick_video(
                             results.push({
                                 url: link.href,
                                 title: title,
-                                channel: ''
+                                channel: '',
+                                channel_href: ''
                             });
                         }
                     }
@@ -237,7 +242,7 @@ async def action_search_and_pick_video(
                         seen.add(a.href);
                         const title = (a.getAttribute('title') || a.innerText || a.getAttribute('aria-label') || '').trim();
                         if (title && title.length > 5 && !/^\\d{1,2}:\\d{2}(:\\d{2})?$/.test(title)) {
-                            list.push({ url: a.href, title, channel: '' });
+                            list.push({ url: a.href, title, channel: '', channel_href: '' });
                         }
                     }
                 }
@@ -247,6 +252,23 @@ async def action_search_and_pick_video(
 
     if not candidates:
         raise RuntimeError(f"Không tìm thấy video kết quả nào cho từ khóa '{keyword}'.")
+
+    # Safety Shield Gatekeeper: Filter out subversive/hostile content
+    safe_candidates = []
+    for cand in candidates:
+        is_safe, blocked_reason = safety.is_safe_for_interaction(
+            title=cand.get("title", ""),
+            channel_name=cand.get("channel", ""),
+            channel_url=cand.get("channel_href", ""),
+            channel_handle=cand.get("channel", ""),
+        )
+        if is_safe:
+            safe_candidates.append(cand)
+        else:
+            logger.warning("SAFETY SHIELD: Bỏ qua video '%s' (%s) do vi phạm: %s", cand.get("title"), cand.get("channel"), blocked_reason)
+    candidates = safe_candidates
+    if not candidates:
+        raise RuntimeError(f"Tất cả video cho từ khóa '{keyword}' đã bị chặn bởi lá chắn an toàn quốc gia.")
 
     excluded_ids = excluded_video_ids or set()
     if excluded_ids:
@@ -261,15 +283,149 @@ async def action_search_and_pick_video(
         if not candidates:
             raise RuntimeError("Không còn video mới phù hợp sau khi loại các video đã xem.")
 
-    # 7. Select video: an explicit target must match; never engage a fallback channel.
+    def _normalize_channel_key(text: str) -> str:
+        unquoted = urllib.parse.unquote(str(text or ""))
+        return re.sub(r"[\s\W_]+", "", unquoted).casefold()
+
+    def _strip_diacritics(text: str) -> str:
+        nfd = unicodedata.normalize("NFD", text)
+        stripped = "".join(c for c in nfd if unicodedata.category(c) != "Mn")
+        return stripped.replace("đ", "d").replace("Đ", "d")
+
+    def _matches_target_channel(cand: dict[str, str], target: str) -> bool:
+        if not target:
+            return False
+        norm_target = _normalize_channel_key(target)
+        if not norm_target:
+            return False
+        unaccent_target = _strip_diacritics(norm_target)
+
+        c_name = str(cand.get("channel") or "")
+        c_href = str(cand.get("channel_href") or "")
+
+        norm_name = _normalize_channel_key(c_name)
+        unaccent_name = _strip_diacritics(norm_name)
+
+        norm_href = _normalize_channel_key(c_href)
+        unaccent_href = _strip_diacritics(norm_href)
+
+        # 1. Exact normalized match on name or href
+        if norm_target == norm_name or norm_target in norm_href:
+            return True
+        # 2. Substring matching on normalized strings
+        if (len(norm_target) >= 3 and norm_target in norm_name) or (len(norm_name) >= 3 and norm_name in norm_target):
+            return True
+        # 3. Unaccented matching (for Vietnamese and multilingual handles)
+        if unaccent_target == unaccent_name or unaccent_target in unaccent_href:
+            return True
+        if (len(unaccent_target) >= 3 and unaccent_target in unaccent_name) or (len(unaccent_name) >= 3 and unaccent_name in unaccent_target):
+            return True
+        return False
+
+    # 7. Select video: if target_channel is set, find match or perform targeted search
     selected_video: dict[str, str] | None = None
     if target_channel:
-        clean_target = target_channel.casefold().lstrip("@").strip()
         for cand in candidates:
-            candidate_channel = str(cand.get("channel") or "").casefold().lstrip("@").strip()
-            if candidate_channel == clean_target:
+            if _matches_target_channel(cand, target_channel):
                 selected_video = cand
                 break
+
+        page_closed = False
+        try:
+            closed_fn = getattr(page, "is_closed", None)
+            if callable(closed_fn):
+                res = closed_fn()
+                if inspect.isawaitable(res):
+                    page_closed = bool(await res)
+                else:
+                    page_closed = bool(res)
+        except Exception:
+            page_closed = False
+
+        if not selected_video and not page_closed:
+            # Secondary targeted search directly for target channel
+            logger.info("Chưa thấy video của kênh mục tiêu '%s' trong kết quả từ khóa chung, thực hiện tìm kiếm trực tiếp kênh...", target_channel)
+            encoded_target = urllib.parse.quote_plus(target_channel)
+            try:
+                await page.goto(f"https://www.youtube.com/results?search_query={encoded_target}", wait_until="domcontentloaded", timeout=int(timeout_seconds * 1000))
+                await asyncio.sleep(random.uniform(2.0, 3.5))
+                await natural_scroll(page, min_scrolls=2, max_scrolls=3)
+                targeted_candidates = await page.evaluate(
+                    """() => {
+                        const list = [];
+                        const seen = new Set();
+                        const videoNodes = document.querySelectorAll(
+                            'ytd-video-renderer, ytd-rich-item-renderer, ytd-item-section-renderer, ytd-grid-video-renderer, #contents ytd-video-renderer'
+                        );
+                        for (const node of videoNodes) {
+                            const titleElem = node.querySelector('a#video-title, a#video-title-link, h3 a, #video-title, .ytd-video-renderer h3 a');
+                            const thumbElem = node.querySelector('a#thumbnail[href*="/watch?v="], a[href*="/watch?v="]');
+                            const channelNode = node.querySelector('ytd-channel-name a, #channel-info a, #byline a, #text.ytd-channel-name, .ytd-channel-name, a[href*="/@"], a[href*="/channel/"]');
+                            let rawUrl = (titleElem && titleElem.href) || (thumbElem && thumbElem.href) || '';
+                            if (rawUrl && rawUrl.includes('/watch?v=')) {
+                                if (!seen.has(rawUrl)) {
+                                    seen.add(rawUrl);
+                                    let titleText = '';
+                                    if (titleElem) {
+                                        titleText = (titleElem.getAttribute('title') || titleElem.innerText || titleElem.getAttribute('aria-label') || '').trim();
+                                    }
+                                    if (!titleText || /^\\d{1,2}:\\d{2}(:\\d{2})?$/.test(titleText)) {
+                                        if (thumbElem) {
+                                            const thumbAria = thumbElem.getAttribute('aria-label') || '';
+                                            if (thumbAria) {
+                                                titleText = thumbAria.replace(/\\s+bởi\\s+.*$/i, '').replace(/\\s+by\\s+.*$/i, '').replace(/\\s+\\d+(\\.\\d+)?\\s*(triệu|nghìn|lượt xem|views|view).*$/i, '').trim();
+                                            }
+                                        }
+                                    }
+                                    const channelText = channelNode ? (channelNode.innerText || channelNode.getAttribute('title') || '').trim() : '';
+                                    const channelHref = (channelNode && channelNode.href) ? channelNode.href : '';
+                                    if (titleText && !/^\\d{1,2}:\\d{2}(:\\d{2})?$/.test(titleText)) {
+                                        list.push({
+                                            url: rawUrl,
+                                            title: titleText,
+                                            channel: channelText,
+                                            channel_href: channelHref
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        return list;
+                    }"""
+                )
+                if targeted_candidates:
+                    # Safety Shield filter on targeted candidates
+                    safe_targeted = []
+                    for c in targeted_candidates:
+                        is_safe, blocked_reason = safety.is_safe_for_interaction(
+                            title=c.get("title", ""),
+                            channel_name=c.get("channel", ""),
+                            channel_url=c.get("channel_href", ""),
+                            channel_handle=c.get("channel", ""),
+                        )
+                        if is_safe:
+                            safe_targeted.append(c)
+                        else:
+                            logger.warning("SAFETY SHIELD: Bỏ qua video kênh mục tiêu '%s' do vi phạm: %s", c.get("title"), blocked_reason)
+                    targeted_candidates = safe_targeted
+
+                    if excluded_ids:
+                        targeted_candidates = [
+                            c for c in targeted_candidates
+                            if not (
+                                (match := re.search(r"[?&]v=([a-zA-Z0-9_-]+)", c["url"]))
+                                and match.group(1) in excluded_ids
+                            )
+                        ]
+                    for cand in targeted_candidates:
+                        if _matches_target_channel(cand, target_channel):
+                            selected_video = cand
+                            break
+                    if not selected_video and targeted_candidates:
+                        selected_video = targeted_candidates[0]
+            except Exception as search_err:
+                logger.debug("Lỗi khi tìm kiếm trực tiếp kênh mục tiêu: %s", search_err)
+
         if not selected_video:
             raise RuntimeError(
                 f"Không tìm thấy video thuộc đúng kênh mục tiêu '{target_channel}'."
@@ -279,7 +435,17 @@ async def action_search_and_pick_video(
         pool = candidates[:min(8, len(candidates))]
         selected_video = random.choice(pool)
 
-    logger.info("Đã chọn video đối thủ: '%s' (%s) từ kênh '%s'", selected_video["title"], selected_video["url"], selected_video["channel"])
+    # Final Gatekeeper verification on selected video
+    is_safe_final, final_reason = safety.is_safe_for_interaction(
+        title=selected_video.get("title", ""),
+        channel_name=selected_video.get("channel", ""),
+        channel_url=selected_video.get("channel_href", ""),
+        channel_handle=selected_video.get("channel", ""),
+    )
+    if not is_safe_final:
+        raise RuntimeError(f"Video được chọn vi phạm lá chắn an toàn quốc gia ({final_reason}).")
+
+    logger.info("Đã chọn video đối thủ an toàn: '%s' (%s) từ kênh '%s'", selected_video["title"], selected_video["url"], selected_video["channel"])
     return selected_video
 
 

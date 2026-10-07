@@ -197,5 +197,6 @@ test('wires Trust Builder into navigation and view rendering', async () => {
   assert.match(appSource, /activeView === ['"]trustbuilder['"][\s\S]*<TrustBuilder/)
   assert.match(trustSource, /import\s*\{\s*useSubRoute\s*\}\s*from\s*['"]\.\/router\.js['"]/)
   assert.match(trustSource, /useSubRoute\(['"]trustbuilder['"],\s*['"]['"]\)/)
+  assert.match(trustSource, /import\s*\{\s*extractErrorMessage\s*\}\s*from\s*['"]\.\/apiError['"]/)
   assert.match(trustSource, /Trust Builder/)
 })

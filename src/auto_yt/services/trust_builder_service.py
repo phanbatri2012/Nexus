@@ -13,7 +13,7 @@ import random
 import re
 from typing import Any
 
-from auto_yt.services import database as db, security_logging
+from auto_yt.services import database as db, security_logging, trust_builder_safety as safety
 from auto_yt.services.channel_scanner_service import (
     channel_browser_session,
     cleanup_owned_page,
@@ -251,8 +251,8 @@ async def run_warmup_session(
 
         timezone_name = str(plan.get("publication_timezone") or "Asia/Ho_Chi_Minh")
         daily_stats = db.get_trust_daily_activity_stats(plan_id, timezone_name)
-        daily_search_target = int(plan.get("daily_search_target"))
-        daily_watch_target = int(plan.get("daily_watch_target"))
+        daily_search_target = int(plan.get("daily_search_target") or 0)
+        daily_watch_target = int(plan.get("daily_watch_target") or 0)
         if (
             daily_stats.get("search_count", 0) >= daily_search_target
             or daily_stats.get("watch_count", 0) >= daily_watch_target
@@ -270,7 +270,10 @@ async def run_warmup_session(
             keywords = ["công nghệ", "tin tức xu hướng", "kiến thức thú vị"]
 
         selected_keyword = random.choice(keywords)
-        selected_target_channel = random.choice(target_channels) if target_channels else ""
+        if target_channels and (not keywords or random.random() < 0.60):
+            selected_target_channel = random.choice(target_channels)
+        else:
+            selected_target_channel = ""
         warmup_phase = str(plan.get("warmup_phase") or "phase_1_consumer")
         excluded_video_ids, used_comments = _recent_session_context(plan_id)
 
@@ -323,7 +326,7 @@ async def run_warmup_session(
 
                     if should_cancel():
                         raise asyncio.CancelledError
-                    min_watch_minutes = int(plan.get("min_watch_minutes"))
+                    min_watch_minutes = int(plan.get("min_watch_minutes") or 10)
                     min_watch_sec = float(min_watch_minutes * 60)
                     max_watch_sec = max(min_watch_sec, 1200.0)
                     watch_res = await action_watch_video(
@@ -350,9 +353,27 @@ async def run_warmup_session(
                         success=True,
                     )
 
+                    # Safety Shield Gatekeeper: Validate safety before any social engagement
+                    is_safe_engage, engage_reason = safety.is_safe_for_interaction(
+                        title=video_title,
+                        channel_name=pick_res.get("channel", ""),
+                        channel_url=video_url,
+                        channel_handle=pick_res.get("channel", ""),
+                    )
+                    if not is_safe_engage:
+                        logger.warning("SAFETY SHIELD: Hủy tương tác Like/Comment/Sub trên video '%s' do vi phạm: %s", video_title, engage_reason)
+                        db.create_trust_activity_log(
+                            plan_id=plan_id,
+                            activity_type="safety_shield",
+                            target_url=video_url,
+                            target_title=video_title,
+                            error_message=f"Bỏ qua tương tác do vi phạm an toàn: {engage_reason}",
+                            success=False,
+                        )
+
                     daily_stats = db.get_trust_daily_activity_stats(plan_id, timezone_name)
-                    if warmup_phase == "phase_2_engage" and not should_cancel():
-                        daily_like_target = int(plan.get("daily_like_target"))
+                    if warmup_phase == "phase_2_engage" and is_safe_engage and not should_cancel():
+                        daily_like_target = int(plan.get("daily_like_target") or 0)
                         if (
                             daily_stats.get("like_count", 0) < daily_like_target
                             and random.random() < 0.75
@@ -371,7 +392,7 @@ async def run_warmup_session(
 
                     daily_stats = db.get_trust_daily_activity_stats(plan_id, timezone_name)
                     if warmup_phase == "phase_2_engage" and not should_cancel():
-                        daily_comment_target = int(plan.get("daily_comment_target"))
+                        daily_comment_target = int(plan.get("daily_comment_target") or 0)
                         if (
                             daily_stats.get("comment_count", 0) < daily_comment_target
                             and random.random() < 0.50
@@ -399,7 +420,7 @@ async def run_warmup_session(
 
                     daily_stats = db.get_trust_daily_activity_stats(plan_id, timezone_name)
                     if warmup_phase == "phase_2_engage" and not should_cancel():
-                        daily_sub_target = int(plan.get("daily_subscribe_target"))
+                        daily_sub_target = int(plan.get("daily_subscribe_target") or 0)
                         if (
                             daily_stats.get("subscribe_count", 0) < daily_sub_target
                             and random.random() < 0.40

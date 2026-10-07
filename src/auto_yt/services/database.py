@@ -3,6 +3,7 @@ import datetime
 import json
 import re
 import unicodedata
+import urllib.parse
 import uuid
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -1403,6 +1404,32 @@ def init_db():
         WHERE NOT EXISTS (
             SELECT 1 FROM channel_trust_plans
             WHERE channel_trust_plans.id = trust_activity_log.plan_id
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS trust_safety_blacklist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_type TEXT NOT NULL,
+            entry_value TEXT NOT NULL,
+            normalized_value TEXT NOT NULL,
+            reason TEXT DEFAULT '',
+            is_custom INTEGER DEFAULT 0,
+            is_enabled INTEGER DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(entry_type, normalized_value)
+        )
+    ''')
+    c.execute('''
+        CREATE INDEX IF NOT EXISTS idx_trust_safety_lookup
+        ON trust_safety_blacklist(entry_type, is_enabled, normalized_value)
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS trust_safety_config (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         )
     ''')
 
@@ -6901,3 +6928,256 @@ def get_trust_daily_activity_stats(
         start_at=local_start.astimezone(datetime.timezone.utc).isoformat(),
         end_at=local_end.astimezone(datetime.timezone.utc).isoformat(),
     )
+
+
+# ---------------------------------------------------------------------------
+# Trust Safety Shield & Blacklist Engine
+# ---------------------------------------------------------------------------
+
+
+def normalize_safety_key(text: str) -> str:
+    unquoted = urllib.parse.unquote(str(text or ""))
+    return re.sub(r"[\s\W_]+", "", unquoted).casefold()
+
+
+def strip_safety_diacritics(text: str) -> str:
+    nfd = unicodedata.normalize("NFD", text)
+    stripped = "".join(c for c in nfd if unicodedata.category(c) != "Mn")
+    return stripped.replace("đ", "d").replace("Đ", "d")
+
+
+def create_safety_blacklist_entry(
+    entry_type: str,
+    entry_value: str,
+    reason: str = "",
+    is_custom: int = 1,
+    is_enabled: int = 1,
+) -> dict:
+    clean_type = str(entry_type or "channel").strip().lower()
+    clean_val = str(entry_value or "").strip()
+    if not clean_val:
+        raise ValueError("Giá trị quy tắc chặn không được để trống.")
+    norm_val = normalize_safety_key(clean_val)
+    if not norm_val:
+        norm_val = clean_val.casefold()
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.execute(
+        """
+        INSERT INTO trust_safety_blacklist (
+            entry_type, entry_value, normalized_value, reason, is_custom, is_enabled, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(entry_type, normalized_value) DO UPDATE SET
+            entry_value = excluded.entry_value,
+            reason = excluded.reason,
+            is_enabled = excluded.is_enabled,
+            updated_at = excluded.updated_at
+        """,
+        (clean_type, clean_val, norm_val, reason.strip(), is_custom, is_enabled, now, now),
+    )
+    entry_id = cursor.lastrowid
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM trust_safety_blacklist WHERE id = ?", (entry_id,)
+    ).fetchone()
+    if not row:
+        row = conn.execute(
+            "SELECT * FROM trust_safety_blacklist WHERE entry_type = ? AND normalized_value = ?",
+            (clean_type, norm_val),
+        ).fetchone()
+    conn.close()
+    return dict(row) if row else {}
+
+
+def upsert_safety_blacklist_bulk(entries: list[dict]) -> int:
+    if not entries:
+        return 0
+    now = utc_now()
+    count = 0
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for item in entries:
+            etype = str(item.get("entry_type") or "channel").strip().lower()
+            eval_val = str(item.get("entry_value") or "").strip()
+            if not eval_val:
+                continue
+            norm_val = normalize_safety_key(eval_val) or eval_val.casefold()
+            reason = str(item.get("reason") or "").strip()
+            is_custom = int(item.get("is_custom") or 0)
+            is_enabled = 1 if item.get("is_enabled", True) else 0
+            conn.execute(
+                """
+                INSERT INTO trust_safety_blacklist (
+                    entry_type, entry_value, normalized_value, reason, is_custom, is_enabled, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(entry_type, normalized_value) DO UPDATE SET
+                    entry_value = excluded.entry_value,
+                    reason = CASE WHEN excluded.reason != '' THEN excluded.reason ELSE trust_safety_blacklist.reason END,
+                    updated_at = excluded.updated_at
+                """,
+                (etype, eval_val, norm_val, reason, is_custom, is_enabled, now, now),
+            )
+            count += 1
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+    return count
+
+
+def list_safety_blacklist_entries(
+    entry_type: str = "",
+    search: str = "",
+    is_custom: int | None = None,
+    enabled_only: bool = False,
+    limit: int = 100,
+    offset: int = 0,
+) -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    filters = []
+    params: list = []
+    if entry_type:
+        filters.append("entry_type = ?")
+        params.append(entry_type)
+    if is_custom is not None:
+        filters.append("is_custom = ?")
+        params.append(is_custom)
+    if enabled_only:
+        filters.append("is_enabled = 1")
+    if search:
+        s_norm = f"%{search.strip().lower()}%"
+        filters.append("(entry_value LIKE ? OR normalized_value LIKE ? OR reason LIKE ?)")
+        params.extend([s_norm, s_norm, s_norm])
+    where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
+    rows = conn.execute(
+        f"""
+        SELECT * FROM trust_safety_blacklist
+        {where_sql}
+        ORDER BY is_custom DESC, updated_at DESC, id DESC
+        LIMIT ? OFFSET ?
+        """,
+        params + [limit, offset],
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_safety_blacklist_entry(entry_id: int) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM trust_safety_blacklist WHERE id = ?", (entry_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def update_safety_blacklist_entry(entry_id: int, **changes) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    set_clauses = []
+    params = []
+    if "is_enabled" in changes:
+        set_clauses.append("is_enabled = ?")
+        params.append(1 if changes["is_enabled"] else 0)
+    if "reason" in changes:
+        set_clauses.append("reason = ?")
+        params.append(str(changes["reason"]).strip())
+    if not set_clauses:
+        conn.close()
+        return get_safety_blacklist_entry(entry_id)
+    set_clauses.append("updated_at = ?")
+    params.append(utc_now())
+    params.append(entry_id)
+    conn.execute(
+        f"UPDATE trust_safety_blacklist SET {', '.join(set_clauses)} WHERE id = ?",
+        params,
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM trust_safety_blacklist WHERE id = ?", (entry_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def delete_safety_blacklist_entry(entry_id: int) -> bool:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    cursor = conn.execute("DELETE FROM trust_safety_blacklist WHERE id = ?", (entry_id,))
+    conn.commit()
+    deleted = cursor.rowcount > 0
+    conn.close()
+    return deleted
+
+
+def get_safety_config() -> dict:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT key, value FROM trust_safety_config").fetchall()
+    conn.close()
+    config = {
+        "shield_enabled": True,
+        "remote_sync_url": "https://raw.githubusercontent.com/Auto-YT/safety-shield/main/vietnam_blacklist.json",
+        "last_synced_at": "",
+        "auto_sync_interval_hours": 24,
+    }
+    for r in rows:
+        k = r["key"]
+        v = r["value"]
+        if k == "shield_enabled":
+            config["shield_enabled"] = v.lower() in {"1", "true", "yes"}
+        elif k == "remote_sync_url":
+            config["remote_sync_url"] = v
+        elif k == "last_synced_at":
+            config["last_synced_at"] = v
+        elif k == "auto_sync_interval_hours":
+            try:
+                config["auto_sync_interval_hours"] = int(v)
+            except ValueError:
+                pass
+    return config
+
+
+def update_safety_config(**kwargs) -> dict:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    now = utc_now()
+    for k, v in kwargs.items():
+        val_str = str(v)
+        if isinstance(v, bool):
+            val_str = "1" if v else "0"
+        conn.execute(
+            """
+            INSERT INTO trust_safety_config (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (k, val_str, now),
+        )
+    conn.commit()
+    conn.close()
+    return get_safety_config()
+
+
+def get_all_active_safety_rules() -> dict[str, list[dict]]:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM trust_safety_blacklist WHERE is_enabled = 1"
+    ).fetchall()
+    conn.close()
+    result = {"channels": [], "keywords": [], "regex_patterns": []}
+    for r in rows:
+        d = dict(r)
+        etype = str(d.get("entry_type") or "").lower()
+        if etype == "channel":
+            result["channels"].append(d)
+        elif etype == "keyword":
+            result["keywords"].append(d)
+        elif etype in {"regex_pattern", "regex"}:
+            result["regex_patterns"].append(d)
+    return result

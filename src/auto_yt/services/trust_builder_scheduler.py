@@ -248,6 +248,29 @@ async def _evaluate_active_plans() -> None:
     await _drain_job_queue()
 
 
+_last_safety_sync_check: datetime.datetime | None = None
+
+
+async def _check_periodic_safety_sync() -> None:
+    global _last_safety_sync_check
+    now = _utc_now()
+    if _last_safety_sync_check is not None and (now - _last_safety_sync_check).total_seconds() < 3600:
+        return
+    _last_safety_sync_check = now
+    config = db.get_safety_config()
+    if not config.get("shield_enabled", True):
+        return
+    last_synced_str = str(config.get("last_synced_at") or "")
+    interval_hours = int(config.get("auto_sync_interval_hours") or 24)
+    last_synced = _parse_utc(last_synced_str)
+    if last_synced is None or (now - last_synced).total_seconds() >= (interval_hours * 3600):
+        try:
+            from auto_yt.services import trust_builder_safety as safety
+            safety.sync_safety_blacklist_from_remote()
+        except Exception as exc:
+            logger.warning("Lỗi tự động đồng bộ Safety Blacklist định kỳ: %s", exc)
+
+
 async def _scheduler_loop() -> None:
     logger.info(
         "Trust Builder scheduler chờ %d giây để backend sẵn sàng.",
@@ -256,6 +279,7 @@ async def _scheduler_loop() -> None:
     await asyncio.sleep(STARTUP_DELAY_SECONDS)
     while _scheduler_running:
         try:
+            await _check_periodic_safety_sync()
             await _evaluate_active_plans()
         except asyncio.CancelledError:
             raise

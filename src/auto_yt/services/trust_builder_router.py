@@ -303,3 +303,106 @@ async def verify_features(plan_id: int):
 @router.get("/scheduler-status")
 def scheduler_status():
     return trust_builder_scheduler.get_trust_builder_scheduler_status()
+
+
+# ---------------------------------------------------------------------------
+# Safety Shield & Blacklist Endpoints
+# ---------------------------------------------------------------------------
+
+
+class SafetyConfigRequest(BaseModel):
+    shield_enabled: Optional[bool] = None
+    remote_sync_url: Optional[str] = None
+    auto_sync_interval_hours: Optional[int] = Field(default=None, ge=1, le=168)
+
+
+class SafetyBlacklistCreateRequest(BaseModel):
+    entry_type: Literal["channel", "keyword", "regex_pattern"] = "channel"
+    entry_value: str = Field(min_length=1, max_length=200)
+    reason: str = Field(default="", max_length=300)
+    is_custom: int = 1
+    is_enabled: bool = True
+
+
+@router.get("/safety/config")
+def get_safety_config_endpoint():
+    """Get Vietnam Safety Shield configuration and total rule counts."""
+    from auto_yt.services import trust_builder_safety as safety
+    safety.ensure_default_safety_rules_seeded()
+    config = db.get_safety_config()
+    rules = db.get_all_active_safety_rules()
+    return {
+        "config": config,
+        "counts": {
+            "channels": len(rules.get("channels") or []),
+            "keywords": len(rules.get("keywords") or []),
+            "regex_patterns": len(rules.get("regex_patterns") or []),
+            "total_active": len(rules.get("channels") or []) + len(rules.get("keywords") or []) + len(rules.get("regex_patterns") or []),
+        },
+    }
+
+
+@router.post("/safety/config")
+def update_safety_config_endpoint(req: SafetyConfigRequest):
+    """Update Vietnam Safety Shield settings."""
+    changes = req.model_dump(exclude_unset=True)
+    updated = db.update_safety_config(**changes)
+    return {"success": True, "config": updated}
+
+
+@router.post("/safety/sync")
+def sync_safety_blacklist_endpoint():
+    """Trigger manual 1-click sync of Core Safety Blacklist from remote URL."""
+    from auto_yt.services import trust_builder_safety as safety
+    result = safety.sync_safety_blacklist_from_remote()
+    if not result.get("success") and not result.get("offline_fallback"):
+        raise HTTPException(status_code=400, detail=result.get("message", "Lỗi đồng bộ danh mục đen."))
+    return result
+
+
+@router.get("/safety/blacklist")
+def list_safety_blacklist_endpoint(
+    entry_type: str = Query("", description="Filter by channel, keyword, or regex_pattern"),
+    search: str = Query("", description="Search text in values or reasons"),
+    is_custom: Optional[int] = Query(None, description="0 for core, 1 for custom"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """List paginated blacklist rules with search and filter support."""
+    from auto_yt.services import trust_builder_safety as safety
+    safety.ensure_default_safety_rules_seeded()
+    entries = db.list_safety_blacklist_entries(
+        entry_type=entry_type,
+        search=search,
+        is_custom=is_custom,
+        limit=limit,
+        offset=offset,
+    )
+    return {"entries": entries, "limit": limit, "offset": offset, "total": len(entries)}
+
+
+@router.post("/safety/blacklist")
+def create_safety_blacklist_endpoint(req: SafetyBlacklistCreateRequest):
+    """Add a new custom rule or block a channel in 1-click."""
+    try:
+        entry = db.create_safety_blacklist_entry(
+            entry_type=req.entry_type,
+            entry_value=req.entry_value,
+            reason=req.reason or "Người dùng thêm thủ công",
+            is_custom=req.is_custom,
+            is_enabled=1 if req.is_enabled else 0,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"success": True, "entry": entry}
+
+
+@router.delete("/safety/blacklist/{entry_id}")
+def delete_safety_blacklist_endpoint(entry_id: int):
+    """Delete a blacklist rule by ID."""
+    entry = db.get_safety_blacklist_entry(entry_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Không tìm thấy quy tắc chặn.")
+    deleted = db.delete_safety_blacklist_entry(entry_id)
+    return {"success": deleted}
+

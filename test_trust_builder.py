@@ -133,13 +133,14 @@ def test_action_search_does_not_fallback_when_target_channel_is_missing():
             }
         ]
 
-        with pytest.raises(RuntimeError, match="kênh mục tiêu"):
-            await action_search_and_pick_video(
-                mock_page,
-                keyword="channel topic",
-                target_channel="@required-channel",
-                timeout_seconds=5.0,
-            )
+        with patch("auto_yt.services.trust_builder_actions.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(RuntimeError, match="kênh mục tiêu"):
+                await action_search_and_pick_video(
+                    mock_page,
+                    keyword="channel topic",
+                    target_channel="@required-channel",
+                    timeout_seconds=5.0,
+                )
 
     asyncio.run(_run())
 

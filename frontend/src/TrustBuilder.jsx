@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useSubRoute } from './router.js'
+import { extractErrorMessage } from './apiError'
 import './TrustBuilder.css'
 
 const API_BASE = 'http://127.0.0.1:8080'
@@ -81,22 +82,171 @@ export default function TrustBuilder() {
   const [targetChannelInput, setTargetChannelInput] = useState('')
   const [searchFilter, setSearchFilter] = useState('')
 
-  // CSRF / Security fetch helper
-  const apiFetch = useCallback(async (url, options = {}) => {
-    return fetch(url, {
-      ...options,
-      credentials: 'include',
-      headers: {
-        'Accept': 'application/json',
-        'Content-Type': 'application/json',
-        ...(options.headers || {})
-      }
-    })
-  }, [])
+  // Safety Shield State
+  const [safetyConfig, setSafetyConfig] = useState(null)
+  const [safetyCounts, setSafetyCounts] = useState(null)
+  const [safetyModalOpen, setSafetyModalOpen] = useState(false)
+  const [blacklistEntries, setBlacklistEntries] = useState([])
+  const [blacklistLoading, setBlacklistLoading] = useState(false)
+  const [blacklistSearch, setBlacklistSearch] = useState('')
+  const [blacklistTypeFilter, setBlacklistTypeFilter] = useState('')
+  const [newRuleValue, setNewRuleValue] = useState('')
+  const [newRuleType, setNewRuleType] = useState('channel')
+  const [newRuleReason, setNewRuleReason] = useState('')
+  const [syncBusy, setSyncBusy] = useState(false)
 
   const showFeedback = (msg, type = 'info') => {
     setFeedback({ message: msg, type })
     setTimeout(() => setFeedback({ message: '', type: '' }), 5000)
+  }
+
+  const loadSafetyConfig = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/trust-builder/safety/config`)
+      if (res.ok) {
+        const data = await res.json()
+        setSafetyConfig(data.config)
+        setSafetyCounts(data.counts)
+      }
+    } catch (err) {
+      console.warn('Lỗi tải cấu hình Safety Shield:', err)
+    }
+  }, [])
+
+  const loadBlacklistRules = useCallback(async (type = '', search = '') => {
+    setBlacklistLoading(true)
+    try {
+      const params = new URLSearchParams()
+      if (type) params.set('entry_type', type)
+      if (search) params.set('search', search)
+      params.set('limit', '200')
+      const res = await fetch(`${API_BASE}/api/trust-builder/safety/blacklist?${params.toString()}`)
+      if (res.ok) {
+        const data = await res.json()
+        setBlacklistEntries(data.entries || [])
+      }
+    } catch (err) {
+      console.warn('Lỗi tải danh sách Blacklist:', err)
+    } finally {
+      setBlacklistLoading(false)
+    }
+  }, [])
+
+  const handleTriggerSync = async () => {
+    setSyncBusy(true)
+    try {
+      const res = await fetch(`${API_BASE}/api/trust-builder/safety/sync`, { method: 'POST' })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok) {
+        showFeedback(data.message || 'Đồng bộ Core Blacklist thành công!', 'success')
+        await loadSafetyConfig()
+        if (safetyModalOpen) {
+          await loadBlacklistRules(blacklistTypeFilter, blacklistSearch)
+        }
+      } else {
+        showFeedback(extractErrorMessage(data, 'Không thể đồng bộ Blacklist.'), 'error')
+      }
+    } catch {
+      showFeedback('Lỗi kết nối khi đồng bộ Blacklist.', 'error')
+    } finally {
+      setSyncBusy(false)
+    }
+  }
+
+  const handleToggleShield = async () => {
+    if (!safetyConfig) return
+    const newState = !safetyConfig.shield_enabled
+    try {
+      const res = await fetch(`${API_BASE}/api/trust-builder/safety/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ shield_enabled: newState })
+      })
+      if (res.ok) {
+        const data = await res.json()
+        setSafetyConfig(data.config)
+        showFeedback(`Đã ${newState ? 'BẬT' : 'TẮT'} Lá Chắn An Toàn Quốc Gia.`, 'success')
+      }
+    } catch {
+      showFeedback('Lỗi khi cập nhật trạng thái khiên.', 'error')
+    }
+  }
+
+  const handleQuickBlockChannel = async (channelVal, reason = 'Chặn nhanh từ Nhật ký hoạt động') => {
+    if (!channelVal) return
+    const clean = String(channelVal).trim()
+    if (!clean) return
+    try {
+      const res = await fetch(`${API_BASE}/api/trust-builder/safety/blacklist`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          entry_type: 'channel',
+          entry_value: clean,
+          reason,
+          is_custom: 1,
+          is_enabled: true
+        })
+      })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok) {
+        showFeedback(`Đã chặn kênh '${clean}' thành công vào Blacklist!`, 'success')
+        await loadSafetyConfig()
+        if (safetyModalOpen) {
+          await loadBlacklistRules(blacklistTypeFilter, blacklistSearch)
+        }
+      } else {
+        showFeedback(extractErrorMessage(data, 'Không thể chặn kênh.'), 'error')
+      }
+    } catch {
+      showFeedback('Lỗi khi thêm quy tắc chặn kênh.', 'error')
+    }
+  }
+
+  const handleAddCustomRule = async (e) => {
+    if (e) e.preventDefault()
+    const val = newRuleValue.trim()
+    if (!val) return
+    try {
+      const res = await fetch(`${API_BASE}/api/trust-builder/safety/blacklist`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          entry_type: newRuleType,
+          entry_value: val,
+          reason: newRuleReason.trim() || 'Người dùng thêm thủ công',
+          is_custom: 1,
+          is_enabled: true
+        })
+      })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok) {
+        showFeedback(`Đã thêm quy tắc chặn '${val}' thành công!`, 'success')
+        setNewRuleValue('')
+        setNewRuleReason('')
+        await loadSafetyConfig()
+        await loadBlacklistRules(blacklistTypeFilter, blacklistSearch)
+      } else {
+        showFeedback(extractErrorMessage(data, 'Không thể thêm quy tắc.'), 'error')
+      }
+    } catch {
+      showFeedback('Lỗi khi thêm quy tắc.', 'error')
+    }
+  }
+
+  const handleDeleteRule = async (ruleId) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/trust-builder/safety/blacklist/${ruleId}`, {
+        method: 'DELETE'
+      })
+      if (res.ok) {
+        showFeedback('Đã xóa quy tắc chặn.', 'success')
+        await loadSafetyConfig()
+        await loadBlacklistRules(blacklistTypeFilter, blacklistSearch)
+      }
+    } catch {
+      showFeedback('Lỗi khi xóa quy tắc.', 'error')
+    }
   }
 
   const handleSelectChannel = useCallback((channelId) => {
@@ -104,60 +254,8 @@ export default function TrustBuilder() {
     setSubRoute(String(channelId), { replace: false })
   }, [setSubRoute])
 
-  // Load channels and trust plans
-  const loadInitialData = useCallback(async () => {
-    try {
-      // 1. Fetch channels
-      const chRes = await apiFetch(`${API_BASE}/api/youtube-comments/channels`)
-      let chList = []
-      if (chRes.ok) {
-        const chData = await chRes.json()
-        chList = Array.isArray(chData) ? chData : (chData.items || chData.channels || [])
-      }
-
-      // 2. Fetch trust plans
-      const planRes = await apiFetch(`${API_BASE}/api/trust-builder/plans`)
-      let planList = []
-      if (planRes.ok) {
-        const planData = await planRes.json()
-        planList = Array.isArray(planData) ? planData : (planData.plans || planData.items || [])
-      }
-
-      setChannels(chList)
-      setPlans(planList)
-
-      if (chList.length > 0) {
-        let matched = null
-        if (subRoute) {
-          matched = chList.find(c => String(c.id) === String(subRoute) || String(c.channel_id) === String(subRoute))
-        }
-        const target = matched || chList[0]
-        setSelectedChannelId(target.id)
-        if (String(subRoute) !== String(target.id)) {
-          setSubRoute(String(target.id), { replace: true })
-        }
-      }
-    } catch (err) {
-      console.error('Error loading trust data:', err)
-      showFeedback('Không thể kết nối API Trust Builder.', 'error')
-    }
-  }, [apiFetch, subRoute, setSubRoute])
-
-  useEffect(() => {
-    loadInitialData()
-  }, [loadInitialData])
-
-  // Sync state if subRoute changes externally (e.g. browser back/forward or direct link)
-  useEffect(() => {
-    if (!subRoute || channels.length === 0) return
-    const matched = channels.find(c => String(c.id) === String(subRoute) || String(c.channel_id) === String(subRoute))
-    if (matched && matched.id !== selectedChannelId) {
-      setSelectedChannelId(matched.id)
-    }
-  }, [subRoute, channels, selectedChannelId])
-
-  // Load plan details & activities when selected channel changes
-  const loadPlanDetails = useCallback(async (channelId) => {
+  // Load plan details & activities for given channel
+  const loadPlanDetails = useCallback(async (channelId, plansList = null) => {
     if (!channelId) {
       setSelectedPlan(null)
       setActivities([])
@@ -167,7 +265,8 @@ export default function TrustBuilder() {
       return
     }
 
-    const currentPlan = plans.find(p => p.channel_db_id === channelId)
+    const activePlans = plansList || plans
+    const currentPlan = activePlans.find(p => p.channel_db_id === channelId)
     if (!currentPlan) {
       setSelectedPlan(null)
       setActivities([])
@@ -178,48 +277,110 @@ export default function TrustBuilder() {
     }
 
     try {
-      // Detail & Stats
-      const res = await apiFetch(`${API_BASE}/api/trust-builder/plans/${currentPlan.id}`)
-      if (res.ok) {
-        const data = await res.json()
+      const [detailRes, actRes] = await Promise.all([
+        fetch(`${API_BASE}/api/trust-builder/plans/${currentPlan.id}`),
+        fetch(`${API_BASE}/api/trust-builder/plans/${currentPlan.id}/activities?limit=30`)
+      ])
+
+      if (detailRes.ok) {
+        const data = await detailRes.json()
         setSelectedPlan(data.plan)
         setStats(data.stats)
         setDailyStats(data.daily_stats || null)
         setActiveJob(data.active_job || null)
       }
 
-      // Activities
-      const actRes = await apiFetch(`${API_BASE}/api/trust-builder/plans/${currentPlan.id}/activities?limit=30`)
       if (actRes.ok) {
         const actData = await actRes.json()
         setActivities(actData.logs || [])
       }
     } catch (err) {
-      console.error('Error loading plan details:', err)
+      console.warn('Lỗi tải chi tiết plan:', err)
     }
-  }, [plans, apiFetch])
+  }, [plans])
 
+  // Load channels and trust plans once or on demand
+  const loadInitialData = useCallback(async () => {
+    try {
+      const [chRes, planRes] = await Promise.all([
+        fetch(`${API_BASE}/api/youtube-comments/channels`),
+        fetch(`${API_BASE}/api/trust-builder/plans`)
+      ])
+      let chList = []
+      if (chRes.ok) {
+        const chData = await chRes.json()
+        chList = Array.isArray(chData) ? chData : (chData.items || chData.channels || [])
+      }
+
+      let planList = []
+      if (planRes.ok) {
+        const planData = await planRes.json()
+        planList = Array.isArray(planData) ? planData : (planData.plans || planData.items || [])
+      }
+
+      setChannels(chList)
+      setPlans(planList)
+      return { chList, planList }
+    } catch (err) {
+      console.warn('Lỗi kết nối API Trust Builder:', err)
+      return { chList: [], planList: [] }
+    }
+  }, [])
+
+  // Mount effect: load initial channels, plans, and safety status
   useEffect(() => {
-    loadPlanDetails(selectedChannelId)
+    let cancelled = false
+    loadSafetyConfig()
+    loadInitialData().then(({ chList, planList }) => {
+      if (cancelled || chList.length === 0) return
+      let matched = null
+      if (subRoute) {
+        matched = chList.find(c => String(c.id) === String(subRoute) || String(c.channel_id) === String(subRoute))
+      }
+      const target = matched || chList[0]
+      setSelectedChannelId(target.id)
+      loadPlanDetails(target.id, planList)
+    })
+    return () => { cancelled = true }
+  }, [loadInitialData, loadSafetyConfig])
+
+  // Sync state if subRoute changes externally (e.g. browser back/forward or direct link)
+  useEffect(() => {
+    if (!subRoute || channels.length === 0) return
+    const matched = channels.find(c => String(c.id) === String(subRoute) || String(c.channel_id) === String(subRoute))
+    if (matched && matched.id !== selectedChannelId) {
+      setSelectedChannelId(matched.id)
+    }
+  }, [subRoute, channels, selectedChannelId])
+
+  // Load plan details when selected channel changes
+  useEffect(() => {
+    if (selectedChannelId) {
+      loadPlanDetails(selectedChannelId)
+    }
   }, [selectedChannelId, loadPlanDetails])
 
-  // Poll faster while a session is running and slower while waiting for schedule.
+  // Poll while a session is running or plan is active
   useEffect(() => {
-    if (!selectedPlan || (selectedPlan.status !== 'active' && !activeJob)) return
-    const pollMilliseconds = activeJob?.status === 'running' ? 5000 : 15000
+    const isJobActive = activeJob?.status === 'running' || activeJob?.status === 'queued'
+    const isPlanActive = selectedPlan?.status === 'active'
+    if (!isJobActive && !isPlanActive) return
+
+    const pollMilliseconds = isJobActive ? 5000 : 15000
     const interval = setInterval(() => {
       loadPlanDetails(selectedChannelId)
     }, pollMilliseconds)
     return () => clearInterval(interval)
-  }, [selectedPlan, activeJob, selectedChannelId, loadPlanDetails])
+  }, [activeJob?.status, selectedPlan?.status, selectedChannelId, loadPlanDetails])
 
   // Create Plan for selected channel
   const handleCreatePlan = async () => {
     if (!selectedChannelId) return
     setActionBusy(true)
     try {
-      const res = await apiFetch(`${API_BASE}/api/trust-builder/plans`, {
+      const res = await fetch(`${API_BASE}/api/trust-builder/plans`, {
         method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           channel_db_id: selectedChannelId,
           niche_keywords: ['công nghệ', 'xu hướng', 'kiến thức thú vị'],
@@ -233,13 +394,13 @@ export default function TrustBuilder() {
           warmup_phase: 'phase_1_consumer'
         })
       })
-      const data = await res.json()
+      const data = await res.json().catch(() => ({}))
       if (res.ok) {
         showFeedback('Đã khởi tạo Kế hoạch nuôi kênh thành công!', 'success')
-        await loadInitialData()
-        await loadPlanDetails(selectedChannelId)
+        const { planList } = await loadInitialData()
+        await loadPlanDetails(selectedChannelId, planList)
       } else {
-        showFeedback(data.detail || 'Không thể tạo Kế hoạch.', 'error')
+        showFeedback(extractErrorMessage(data, 'Không thể tạo Kế hoạch.'), 'error')
       }
     } catch {
       showFeedback('Lỗi kết nối khi tạo plan.', 'error')
@@ -252,16 +413,17 @@ export default function TrustBuilder() {
   const handleUpdatePlan = async (changes) => {
     if (!selectedPlan) return
     try {
-      const res = await apiFetch(`${API_BASE}/api/trust-builder/plans/${selectedPlan.id}`, {
+      const res = await fetch(`${API_BASE}/api/trust-builder/plans/${selectedPlan.id}`, {
         method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(changes)
       })
-      const data = await res.json()
+      const data = await res.json().catch(() => ({}))
       if (res.ok) {
         setSelectedPlan(data.plan)
         showFeedback('Đã lưu cấu hình nuôi kênh.', 'success')
       } else {
-        showFeedback(data.detail || 'Không thể lưu cấu hình.', 'error')
+        showFeedback(extractErrorMessage(data, 'Không thể lưu cấu hình.'), 'error')
       }
     } catch {
       showFeedback('Lỗi khi lưu cấu hình.', 'error')
@@ -281,10 +443,10 @@ export default function TrustBuilder() {
     if (!selectedPlan) return
     setActionBusy(true)
     try {
-      const res = await apiFetch(`${API_BASE}/api/trust-builder/plans/${selectedPlan.id}/${actionType}`, {
+      const res = await fetch(`${API_BASE}/api/trust-builder/plans/${selectedPlan.id}/${actionType}`, {
         method: 'POST'
       })
-      const data = await res.json()
+      const data = await res.json().catch(() => ({}))
       if (res.ok) {
         if (actionType === 'run-session') {
           setActiveJob(data.job || null)
@@ -294,7 +456,7 @@ export default function TrustBuilder() {
         }
         await loadPlanDetails(selectedChannelId)
       } else {
-        showFeedback(data.detail || data.message || 'Thao tác không thành công.', 'error')
+        showFeedback(extractErrorMessage(data, 'Thao tác không thành công.'), 'error')
       }
     } catch {
       showFeedback(`Lỗi khi thực hiện ${actionType}.`, 'error')
@@ -309,13 +471,16 @@ export default function TrustBuilder() {
     if (!window.confirm('Bạn có chắc chắn muốn xóa Kế hoạch nuôi kênh này? Lịch sử tương tác sẽ bị xóa.')) return
     setActionBusy(true)
     try {
-      const res = await apiFetch(`${API_BASE}/api/trust-builder/plans/${selectedPlan.id}`, {
+      const res = await fetch(`${API_BASE}/api/trust-builder/plans/${selectedPlan.id}`, {
         method: 'DELETE'
       })
+      const data = await res.json().catch(() => ({}))
       if (res.ok) {
         showFeedback('Đã xóa Kế hoạch nuôi kênh.', 'success')
         setSelectedPlan(null)
         await loadInitialData()
+      } else {
+        showFeedback(extractErrorMessage(data, 'Không thể xóa plan.'), 'error')
       }
     } catch {
       showFeedback('Lỗi khi xóa plan.', 'error')
@@ -330,15 +495,15 @@ export default function TrustBuilder() {
     setActionBusy(true)
     showFeedback('Đang mở Profile GPM để Audit Branding kênh, vui lòng đợi...', 'info')
     try {
-      const res = await apiFetch(`${API_BASE}/api/trust-builder/plans/${selectedPlan.id}/branding-audit`, {
+      const res = await fetch(`${API_BASE}/api/trust-builder/plans/${selectedPlan.id}/branding-audit`, {
         method: 'POST'
       })
-      const data = await res.json()
+      const data = await res.json().catch(() => ({}))
       if (res.ok) {
         showFeedback(`Audit hoàn tất! Điểm Trust mới: ${data.trust_score}/100`, 'success')
         await loadPlanDetails(selectedChannelId)
       } else {
-        showFeedback(data.detail || 'Không thể audit kênh.', 'error')
+        showFeedback(extractErrorMessage(data, 'Không thể audit kênh.'), 'error')
       }
     } catch {
       showFeedback('Lỗi khi kết nối audit.', 'error')
@@ -352,10 +517,10 @@ export default function TrustBuilder() {
     if (!selectedPlan) return
     setActionBusy(true)
     try {
-      const res = await apiFetch(`${API_BASE}/api/trust-builder/plans/${selectedPlan.id}/verify-features`, {
+      const res = await fetch(`${API_BASE}/api/trust-builder/plans/${selectedPlan.id}/verify-features`, {
         method: 'POST'
       })
-      const data = await res.json()
+      const data = await res.json().catch(() => ({}))
       if (res.ok) {
         const featureMessage = data.verified
           ? `Đã xác minh cấp tính năng: ${data.feature_level}. Readiness: ${data.trust_score}/100`
@@ -363,7 +528,7 @@ export default function TrustBuilder() {
         showFeedback(featureMessage, data.verified ? 'success' : 'info')
         await loadPlanDetails(selectedChannelId)
       } else {
-        showFeedback(data.detail || 'Không thể kiểm tra cấp tính năng.', 'error')
+        showFeedback(extractErrorMessage(data, 'Không thể kiểm tra cấp tính năng.'), 'error')
       }
     } catch {
       showFeedback('Lỗi khi xác minh tính năng.', 'error')
@@ -445,6 +610,38 @@ export default function TrustBuilder() {
             Warm-up kênh qua GPM-Login &amp; Playwright CDP. Điểm hiển thị là chỉ số readiness nội bộ, không phải Trust Score chính thức của YouTube.
           </p>
         </div>
+
+        <div className="trust-header-controls">
+          <div className="safety-shield-widget">
+            <span className={`safety-shield-badge ${safetyConfig?.shield_enabled ? 'enabled' : 'disabled'}`}>
+              {safetyConfig?.shield_enabled ? '🛡️ VN Shield: BẬT' : '⚠️ VN Shield: TẮT'}
+              {safetyCounts && (
+                <span className="safety-rules-count">({safetyCounts.total_active} mục chặn)</span>
+              )}
+            </span>
+            <button
+              type="button"
+              className="safety-sync-btn"
+              onClick={handleTriggerSync}
+              disabled={syncBusy}
+              title="Cập nhật danh sách đen từ xa ngay lập tức"
+            >
+              {syncBusy ? '🔄 Đang tải...' : '🔄 Cập nhật Core'}
+            </button>
+            <button
+              type="button"
+              className="safety-manage-btn"
+              onClick={() => {
+                setSafetyModalOpen(true)
+                loadBlacklistRules(blacklistTypeFilter, blacklistSearch)
+              }}
+              title="Xem và quản lý danh sách kênh/từ khóa bị chặn"
+            >
+              ⚙️ Quản lý Blacklist
+            </button>
+          </div>
+        </div>
+
         {feedback.message && (
           <div className={`trust-feedback-toast ${feedback.type}`}>
             {feedback.message}
@@ -842,26 +1039,39 @@ export default function TrustBuilder() {
                   {activities.length === 0 ? (
                     <div className="activity-empty">Chưa có nhật ký hoạt động nào. Hãy bấm "Chạy ngay 1 Session" để bắt đầu.</div>
                   ) : (
-                    activities.map((log) => (
-                      <div key={log.id} className={`activity-log-row ${log.success ? 'success' : 'failed'}`}>
-                        <div className="activity-type-icon">{getActivityIcon(log.activity_type)}</div>
-                        <div className="activity-main-info">
-                          <div className="activity-title">
-                            <b>{log.activity_type.toUpperCase()}</b>: {log.target_title || log.detail_json?.keyword || log.target_url || 'Tác vụ hệ thống'}
+                    activities.map((log) => {
+                      const matchedChannel = log.detail_json?.matched_channel || ''
+                      return (
+                        <div key={log.id} className={`activity-log-row ${log.success ? 'success' : 'failed'}`}>
+                          <div className="activity-type-icon">{getActivityIcon(log.activity_type)}</div>
+                          <div className="activity-main-info">
+                            <div className="activity-title">
+                              <b>{log.activity_type.toUpperCase()}</b>: {log.target_title || log.detail_json?.keyword || log.target_url || 'Tác vụ hệ thống'}
+                            </div>
+                            {log.detail_json?.comment_text && (
+                              <div className="activity-detail-comment">"{log.detail_json.comment_text}"</div>
+                            )}
+                            {log.error_message && (
+                              <div className="activity-detail-error">Lỗi: {log.error_message}</div>
+                            )}
                           </div>
-                          {log.detail_json?.comment_text && (
-                            <div className="activity-detail-comment">"{log.detail_json.comment_text}"</div>
+                          {log.duration_seconds > 0 && (
+                            <div className="activity-duration">⏱️ {formatSeconds(log.duration_seconds)}</div>
                           )}
-                          {log.error_message && (
-                            <div className="activity-detail-error">Lỗi: {log.error_message}</div>
+                          {matchedChannel && (
+                            <button
+                              type="button"
+                              className="activity-quick-block-btn"
+                              title={`Chặn ngay kênh '${matchedChannel}' vào Blacklist an toàn`}
+                              onClick={() => handleQuickBlockChannel(matchedChannel, `Chặn nhanh từ log: ${log.target_title || ''}`)}
+                            >
+                              🚫 Chặn kênh
+                            </button>
                           )}
+                          <div className="activity-time">{log.executed_at ? log.executed_at.slice(11, 19) : ''}</div>
                         </div>
-                        {log.duration_seconds > 0 && (
-                          <div className="activity-duration">⏱️ {formatSeconds(log.duration_seconds)}</div>
-                        )}
-                        <div className="activity-time">{log.executed_at ? log.executed_at.slice(11, 19) : ''}</div>
-                      </div>
-                    ))
+                      )
+                    })
                   )}
                 </div>
               </div>
@@ -892,6 +1102,171 @@ export default function TrustBuilder() {
           )}
         </div>
       </div>
+
+      {/* Safety Shield Settings Modal */}
+      {safetyModalOpen && (
+        <div className="safety-modal-overlay" onClick={() => setSafetyModalOpen(false)}>
+          <div className="safety-modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="safety-modal-header">
+              <div className="safety-modal-title">
+                <h3>🛡️ Cấu Hình Lá Chắn An Toàn Quốc Gia (VN Safety Shield)</h3>
+                <p>Tự động ngăn chặn tương tác với các kênh phản động, chống phá và nội dung vi phạm pháp luật.</p>
+              </div>
+              <button type="button" className="safety-modal-close" onClick={() => setSafetyModalOpen(false)}>✕</button>
+            </div>
+
+            <div className="safety-modal-body">
+              {/* Shield Status Toggle */}
+              <div className="safety-toggle-section">
+                <div className="safety-toggle-info">
+                  <div className="safety-toggle-label">Trạng thái Lá chắn:</div>
+                  <div className="safety-toggle-desc">
+                    {safetyConfig?.shield_enabled
+                      ? 'Lá chắn ĐANG BẬT: Mọi video và kênh thuộc danh mục đen sẽ bị từ chối 100%.'
+                      : 'Lá chắn ĐANG TẮT: Bot sẽ không kiểm tra danh mục an toàn quốc gia.'}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className={`safety-toggle-btn ${safetyConfig?.shield_enabled ? 'enabled' : 'disabled'}`}
+                  onClick={handleToggleShield}
+                >
+                  {safetyConfig?.shield_enabled ? '🟢 ĐANG BẬT' : '🔴 ĐÃ TẮT'}
+                </button>
+              </div>
+
+              {/* Sync Config Card */}
+              <div className="safety-sync-card">
+                <div className="safety-sync-info">
+                  <div><b>URL Đồng bộ từ xa:</b> <span className="safety-url-text">{safetyConfig?.remote_sync_url || 'Mặc định (GitHub Raw)'}</span></div>
+                  <div><b>Đồng bộ lần cuối:</b> <span>{safetyConfig?.last_synced_at ? new Date(safetyConfig.last_synced_at).toLocaleString() : 'Chưa đồng bộ'}</span></div>
+                </div>
+                <button
+                  type="button"
+                  className="safety-sync-action-btn"
+                  onClick={handleTriggerSync}
+                  disabled={syncBusy}
+                >
+                  {syncBusy ? '🔄 Đang tải...' : '🔄 Đồng bộ Ngay'}
+                </button>
+              </div>
+
+              {/* Add Custom Rule Form */}
+              <form className="safety-add-rule-form" onSubmit={handleAddCustomRule}>
+                <div className="form-group-type">
+                  <select
+                    value={newRuleType}
+                    onChange={(e) => setNewRuleType(e.target.value)}
+                    className="safety-select"
+                  >
+                    <option value="channel">Kênh / Handle (@...)</option>
+                    <option value="keyword">Từ khóa cấm</option>
+                    <option value="regex_pattern">Mẫu Regex</option>
+                  </select>
+                </div>
+                <div className="form-group-val">
+                  <input
+                    type="text"
+                    placeholder={newRuleType === 'channel' ? 'Nhập handle (vd: @viettan, Tên kênh...)' : 'Nhập từ khóa cần chặn...'}
+                    value={newRuleValue}
+                    onChange={(e) => setNewRuleValue(e.target.value)}
+                    className="safety-input"
+                    required
+                  />
+                </div>
+                <div className="form-group-reason">
+                  <input
+                    type="text"
+                    placeholder="Lý do chặn (tùy chọn)..."
+                    value={newRuleReason}
+                    onChange={(e) => setNewRuleReason(e.target.value)}
+                    className="safety-input"
+                  />
+                </div>
+                <button type="submit" className="safety-add-btn">+ Thêm Chặn</button>
+              </form>
+
+              {/* Rules List Filter & Table */}
+              <div className="safety-rules-header">
+                <h4>Danh Mục Quy Tắc Chặn ({blacklistEntries.length})</h4>
+                <div className="safety-filter-row">
+                  <select
+                    value={blacklistTypeFilter}
+                    onChange={(e) => {
+                      setBlacklistTypeFilter(e.target.value)
+                      loadBlacklistRules(e.target.value, blacklistSearch)
+                    }}
+                    className="safety-select-filter"
+                  >
+                    <option value="">Tất cả loại</option>
+                    <option value="channel">Kênh ({safetyCounts?.channels || 0})</option>
+                    <option value="keyword">Từ khóa ({safetyCounts?.keywords || 0})</option>
+                    <option value="regex_pattern">Mẫu Regex ({safetyCounts?.regex_patterns || 0})</option>
+                  </select>
+                  <input
+                    type="text"
+                    placeholder="🔍 Tìm kiếm quy tắc..."
+                    value={blacklistSearch}
+                    onChange={(e) => {
+                      setBlacklistSearch(e.target.value)
+                      loadBlacklistRules(blacklistTypeFilter, e.target.value)
+                    }}
+                    className="safety-search-input"
+                  />
+                </div>
+              </div>
+
+              <div className="safety-rules-table-wrapper">
+                {blacklistLoading ? (
+                  <div className="safety-loading">Đang tải danh sách quy tắc...</div>
+                ) : blacklistEntries.length === 0 ? (
+                  <div className="safety-empty">Không tìm thấy quy tắc nào.</div>
+                ) : (
+                  <table className="safety-rules-table">
+                    <thead>
+                      <tr>
+                        <th>Loại</th>
+                        <th>Giá trị chặn</th>
+                        <th>Lý do</th>
+                        <th>Nguồn</th>
+                        <th>Thao tác</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {blacklistEntries.map((entry) => (
+                        <tr key={entry.id}>
+                          <td>
+                            <span className={`rule-type-badge ${entry.entry_type}`}>
+                              {entry.entry_type === 'channel' ? 'Kênh' : entry.entry_type === 'keyword' ? 'Từ khóa' : 'Regex'}
+                            </span>
+                          </td>
+                          <td className="rule-val-cell">{entry.entry_value}</td>
+                          <td className="rule-reason-cell">{entry.reason || '—'}</td>
+                          <td>
+                            <span className={`rule-source-badge ${entry.is_custom ? 'custom' : 'core'}`}>
+                              {entry.is_custom ? 'Thủ công' : 'Core'}
+                            </span>
+                          </td>
+                          <td>
+                            <button
+                              type="button"
+                              className="rule-del-btn"
+                              onClick={() => handleDeleteRule(entry.id)}
+                              title="Xóa quy tắc chặn này"
+                            >
+                              🗑️
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
