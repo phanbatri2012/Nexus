@@ -1407,7 +1407,7 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
         </div>
         <div className="fb-stat-card">
           <div className="fb-stat-label">Meta đã nhận lịch</div>
-          <div className="fb-stat-value scheduled">{stats.meta_scheduled}</div>
+          <div className="fb-stat-value meta_scheduled">{stats.meta_scheduled}</div>
         </div>
         <div className="fb-stat-card">
           <div className="fb-stat-label">Meta đang xử lý</div>
