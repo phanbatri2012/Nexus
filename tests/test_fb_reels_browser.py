@@ -424,6 +424,71 @@ class TestFbReelsBrowser(unittest.TestCase):
         import asyncio
         asyncio.run(_test())
 
+    def test_silence_media_init_script_content(self):
+        from auto_yt.services.fb_reels_browser_service import SILENCE_MEDIA_INIT_SCRIPT
+        self.assertIn("muted = true", SILENCE_MEDIA_INIT_SCRIPT)
+        self.assertIn("volume = 0.0", SILENCE_MEDIA_INIT_SCRIPT)
+        self.assertIn("pause()", SILENCE_MEDIA_INIT_SCRIPT)
+        self.assertIn("MutationObserver", SILENCE_MEDIA_INIT_SCRIPT)
+        self.assertIn("play", SILENCE_MEDIA_INIT_SCRIPT)
+        self.assertIn("loadedmetadata", SILENCE_MEDIA_INIT_SCRIPT)
+
+    def test_silence_composer_video_none_or_closed_page(self):
+        from auto_yt.services.fb_reels_browser_service import _silence_composer_video
+        import asyncio
+
+        class ClosedPageMock:
+            def is_closed(self):
+                return True
+
+        async def _test():
+            # Should not raise exception
+            await _silence_composer_video(None)
+            await _silence_composer_video(ClosedPageMock())
+
+        asyncio.run(_test())
+
+    def test_silence_composer_video_evaluates_and_clicks_ui_mute(self):
+        from auto_yt.services.fb_reels_browser_service import _silence_composer_video
+        import asyncio
+
+        evaluated_scripts = []
+        clicked_buttons = []
+
+        class LocatorMock:
+            def __init__(self, visible=True):
+                self._visible = visible
+
+            @property
+            def first(self):
+                return self
+
+            async def is_visible(self):
+                return self._visible
+
+            async def click(self, timeout=800):
+                clicked_buttons.append(True)
+
+        class OpenPageMock:
+            def is_closed(self):
+                return False
+
+            async def evaluate(self, script):
+                evaluated_scripts.append(script)
+
+            def locator(self, selector):
+                return LocatorMock(visible=True)
+
+        async def _test():
+            page_mock = OpenPageMock()
+            await _silence_composer_video(page_mock)
+            self.assertEqual(len(evaluated_scripts), 1)
+            self.assertIn("muted = true", evaluated_scripts[0])
+            self.assertIn("pause()", evaluated_scripts[0])
+            self.assertEqual(len(clicked_buttons), 1)
+
+        asyncio.run(_test())
+
 
 if __name__ == "__main__":
     unittest.main()

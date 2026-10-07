@@ -40,6 +40,54 @@ THUMBNAIL_DEFAULT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+SILENCE_MEDIA_INIT_SCRIPT = """
+(() => {
+    const silenceElement = (el) => {
+        try {
+            if (el && (el.tagName === 'VIDEO' || el.tagName === 'AUDIO')) {
+                el.muted = true;
+                el.volume = 0.0;
+                if (!el.paused) {
+                    el.pause();
+                }
+            }
+        } catch (e) {}
+    };
+
+    const silenceAll = () => {
+        document.querySelectorAll('video, audio').forEach(silenceElement);
+    };
+
+    silenceAll();
+    window.addEventListener('play', (e) => silenceElement(e.target), true);
+    window.addEventListener('playing', (e) => silenceElement(e.target), true);
+    window.addEventListener('loadeddata', (e) => silenceElement(e.target), true);
+    window.addEventListener('loadedmetadata', (e) => silenceElement(e.target), true);
+
+    const observer = new MutationObserver((mutations) => {
+        for (const mutation of mutations) {
+            for (const node of mutation.addedNodes) {
+                if (node.nodeType === 1) {
+                    if (node.tagName === 'VIDEO' || node.tagName === 'AUDIO') {
+                        silenceElement(node);
+                    } else if (node.querySelectorAll) {
+                        node.querySelectorAll('video, audio').forEach(silenceElement);
+                    }
+                }
+            }
+        }
+    });
+
+    if (document.documentElement) {
+        observer.observe(document.documentElement, { childList: true, subtree: true });
+    } else {
+        document.addEventListener('DOMContentLoaded', () => {
+            observer.observe(document.documentElement, { childList: true, subtree: true });
+        });
+    }
+})();
+"""
+
 
 async def upload_file_via_cdp(
     page: Any,
@@ -249,6 +297,51 @@ def _schedule_values_match(
         return False
 
 
+async def _silence_composer_video(page: Any) -> None:
+    """Mute and pause preview video player in Meta Reels Composer to eliminate background noise."""
+    if page is None:
+        return
+    try:
+        if page.is_closed():
+            return
+    except Exception:
+        return
+
+    # 1. Direct DOM pause and mute on all media elements
+    try:
+        await page.evaluate(
+            """() => {
+                document.querySelectorAll('video, audio').forEach(el => {
+                    try {
+                        el.muted = true;
+                        el.volume = 0.0;
+                        if (!el.paused) {
+                            el.pause();
+                        }
+                    } catch (e) {}
+                });
+            }"""
+        )
+    except Exception as exc:
+        logger.debug("Lỗi khi pause/mute video qua DOM evaluate: %s", exc)
+
+    # 2. UI Click fallback if mute / pause icon exists in Meta preview player
+    try:
+        mute_or_pause_btn = page.locator(
+            'div[aria-label*="Tắt tiếng" i], button[aria-label*="Tắt tiếng" i], '
+            'div[aria-label*="Mute" i], button[aria-label*="Mute" i], '
+            'div[aria-label*="Tạm dừng" i], button[aria-label*="Tạm dừng" i], '
+            'div[aria-label*="Pause" i], button[aria-label*="Pause" i]'
+        ).first
+        if await mute_or_pause_btn.is_visible():
+            try:
+                await mute_or_pause_btn.click(timeout=800)
+            except Exception:
+                await mute_or_pause_btn.evaluate("el => el.click()")
+    except Exception as exc:
+        logger.debug("Lỗi khi click nút tắt tiếng / tạm dừng UI: %s", exc)
+
+
 async def _dismiss_unwanted_modals(page: Any) -> bool:
     """Detect and dismiss unwanted blocking modals, promo popups, or sub-feature dialogs (e.g. 'Bản nhạc đã dịch')."""
     if page is None:
@@ -258,6 +351,8 @@ async def _dismiss_unwanted_modals(page: Any) -> bool:
             return False
     except Exception:
         return False
+
+    await _silence_composer_video(page)
 
     dismissed = False
     try:
@@ -955,6 +1050,12 @@ async def schedule_reel_via_gpm(
             page = await context.new_page()
             await page.bring_to_front()
 
+        try:
+            await page.add_init_script(SILENCE_MEDIA_INIT_SCRIPT)
+        except Exception as init_err:
+            logger.debug("Không thể nạp init script mute media: %s", init_err)
+        await _silence_composer_video(page)
+
         preserve_page = True
         try:
             # Set default timeout for individual actions
@@ -1195,6 +1296,7 @@ async def schedule_reel_via_gpm(
                 trigger_button_locator=add_btn,
                 timeout_seconds=15.0,
             )
+            await _silence_composer_video(page)
 
             notify("CP5_ASSET_UPLOADED", "Đang chờ video upload lên Meta Business Suite (100%)...", 35)
 
@@ -1202,6 +1304,7 @@ async def schedule_reel_via_gpm(
             upload_finished = False
             for loop_i in range(240): # up to 6 minutes for video upload
                 await asyncio.sleep(1.5)
+                await _silence_composer_video(page)
                 # Check 100% text or "Video của bạn an toàn để đăng!"
                 page_text = await page.content()
                 if "100%" in page_text or "Video của bạn an toàn" in page_text or "an toàn để đăng" in page_text:
@@ -1226,6 +1329,7 @@ async def schedule_reel_via_gpm(
                         upload_finished = True
                         break
 
+            await _silence_composer_video(page)
             notify("CP6_METADATA_FILLED", "Video đã tải lên xong. Đang nhập mô tả, tùy chỉnh FB & IG...", 50)
 
             # 3. Facebook & Instagram Destination Handling
