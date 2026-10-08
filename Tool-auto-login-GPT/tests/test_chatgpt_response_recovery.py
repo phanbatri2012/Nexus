@@ -19,15 +19,21 @@ def test_is_pure_thinking_indicator():
     # Single line indicators
     assert _is_pure_thinking_indicator("Worked for 1m 47s") is True
     assert _is_pure_thinking_indicator("Checked historical claims") is True
+    assert _is_pure_thinking_indicator("Clarified narrative claims and structured the account") is True
+    assert _is_pure_thinking_indicator("Structured the chronological timeline") is True
+    assert _is_pure_thinking_indicator("Detailed key historical milestones") is True
+    assert _is_pure_thinking_indicator("Formulated outline structure") is True
+    assert _is_pure_thinking_indicator("Examined Soviet-Vietnamese treaty context") is True
     assert _is_pure_thinking_indicator("Thought for 32 seconds") is True
     assert _is_pure_thinking_indicator("Searching for Vietnamese history") is True
     assert _is_pure_thinking_indicator("Analyzed historical documents") is True
     assert _is_pure_thinking_indicator("Đã kiểm tra tài liệu lịch sử") is True
+    assert _is_pure_thinking_indicator("Làm rõ các luận điểm chính") is True
     assert _is_pure_thinking_indicator("Đang suy nghĩ...") is True
     assert _is_pure_thinking_indicator("Stopped thinking") is True
 
     # Multi-line indicators
-    multiline = "Worked for 1m 47s\nChecked historical claims"
+    multiline = "Worked for 1m 26s\nClarified narrative claims and structured the account"
     assert _is_pure_thinking_indicator(multiline) is True
 
     # Real narrative or outline responses must NOT match
@@ -294,3 +300,69 @@ def test_wait_for_assistant_response_handles_transient_render_crash(monkeypatch)
     )
 
     assert response == "[PHAN 1] Kịch bản hoàn thành ở phút thứ 3"
+
+
+def test_extract_payload_with_turn_exchange_id_and_thought_node():
+    payload = {
+        "current_node": "node_thought",
+        "mapping": {
+            "node_user": {
+                "id": "node_user",
+                "parent": None,
+                "message": {
+                    "id": "node_user",
+                    "author": {"role": "user"},
+                    "content": {"content_type": "text", "parts": ["Prompt 2: Tạo dàn ý..."]},
+                    "status": "finished_successfully",
+                    "metadata": {"turn_exchange_id": "exchange_1"},
+                },
+            },
+            "node_thought": {
+                "id": "node_thought",
+                "parent": "node_user",
+                "message": {
+                    "id": "node_thought",
+                    "author": {"role": "assistant"},
+                    "content": {"content_type": "thoughts", "parts": ["Clarified narrative claims and structured the account"]},
+                    "status": "finished_successfully",
+                    "metadata": {"turn_exchange_id": "exchange_1"},
+                },
+            },
+            "node_assistant": {
+                "id": "node_assistant",
+                "parent": "node_thought",
+                "message": {
+                    "id": "node_assistant",
+                    "author": {"role": "assistant"},
+                    "content": {
+                        "content_type": "text",
+                        "parts": ["[PHAN 1] Mở đầu lịch sử...", "[PHAN 2] Diễn biến chi tiết..."],
+                    },
+                    "status": "finished_successfully",
+                    "end_turn": True,
+                    "metadata": {"turn_exchange_id": "exchange_1"},
+                },
+            },
+        },
+    }
+
+    extracted = extract_assistant_response_from_conversation_payload(
+        payload,
+        expected_user_text="Prompt 2: Tạo dàn ý...",
+    )
+    assert "[PHAN 1] Mở đầu lịch sử..." in extracted
+    assert "[PHAN 2] Diễn biến chi tiết..." in extracted
+
+
+def test_split_outline_parts_filters_thought_headers():
+    outline_with_thought = (
+        "Clarified narrative claims and structured the account\n\n"
+        "[PHAN 1] Phần mở đầu lịch sử về cố Tổng Bí thư Lê Duẩn và quan điểm chiến lược.\n\n"
+        "[PHAN 2] Diễn biến và các phân tích sâu về mối bang giao và bài học giữ nước."
+    )
+    parts = split_outline_parts(outline_with_thought)
+    assert len(parts) == 2
+    assert "Clarified narrative claims" not in parts[0]
+    assert "Phần mở đầu lịch sử" in parts[0]
+    assert "Diễn biến và các phân tích sâu" in parts[1]
+

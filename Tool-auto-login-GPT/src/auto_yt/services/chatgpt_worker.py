@@ -266,8 +266,22 @@ MIN_CORRUPTED_UNICODE_MARKERS = 3
 THINKING_INDICATOR_PATTERN = re.compile(
     r"^(?:stopped\s+thinking|thought\s+for\s+\d+.*|worked\s+for\s+\d+.*|thinking\.{0,3}|"
     r"đã\s+dừng\s+suy\s+nghĩ|đang\s+suy\s+nghĩ\.{0,3}|đã\s+suy\s+nghĩ\s+trong\s+\d+.*|"
-    r"(?:verif(?:y|ying|ied)|check(?:ing|ed|s)?|search(?:ing|ed|es)?(?:\s+for)?|analyz(?:e|ing|ed|es)|research(?:ing|ed|es)?|look(?:ing|ed)?\s+up|refin(?:e|ing|ed)|read(?:ing)?|draft(?:ing|ed)?|explor(?:e|ing|ed)|review(?:ing|ed)?|find(?:ing)?|found|compar(?:e|ing|ed)|synthesiz(?:e|ing|ed)|gather(?:ing|ed)?|identif(?:y|ying|ied)|evaluat(?:e|ing|ed)|investigat(?:e|ing|ed)|summariz(?:e|ing|ed)|generat(?:e|ing|ed)|"
-    r"(?:đã\s+)?(?:kiểm\s+tra|tìm\s+kiếm|tra\s+cứu|phân\s+tích|nghiên\s+cứu|đọc|xác\s+minh|tổng\s+hợp|đánh\s+giá|so\s+sánh|thu\s+thập))\s+[^\r\n]{1,80})$",
+    r"(?:clarif(?:y|ying|ied)|structur(?:e|ing|ed)|formulat(?:e|ing|ed)|outlin(?:e|ing|ed)|"
+    r"detail(?:ing|ed|s)?|examin(?:e|ing|ed|es)|process(?:ing|ed|es)?|reason(?:ing|ed|s)?|"
+    r"expand(?:ing|ed|s)?|fram(?:e|ing|ed|es)|connect(?:ing|ed|s)?|organiz(?:e|ing|ed|es)|"
+    r"decid(?:e|ing|ed|es)|determin(?:e|ing|ed|es)|select(?:ing|ed|s)?|plan(?:ning|ned|s)?|"
+    r"construct(?:ing|ed|s)?|build(?:ing|t|s)?|prepar(?:e|ing|ed|es)|address(?:ing|ed|es)?|"
+    r"resolv(?:e|ing|ed|es)|revis(?:e|ing|ed|es)|adjust(?:ing|ed|s)?|finaliz(?:e|ing|ed|es)|"
+    r"complet(?:e|ing|ed|es)|validat(?:e|ing|ed|es)|confirm(?:ing|ed|s)?|consid(?:er|ering|ered|ers)|"
+    r"weigh(?:ing|ed|s)?|delv(?:e|ing|ed|es)|highlight(?:ing|ed|s)?|focus(?:ing|ed|es)?|"
+    r"extract(?:ing|ed|s)?|synthesiz(?:e|ing|ed|es)|summariz(?:e|ing|ed|es)|generat(?:e|ing|ed|es)|"
+    r"creat(?:e|ing|ed|es)|verif(?:y|ying|ied)|check(?:ing|ed|s)?|search(?:ing|ed|es)?(?:\s+for)?|"
+    r"analyz(?:e|ing|ed|es)|research(?:ing|ed|es)?|look(?:ing|ed)?\s+up|refin(?:e|ing|ed)|"
+    r"read(?:ing)?|draft(?:ing|ed)?|explor(?:e|ing|ed)|review(?:ing|ed)?|find(?:ing)?|found|"
+    r"compar(?:e|ing|ed)|gather(?:ing|ed)?|identif(?:y|ying|ied)|evaluat(?:e|ing|ed)|investigat(?:e|ing|ed)|"
+    r"(?:đã\s+)?(?:kiểm\s+tra|tìm\s+kiếm|tra\s+cứu|phân\s+tích|nghiên\s+cứu|đọc|xác\s+minh|tổng\s+hợp|"
+    r"đánh\s+giá|so\s+sánh|thu\s+thập|làm\s+rõ|cấu\s+trúc|lập\s+dàn\s+ý|xây\s+dựng|hoàn\s+thiện|"
+    r"chuẩn\s+bị|xử\s+lý|tạo|tóm\s+tắt|tinh\s+chỉnh|lựa\s+chọn|xác\s+định|xem\s+xét|bổ\s+sung))\s+[^\r\n]{1,120})$",
     re.IGNORECASE | re.UNICODE,
 )
 
@@ -2309,9 +2323,14 @@ def _extract_clean_markdown_text(node) -> str:
                 '[data-testid*="thought"]',
                 '[data-testid*="reasoning"]',
                 '[data-testid*="thinking"]',
+                '[data-testid*="thought-summary"]',
                 '[class*="thought"]',
                 '[class*="reasoning"]',
                 '[class*="thinking"]',
+                '[class*="thought-summary"]',
+                '[class*="thought_summary"]',
+                '[class*="reasoning-summary"]',
+                '[class*="reasoning_summary"]',
                 '.result-thinking',
                 '[data-testid*="search"]',
                 '[data-testid*="web-search"]',
@@ -2329,8 +2348,10 @@ def _extract_clean_markdown_text(node) -> str:
                 clone.querySelectorAll(sel).forEach((badEl) => badEl.remove());
             });
 
-            // 3. Remove standalone Canvas title headers, buttons, thought summaries & action pill controls
-            clone.querySelectorAll('div, span, p, header, a, section, aside').forEach((elem) => {
+            // 3. Remove thinking containers and thought summary items
+            const thoughtVerbRegex = /^(?:clarif(?:y|ying|ied)|structur(?:e|ing|ed)|formulat(?:e|ing|ed)|outlin(?:e|ing|ed)|detail(?:ing|ed|s)?|examin(?:e|ing|ed|es)|process(?:ing|ed|es)?|reason(?:ing|ed|s)?|expand(?:ing|ed|s)?|fram(?:e|ing|ed|es)|connect(?:ing|ed|s)?|organiz(?:e|ing|ed|es)|decid(?:e|ing|ed|es)|determin(?:e|ing|ed|es)|select(?:ing|ed|s)?|plan(?:ning|ned|s)?|construct(?:ing|ed|s)?|build(?:ing|t|s)?|prepar(?:e|ing|ed|es)|address(?:ing|ed|es)?|resolv(?:e|ing|ed|es)|revis(?:e|ing|ed|es)|adjust(?:ing|ed|s)?|finaliz(?:e|ing|ed|es)|complet(?:e|ing|ed|es)|validat(?:e|ing|ed|es)|confirm(?:ing|ed|s)?|consid(?:er|ering|ered|ers)|weigh(?:ing|ed|s)?|delv(?:e|ing|ed|es)|highlight(?:ing|ed|s)?|focus(?:ing|ed|es)?|extract(?:ing|ed|s)?|synthesiz(?:e|ing|ed|es)|summariz(?:e|ing|ed|es)|generat(?:e|ing|ed|es)|creat(?:e|ing|ed|es)|verif(?:y|ying|ied)|check(?:ing|ed|s)?|search(?:ing|ed|es)?|analyz(?:e|ing|ed|es)|research(?:ing|ed|es)?|look(?:ing|ed)?\s+up|refin(?:e|ing|ed)|read(?:ing)?|draft(?:ing|ed)?|explor(?:e|ing|ed)|review(?:ing|ed)?|find(?:ing)?|found|compar(?:e|ing|ed)|gather(?:ing|ed)?|identif(?:y|ying|ied)|evaluat(?:e|ing|ed)|investigat(?:e|ing|ed)|(?:đã\s+)?(?:kiểm\s+tra|tìm\s+kiếm|tra\s+cứu|phân\s+tích|nghiên\s+cứu|đọc|xác\s+minh|tổng\s+hợp|đánh\s+giá|so\s+sánh|thu\s+thập|làm\s+rõ|cấu\s+trúc|lập\s+dàn\s+ý|xây\s+dựng|hoàn\s+thiện|chuẩn\s+bị|xử\s+lý|tạo|tóm\s+tắt|tinh\s+chỉnh|lựa\s+chọn|xác\s+định|xem\s+xét|bổ\s+sung))\s+/i;
+
+            clone.querySelectorAll('div, span, p, li, header, a, section, aside').forEach((elem) => {
                 const txt = (elem.textContent || '').trim().toLowerCase();
                 if (
                     txt === 'nội dung chính' ||
@@ -2367,6 +2388,13 @@ def _extract_clean_markdown_text(node) -> str:
                         txt.startsWith('thought for ') ||
                         txt.startsWith('đã suy nghĩ trong ')
                     ) {
+                        elem.remove();
+                        return;
+                    }
+                }
+                // Strip thought step phrases
+                if (txt.length > 0 && txt.length <= 150 && thoughtVerbRegex.test(txt) && !txt.includes('[phan]') && !txt.includes('###')) {
+                    if (elem.children.length <= 1) {
                         elem.remove();
                     }
                 }
@@ -2432,6 +2460,7 @@ def _read_assistant_message(message) -> str:
         if (
             markdown_text
             and not _is_pure_thinking_indicator(markdown_text)
+            and not looks_like_editorial_artifact(markdown_text)
             and markdown_text not in markdown_parts
         ):
             # If this markdown part is a subset of an existing one or vice versa, keep the longer one
@@ -2447,9 +2476,24 @@ def _read_assistant_message(message) -> str:
             if not is_subset:
                 markdown_parts.append(markdown_text)
     if markdown_parts:
-        return "\n\n".join(markdown_parts)
+        valid_parts = [
+            p for p in markdown_parts
+            if p and not _is_pure_thinking_indicator(p) and not looks_like_editorial_artifact(p)
+        ]
+        if valid_parts:
+            has_substantive = any(
+                len(p.split()) >= 15 or "[phan]" in p.lower() or "###" in p
+                for p in valid_parts
+            )
+            if has_substantive:
+                valid_parts = [
+                    p for p in valid_parts
+                    if len(p.split()) >= 10 or "[phan]" in p.lower() or "###" in p or not _is_pure_thinking_indicator(p)
+                ]
+            if valid_parts:
+                return "\n\n".join(valid_parts)
     fallback = _extract_clean_markdown_text(message)
-    if _is_pure_thinking_indicator(fallback):
+    if _is_pure_thinking_indicator(fallback) or looks_like_editorial_artifact(fallback):
         return ""
     return fallback
 
@@ -2518,11 +2562,20 @@ def get_assistant_response_after_latest_user(
             const cleanNode = (el) => {
                 if (!el) return '';
                 const clone = el.cloneNode(true);
-                clone.querySelectorAll('button, .sr-only, [data-testid*="citation"], sup.citation, header, [class*="header-"], [class*="editorControls"], [class*="suggestion"], [class*="pill"], [data-testid*="thought"], [data-testid*="reasoning"], [data-testid*="thinking"], [class*="thought"], [class*="reasoning"], [class*="thinking"], .result-thinking, [data-testid*="search"], [data-testid*="web-search"], [class*="web-search"], details, summary').forEach(b => b.remove());
-                clone.querySelectorAll('div, span, p, header, a, section, aside').forEach((elem) => {
+                clone.querySelectorAll('button, .sr-only, [data-testid*="citation"], sup.citation, header, [class*="header-"], [class*="editorControls"], [class*="suggestion"], [class*="pill"], [data-testid*="thought"], [data-testid*="reasoning"], [data-testid*="thinking"], [data-testid*="thought-summary"], [class*="thought"], [class*="reasoning"], [class*="thinking"], [class*="thought-summary"], [class*="thought_summary"], [class*="reasoning-summary"], [class*="reasoning_summary"], .result-thinking, [data-testid*="search"], [data-testid*="web-search"], [class*="web-search"], details, summary').forEach(b => b.remove());
+                const thoughtVerbRegex = /^(?:clarif(?:y|ying|ied)|structur(?:e|ing|ed)|formulat(?:e|ing|ed)|outlin(?:e|ing|ed)|detail(?:ing|ed|s)?|examin(?:e|ing|ed|es)|process(?:ing|ed|es)?|reason(?:ing|ed|s)?|expand(?:ing|ed|s)?|fram(?:e|ing|ed|es)|connect(?:ing|ed|s)?|organiz(?:e|ing|ed|es)|decid(?:e|ing|ed|es)|determin(?:e|ing|ed|es)|select(?:ing|ed|s)?|plan(?:ning|ned|s)?|construct(?:ing|ed|s)?|build(?:ing|t|s)?|prepar(?:e|ing|ed|es)|address(?:ing|ed|es)?|resolv(?:e|ing|ed|es)|revis(?:e|ing|ed|es)|adjust(?:ing|ed|s)?|finaliz(?:e|ing|ed|es)|complet(?:e|ing|ed|es)|validat(?:e|ing|ed|es)|confirm(?:ing|ed|s)?|consid(?:er|ering|ered|ers)|weigh(?:ing|ed|s)?|delv(?:e|ing|ed|es)|highlight(?:ing|ed|s)?|focus(?:ing|ed|es)?|extract(?:ing|ed|s)?|synthesiz(?:e|ing|ed|es)|summariz(?:e|ing|ed|es)|generat(?:e|ing|ed|es)|creat(?:e|ing|ed|es)|verif(?:y|ying|ied)|check(?:ing|ed|s)?|search(?:ing|ed|es)?|analyz(?:e|ing|ed|es)|research(?:ing|ed|es)?|look(?:ing|ed)?\s+up|refin(?:e|ing|ed)|read(?:ing)?|draft(?:ing|ed)?|explor(?:e|ing|ed)|review(?:ing|ed)?|find(?:ing)?|found|compar(?:e|ing|ed)|gather(?:ing|ed)?|identif(?:y|ying|ied)|evaluat(?:e|ing|ed)|investigat(?:e|ing|ed)|(?:đã\s+)?(?:kiểm\s+tra|tìm\s+kiếm|tra\s+cứu|phân\s+tích|nghiên\s+cứu|đọc|xác\s+minh|tổng\s+hợp|đánh\s+giá|so\s+sánh|thu\s+thập|làm\s+rõ|cấu\s+trúc|lập\s+dàn\s+ý|xây\s+dựng|hoàn\s+thiện|chuẩn\s+bị|xử\s+lý|tạo|tóm\s+tắt|tinh\s+chỉnh|lựa\s+chọn|xác\s+định|xem\s+xét|bổ\s+sung))\s+/i;
+                clone.querySelectorAll('div, span, p, li, header, a, section, aside').forEach((elem) => {
                     const txt = (elem.textContent || '').trim().toLowerCase();
-                    if (txt.startsWith('worked for ') || txt.startsWith('thought for ') || txt.startsWith('đã suy nghĩ trong ') || txt.startsWith('thinking...') || txt.startsWith('đang suy nghĩ')) {
-                        elem.remove();
+                    if (txt.startsWith('worked for ') || txt.startsWith('thought for ') || txt.startsWith('đã suy nghĩ trong ') || txt.startsWith('thinking...') || txt.startsWith('đang suy nghĩ') || txt.startsWith('đã dừng suy nghĩ') || txt.startsWith('stopped thinking')) {
+                        if (elem.children.length === 0 || elem.tagName === 'HEADER' || elem.tagName === 'SECTION' || elem.tagName === 'ASIDE' || txt.startsWith('worked for ') || txt.startsWith('thought for ') || txt.startsWith('đã suy nghĩ trong ')) {
+                            elem.remove();
+                            return;
+                        }
+                    }
+                    if (txt.length > 0 && txt.length <= 150 && thoughtVerbRegex.test(txt) && !txt.includes('[phan]') && !txt.includes('###')) {
+                        if (elem.children.length <= 1) {
+                            elem.remove();
+                        }
                     }
                 });
                 return (clone.innerText || clone.textContent || '').trim();
@@ -2754,10 +2807,13 @@ def _get_payload_content_text(message: dict) -> str:
     if not isinstance(content, dict):
         return ""
     content_type = str(content.get("content_type") or "").lower()
-    if content_type in ("thoughts", "reasoning", "tether_quote", "tether_browsing_code", "execution_output"):
+    if content_type in ("thoughts", "reasoning", "thought", "tether_quote", "tether_browsing_code", "execution_output"):
         return ""
     recipient = str(message.get("recipient") or "").lower()
-    if recipient in ("browser", "python", "dalle", "interpreter"):
+    if recipient in ("thought", "thoughts", "browser", "python", "dalle", "interpreter"):
+        return ""
+    role = _get_payload_message_role(message)
+    if role == "tool":
         return ""
     parts = content.get("parts")
     if not isinstance(parts, list):
@@ -2816,7 +2872,7 @@ def _get_completed_payload_assistant_text(message: dict) -> str:
     if _get_payload_message_role(message) != "assistant":
         return ""
     recipient = str(message.get("recipient") or "").lower()
-    if recipient in ("browser", "python", "dalle", "interpreter"):
+    if recipient in ("thought", "thoughts", "browser", "python", "dalle", "interpreter"):
         return ""
     status = str(message.get("status") or "").casefold()
     if status not in CHATGPT_SUCCESSFUL_MESSAGE_STATUSES:
@@ -2850,7 +2906,7 @@ def _extract_payload_response_after_user(
         if _get_payload_message_role(message) == "user":
             break
         candidate = _get_completed_payload_assistant_text(message)
-        if candidate:
+        if candidate and not _is_pure_thinking_indicator(candidate):
             response_text = candidate
     return response_text
 
@@ -2931,41 +2987,34 @@ def extract_assistant_response_from_conversation_payload(
                 "none",
                 "current_node_missing",
             )
-            return ""
-        branch = []
-        seen = set()
-        node_id = current_node
-        while node_id and node_id not in seen:
-            seen.add(node_id)
-            message = message_by_id.get(node_id)
-            if message is None:
-                parent_chain_incomplete = True
-                break
-            branch.append(message)
-            parent_id = _get_payload_parent_id(message)
-            if parent_id and parent_id not in message_by_id:
-                parent_chain_incomplete = True
-            node_id = parent_id
-        branch_response = _extract_payload_response_after_user(
-            list(reversed(branch)),
-            expected_user_text,
-        )
-        if branch_response:
-            _log_payload_recovery_selection(
-                len(messages),
-                parent_chain_incomplete,
-                "parent_chain",
-                "accepted",
+            # Do not return "" immediately if mapping has full list of messages
+        else:
+            branch = []
+            seen = set()
+            node_id = current_node
+            while node_id and node_id not in seen:
+                seen.add(node_id)
+                message = message_by_id.get(node_id)
+                if message is None:
+                    parent_chain_incomplete = True
+                    break
+                branch.append(message)
+                parent_id = _get_payload_parent_id(message)
+                if parent_id and parent_id not in message_by_id:
+                    parent_chain_incomplete = True
+                node_id = parent_id
+            branch_response = _extract_payload_response_after_user(
+                list(reversed(branch)),
+                expected_user_text,
             )
-            return branch_response
-        if not parent_chain_incomplete:
-            _log_payload_recovery_selection(
-                len(messages),
-                False,
-                "parent_chain",
-                "matching_response_missing",
-            )
-            return ""
+            if branch_response:
+                _log_payload_recovery_selection(
+                    len(messages),
+                    parent_chain_incomplete,
+                    "parent_chain",
+                    "accepted",
+                )
+                return branch_response
 
     if current_message is not None:
         current_metadata = _get_payload_message_metadata(current_message)
@@ -3004,7 +3053,6 @@ def extract_assistant_response_from_conversation_payload(
                 correlation_field,
                 "matching_response_missing",
             )
-            return ""
 
     if current_message is not None:
         current_index = messages.index(current_message)
@@ -3021,7 +3069,7 @@ def extract_assistant_response_from_conversation_payload(
             current_response = _get_completed_payload_assistant_text(
                 current_message,
             )
-            if current_response:
+            if current_response and not _is_pure_thinking_indicator(current_response):
                 _log_payload_recovery_selection(
                     len(messages),
                     parent_chain_incomplete,
@@ -3044,7 +3092,7 @@ def extract_assistant_response_from_conversation_payload(
         ]
         all_msgs.sort(key=lambda m: float(m.get("create_time") or 0.0))
         fallback_resp = _extract_payload_response_after_user(all_msgs, expected_user_text)
-        if fallback_resp:
+        if fallback_resp and not _is_pure_thinking_indicator(fallback_resp):
             _log_payload_recovery_selection(
                 len(messages),
                 parent_chain_incomplete,
@@ -3505,11 +3553,20 @@ def get_reusable_chapter_response(page: Page) -> str:
             const cleanNode = (el) => {
                 if (!el) return '';
                 const clone = el.cloneNode(true);
-                clone.querySelectorAll('button, .sr-only, [data-testid*="citation"], sup.citation, header, [class*="header-"], [class*="editorControls"], [class*="suggestion"], [class*="pill"], [data-testid*="thought"], [data-testid*="reasoning"], [data-testid*="thinking"], [class*="thought"], [class*="reasoning"], [class*="thinking"], .result-thinking, [data-testid*="search"], [data-testid*="web-search"], [class*="web-search"], details, summary').forEach(b => b.remove());
-                clone.querySelectorAll('div, span, p, header, a, section, aside').forEach((elem) => {
+                clone.querySelectorAll('button, .sr-only, [data-testid*="citation"], sup.citation, header, [class*="header-"], [class*="editorControls"], [class*="suggestion"], [class*="pill"], [data-testid*="thought"], [data-testid*="reasoning"], [data-testid*="thinking"], [data-testid*="thought-summary"], [class*="thought"], [class*="reasoning"], [class*="thinking"], [class*="thought-summary"], [class*="thought_summary"], [class*="reasoning-summary"], [class*="reasoning_summary"], .result-thinking, [data-testid*="search"], [data-testid*="web-search"], [class*="web-search"], details, summary').forEach(b => b.remove());
+                const thoughtVerbRegex = /^(?:clarif(?:y|ying|ied)|structur(?:e|ing|ed)|formulat(?:e|ing|ed)|outlin(?:e|ing|ed)|detail(?:ing|ed|s)?|examin(?:e|ing|ed|es)|process(?:ing|ed|es)?|reason(?:ing|ed|s)?|expand(?:ing|ed|s)?|fram(?:e|ing|ed|es)|connect(?:ing|ed|s)?|organiz(?:e|ing|ed|es)|decid(?:e|ing|ed|es)|determin(?:e|ing|ed|es)|select(?:ing|ed|s)?|plan(?:ning|ned|s)?|construct(?:ing|ed|s)?|build(?:ing|t|s)?|prepar(?:e|ing|ed|es)|address(?:ing|ed|es)?|resolv(?:e|ing|ed|es)|revis(?:e|ing|ed|es)|adjust(?:ing|ed|s)?|finaliz(?:e|ing|ed|es)|complet(?:e|ing|ed|es)|validat(?:e|ing|ed|es)|confirm(?:ing|ed|s)?|consid(?:er|ering|ered|ers)|weigh(?:ing|ed|s)?|delv(?:e|ing|ed|es)|highlight(?:ing|ed|s)?|focus(?:ing|ed|es)?|extract(?:ing|ed|s)?|synthesiz(?:e|ing|ed|es)|summariz(?:e|ing|ed|es)|generat(?:e|ing|ed|es)|creat(?:e|ing|ed|es)|verif(?:y|ying|ied)|check(?:ing|ed|s)?|search(?:ing|ed|es)?|analyz(?:e|ing|ed|es)|research(?:ing|ed|es)?|look(?:ing|ed)?\s+up|refin(?:e|ing|ed)|read(?:ing)?|draft(?:ing|ed)?|explor(?:e|ing|ed)|review(?:ing|ed)?|find(?:ing)?|found|compar(?:e|ing|ed)|gather(?:ing|ed)?|identif(?:y|ying|ied)|evaluat(?:e|ing|ed)|investigat(?:e|ing|ed)|(?:đã\s+)?(?:kiểm\s+tra|tìm\s+kiếm|tra\s+cứu|phân\s+tích|nghiên\s+cứu|đọc|xác\s+minh|tổng\s+hợp|đánh\s+giá|so\s+sánh|thu\s+thập|làm\s+rõ|cấu\s+trúc|lập\s+dàn\s+ý|xây\s+dựng|hoàn\s+thiện|chuẩn\s+bị|xử\s+lý|tạo|tóm\s+tắt|tinh\s+chỉnh|lựa\s+chọn|xác\s+định|xem\s+xét|bổ\s+sung))\s+/i;
+                clone.querySelectorAll('div, span, p, li, header, a, section, aside').forEach((elem) => {
                     const txt = (elem.textContent || '').trim().toLowerCase();
-                    if (txt.startsWith('worked for ') || txt.startsWith('thought for ') || txt.startsWith('đã suy nghĩ trong ') || txt.startsWith('thinking...') || txt.startsWith('đang suy nghĩ')) {
-                        elem.remove();
+                    if (txt.startsWith('worked for ') || txt.startsWith('thought for ') || txt.startsWith('đã suy nghĩ trong ') || txt.startsWith('thinking...') || txt.startsWith('đang suy nghĩ') || txt.startsWith('đã dừng suy nghĩ') || txt.startsWith('stopped thinking')) {
+                        if (elem.children.length === 0 || elem.tagName === 'HEADER' || elem.tagName === 'SECTION' || elem.tagName === 'ASIDE' || txt.startsWith('worked for ') || txt.startsWith('thought for ') || txt.startsWith('đã suy nghĩ trong ')) {
+                            elem.remove();
+                            return;
+                        }
+                    }
+                    if (txt.length > 0 && txt.length <= 150 && thoughtVerbRegex.test(txt) && !txt.includes('[phan]') && !txt.includes('###')) {
+                        if (elem.children.length <= 1) {
+                            elem.remove();
+                        }
                     }
                 });
                 return (clone.innerText || clone.textContent || '').trim();
@@ -3553,11 +3610,20 @@ def get_reusable_outline_response(page: Page) -> str:
             const cleanNode = (el) => {
                 if (!el) return '';
                 const clone = el.cloneNode(true);
-                clone.querySelectorAll('button, .sr-only, [data-testid*="citation"], sup.citation, header, [class*="header-"], [class*="editorControls"], [class*="suggestion"], [class*="pill"], [data-testid*="thought"], [data-testid*="reasoning"], [data-testid*="thinking"], [class*="thought"], [class*="reasoning"], [class*="thinking"], .result-thinking, [data-testid*="search"], [data-testid*="web-search"], [class*="web-search"], details, summary').forEach(b => b.remove());
-                clone.querySelectorAll('div, span, p, header, a, section, aside').forEach((elem) => {
+                clone.querySelectorAll('button, .sr-only, [data-testid*="citation"], sup.citation, header, [class*="header-"], [class*="editorControls"], [class*="suggestion"], [class*="pill"], [data-testid*="thought"], [data-testid*="reasoning"], [data-testid*="thinking"], [data-testid*="thought-summary"], [class*="thought"], [class*="reasoning"], [class*="thinking"], [class*="thought-summary"], [class*="thought_summary"], [class*="reasoning-summary"], [class*="reasoning_summary"], .result-thinking, [data-testid*="search"], [data-testid*="web-search"], [class*="web-search"], details, summary').forEach(b => b.remove());
+                const thoughtVerbRegex = /^(?:clarif(?:y|ying|ied)|structur(?:e|ing|ed)|formulat(?:e|ing|ed)|outlin(?:e|ing|ed)|detail(?:ing|ed|s)?|examin(?:e|ing|ed|es)|process(?:ing|ed|es)?|reason(?:ing|ed|s)?|expand(?:ing|ed|s)?|fram(?:e|ing|ed|es)|connect(?:ing|ed|s)?|organiz(?:e|ing|ed|es)|decid(?:e|ing|ed|es)|determin(?:e|ing|ed|es)|select(?:ing|ed|s)?|plan(?:ning|ned|s)?|construct(?:ing|ed|s)?|build(?:ing|t|s)?|prepar(?:e|ing|ed|es)|address(?:ing|ed|es)?|resolv(?:e|ing|ed|es)|revis(?:e|ing|ed|es)|adjust(?:ing|ed|s)?|finaliz(?:e|ing|ed|es)|complet(?:e|ing|ed|es)|validat(?:e|ing|ed|es)|confirm(?:ing|ed|s)?|consid(?:er|ering|ered|ers)|weigh(?:ing|ed|s)?|delv(?:e|ing|ed|es)|highlight(?:ing|ed|s)?|focus(?:ing|ed|es)?|extract(?:ing|ed|s)?|synthesiz(?:e|ing|ed|es)|summariz(?:e|ing|ed|es)|generat(?:e|ing|ed|es)|creat(?:e|ing|ed|es)|verif(?:y|ying|ied)|check(?:ing|ed|s)?|search(?:ing|ed|es)?|analyz(?:e|ing|ed|es)|research(?:ing|ed|es)?|look(?:ing|ed)?\s+up|refin(?:e|ing|ed)|read(?:ing)?|draft(?:ing|ed)?|explor(?:e|ing|ed)|review(?:ing|ed)?|find(?:ing)?|found|compar(?:e|ing|ed)|gather(?:ing|ed)?|identif(?:y|ying|ied)|evaluat(?:e|ing|ed)|investigat(?:e|ing|ed)|(?:đã\s+)?(?:kiểm\s+tra|tìm\s+kiếm|tra\s+cứu|phân\s+tích|nghiên\s+cứu|đọc|xác\s+minh|tổng\s+hợp|đánh\s+giá|so\s+sánh|thu\s+thập|làm\s+rõ|cấu\s+trúc|lập\s+dàn\s+ý|xây\s+dựng|hoàn\s+thiện|chuẩn\s+bị|xử\s+lý|tạo|tóm\s+tắt|tinh\s+chỉnh|lựa\s+chọn|xác\s+định|xem\s+xét|bổ\s+sung))\s+/i;
+                clone.querySelectorAll('div, span, p, li, header, a, section, aside').forEach((elem) => {
                     const txt = (elem.textContent || '').trim().toLowerCase();
-                    if (txt.startsWith('worked for ') || txt.startsWith('thought for ') || txt.startsWith('đã suy nghĩ trong ') || txt.startsWith('thinking...') || txt.startsWith('đang suy nghĩ')) {
-                        elem.remove();
+                    if (txt.startsWith('worked for ') || txt.startsWith('thought for ') || txt.startsWith('đã suy nghĩ trong ') || txt.startsWith('thinking...') || txt.startsWith('đang suy nghĩ') || txt.startsWith('đã dừng suy nghĩ') || txt.startsWith('stopped thinking')) {
+                        if (elem.children.length === 0 || elem.tagName === 'HEADER' || elem.tagName === 'SECTION' || elem.tagName === 'ASIDE' || txt.startsWith('worked for ') || txt.startsWith('thought for ') || txt.startsWith('đã suy nghĩ trong ')) {
+                            elem.remove();
+                            return;
+                        }
+                    }
+                    if (txt.length > 0 && txt.length <= 150 && thoughtVerbRegex.test(txt) && !txt.includes('[phan]') && !txt.includes('###')) {
+                        if (elem.children.length <= 1) {
+                            elem.remove();
+                        }
                     }
                 });
                 return (clone.innerText || clone.textContent || '').trim();
