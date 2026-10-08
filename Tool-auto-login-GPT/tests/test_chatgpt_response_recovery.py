@@ -1,4 +1,5 @@
 import pytest
+import time
 from unittest.mock import MagicMock
 from auto_yt.services.chatgpt_worker import (
     _is_pure_thinking_indicator,
@@ -9,6 +10,7 @@ from auto_yt.services.chatgpt_worker import (
     extract_assistant_response_from_conversation_payload,
     recover_assistant_response_from_backend,
     _accept_or_recover_assistant_response,
+    wait_for_assistant_response,
     split_outline_parts,
 )
 
@@ -224,3 +226,71 @@ def test_accept_or_recover_on_thinking_indicator(monkeypatch):
         "Prompt 2: Tạo dàn ý...",
     )
     assert result == "[PHAN 1] Dàn ý chuẩn xác từ API"
+
+
+def test_wait_for_assistant_response_handles_transient_render_crash(monkeypatch):
+    mock_page = MagicMock()
+    mock_page.url = "https://chatgpt.com/g/g-p-123/c/6ac76eef-3990-83ec-a218-0f3c09bf20a5"
+
+    call_count = [0]
+    
+    finished_payload = {
+        "current_node": "node_2",
+        "mapping": {
+            "node_1": {
+                "id": "node_1",
+                "parent": None,
+                "message": {
+                    "id": "node_1",
+                    "author": {"role": "user"},
+                    "content": {"content_type": "text", "parts": ["Prompt 2: Tạo dàn ý..."]},
+                    "status": "finished_successfully",
+                },
+            },
+            "node_2": {
+                "id": "node_2",
+                "parent": "node_1",
+                "message": {
+                    "id": "node_2",
+                    "author": {"role": "assistant"},
+                    "content": {
+                        "content_type": "text",
+                        "parts": ["[PHAN 1] Kịch bản hoàn thành ở phút thứ 3"],
+                    },
+                    "status": "finished_successfully",
+                    "end_turn": True,
+                },
+            },
+        },
+    }
+
+    # Simulate: 
+    # At first, evaluate calls return in_progress or render crash
+    # On 2nd backend poll, evaluate returns finished_payload
+    def fake_evaluate(script, arg=None):
+        script_str = str(script)
+        if "backend-api/conversation" in script_str:
+            call_count[0] += 1
+            if call_count[0] >= 2:
+                return finished_payload
+            return {"mapping": {}}
+        if "this response couldn't load" in script_str:
+            return True # Render error present
+        return False
+
+    mock_page.evaluate = fake_evaluate
+
+    # Mock DOM message extractors to simulate crashed DOM
+    monkeypatch.setattr("auto_yt.services.chatgpt_worker.get_new_assistant_response", lambda *args, **kwargs: "")
+    monkeypatch.setattr("auto_yt.services.chatgpt_worker.get_assistant_response_after_latest_user", lambda *args, **kwargs: "This response couldn't load")
+    monkeypatch.setattr("auto_yt.services.chatgpt_worker.is_chatgpt_generation_active", lambda *args: False)
+    monkeypatch.setattr("auto_yt.services.chatgpt_worker.accept_external_app_permission_dialog", lambda *args: False)
+
+    response = wait_for_assistant_response(
+        mock_page,
+        previous_assistant_turn=0,
+        submitted_prompt_text="Prompt 2: Tạo dàn ý...",
+        timeout=10,
+    )
+
+    assert response == "[PHAN 1] Kịch bản hoàn thành ở phút thứ 3"

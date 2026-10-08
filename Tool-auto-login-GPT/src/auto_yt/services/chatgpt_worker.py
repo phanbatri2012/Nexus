@@ -3087,7 +3087,12 @@ def _accept_or_recover_assistant_response(
         if recovered_response:
             return recovered_response
 
-    if response_text and not _is_pure_thinking_indicator(response_text):
+    if (
+        response_text
+        and not _is_pure_thinking_indicator(response_text)
+        and not is_chatgpt_render_error_present(page)
+        and not looks_like_chatgpt_error(response_text)
+    ):
         _check_for_chatgpt_errors(response_text)
     return response_text
 
@@ -3109,11 +3114,33 @@ def wait_for_assistant_response(
     last_response = ""
     last_change_at = started_at
     saw_busy_state = False
+    last_backend_poll_at = 0.0
+    backend_poll_interval = 4.0
 
     while True:
         accept_external_app_permission_dialog(page)
         busy = is_chatgpt_generation_active(page)
         saw_busy_state = saw_busy_state or busy
+        now = time.monotonic()
+
+        # 1. Periodic background API polling if DOM is degraded, crashed, thinking, or generation stopped
+        render_crashed = is_chatgpt_render_error_present(page)
+        should_poll_backend = (
+            render_crashed
+            or (last_response and (looks_like_chatgpt_error(last_response) or _is_pure_thinking_indicator(last_response)))
+            or (saw_busy_state and not busy)
+            or (now - started_at >= 15.0 and not last_response)
+        )
+        if should_poll_backend and (now - last_backend_poll_at >= backend_poll_interval):
+            last_backend_poll_at = now
+            backend_text = recover_assistant_response_from_backend(
+                page,
+                expected_user_text=submitted_prompt_text,
+            )
+            if backend_text and not _is_pure_thinking_indicator(backend_text):
+                return backend_text
+
+        # 2. Extract DOM candidate
         response_text = get_new_assistant_response(
             page,
             previous_assistant_turn,
@@ -3124,25 +3151,12 @@ def wait_for_assistant_response(
                 page,
                 expected_user_text=submitted_prompt_text,
             )
-        now = time.monotonic()
 
         if response_text != last_response:
             last_response = response_text
             last_change_at = now
 
-        if (
-            last_response
-            and (looks_like_chatgpt_error(last_response) or _is_pure_thinking_indicator(last_response))
-            and now - last_change_at >= 1.5
-        ):
-            recovered = _accept_or_recover_assistant_response(
-                page,
-                last_response,
-                submitted_prompt_text,
-            )
-            if recovered and not _is_pure_thinking_indicator(recovered):
-                return recovered
-
+        # 3. If DOM response is valid, clean, and stable
         required_stability = (
             ASSISTANT_RESPONSE_SETTLE_AFTER_BUSY_SECONDS
             if saw_busy_state
@@ -3151,34 +3165,14 @@ def wait_for_assistant_response(
         if (
             last_response
             and not _is_pure_thinking_indicator(last_response)
+            and not looks_like_chatgpt_error(last_response)
+            and not render_crashed
             and not busy
             and now - last_change_at >= required_stability
         ):
-            return _accept_or_recover_assistant_response(
-                page,
-                last_response,
-                submitted_prompt_text,
-            )
+            return last_response
 
-        if (
-            saw_busy_state
-            and not busy
-            and (
-                not last_response
-                or _is_pure_thinking_indicator(last_response)
-                or looks_like_chatgpt_error(last_response)
-                or is_chatgpt_render_error_present(page)
-            )
-            and now - last_change_at >= ASSISTANT_RESPONSE_SETTLE_AFTER_BUSY_SECONDS
-        ):
-            recovered = _accept_or_recover_assistant_response(
-                page,
-                last_response,
-                submitted_prompt_text,
-            )
-            if recovered and not _is_pure_thinking_indicator(recovered):
-                return recovered
-
+        # 4. If empty response is allowed and generation finished
         if (
             allow_empty_response
             and not busy
@@ -3187,24 +3181,21 @@ def wait_for_assistant_response(
                 or now >= empty_response_deadline
             )
         ):
-            return _accept_or_recover_assistant_response(
+            if last_response and not _is_pure_thinking_indicator(last_response) and not looks_like_chatgpt_error(last_response):
+                return last_response
+            return ""
+
+        # 5. Handle timeout
+        if now >= deadline:
+            recovered_response = recover_assistant_response_from_backend(
                 page,
-                last_response,
+                submitted_prompt_text,
+            ) or recover_assistant_response_after_reload(
+                page,
                 submitted_prompt_text,
             )
-
-        if now >= deadline:
-            if submitted_prompt_text or is_chatgpt_conversation_url(page.url):
-                recovered_response = recover_assistant_response_from_backend(
-                    page,
-                    submitted_prompt_text,
-                ) or recover_assistant_response_after_reload(
-                    page,
-                    submitted_prompt_text,
-                )
-                if recovered_response:
-                    _check_for_chatgpt_errors(recovered_response)
-                    return recovered_response
+            if recovered_response and not _is_pure_thinking_indicator(recovered_response):
+                return recovered_response
             if busy:
                 raise ChatGPTGenerationTimeoutError(
                     "ChatGPT generation did not finish after 20 minutes. "
@@ -3213,6 +3204,9 @@ def wait_for_assistant_response(
                     previous_assistant_turn,
                     previous_assistant_count or 0,
                 )
+            if last_response and not _is_pure_thinking_indicator(last_response):
+                _check_for_chatgpt_errors(last_response)
+                return last_response
             raise RuntimeError(
                 "ChatGPT returned no readable text for this step. "
                 "The same conversation was reloaded once and no next prompt "
@@ -3232,26 +3226,38 @@ def wait_for_existing_assistant_response(
     last_response = ""
     last_change_at = started_at
     saw_busy_state = False
+    last_backend_poll_at = 0.0
+    backend_poll_interval = 4.0
 
     while True:
         accept_external_app_permission_dialog(page)
         busy = is_chatgpt_generation_active(page)
         saw_busy_state = saw_busy_state or busy
+        now = time.monotonic()
+
+        render_crashed = is_chatgpt_render_error_present(page)
+        should_poll_backend = (
+            render_crashed
+            or (last_response and (looks_like_chatgpt_error(last_response) or _is_pure_thinking_indicator(last_response)))
+            or (saw_busy_state and not busy)
+            or (now - started_at >= 10.0 and not last_response)
+        )
+        if should_poll_backend and (now - last_backend_poll_at >= backend_poll_interval):
+            last_backend_poll_at = now
+            backend_text = recover_assistant_response_from_backend(
+                page,
+                expected_user_text=expected_user_text,
+            )
+            if backend_text and not _is_pure_thinking_indicator(backend_text):
+                return backend_text
+
         response_text = get_assistant_response_after_latest_user(
             page,
             expected_user_text=expected_user_text,
         )
-        now = time.monotonic()
         if response_text != last_response:
             last_response = response_text
             last_change_at = now
-
-        if (
-            last_response
-            and looks_like_chatgpt_error(last_response)
-            and now - last_change_at >= 1.5
-        ):
-            _check_for_chatgpt_errors(last_response)
 
         required_stability = (
             ASSISTANT_RESPONSE_SETTLE_AFTER_BUSY_SECONDS
@@ -3261,29 +3267,25 @@ def wait_for_existing_assistant_response(
         if (
             last_response
             and not _is_pure_thinking_indicator(last_response)
+            and not looks_like_chatgpt_error(last_response)
+            and not render_crashed
             and not busy
             and now - last_change_at >= required_stability
         ):
-            _check_for_chatgpt_errors(last_response)
             return last_response
 
-        if (
-            saw_busy_state
-            and not busy
-            and (
-                not last_response
-                or _is_pure_thinking_indicator(last_response)
-                or looks_like_chatgpt_error(last_response)
-                or is_chatgpt_render_error_present(page)
-            )
-            and now - last_change_at >= ASSISTANT_RESPONSE_SETTLE_AFTER_BUSY_SECONDS
-        ):
-            backend_resp = recover_assistant_response_from_backend(page, expected_user_text)
-            if backend_resp:
-                return backend_resp
-
         if now >= deadline:
+            backend_text = recover_assistant_response_from_backend(
+                page,
+                expected_user_text=expected_user_text,
+            )
+            if backend_text and not _is_pure_thinking_indicator(backend_text):
+                return backend_text
+            if last_response and not _is_pure_thinking_indicator(last_response):
+                _check_for_chatgpt_errors(last_response)
+                return last_response
             return ""
+
         time.sleep(ASSISTANT_RESPONSE_POLL_SECONDS)
 
 
@@ -3320,7 +3322,7 @@ def fetch_chatgpt_conversation_payload(page: Page, conversation_id: str = "") ->
             try {
                 let token = '';
                 try {
-                    const sessionRes = await fetch('/api/auth/session');
+                    const sessionRes = await fetch('/api/auth/session', { credentials: 'include' });
                     if (sessionRes.ok) {
                         const sessionData = await sessionRes.json();
                         token = sessionData.accessToken || '';
@@ -3331,7 +3333,10 @@ def fetch_chatgpt_conversation_payload(page: Page, conversation_id: str = "") ->
                 if (token) {
                     headers['Authorization'] = 'Bearer ' + token;
                 }
-                const r = await fetch('/backend-api/conversation/' + cid, { headers });
+                const r = await fetch('/backend-api/conversation/' + cid, {
+                    headers,
+                    credentials: 'include'
+                });
                 if (r.ok) {
                     return await r.json();
                 }
