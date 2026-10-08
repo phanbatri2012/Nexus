@@ -12,6 +12,7 @@ from auto_yt.services.chatgpt_worker import (
     _accept_or_recover_assistant_response,
     wait_for_assistant_response,
     split_outline_parts,
+    get_reusable_outline_response,
 )
 
 
@@ -31,10 +32,21 @@ def test_is_pure_thinking_indicator():
     assert _is_pure_thinking_indicator("Làm rõ các luận điểm chính") is True
     assert _is_pure_thinking_indicator("Đang suy nghĩ...") is True
     assert _is_pure_thinking_indicator("Stopped thinking") is True
+    # Vietnamese thinking verbs (including Video 281 case)
+    assert _is_pure_thinking_indicator("Sắp xếp mốc lịch sử") is True
+    assert _is_pure_thinking_indicator("Liệt kê các mốc chính") is True
+    assert _is_pure_thinking_indicator("Trình bày bối cảnh lịch sử") is True
+    assert _is_pure_thinking_indicator("Khái quát các giai đoạn") is True
+    assert _is_pure_thinking_indicator("Xâu chuỗi diễn biến") is True
+    assert _is_pure_thinking_indicator("Lược thuật cuộc xung đột") is True
+    assert _is_pure_thinking_indicator("Sơ lược nội dung") is True
+    assert _is_pure_thinking_indicator("Xây dựng dàn ý chi tiết") is True
 
     # Multi-line indicators
     multiline = "Worked for 1m 26s\nClarified narrative claims and structured the account"
     assert _is_pure_thinking_indicator(multiline) is True
+    multiline_vn = "Sắp xếp mốc lịch sử\nĐã kiểm tra tài liệu tham khảo"
+    assert _is_pure_thinking_indicator(multiline_vn) is True
 
     # Real narrative or outline responses must NOT match
     real_outline = "[PHAN] Trong cuốn sổ tay năm 1978 của cố Tổng Bí thư Lê Duẩn..."
@@ -365,4 +377,47 @@ def test_split_outline_parts_filters_thought_headers():
     assert "Clarified narrative claims" not in parts[0]
     assert "Phần mở đầu lịch sử" in parts[0]
     assert "Diễn biến và các phân tích sâu" in parts[1]
+
+
+def test_get_reusable_outline_response_ignores_busy_page(monkeypatch):
+    page = MagicMock()
+    page.url = "https://chatgpt.com/g/g-p-test/c/test-uuid"
+
+    # 1. When generation is actively running, should immediately return ""
+    monkeypatch.setattr(
+        "auto_yt.services.chatgpt_worker.is_chatgpt_generation_active",
+        lambda p: True,
+    )
+    assert get_reusable_outline_response(page) == ""
+
+    # 2. When generation is idle and DOM has valid completed outline
+    monkeypatch.setattr(
+        "auto_yt.services.chatgpt_worker.is_chatgpt_generation_active",
+        lambda p: False,
+    )
+    valid_outline_dom = [
+        ("user", "Prompt 2: Tạo dàn ý..."),
+        (
+            "assistant",
+            "[PHAN 1] Bối cảnh lịch sử và tư tưởng chiến lược năm 1978.\n\n"
+            "[PHAN 2] Diễn biến ngoại giao và hiệp ước phòng thủ chung.\n\n"
+            "[PHAN 3] Bài học kinh nghiệm giữ nước và bảo vệ biên cương.",
+        ),
+    ]
+    page.evaluate.return_value = valid_outline_dom
+    res = get_reusable_outline_response(page)
+    assert "[PHAN 1]" in res
+    assert "[PHAN 2]" in res
+
+    # 3. When DOM has only a thinking status (e.g. "Sắp xếp mốc lịch sử"), it should not return it
+    thinking_only_dom = [
+        ("user", "Prompt 2: Tạo dàn ý..."),
+        ("assistant", "Sắp xếp mốc lịch sử"),
+    ]
+    page.evaluate.return_value = thinking_only_dom
+    monkeypatch.setattr(
+        "auto_yt.services.chatgpt_worker.recover_assistant_response_from_backend",
+        lambda p: "",
+    )
+    assert get_reusable_outline_response(page) == ""
 
