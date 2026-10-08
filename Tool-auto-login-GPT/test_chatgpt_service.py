@@ -46,6 +46,62 @@ def make_dil_conversation_payload(
     }
 
 
+def make_paginated_dil_conversation_payload(
+    *,
+    correlation_field="turn_exchange_id",
+    correlation_value="exchange-current",
+    status="finished_successfully",
+    end_turn=True,
+):
+    correlation = (
+        {correlation_field: correlation_value}
+        if correlation_field
+        else {}
+    )
+    return {
+        "current_node": "assistant-current",
+        "messages": [
+            {
+                "id": "user-current",
+                "author": {"role": "user"},
+                "status": "finished_successfully",
+                "content": {
+                    "content_type": "text",
+                    "parts": ["Prompt metadata"],
+                },
+                "metadata": dict(correlation),
+            },
+            {
+                "id": "system-current",
+                "author": {"role": "system"},
+                "status": "finished_successfully",
+                "content": {"content_type": "text", "parts": [""]},
+                "metadata": {
+                    "parent_id": "missing-paginated-node",
+                    **correlation,
+                },
+            },
+            {
+                "id": "assistant-current",
+                "author": {"role": "assistant"},
+                "status": status,
+                "end_turn": end_turn,
+                "content": {
+                    "content_type": "text",
+                    "parts": ["Payload text"],
+                },
+                "metadata": {
+                    "parent_id": "system-current",
+                    "model_dil_v2": {
+                        "fallbackMarkdown": "Recovered paginated response",
+                    },
+                    **correlation,
+                },
+            },
+        ],
+    }
+
+
 class ChatGptServiceTests(unittest.TestCase):
     def test_markdown_extraction_preserves_block_boundaries(self):
         html = (
@@ -319,6 +375,189 @@ class ChatGptServiceTests(unittest.TestCase):
             ),
             "",
         )
+
+    def test_dil_payload_extraction_recovers_paginated_exchange(self):
+        for correlation_field in (
+            "turn_exchange_id",
+            "working_turn_id",
+            "request_id",
+        ):
+            with self.subTest(correlation_field=correlation_field):
+                payload = make_paginated_dil_conversation_payload(
+                    correlation_field=correlation_field,
+                )
+
+                response = (
+                    chatgpt_worker.extract_assistant_response_from_conversation_payload(
+                        payload,
+                        "Prompt metadata",
+                    )
+                )
+
+                self.assertEqual(response, "Recovered paginated response")
+
+    def test_mapping_tree_payload_extraction_recovers_response(self):
+        payload = {
+            "current_node": "node-assistant-2",
+            "mapping": {
+                "node-root": {
+                    "id": "node-root",
+                    "message": None,
+                    "parent": None,
+                    "children": ["node-user-1"],
+                },
+                "node-user-1": {
+                    "id": "node-user-1",
+                    "message": {
+                        "id": "node-user-1",
+                        "author": {"role": "user"},
+                        "status": "finished_successfully",
+                        "content": {"content_type": "text", "parts": ["Outline prompt"]},
+                        "create_time": 100.0,
+                    },
+                    "parent": "node-root",
+                    "children": ["node-assistant-1"],
+                },
+                "node-assistant-1": {
+                    "id": "node-assistant-1",
+                    "message": {
+                        "id": "node-assistant-1",
+                        "author": {"role": "assistant"},
+                        "status": "finished_successfully",
+                        "content": {"content_type": "text", "parts": ["Outline response"]},
+                        "create_time": 101.0,
+                    },
+                    "parent": "node-user-1",
+                    "children": ["node-user-2"],
+                },
+                "node-user-2": {
+                    "id": "node-user-2",
+                    "message": {
+                        "id": "node-user-2",
+                        "author": {"role": "user"},
+                        "status": "finished_successfully",
+                        "content": {"content_type": "text", "parts": ["Body prompt"]},
+                        "create_time": 102.0,
+                    },
+                    "parent": "node-assistant-1",
+                    "children": ["node-assistant-2"],
+                },
+                "node-assistant-2": {
+                    "id": "node-assistant-2",
+                    "message": {
+                        "id": "node-assistant-2",
+                        "author": {"role": "assistant"},
+                        "status": "finished_successfully",
+                        "content": {"content_type": "text", "parts": ["Body response text"]},
+                        "create_time": 103.0,
+                    },
+                    "parent": "node-user-2",
+                    "children": [],
+                },
+            },
+        }
+        resp = chatgpt_worker.extract_assistant_response_from_conversation_payload(
+            payload,
+            "Body prompt",
+        )
+        self.assertEqual(resp, "Body response text")
+
+    def test_dil_payload_extraction_keeps_same_prompt_on_current_exchange(self):
+        payload = make_paginated_dil_conversation_payload()
+        payload["messages"][0:0] = [
+            {
+                "id": "user-sibling",
+                "author": {"role": "user"},
+                "status": "finished_successfully",
+                "content": {
+                    "content_type": "text",
+                    "parts": ["Prompt metadata"],
+                },
+                "metadata": {"turn_exchange_id": "exchange-sibling"},
+            },
+            {
+                "id": "assistant-sibling",
+                "author": {"role": "assistant"},
+                "status": "finished_successfully",
+                "end_turn": True,
+                "content": {"content_type": "text", "parts": ["Wrong branch"]},
+                "metadata": {
+                    "parent_id": "user-sibling",
+                    "turn_exchange_id": "exchange-sibling",
+                },
+            },
+        ]
+
+        response = chatgpt_worker.extract_assistant_response_from_conversation_payload(
+            payload,
+            "Prompt metadata",
+        )
+
+        self.assertEqual(response, "Recovered paginated response")
+
+    def test_dil_payload_extraction_rejects_mismatched_exchange(self):
+        payload = make_paginated_dil_conversation_payload()
+        payload["messages"][0]["metadata"]["turn_exchange_id"] = (
+            "exchange-other"
+        )
+
+        response = chatgpt_worker.extract_assistant_response_from_conversation_payload(
+            payload,
+            "Prompt metadata",
+        )
+
+        self.assertEqual(response, "")
+
+    def test_dil_payload_extraction_rejects_unfinished_paginated_response(self):
+        for status, end_turn in (
+            ("in_progress", True),
+            ("finished_successfully", False),
+            ("", True),
+        ):
+            with self.subTest(status=status, end_turn=end_turn):
+                payload = make_paginated_dil_conversation_payload(
+                    status=status,
+                    end_turn=end_turn,
+                )
+
+                response = (
+                    chatgpt_worker.extract_assistant_response_from_conversation_payload(
+                        payload,
+                        "Prompt metadata",
+                    )
+                )
+
+                self.assertEqual(response, "")
+
+    def test_dil_payload_extraction_accepts_unambiguous_ordered_fallback(self):
+        payload = make_paginated_dil_conversation_payload(correlation_field="")
+
+        response = chatgpt_worker.extract_assistant_response_from_conversation_payload(
+            payload,
+            "Prompt metadata",
+        )
+
+        self.assertEqual(response, "Recovered paginated response")
+
+    def test_dil_payload_extraction_rejects_ambiguous_ordered_fallback(self):
+        payload = make_paginated_dil_conversation_payload(correlation_field="")
+        payload["messages"].insert(
+            1,
+            {
+                "id": "user-intervening",
+                "author": {"role": "user"},
+                "status": "finished_successfully",
+                "content": {"content_type": "text", "parts": ["Other prompt"]},
+                "metadata": {},
+            },
+        )
+
+        response = chatgpt_worker.extract_assistant_response_from_conversation_payload(
+            payload,
+            "Prompt metadata",
+        )
+
+        self.assertEqual(response, "")
 
     def test_response_recovery_uses_dil_payload_when_dom_render_fails(self):
         page = Mock(url="https://chatgpt.com/c/saved-chat")

@@ -55,6 +55,9 @@ COMMON_BROWSER_ARGS = (
     "--disable-session-crashed-bubble",
     "--no-first-run",
     "--no-default-browser-check",
+    "--enable-webgl",
+    "--ignore-gpu-blocklist",
+    "--enable-gpu-rasterization",
 )
 
 _manager_lock = threading.RLock()

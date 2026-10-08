@@ -121,6 +121,11 @@ CHATGPT_SUCCESSFUL_MESSAGE_STATUSES = frozenset({
     "finished",
     "finished_successfully",
 })
+CHATGPT_MESSAGE_CORRELATION_FIELDS = (
+    "turn_exchange_id",
+    "working_turn_id",
+    "request_id",
+)
 NARRATIVE_ONLY_INSTRUCTION = (
     "\n\nYÊU CẦU ĐẦU RA CHO PHẦN NỘI DUNG: Chỉ viết văn xuôi liền mạch trong tin nhắn chat thông thường. "
     "TUYỆT ĐỐI KHÔNG mở Canvas, KHÔNG tạo document/tài liệu rời hay artifact riêng. "
@@ -2715,51 +2720,45 @@ def _get_payload_assistant_text(message: dict) -> str:
     return ""
 
 
-def extract_assistant_response_from_conversation_payload(
-    payload: dict,
+def _get_payload_message_metadata(message: dict) -> dict:
+    metadata = message.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _get_payload_message_role(message: dict) -> str:
+    author = message.get("author")
+    return str(author.get("role") or "") if isinstance(author, dict) else ""
+
+
+def _get_payload_parent_id(message: dict) -> str:
+    metadata = _get_payload_message_metadata(message)
+    return str(
+        message.get("parent_id")
+        or message.get("parent")
+        or metadata.get("parent_id")
+        or ""
+    )
+
+
+def _get_completed_payload_assistant_text(message: dict) -> str:
+    if _get_payload_message_role(message) != "assistant":
+        return ""
+    status = str(message.get("status") or "").casefold()
+    if status not in CHATGPT_SUCCESSFUL_MESSAGE_STATUSES:
+        return ""
+    if message.get("end_turn") is False:
+        return ""
+    return _get_payload_assistant_text(message)
+
+
+def _extract_payload_response_after_user(
+    messages: list[dict],
     expected_user_text: str,
 ) -> str:
-    if not isinstance(payload, dict):
-        return ""
-    messages = payload.get("messages")
-    if not isinstance(messages, list):
-        return ""
-    messages = [message for message in messages if isinstance(message, dict)]
-
-    message_by_id = {
-        str(message.get("id")): message
-        for message in messages
-        if message.get("id")
-    }
-    current_node = str(payload.get("current_node") or "")
-    if current_node:
-        if current_node not in message_by_id:
-            return ""
-        branch = []
-        seen = set()
-        node_id = current_node
-        while node_id and node_id not in seen:
-            seen.add(node_id)
-            message = message_by_id.get(node_id)
-            if message is None:
-                break
-            branch.append(message)
-            metadata = message.get("metadata")
-            metadata = metadata if isinstance(metadata, dict) else {}
-            node_id = str(
-                message.get("parent_id")
-                or message.get("parent")
-                or metadata.get("parent_id")
-                or ""
-            )
-        messages = list(reversed(branch))
-
     latest_user_index = -1
     for index in range(len(messages) - 1, -1, -1):
         message = messages[index]
-        author = message.get("author")
-        role = author.get("role") if isinstance(author, dict) else ""
-        if role != "user":
+        if _get_payload_message_role(message) != "user":
             continue
         user_text = _get_payload_content_text(message)
         if not expected_user_text or history_prompt_text_matches(
@@ -2773,20 +2772,218 @@ def extract_assistant_response_from_conversation_payload(
 
     response_text = ""
     for message in messages[latest_user_index + 1:]:
-        author = message.get("author")
-        role = author.get("role") if isinstance(author, dict) else ""
-        if role == "user":
+        if _get_payload_message_role(message) == "user":
             break
-        if role != "assistant":
-            continue
-        status = str(message.get("status") or "").casefold()
-        if status and status not in CHATGPT_SUCCESSFUL_MESSAGE_STATUSES:
-            continue
-        if message.get("end_turn") is False:
-            continue
-        candidate = _get_payload_assistant_text(message)
+        candidate = _get_completed_payload_assistant_text(message)
         if candidate:
             response_text = candidate
+    return response_text
+
+
+def _log_payload_recovery_selection(
+    message_count: int,
+    parent_chain_incomplete: bool,
+    strategy: str,
+    result: str,
+) -> None:
+    print(
+        ">>> ChatGPT payload recovery: "
+        f"messages={message_count}, "
+        f"parent_chain_incomplete={str(parent_chain_incomplete).lower()}, "
+        f"strategy={strategy}, result={result}.",
+        file=sys.stderr,
+    )
+
+
+def extract_assistant_response_from_conversation_payload(
+    payload: dict,
+    expected_user_text: str,
+) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    payload_messages = payload.get("messages")
+    if not isinstance(payload_messages, list) and isinstance(payload.get("mapping"), dict):
+        mapping = payload["mapping"]
+        current_node = str(payload.get("current_node") or "")
+        lineage_messages = []
+        seen = set()
+        curr = current_node
+        while curr and curr not in seen:
+            seen.add(curr)
+            node = mapping.get(curr)
+            if not isinstance(node, dict):
+                break
+            msg = node.get("message")
+            if isinstance(msg, dict):
+                if not msg.get("id"):
+                    msg["id"] = curr
+                if not msg.get("parent") and node.get("parent"):
+                    msg["parent"] = node["parent"]
+                lineage_messages.append(msg)
+            curr = node.get("parent")
+        if lineage_messages:
+            payload_messages = list(reversed(lineage_messages))
+        else:
+            all_msgs = [
+                node["message"]
+                for node in mapping.values()
+                if isinstance(node, dict) and isinstance(node.get("message"), dict)
+            ]
+            all_msgs.sort(key=lambda m: float(m.get("create_time") or 0.0))
+            payload_messages = all_msgs
+
+    if not isinstance(payload_messages, list):
+        return ""
+    messages = [
+        message
+        for message in payload_messages
+        if isinstance(message, dict)
+    ]
+
+    message_by_id = {
+        str(message.get("id")): message
+        for message in messages
+        if message.get("id")
+    }
+    current_node = str(payload.get("current_node") or "")
+    current_message = message_by_id.get(current_node) if current_node else None
+    parent_chain_incomplete = False
+    if current_node:
+        if current_message is None:
+            _log_payload_recovery_selection(
+                len(messages),
+                True,
+                "none",
+                "current_node_missing",
+            )
+            return ""
+        branch = []
+        seen = set()
+        node_id = current_node
+        while node_id and node_id not in seen:
+            seen.add(node_id)
+            message = message_by_id.get(node_id)
+            if message is None:
+                parent_chain_incomplete = True
+                break
+            branch.append(message)
+            parent_id = _get_payload_parent_id(message)
+            if parent_id and parent_id not in message_by_id:
+                parent_chain_incomplete = True
+            node_id = parent_id
+        branch_response = _extract_payload_response_after_user(
+            list(reversed(branch)),
+            expected_user_text,
+        )
+        if branch_response:
+            _log_payload_recovery_selection(
+                len(messages),
+                parent_chain_incomplete,
+                "parent_chain",
+                "accepted",
+            )
+            return branch_response
+        if not parent_chain_incomplete:
+            _log_payload_recovery_selection(
+                len(messages),
+                False,
+                "parent_chain",
+                "matching_response_missing",
+            )
+            return ""
+
+    if current_message is not None:
+        current_metadata = _get_payload_message_metadata(current_message)
+        current_index = messages.index(current_message)
+        correlation_field = next(
+            (
+                field
+                for field in CHATGPT_MESSAGE_CORRELATION_FIELDS
+                if current_metadata.get(field)
+            ),
+            "",
+        )
+        if correlation_field:
+            correlation_value = current_metadata[correlation_field]
+            exchange_messages = [
+                message
+                for message in messages[:current_index + 1]
+                if _get_payload_message_metadata(message).get(correlation_field)
+                == correlation_value
+            ]
+            exchange_response = _extract_payload_response_after_user(
+                exchange_messages,
+                expected_user_text,
+            )
+            if exchange_response:
+                _log_payload_recovery_selection(
+                    len(messages),
+                    parent_chain_incomplete,
+                    correlation_field,
+                    "accepted",
+                )
+                return exchange_response
+            _log_payload_recovery_selection(
+                len(messages),
+                parent_chain_incomplete,
+                correlation_field,
+                "matching_response_missing",
+            )
+            return ""
+
+    if current_message is not None:
+        current_index = messages.index(current_message)
+        preceding_users = [
+            message
+            for message in messages[:current_index]
+            if _get_payload_message_role(message) == "user"
+        ]
+        latest_user = preceding_users[-1] if preceding_users else None
+        if latest_user is not None and history_prompt_text_matches(
+            expected_user_text,
+            _get_payload_content_text(latest_user),
+        ):
+            current_response = _get_completed_payload_assistant_text(
+                current_message,
+            )
+            if current_response:
+                _log_payload_recovery_selection(
+                    len(messages),
+                    parent_chain_incomplete,
+                    "latest_user_current_node",
+                    "accepted",
+                )
+                return current_response
+
+    strategy = "none" if current_node else "ordered_without_current_node"
+    response_text = (
+        ""
+        if current_node
+        else _extract_payload_response_after_user(messages, expected_user_text)
+    )
+    if not response_text and isinstance(payload.get("mapping"), dict):
+        all_msgs = [
+            node["message"]
+            for node in payload["mapping"].values()
+            if isinstance(node, dict) and isinstance(node.get("message"), dict)
+        ]
+        all_msgs.sort(key=lambda m: float(m.get("create_time") or 0.0))
+        fallback_resp = _extract_payload_response_after_user(all_msgs, expected_user_text)
+        if fallback_resp:
+            _log_payload_recovery_selection(
+                len(messages),
+                parent_chain_incomplete,
+                "mapping_all_nodes",
+                "accepted",
+            )
+            return fallback_resp
+
+    _log_payload_recovery_selection(
+        len(messages),
+        parent_chain_incomplete,
+        strategy,
+        "accepted" if response_text else "matching_response_missing",
+    )
     return response_text
 
 
@@ -2846,6 +3043,17 @@ def wait_for_assistant_response(
             last_response = response_text
             last_change_at = now
 
+        if (
+            last_response
+            and looks_like_chatgpt_error(last_response)
+            and now - last_change_at >= 1.5
+        ):
+            return _accept_or_recover_assistant_response(
+                page,
+                last_response,
+                submitted_prompt_text,
+            )
+
         required_stability = (
             ASSISTANT_RESPONSE_SETTLE_AFTER_BUSY_SECONDS
             if saw_busy_state
@@ -2877,14 +3085,6 @@ def wait_for_assistant_response(
             )
 
         if now >= deadline:
-            if busy:
-                raise ChatGPTGenerationTimeoutError(
-                    "ChatGPT generation did not finish after 20 minutes. "
-                    "No next prompt was sent.",
-                    last_response,
-                    previous_assistant_turn,
-                    previous_assistant_count or 0,
-                )
             if submitted_prompt_text:
                 recovered_response = recover_assistant_response_after_reload(
                     page,
@@ -2893,6 +3093,14 @@ def wait_for_assistant_response(
                 if recovered_response:
                     _check_for_chatgpt_errors(recovered_response)
                     return recovered_response
+            if busy:
+                raise ChatGPTGenerationTimeoutError(
+                    "ChatGPT generation did not finish after 20 minutes. "
+                    "No next prompt was sent.",
+                    last_response,
+                    previous_assistant_turn,
+                    previous_assistant_count or 0,
+                )
             raise RuntimeError(
                 "ChatGPT returned no readable text for this step. "
                 "The same conversation was reloaded once and no next prompt "
@@ -2925,6 +3133,14 @@ def wait_for_existing_assistant_response(
         if response_text != last_response:
             last_response = response_text
             last_change_at = now
+
+        if (
+            last_response
+            and looks_like_chatgpt_error(last_response)
+            and now - last_change_at >= 1.5
+        ):
+            _check_for_chatgpt_errors(last_response)
+
         required_stability = (
             ASSISTANT_RESPONSE_SETTLE_AFTER_BUSY_SECONDS
             if saw_busy_state
@@ -2977,6 +3193,38 @@ def _reload_and_capture_conversation_payload(
         )
         return {}
 
+    # 1. Direct in-page fetch with Bearer token (faster and bypasses web stream failures)
+    try:
+        direct_payload = page.evaluate("""async (convId) => {
+            try {
+                let token = '';
+                try {
+                    const sessionRes = await fetch('/api/auth/session');
+                    if (sessionRes.ok) {
+                        const sessionData = await sessionRes.json();
+                        token = sessionData.accessToken || '';
+                    }
+                } catch(e) {}
+                
+                const headers = { 'accept': 'application/json' };
+                if (token) {
+                    headers['Authorization'] = 'Bearer ' + token;
+                }
+                const r = await fetch('/backend-api/conversation/' + convId, { headers });
+                if (r.ok) {
+                    return await r.json();
+                }
+                return {};
+            } catch(e) {
+                return {};
+            }
+        }""", conversation_id)
+        if isinstance(direct_payload, dict) and (direct_payload.get("mapping") or direct_payload.get("messages")):
+            return direct_payload
+    except Exception as exc:
+        print(f">>> Direct in-page conversation payload fetch skipped: {exc}", file=sys.stderr)
+
+    # 2. Network interception fallback via page reload
     try:
         with page.expect_response(
             lambda response: _is_conversation_payload_response(
@@ -3020,13 +3268,6 @@ def recover_assistant_response_after_reload(
             page,
             expected_url,
         )
-        check_chatgpt_page_attention(page)
-        ensure_expected_conversation_page(page.url, expected_url)
-        page.locator(CHATGPT_VISIBLE_COMPOSER_SELECTOR).first.wait_for(
-            state="visible",
-            timeout=CHATGPT_COMPOSER_WAIT_PER_ATTEMPT_MS,
-        )
-        wait_for_conversation_history(page, composer_ready=True)
         payload_response = extract_assistant_response_from_conversation_payload(
             payload,
             expected_user_text,
@@ -3038,6 +3279,14 @@ def recover_assistant_response_after_reload(
                 file=sys.stderr,
             )
             return payload_response
+
+        check_chatgpt_page_attention(page)
+        ensure_expected_conversation_page(page.url, expected_url)
+        page.locator(CHATGPT_VISIBLE_COMPOSER_SELECTOR).first.wait_for(
+            state="visible",
+            timeout=CHATGPT_COMPOSER_WAIT_PER_ATTEMPT_MS,
+        )
+        wait_for_conversation_history(page, composer_ready=True)
         return wait_for_existing_assistant_response(
             page,
             expected_user_text,
