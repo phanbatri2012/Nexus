@@ -204,6 +204,21 @@ _BLOCKER_RULES: list[dict[str, Any]] = [
             "Enter the code sent to",
         ],
     },
+    # 7. UI Render / Response Load Errors (ChatGPT / Google Flow)
+    {
+        "category": CATEGORY_UI_RENDER_ERROR,
+        "confidence": "high",
+        "action_required": "retry_generation",
+        "message": "Giao diện web gặp lỗi tải phản hồi (This response couldn't load).",
+        "url_patterns": [],
+        "title_patterns": [],
+        "html_markers": [
+            "This response couldn't load",
+            "This response couldn’t load",
+            "This response could not load",
+            "There was an error generating a response",
+        ],
+    },
 ]
 
 

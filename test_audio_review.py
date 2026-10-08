@@ -286,6 +286,39 @@ class AudioReviewTests(unittest.TestCase):
         self.assertEqual(database.get_audio_review(self.video_id)["status"], "approved")
         ensure_audio.assert_called_once()
 
+    def test_audit_script_blocks_chatgpt_response_load_error(self):
+        error_script = """
+### [INTRO]
+This response couldn’t load
+
+### [BODY]
+This response couldn’t load
+
+### [OUTRO]
+This response couldn’t load
+""".strip()
+        report = audit_script_for_audio(error_script)
+        self.assertFalse(report["can_approve"])
+        error_codes = {item["code"] for item in report["errors"]}
+        self.assertIn("system_error_artifact", error_codes)
+
+    def test_audit_script_blocks_too_short_script(self):
+        short_script = """
+### [INTRO]
+Chào bạn.
+
+### [BODY]
+Nội dung ngắn.
+
+### [OUTRO]
+Hết rồi.
+""".strip()
+        report = audit_script_for_audio(short_script)
+        self.assertFalse(report["can_approve"])
+        error_codes = {item["code"] for item in report["errors"]}
+        self.assertTrue("insufficient_content" in error_codes or "section_too_short" in error_codes)
+
 
 if __name__ == "__main__":
     unittest.main()
+

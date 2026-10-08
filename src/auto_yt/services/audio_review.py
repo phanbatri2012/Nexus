@@ -16,6 +16,23 @@ WORDS_PER_MINUTE_FAST = 300
 SECTION_PATTERN = re.compile(
     r"(?ms)^### \[([^\]]+)\]\s*\n(.*?)(?=^### \[[^\]]+\]\s*$|\Z)"
 )
+SYSTEM_ERROR_PATTERNS = (
+    re.compile(r"this response couldn['’]?t load", re.IGNORECASE),
+    re.compile(r"this response could not load", re.IGNORECASE),
+    re.compile(r"something went wrong", re.IGNORECASE),
+    re.compile(r"an error occurred while generating", re.IGNORECASE),
+    re.compile(r"there was an error generating a response", re.IGNORECASE),
+    re.compile(r"a network error occurred", re.IGNORECASE),
+    re.compile(r"the server had an error while processing", re.IGNORECASE),
+    re.compile(r"failed to fetch", re.IGNORECASE),
+    re.compile(r"conversation not found", re.IGNORECASE),
+)
+MIN_AUDIO_SCRIPT_WORDS = 15
+MIN_SECTION_WORDS = {
+    "INTRO": 3,
+    "BODY": 5,
+    "OUTRO": 3,
+}
 EDITORIAL_PREFIXES = (
     "bổ sung ",
     "bỏ ",
@@ -213,6 +230,37 @@ def audit_script_for_audio(script_text: str) -> dict:
                 "Phần đọc còn chứa khối mã hoặc nhãn hệ thống không hợp lệ.",
             )
         )
+
+    for section_name, section_text in sections.items():
+        for pat in SYSTEM_ERROR_PATTERNS:
+            if pat.search(section_text):
+                errors.append(
+                    _issue(
+                        "system_error_artifact",
+                        f"Phần {section_name} chứa thông báo lỗi hệ thống/mạng thay vì nội dung đọc.",
+                        section_name,
+                    )
+                )
+                break
+
+    word_count = _word_count(audio_script)
+    if word_count < MIN_AUDIO_SCRIPT_WORDS:
+        errors.append(
+            _issue(
+                "insufficient_content",
+                f"Kịch bản quá ngắn ({word_count} từ, tối thiểu {MIN_AUDIO_SCRIPT_WORDS} từ), chưa đủ nội dung để tạo audio.",
+            )
+        )
+    for section_name, min_words in MIN_SECTION_WORDS.items():
+        sec_words = _word_count(sections.get(section_name, ""))
+        if sec_words > 0 and sec_words < min_words:
+            errors.append(
+                _issue(
+                    "section_too_short",
+                    f"Phần {section_name} quá ngắn ({sec_words} từ, tối thiểu {min_words} từ).",
+                    section_name,
+                )
+            )
 
     warnings.extend(_find_editorial_artifacts(sections))
     errors.extend(_find_duplicate_paragraphs(sections))

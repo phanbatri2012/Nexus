@@ -5158,34 +5158,40 @@ def _execute_video_job(job: dict) -> None:
             result,
         ):
             return
+        job_status = "done"
+        job_error = ""
+        job_progress = ""
+        if generation_warning:
+            job_status = "error"
+            job_error = generation_warning
+            job_progress = "Đã giữ phần hoàn tất nhưng tự phục hồi đã hết số lần thử"
+        elif audio_error:
+            job_status = "error"
+            job_error = f"Lỗi TTS Audio: {audio_error}"
+            job_progress = f"Kịch bản đã tự động duyệt; audio chưa thể khởi tạo: {audio_error}"
+        elif audio_review and audio_review.get("status") == "blocked":
+            job_status = "review_blocked"
+            job_error = "Kịch bản không đạt kiểm tra tự động trước khi tạo audio."
+            job_progress = "Kịch bản không đạt kiểm tra tự động; chưa tạo audio"
+        else:
+            job_status = "done"
+            job_error = ""
+            if not pipeline["audio"]:
+                job_progress = "Kịch bản đã hoàn thành; pipeline không tự tạo audio"
+            elif audio_task and audio_task.get("status") == "completed":
+                job_progress = "Kịch bản và audio đã hoàn thành"
+            else:
+                provider_label = _get_tts_provider_display_name(
+                    audio_task.get("tts_provider_id") if audio_task else voice_snapshot.get("provider_id")
+                )
+                job_progress = f"Kịch bản đã tự động duyệt; {provider_label} đang tạo audio"
+
         _update_video_job(
             job_id,
-            status="error" if generation_warning else "done",
-            progress=(
-                (
-                    "Đã giữ phần hoàn tất nhưng tự phục hồi đã hết số lần thử"
-                )
-                if generation_warning
-                else (
-                    "Kịch bản đã hoàn thành; pipeline không tự tạo audio"
-                    if not pipeline["audio"]
-                    else (
-                        "Kịch bản không đạt kiểm tra tự động; chưa tạo audio"
-                        if audio_review and audio_review.get("status") == "blocked"
-                        else (
-                            "Kịch bản đã tự động duyệt; audio chưa thể khởi tạo"
-                            if audio_error
-                            else (
-                                "Kịch bản và audio đã hoàn thành"
-                                if audio_task and audio_task.get("status") == "completed"
-                                else f"Kịch bản đã tự động duyệt; {_get_tts_provider_display_name(audio_task.get('tts_provider_id') if audio_task else voice_snapshot.get('provider_id'))} đang tạo audio"
-                            )
-                        )
-                    )
-                )
-            ),
+            status=job_status,
+            progress=job_progress,
             result_json=result,
-            error=generation_warning,
+            error=job_error,
             resume_from_step="",
             next_retry_at="",
             cancel_requested=0,
@@ -6466,9 +6472,18 @@ def continue_video_generation(video_id: int):
             elif not complete_for_audio:
                 audio_review = _prepare_audio_review(video_id)
 
+            legacy_status = (
+                "error"
+                if generation_warning or audio_error
+                else (
+                    "review_blocked"
+                    if (audio_review and audio_review.get("status") == "blocked")
+                    else "done"
+                )
+            )
             with _jobs_lock:
                 _jobs[job_id].update({
-                    "status": "done",
+                    "status": legacy_status,
                     "progress": (
                         (
                             "⚠️ Phần đọc đã tự động duyệt và gửi audio; "
@@ -6484,7 +6499,7 @@ def continue_video_generation(video_id: int):
                                 "⛔ Kịch bản không đạt kiểm tra tự động; chưa tạo audio."
                                 if audio_review and audio_review.get("status") == "blocked"
                                 else (
-                                    "⚠️ Kịch bản đã tự động duyệt; audio chưa thể khởi tạo."
+                                    f"❌ Kịch bản đã duyệt nhưng lỗi audio: {audio_error}"
                                     if audio_error
                                     else f"🎙️ Kịch bản đã tự động duyệt; {_get_tts_provider_display_name(video.get('tts_provider_id') or (audio_task.get('tts_provider_id') if audio_task else None))} đang tạo audio."
                                 )

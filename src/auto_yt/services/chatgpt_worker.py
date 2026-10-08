@@ -287,6 +287,10 @@ THUMBNAIL_GENERATION_ERROR_MARKERS = (
     "content policies",
     "content policy",
     "image generation failed",
+    "this response couldn't load",
+    "this response couldn’t load",
+    "this response could not load",
+    "failed to generate",
     "đã xảy ra lỗi",
     "hãy thử lại",
 )
@@ -586,8 +590,9 @@ def split_outline_parts(
     outline: str,
     max_chars: int = OUTLINE_PART_MAX_CHARS,
 ) -> list[str]:
+    _check_for_chatgpt_errors(outline)
     clean_outline = strip_outline_preamble(outline)
-    if not clean_outline:
+    if not clean_outline or looks_like_chatgpt_error(clean_outline):
         return []
 
     # Priority 1: Delimiters with [PHẦN ...], [PHAN ...], [PART ...], [SECTION ...]
@@ -1491,6 +1496,61 @@ def click_chatgpt_full_page_retry(page: Page) -> bool:
                     retryButton.click();
                     return true;
                 """)
+            )
+        )
+    except Exception:
+        return False
+
+
+def click_chatgpt_inline_retry(page: Page) -> bool:
+    """Click an in-conversation retry / regenerate button if an assistant turn failed."""
+    try:
+        return bool(
+            page.evaluate(
+                """() => {
+                    const isVisible = (element) => {
+                        if (!element) return false;
+                        const style = window.getComputedStyle(element);
+                        const rect = element.getBoundingClientRect();
+                        return style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && rect.width > 0
+                            && rect.height > 0;
+                    };
+                    const normalize = (value) => (value || '')
+                        .replace(/\\s+/g, ' ')
+                        .trim()
+                        .toLowerCase();
+                    const retryLabels = ['try again', 'retry', 'thử lại', 'regenerate', 'tạo lại'];
+                    // 1. Check explicit data-testid retry buttons
+                    const retryBtn = document.querySelector('[data-testid="retry-button"], [data-testid="regenerate-button"]');
+                    if (retryBtn && isVisible(retryBtn)) {
+                        retryBtn.click();
+                        return true;
+                    }
+                    // 2. Check buttons in latest assistant message turn
+                    const assistantTurns = document.querySelectorAll(
+                        '[data-message-author-role="assistant"], [data-testid^="conversation-turn-"]'
+                    );
+                    if (assistantTurns.length > 0) {
+                        const latestTurn = assistantTurns[assistantTurns.length - 1];
+                        const buttons = [...latestTurn.querySelectorAll('button, [role="button"]')];
+                        const match = buttons.find((btn) => {
+                            const label = normalize(
+                                btn.innerText
+                                || btn.textContent
+                                || btn.getAttribute('aria-label')
+                                || btn.getAttribute('title')
+                            );
+                            return isVisible(btn) && retryLabels.some((candidate) => label.includes(candidate));
+                        });
+                        if (match) {
+                            match.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }"""
             )
         )
     except Exception:
@@ -2532,18 +2592,37 @@ def is_chatgpt_generation_active(page: Page) -> bool:
         return False
 
 
+CHATGPT_ERROR_PATTERNS = (
+    "a network error occurred",
+    "there was an error generating a response",
+    "something went wrong",
+    "the server had an error while processing your request",
+    "conversation not found",
+    "this response couldn't load",
+    "this response couldn’t load",
+    "this response could not load",
+    "failed to get response",
+    "failed to fetch",
+    "an error occurred while generating",
+    "an error occurred",
+    "unusual activity has been detected",
+    "please try again later",
+)
+
+
+def looks_like_chatgpt_error(text: str) -> bool:
+    if not text:
+        return False
+    lowered = text.strip().lower()
+    return any(err in lowered for err in CHATGPT_ERROR_PATTERNS)
+
+
 def _check_for_chatgpt_errors(text: str) -> None:
     if not text:
         return
-    errors = [
-        "A network error occurred. Please check your connection",
-        "There was an error generating a response",
-        "Something went wrong. If this issue persists",
-        "The server had an error while processing your request",
-        "Conversation not found",
-    ]
-    for err in errors:
-        if err.lower() in text.lower():
+    lowered = text.strip().lower()
+    for err in CHATGPT_ERROR_PATTERNS:
+        if err in lowered:
             raise Exception(f"ChatGPT ERROR detected: {err}")
 
 

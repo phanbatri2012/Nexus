@@ -120,6 +120,23 @@ Phan 27"""
         parts = split_outline_parts(pol_pot_sample)
         self.assertEqual(len(parts), 27)
 
+    def test_looks_like_chatgpt_error_detection(self):
+        from auto_yt.services.chatgpt_worker import looks_like_chatgpt_error, _check_for_chatgpt_errors
+        self.assertTrue(looks_like_chatgpt_error("This response couldn't load"))
+        self.assertTrue(looks_like_chatgpt_error("This response couldn’t load"))
+        self.assertTrue(looks_like_chatgpt_error("Something went wrong. If this issue persists"))
+        self.assertFalse(looks_like_chatgpt_error("Mở đầu câu chuyện lịch sử Việt Nam."))
+
+        with self.assertRaises(Exception) as ctx:
+            _check_for_chatgpt_errors("This response couldn’t load")
+        self.assertIn("ChatGPT ERROR detected", str(ctx.exception))
+
+    def test_split_outline_parts_raises_on_chatgpt_error(self):
+        with self.assertRaises(Exception) as ctx:
+            split_outline_parts("This response couldn’t load")
+        self.assertIn("ChatGPT ERROR detected", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
+
