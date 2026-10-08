@@ -1,0 +1,116 @@
+# POST /v1/voice-changer
+# Voice changer (speech-to-speech)
+
+method: POST
+path: /v1/voice-changer
+group: Voice Changer
+title: Voice changer
+description: |
+  Convert speech audio to a different voice (speech-to-speech). Upload an audio file and specify a target voice.
+  Only ElevenLabs voices are supported. Processing is async — poll the history endpoint for results.
+  Credits are calculated based on audio duration: ~1000 credits per minute.
+order: 1
+
+# Authentication
+auth:
+  type: xi-api-key
+  required: true
+
+# Path Parameters
+path_parameters: []
+
+# Query Parameters
+query_parameters: []
+
+# Request Body
+request_body:
+  content_type: multipart/form-data
+  required: true
+  properties:
+    audio:
+      type: file
+      required: true
+      description: Source audio file to convert (max 50MB, max 5 minutes)
+    voice_id:
+      type: string
+      required: true
+      description: Target ElevenLabs voice ID
+    model_id:
+      type: string
+      required: false
+      description: ElevenLabs STS model ID
+      default: eleven_multilingual_sts_v2
+    remove_background_noise:
+      type: string
+      required: false
+      description: "Set to 'true' to apply background noise removal"
+      default: "false"
+    voice_settings:
+      type: string (JSON)
+      required: false
+      description: |
+        Voice settings as a JSON string. Available fields:
+        - stability (number): 0.0 - 1.0
+        - similarity_boost (number): 0.0 - 1.0
+        - style (number): 0.0 - 1.0
+        - use_speaker_boost (boolean)
+
+# Code Examples
+examples:
+  curl: |
+    curl -X POST "https://api.genmax.io/v1/voice-changer" \
+      -H "xi-api-key: YOUR_API_KEY" \
+      -F "audio=@recording.mp3" \
+      -F "voice_id=rv30Fd6w5bnbL0kHzWlr" \
+      -F "model_id=eleven_multilingual_sts_v2" \
+      -F "remove_background_noise=true" \
+      -F 'voice_settings={"stability":0.5,"similarity_boost":0.75}'
+
+  javascript: |
+    const formData = new FormData();
+    formData.append('audio', audioFile);
+    formData.append('voice_id', 'rv30Fd6w5bnbL0kHzWlr');
+    formData.append('model_id', 'eleven_multilingual_sts_v2');
+    formData.append('remove_background_noise', 'true');
+    formData.append('voice_settings', JSON.stringify({
+      stability: 0.5,
+      similarity_boost: 0.75
+    }));
+
+    const response = await fetch('https://api.genmax.io/v1/voice-changer', {
+      method: 'POST',
+      headers: { 'xi-api-key': 'YOUR_API_KEY' },
+      body: formData
+    });
+    const data = await response.json();
+
+  python: |
+    import json
+    import requests
+
+    with open('recording.mp3', 'rb') as f:
+        response = requests.post(
+            'https://api.genmax.io/v1/voice-changer',
+            headers={'xi-api-key': 'YOUR_API_KEY'},
+            files={'audio': f},
+            data={
+                'voice_id': 'rv30Fd6w5bnbL0kHzWlr',
+                'model_id': 'eleven_multilingual_sts_v2',
+                'remove_background_noise': 'true',
+                'voice_settings': json.dumps({
+                    'stability': 0.5,
+                    'similarity_boost': 0.75
+                }),
+            },
+        )
+    data = response.json()
+
+# Responses
+responses:
+  - status: 202
+    description: Accepted - Voice changer task queued for processing
+    example: |
+      {
+        "task_id": "9b19d3e2-7c68-4eca-be48-e9917682d73e",
+        "status": "pending"
+      }

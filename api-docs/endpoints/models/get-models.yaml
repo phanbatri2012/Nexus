@@ -1,0 +1,117 @@
+# GET /v1/models
+# Get TTS models
+
+method: GET
+path: /v1/models
+group: Models
+title: Get models
+description: Get all available TTS models. Defaults to ElevenLabs models. Pass provider=minimax for MiniMax models.
+order: 1
+
+# Authentication
+auth:
+  type: xi-api-key
+  required: true
+
+# Path Parameters
+path_parameters: []
+
+# Query Parameters
+query_parameters:
+  - name: provider
+    type: string
+    required: false
+    description: Provider to get models for. Defaults to ElevenLabs. Use "minimax" for MiniMax models.
+
+# Request Body
+request_body: null
+
+# Code Examples
+examples:
+  curl: |
+    # ElevenLabs models (default)
+    curl -X GET "https://api.genmax.io/v1/models" \
+      -H "xi-api-key: YOUR_API_KEY"
+
+    # MiniMax models
+    curl -X GET "https://api.genmax.io/v1/models?provider=minimax" \
+      -H "xi-api-key: YOUR_API_KEY"
+
+  javascript: |
+    // ElevenLabs models (default)
+    const response = await fetch('https://api.genmax.io/v1/models', {
+      method: 'GET',
+      headers: { 'xi-api-key': 'YOUR_API_KEY' }
+    });
+    const data = await response.json();
+
+    // MiniMax models
+    const mmResponse = await fetch('https://api.genmax.io/v1/models?provider=minimax', {
+      method: 'GET',
+      headers: { 'xi-api-key': 'YOUR_API_KEY' }
+    });
+    const mmData = await mmResponse.json();
+
+  python: |
+    import requests
+
+    headers = {'xi-api-key': 'YOUR_API_KEY'}
+
+    # ElevenLabs models (default)
+    response = requests.get('https://api.genmax.io/v1/models', headers=headers)
+    data = response.json()
+
+    # MiniMax models
+    response = requests.get('https://api.genmax.io/v1/models', params={'provider': 'minimax'}, headers=headers)
+    data = response.json()
+
+# Responses
+responses:
+  - status: 200
+    description: ElevenLabs models (default)
+    example: |
+      [
+        {
+          "model_id": "eleven_multilingual_v2",
+          "name": "Eleven Multilingual v2",
+          "description": "Description of the model",
+          "can_do_text_to_speech": true,
+          "can_do_voice_conversion": false,
+          "can_use_style": true,
+          "can_use_speaker_boost": true,
+          "can_be_finetuned": true,
+          "serves_pro_voices": false,
+          "requires_alpha_access": false,
+          "max_characters_request_free_user": 10000,
+          "max_characters_request_subscribed_user": 10000,
+          "maximum_text_length_per_request": 10000,
+          "token_cost_factor": 1,
+          "concurrency_group": "standard",
+          "model_rates": {
+            "character_cost_multiplier": 1
+          },
+          "languages": [
+            {
+                "language_id": "en",
+                "name": "English"
+            }
+          ],
+          "supports_context": true,
+          "supports_speed": true,
+          "supports_similarity": true
+        }
+      ]
+  - status: 200
+    description: MiniMax models (provider=minimax)
+    example: |
+      [
+        {
+          "model_id": "speech-2.8-hd",
+          "name": "Speech 2.8 HD",
+          "description": "Latest generation with highest quality audio. Best for professional productions.",
+          "img": "https://cdn.hailuoai.video/...",
+          "badge": "newest",
+          "credit_ratio": 1,
+          "max_chars": 5000
+        }
+      ]

@@ -1,0 +1,49 @@
+# Python and test caches
+**/__pycache__/
+**/.pytest_cache/
+*.py[cod]
+**/.venv/
+
+# Frontend build artifacts
+**/node_modules/
+**/dist/
+
+# Runtime data and logs
+*.db
+*.sqlite
+*.log
+/Tool-auto-login-GPT/data/
+/temp_*
+/debug_*
+
+# Secrets and browser artifacts
+.env
+.env.*
+!.env.example
+.cookies.txt
+cookies.txt
+page.html
+job.json
+
+# Local archives and transfer packages
+*.zip
+
+# One-off local diagnostics with video-specific state
+/monitor_loop.py
+/watch_*.py
+
+# Local scratch and recovery files
+*.patch
+/check_*.py
+/debug.py
+/find_caps.py
+/*.vtt
+/patch_*.py
+/inspect_*.py
+/extract_*.py
+/find_*.py
+/get_*.py
+/probe_*.py
+/recovered_*.txt
+/scratch_*.py
+/scratch/

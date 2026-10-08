@@ -1,0 +1,112 @@
+# POST /v1/minimax/voices/clone
+# Clone a voice
+
+method: POST
+path: /v1/minimax/voices/clone
+group: MiniMax Voices
+title: Clone voice
+description: Clone a voice from an audio file. Processing is async — the response returns immediately with status "processing". Poll the list endpoint to check when status becomes "done".
+order: 2
+
+# Authentication
+auth:
+  type: xi-api-key
+  required: true
+
+# Path Parameters
+path_parameters: []
+
+# Query Parameters
+query_parameters: []
+
+# Request Body
+request_body:
+  content_type: multipart/form-data
+  required: true
+  properties:
+    file:
+      type: file
+      required: true
+      description: Audio file to clone voice from (max 20MB)
+    voice_name:
+      type: string
+      required: true
+      description: Name for the cloned voice
+    language_tag:
+      type: string
+      required: false
+      description: Language of the voice
+      default: English
+    gender:
+      type: string
+      required: false
+      description: Gender of the voice
+      default: Male
+    need_noise_reduction:
+      type: boolean
+      required: false
+      description: Apply noise reduction to the audio
+      default: true
+    preview_text:
+      type: string
+      required: false
+      description: Text for generating a preview sample (max 200 characters)
+      default: Hello
+
+# Code Examples
+examples:
+  curl: |
+    curl -X POST "https://api.genmax.io/v1/minimax/voices/clone" \
+      -H "xi-api-key: YOUR_API_KEY" \
+      -F "file=@voice_sample.mp3" \
+      -F "voice_name=My Voice" \
+      -F "language_tag=English" \
+      -F "gender=Male" \
+      -F "preview_text=Hello, this is a test"
+
+  javascript: |
+    const formData = new FormData();
+    formData.append('file', audioFile);
+    formData.append('voice_name', 'My Voice');
+    formData.append('language_tag', 'English');
+    formData.append('gender', 'Male');
+    formData.append('preview_text', 'Hello, this is a test');
+
+    const response = await fetch('https://api.genmax.io/v1/minimax/voices/clone', {
+      method: 'POST',
+      headers: { 'xi-api-key': 'YOUR_API_KEY' },
+      body: formData
+    });
+    const data = await response.json();
+
+  python: |
+    import requests
+
+    with open('voice_sample.mp3', 'rb') as f:
+        response = requests.post(
+            'https://api.genmax.io/v1/minimax/voices/clone',
+            headers={'xi-api-key': 'YOUR_API_KEY'},
+            files={'file': f},
+            data={
+                'voice_name': 'My Voice',
+                'language_tag': 'English',
+                'gender': 'Male',
+                'preview_text': 'Hello, this is a test',
+            },
+        )
+    data = response.json()
+
+# Responses
+responses:
+  - status: 200
+    description: Voice clone initiated (processing async)
+    example: |
+      {
+        "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "voice_name": "My Voice",
+        "language_tag": "English",
+        "gender": "Male",
+        "status": "processing",
+        "created_at": "2026-02-08T10:30:00Z"
+      }
+

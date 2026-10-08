@@ -1,0 +1,160 @@
+# POST /v1/aidubbing/upload/complete
+# Step 3: reassemble the parts and start the dubbing task
+
+method: POST
+path: /v1/aidubbing/upload/complete
+group: Dubbing
+title: 3. Complete & start dubbing
+description: |
+  Final step: reassembles all parts (0..total_chunks-1) and starts the dubbing
+  job with the parameters sent in this request. Costs 50 credits per second of
+  source duration, deducted upfront. Async — poll the history endpoint. The
+  upload session is consumed either way.
+order: 3
+
+# Authentication
+auth:
+  type: xi-api-key
+  required: true
+
+# Path Parameters
+path_parameters: []
+
+# Query Parameters
+query_parameters: []
+
+# Request Body
+request_body:
+  content_type: multipart/form-data
+  required: true
+  properties:
+    upload_id:
+      type: string
+      required: true
+      description: Session ID returned by upload/init.
+    total_chunks:
+      type: int
+      required: true
+      description: Number of parts uploaded (1-512). All indexes 0..total_chunks-1 must be present.
+    filename:
+      type: string
+      required: false
+      default: upload
+      description: Original file name (used for display in history).
+    content_type:
+      type: string
+      required: false
+      description: MIME type of the source file (e.g. video/mp4). Helps video detection.
+    target_language:
+      type: string
+      required: true
+      description: |
+        ISO 639-1 code to dub into (no locale suffix). Must be supported by the chosen provider.
+        Supported: af, ar, hy, as, az, be, bn, bs, bg, ca, ceb, ny, zh, hr, cs, da, nl, en,
+        et, fil, fi, fr, gl, ka, de, el, gu, ha, he, hi, hu, is, id, ga, it, ja, jv, kn, kk,
+        ky, ko, lv, ln, lt, lb, mk, ms, ml, mr, ne, no, ps, fa, pl, pt, pa, ro, ru, sr, sd,
+        sk, sl, so, es, sw, sv, ta, te, th, tr, uk, ur, vi, cy, nn, yue.
+    source_language:
+      type: string
+      required: true
+      description: |
+        Source language code. Required — `auto` NOT accepted. Same list as
+        target plus mi, tl.
+    provider:
+      type: string
+      required: false
+      default: minimax
+      description: |
+        `minimax`, `elevenlabs` or `capcut`. TTS model is pinned per provider
+        (speech-2.8-hd / eleven_v3 / capcut). CapCut targets are limited to:
+        en, zh, es, id, pt, fr, de, vi, ja, th, tr, it.
+    voice_id:
+      type: string
+      required: true
+      description: |
+        Voice for the dubbed speech. MiniMax: official uniq_id (e.g. `Wise_Woman`)
+        or your cloned voice ID. ElevenLabs: voice ID. CapCut: effect_id from the
+        CapCut voice list — pick a voice whose language matches the target.
+
+# Code Examples
+examples:
+  curl: |
+    curl -X POST "https://api.genmax.io/v1/aidubbing/upload/complete" \
+      -H "xi-api-key: YOUR_API_KEY" \
+      -F "upload_id=0f8fad5b-d9cb-469f-a165-70867728950e" \
+      -F "total_chunks=4" \
+      -F "filename=clip.mp4" \
+      -F "content_type=video/mp4" \
+      -F "target_language=vi" \
+      -F "source_language=en" \
+      -F "provider=minimax" \
+      -F "voice_id=Wise_Woman"
+
+  javascript: |
+    const formData = new FormData();
+    formData.append('upload_id', uploadId);
+    formData.append('total_chunks', String(totalChunks));
+    formData.append('filename', file.name);
+    formData.append('content_type', file.type);
+    formData.append('target_language', 'vi');
+    formData.append('source_language', 'en');
+    formData.append('provider', 'minimax');
+    formData.append('voice_id', 'Wise_Woman');
+
+    const response = await fetch('https://api.genmax.io/v1/aidubbing/upload/complete', {
+      method: 'POST',
+      headers: { 'xi-api-key': 'YOUR_API_KEY' },
+      body: formData
+    });
+    const task = await response.json();
+
+  python: |
+    import requests
+
+    response = requests.post(
+        'https://api.genmax.io/v1/aidubbing/upload/complete',
+        headers={'xi-api-key': 'YOUR_API_KEY'},
+        data={
+            'upload_id': upload_id,
+            'total_chunks': 4,
+            'filename': 'clip.mp4',
+            'content_type': 'video/mp4',
+            'target_language': 'vi',
+            'source_language': 'en',
+            'provider': 'minimax',
+            'voice_id': 'Wise_Woman',
+        },
+    )
+    task = response.json()
+
+# Responses
+responses:
+  - status: 202
+    description: Accepted - AI dubbing task queued for processing
+    example: |
+      {
+        "task_id": "9b19d3e2-7c68-4eca-be48-e9917682d73e",
+        "status": "pending"
+      }
+
+  - status: 400
+    description: Bad request - missing chunk, invalid total_chunks, invalid dubbing params, or file too large
+    example: |
+      {
+        "error": "missing chunk 2"
+      }
+
+  - status: 402
+    description: Payment required - insufficient credits (50 credits per second of source)
+    example: |
+      {
+        "error": "insufficient credits",
+        "required": 18000
+      }
+
+  - status: 404
+    description: Not found - unknown upload_id or session owned by another user
+    example: |
+      {
+        "error": "upload session not found"
+      }

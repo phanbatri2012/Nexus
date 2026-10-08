@@ -1,0 +1,187 @@
+# POST /v1/dialogue
+# Create dialogue TTS
+
+method: POST
+path: /v1/dialogue
+group: Dialogue
+title: Create dialogue
+description: |
+  Convert a multi-speaker dialogue script to speech. Each speaker can use a different provider, voice, model, and settings.
+  The dialogue text format is "SpeakerName: text..." — each line starting with a speaker name followed by a colon begins a new turn.
+order: 1
+
+# Authentication
+auth:
+  type: xi-api-key
+  required: true
+
+# Path Parameters
+path_parameters: []
+
+# Query Parameters
+query_parameters: []
+
+# Request Body
+request_body:
+  content_type: application/json
+  required: true
+  properties:
+    text:
+      type: string
+      required: true
+      description: |
+        Dialogue script in "SpeakerName: text" format. Each line starting with "Name:" begins a new turn.
+        Multi-line text per turn is supported (continuation lines without "Name:" prefix).
+        At least 2 different speakers must appear in the text.
+        Example:
+          Alice: Hello, how are you?
+          Bob: I'm doing great, thanks for asking!
+          Alice: That's wonderful to hear.
+    speakers:
+      type: object
+      required: true
+      description: |
+        Map of speaker name → TTS configuration. Keys must match the speaker names used in the text.
+        At least 2 speakers are required. Each speaker is fully independent with their own provider, voice, model, and settings.
+      properties:
+        "[speaker_name]":
+          type: object
+          description: TTS configuration for this speaker
+          properties:
+            provider:
+              type: string
+              required: true
+              description: "TTS provider: 'elevenlabs' or 'minimax'"
+            voice_id:
+              type: string
+              required: true
+              description: Voice ID for this speaker
+            model_id:
+              type: string
+              required: true
+              description: Model ID for this speaker
+            language_code:
+              type: string
+              required: false
+              description: Language code (ElevenLabs) or language name (MiniMax)
+            voice_settings:
+              type: object
+              required: false
+              description: Voice settings (provider-specific, same as TTS endpoint)
+    pause_between_turns:
+      type: number
+      required: false
+      description: Silence duration between turns in seconds (0-3)
+      default: 0
+
+# Code Examples
+examples:
+  curl: |
+    curl -X POST "https://api.genmax.io/v1/dialogue" \
+      -H "xi-api-key: YOUR_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "text": "Alice: Hello, how are you today?\nBob: I am doing great, thanks for asking!\nAlice: That is wonderful to hear.",
+        "speakers": {
+          "Alice": {
+            "provider": "elevenlabs",
+            "voice_id": "rv30Fd6w5bnbL0kHzWlr",
+            "model_id": "eleven_multilingual_v2",
+            "language_code": "en",
+            "voice_settings": {
+              "stability": 0.5,
+              "similarity_boost": 0.75,
+              "speed": 1.0
+            }
+          },
+          "Bob": {
+            "provider": "minimax",
+            "voice_id": "English_ManWithDeepVoice",
+            "model_id": "speech-2.8-turbo",
+            "language_code": "English",
+            "voice_settings": {
+              "speed": 1.0,
+              "pitch": 0,
+              "vol": 1.0
+            }
+          }
+        },
+        "pause_between_turns": 0.5
+      }'
+
+  javascript: |
+    const response = await fetch('https://api.genmax.io/v1/dialogue', {
+      method: 'POST',
+      headers: {
+        'xi-api-key': 'YOUR_API_KEY',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        text: 'Alice: Hello, how are you today?\nBob: I am doing great, thanks for asking!\nAlice: That is wonderful to hear.',
+        speakers: {
+          Alice: {
+            provider: 'elevenlabs',
+            voice_id: 'rv30Fd6w5bnbL0kHzWlr',
+            model_id: 'eleven_multilingual_v2',
+            language_code: 'en',
+            voice_settings: { stability: 0.5, similarity_boost: 0.75, speed: 1.0 }
+          },
+          Bob: {
+            provider: 'minimax',
+            voice_id: 'English_ManWithDeepVoice',
+            model_id: 'speech-2.8-turbo',
+            language_code: 'English',
+            voice_settings: { speed: 1.0, pitch: 0, vol: 1.0 }
+          }
+        },
+        pause_between_turns: 0.5
+      })
+    });
+    const data = await response.json();
+
+  python: |
+    import requests
+
+    response = requests.post(
+        'https://api.genmax.io/v1/dialogue',
+        headers={'xi-api-key': 'YOUR_API_KEY'},
+        json={
+            'text': 'Alice: Hello, how are you today?\nBob: I am doing great, thanks for asking!\nAlice: That is wonderful to hear.',
+            'speakers': {
+                'Alice': {
+                    'provider': 'elevenlabs',
+                    'voice_id': 'rv30Fd6w5bnbL0kHzWlr',
+                    'model_id': 'eleven_multilingual_v2',
+                    'language_code': 'en',
+                    'voice_settings': {
+                        'stability': 0.5,
+                        'similarity_boost': 0.75,
+                        'speed': 1.0
+                    }
+                },
+                'Bob': {
+                    'provider': 'minimax',
+                    'voice_id': 'English_ManWithDeepVoice',
+                    'model_id': 'speech-2.8-turbo',
+                    'language_code': 'English',
+                    'voice_settings': {
+                        'speed': 1.0,
+                        'pitch': 0,
+                        'vol': 1.0
+                    }
+                }
+            },
+            'pause_between_turns': 0.5
+        }
+    )
+    data = response.json()
+
+# Responses
+responses:
+  - status: 202
+    description: Accepted - Dialogue task queued for processing
+    example: |
+      {
+        "id": "9b19d3e2-7c68-4eca-be48-e9917682d73e",
+        "status": "pending"
+      }

@@ -1,0 +1,91 @@
+# POST /v1/aidubbing/history/{id}/retry
+# Retry AI dubbing task
+
+method: POST
+path: /v1/aidubbing/history/{id}/retry
+group: Dubbing
+title: Retry task
+description: |
+  Re-run a completed or failed task from its stored source (no re-upload).
+  Re-deducts the original credit cost.
+order: 6
+
+# Authentication
+auth:
+  type: xi-api-key
+  required: true
+
+# Path Parameters
+path_parameters:
+  - name: id
+    type: string
+    required: true
+    description: Task ID to retry
+    example: 9b19d3e2-7c68-4eca-be48-e9917682d73e
+
+# Query Parameters
+query_parameters: []
+
+# Request Body
+request_body: null
+
+# Code Examples
+examples:
+  curl: |
+    curl -X POST "https://api.genmax.io/v1/aidubbing/history/{id}/retry" \
+      -H "xi-api-key: YOUR_API_KEY"
+
+  javascript: |
+    const response = await fetch('https://api.genmax.io/v1/aidubbing/history/{id}/retry', {
+      method: 'POST',
+      headers: { 'xi-api-key': 'YOUR_API_KEY' }
+    });
+    const data = await response.json();
+
+  python: |
+    import requests
+
+    response = requests.post(
+        'https://api.genmax.io/v1/aidubbing/history/{id}/retry',
+        headers={'xi-api-key': 'YOUR_API_KEY'},
+    )
+    task = response.json()
+
+# Responses
+responses:
+  - status: 202
+    description: Accepted - task queued again
+    example: |
+      {
+        "task_id": "9b19d3e2-7c68-4eca-be48-e9917682d73e",
+        "status": "pending"
+      }
+
+  - status: 402
+    description: Payment required - insufficient credits for the re-run
+    example: |
+      {
+        "error": "insufficient credits",
+        "required": 18000
+      }
+
+  - status: 404
+    description: Not found - task does not exist or belongs to another user
+    example: |
+      {
+        "error": "task not found"
+      }
+
+  - status: 409
+    description: Conflict - task is still pending/processing
+    example: |
+      {
+        "error": "only completed or failed tasks can be retried"
+      }
+
+  - status: 422
+    description: Unprocessable - source file no longer available (credits refunded)
+    example: |
+      {
+        "error": "cannot retry: source file no longer available"
+      }

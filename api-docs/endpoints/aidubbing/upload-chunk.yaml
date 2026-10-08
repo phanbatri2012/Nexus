@@ -1,0 +1,111 @@
+# POST /v1/aidubbing/upload/chunk
+# Step 2: upload the file parts
+
+method: POST
+path: /v1/aidubbing/upload/chunk
+group: Dubbing
+title: 2. Upload chunks
+description: |
+  Step 2: upload each file part at its 0-based index (a small file is a single
+  part). Any order, parallel OK; re-POST the same index to retry. Slice at
+  `chunk_size` from init; max 100 MB per part, 2 GB total per session.
+order: 2
+
+# Authentication
+auth:
+  type: xi-api-key
+  required: true
+
+# Path Parameters
+path_parameters: []
+
+# Query Parameters
+query_parameters: []
+
+# Request Body
+request_body:
+  content_type: multipart/form-data
+  required: true
+  properties:
+    upload_id:
+      type: string
+      required: true
+      description: Session ID returned by upload/init.
+    index:
+      type: int
+      required: true
+      description: 0-based chunk index (max 511).
+    chunk:
+      type: file
+      required: true
+      description: The file slice for this index. Max 100 MB per part.
+
+# Code Examples
+examples:
+  curl: |
+    curl -X POST "https://api.genmax.io/v1/aidubbing/upload/chunk" \
+      -H "xi-api-key: YOUR_API_KEY" \
+      -F "upload_id=0f8fad5b-d9cb-469f-a165-70867728950e" \
+      -F "index=0" \
+      -F "chunk=@clip.part0"
+
+  javascript: |
+    // Slice the file at chunk_size and POST each part
+    const chunkSize = 52428800; // from upload/init
+    const total = Math.ceil(file.size / chunkSize);
+
+    for (let i = 0; i < total; i++) {
+      const formData = new FormData();
+      formData.append('upload_id', uploadId);
+      formData.append('index', String(i));
+      formData.append('chunk', file.slice(i * chunkSize, (i + 1) * chunkSize));
+
+      await fetch('https://api.genmax.io/v1/aidubbing/upload/chunk', {
+        method: 'POST',
+        headers: { 'xi-api-key': 'YOUR_API_KEY' },
+        body: formData
+      });
+    }
+
+  python: |
+    import requests
+
+    CHUNK_SIZE = 52428800  # from upload/init
+
+    with open('clip.mp4', 'rb') as f:
+        index = 0
+        while True:
+            part = f.read(CHUNK_SIZE)
+            if not part:
+                break
+            requests.post(
+                'https://api.genmax.io/v1/aidubbing/upload/chunk',
+                headers={'xi-api-key': 'YOUR_API_KEY'},
+                data={'upload_id': upload_id, 'index': index},
+                files={'chunk': ('part', part)},
+            ).raise_for_status()
+            index += 1
+
+# Responses
+responses:
+  - status: 200
+    description: OK - chunk stored
+    example: |
+      {
+        "index": 0,
+        "received": true
+      }
+
+  - status: 400
+    description: Bad request - invalid index, missing chunk data, chunk too large, or session over 2 GB
+    example: |
+      {
+        "error": "chunk too large"
+      }
+
+  - status: 404
+    description: Not found - unknown upload_id or session owned by another user
+    example: |
+      {
+        "error": "upload session not found"
+      }

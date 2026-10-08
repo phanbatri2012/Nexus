@@ -1,0 +1,61 @@
+# POST /v1/aidubbing/upload/init
+# Step 1: open an upload session for a AI dubbing job
+
+method: POST
+path: /v1/aidubbing/upload/init
+group: Dubbing
+title: 1. Init upload
+description: |
+  Step 1 of creating an AI dubbing job
+  Opens an upload session and returns `upload_id` + recommended `chunk_size`
+  in bytes. Source max 2 GB, 2.5 hours (mp3, wav, aac, m4a, mp4, mov).
+  Flow: init -> chunk (xN) -> complete.
+order: 1
+
+# Authentication
+auth:
+  type: xi-api-key
+  required: true
+
+# Path Parameters
+path_parameters: []
+
+# Query Parameters
+query_parameters: []
+
+# Request Body
+request_body: null
+
+# Code Examples
+examples:
+  curl: |
+    curl -X POST "https://api.genmax.io/v1/aidubbing/upload/init" \
+      -H "xi-api-key: YOUR_API_KEY"
+
+  javascript: |
+    const response = await fetch('https://api.genmax.io/v1/aidubbing/upload/init', {
+      method: 'POST',
+      headers: { 'xi-api-key': 'YOUR_API_KEY' }
+    });
+    const { upload_id, chunk_size } = await response.json();
+
+  python: |
+    import requests
+
+    response = requests.post(
+        'https://api.genmax.io/v1/aidubbing/upload/init',
+        headers={'xi-api-key': 'YOUR_API_KEY'},
+    )
+    session = response.json()
+    upload_id = session['upload_id']
+    chunk_size = session['chunk_size']
+
+# Responses
+responses:
+  - status: 200
+    description: OK - upload session created
+    example: |
+      {
+        "upload_id": "0f8fad5b-d9cb-469f-a165-70867728950e",
+        "chunk_size": 52428800
+      }

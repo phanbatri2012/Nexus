@@ -1,0 +1,136 @@
+# GET /v1/default-voices
+# List default/premade ElevenLabs voices
+
+method: GET
+path: /v1/default-voices
+group: Elevenlabs Voices
+title: List default voices
+description: Get ElevenLabs default/premade voices. These are high-quality built-in voices available to all users.
+order: 1
+
+# Authentication
+auth:
+  type: xi-api-key
+  required: true
+
+# Path Parameters
+path_parameters: []
+
+# Query Parameters
+query_parameters:
+  - name: page_size
+    type: integer
+    required: false
+    default: 30
+    description: Number of voices per page
+  - name: search
+    type: string
+    required: false
+    description: Search term to filter voices by name
+
+# Request Body
+request_body: null
+
+# Code Examples
+examples:
+  curl: |
+    # Get default voices
+    curl -X GET "https://api.genmax.io/v1/default-voices?page_size=30" \
+      -H "xi-api-key: YOUR_API_KEY"
+
+    # Search for a specific voice
+    curl -X GET "https://api.genmax.io/v1/default-voices?search=aria&page_size=30" \
+      -H "xi-api-key: YOUR_API_KEY"
+
+  javascript: |
+    // Get default voices
+    const response = await fetch('https://api.genmax.io/v1/default-voices?page_size=30', {
+      method: 'GET',
+      headers: { 'xi-api-key': 'YOUR_API_KEY' }
+    });
+    const data = await response.json();
+
+    // Search for a specific voice
+    const searchResponse = await fetch('https://api.genmax.io/v1/default-voices?search=aria&page_size=30', {
+      method: 'GET',
+      headers: { 'xi-api-key': 'YOUR_API_KEY' }
+    });
+    const searchData = await searchResponse.json();
+
+  python: |
+    import requests
+
+    headers = {'xi-api-key': 'YOUR_API_KEY'}
+
+    # Get default voices
+    response = requests.get(
+        'https://api.genmax.io/v1/default-voices',
+        headers=headers,
+        params={'page_size': 30}
+    )
+    data = response.json()
+
+    # Search for a specific voice
+    response = requests.get(
+        'https://api.genmax.io/v1/default-voices',
+        headers=headers,
+        params={'search': 'aria', 'page_size': 30}
+    )
+    data = response.json()
+
+# Responses
+responses:
+  - status: 200
+    description: OK
+    example: |
+      {
+        "voices": [
+          {
+            "voice_id": "rv30Fd6w5bnbL0kHzWlr",
+            "name": "Aria",
+            "description": "A young, expressive female voice with a clear American accent.",
+            "preview_url": "https://storage.googleapis.com/eleven-public-prod/audio/aria.mp3",
+            "category": "premade",
+            "gender": "female",
+            "age": "young",
+            "accent": "american",
+            "language": "en",
+            "use_case": "social_media",
+            "descriptive": "expressive",
+            "free_users_allowed": true,
+            "verified_languages": [
+              {
+                "language_id": "en",
+                "language": "English",
+                "model_id": "eleven_multilingual_v2",
+                "accent": "American",
+                "locale": "en-US"
+              }
+            ]
+          },
+          {
+            "voice_id": "CwhRBWXzGAHq8TQ4Fs17",
+            "name": "Roger",
+            "description": "A confident, mature male voice with a British accent.",
+            "preview_url": "https://storage.googleapis.com/eleven-public-prod/audio/roger.mp3",
+            "category": "premade",
+            "gender": "male",
+            "age": "middle_aged",
+            "accent": "british",
+            "language": "en",
+            "use_case": "narration",
+            "descriptive": "confident",
+            "free_users_allowed": true,
+            "verified_languages": [
+              {
+                "language_id": "en",
+                "language": "English",
+                "model_id": "eleven_multilingual_v2",
+                "accent": "British"
+              }
+            ]
+          }
+        ],
+        "has_more": true,
+        "last_sort_id": "next_page_token_value"
+      }

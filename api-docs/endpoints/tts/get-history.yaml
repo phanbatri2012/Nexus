@@ -1,0 +1,126 @@
+# GET /v1/history
+# Get history
+
+method: GET
+path: /v1/history
+group: Text to speech
+title: Get history list
+description: Get list of text to speech tasks, dialogue tasks across all providers
+order: 3
+
+# Authentication
+auth:
+  type: xi-api-key
+  required: true
+
+# Path Parameters
+path_parameters: []
+
+# Query Parameters
+query_parameters:
+  - name: page_size
+    type: int
+    required: false
+    default: 30
+    description: Number of tasks per page (max 100)
+    example: 30
+
+  - name: page
+    type: int
+    required: false
+    default: 0
+    description: Page number (0-indexed)
+    example: 0
+
+# Request Body
+request_body: null
+
+# Code Examples
+examples:
+  curl: |
+    curl -X GET "https://api.genmax.io/v1/history?page_size=30&page=0" \
+      -H "xi-api-key: YOUR_API_KEY"
+
+  javascript: |
+    const response = await fetch('https://api.genmax.io/v1/history?page_size=30&page=0', {
+      headers: {
+        'xi-api-key': 'YOUR_API_KEY'
+      }
+    });
+    const data = await response.json();
+    console.log(data.tasks);
+
+  python: |
+    import requests
+
+    response = requests.get(
+        'https://api.genmax.io/v1/history',
+        headers={'xi-api-key': 'YOUR_API_KEY'},
+        params={'page_size': 30, 'page': 0}
+    )
+    history = response.json()
+
+# Responses
+responses:
+  - status: 200
+    description: "Success. The provider field indicates which TTS engine was used: 'elevenlabs' or 'minimax'."
+    example: |
+      {
+        "tasks": [
+          {
+            "id": "id_of_the_task",
+            "user_id": "id_of_the_user",
+            "status": "completed",
+            "progress": 100,
+            "provider": "elevenlabs",
+            "text": "Hello world!",
+            "voice_id": "UgBBYS2sOqTuMpoF3BR0",
+            "model_id": "eleven_multilingual_v2",
+            "metadata": {
+              "language_code": "en", // Elevenlabs use language code
+              "voice_settings": {
+                "stability": 0.5,
+                "similarity_boost": 0.75,
+                "style": 0,
+                "use_speaker_boost": true,
+                "speed": 1
+              }
+            },
+            "result": {
+              "audio_url": "https://api.genmax.io/audio/id_of_the_task.mp3"
+            },
+            "error": string | null,
+            "characters_used": 12,
+            "credits_deducted": 12,
+            "created_at": "2026-01-24T07:42:13.641779Z",
+            "updated_at": "2026-01-24T07:42:16.432458Z"
+          },
+          {
+            "id": "id_of_another_task",
+            "user_id": "id_of_the_user",
+            "status": "completed",
+            "progress": 100,
+            "provider": "minimax",
+            "text": "Hello from MiniMax!",
+            "voice_id": "voice-id-uuid",
+            "model_id": "speech-2.8-turbo",
+            "metadata": {
+              "voice_settings": {
+                "speed": 1.0,
+                "pitch": 0,
+                "vol": 1.0
+              },
+              "language_code": "English" // Minimax use full language name
+            },
+            "result": {
+              "audio_url": "https://api.genmax.io/audio/id_of_another_task.mp3"
+            },
+            "error": null,
+            "characters_used": 19,
+            "credits_deducted": 12,
+            "created_at": "2026-01-24T08:00:00.000000Z",
+            "updated_at": "2026-01-24T08:00:05.000000Z"
+          }
+        ],
+        "has_more": false
+      }

@@ -1,0 +1,57 @@
+# POST /v1/api-keys/regenerate
+# Regenerate API key
+
+method: POST
+path: /v1/api-keys/regenerate
+group: API Keys
+title: Regenerate API key
+description: Regenerate API key
+order: 2
+
+# Authentication
+auth:
+  type: BearerAuth
+  required: true
+
+# Path Parameters
+path_parameters: []
+
+# Query Parameters
+query_parameters: []
+
+# Request Body
+request_body: null
+
+# Code Examples
+examples:
+  curl: |
+    curl -X POST "https://api.genmax.io/v1/api-keys/regenerate" \
+      -H "Authorization: Bearer YOUR_TOKEN"
+
+  javascript: |
+    const response = await fetch('https://api.genmax.io/v1/api-keys/regenerate', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer YOUR_TOKEN'
+      }
+    });
+    const data = await response.json();
+
+  python: |
+    import requests
+
+    response = requests.post(
+        'https://api.genmax.io/v1/api-keys/regenerate',
+        headers={'Authorization': 'Bearer YOUR_TOKEN'},
+    )
+    data = response.json()
+
+# Responses
+responses:
+  - status: 200
+    description: OK
+    example: |
+      {
+        "api_key": "sk_abc...",
+        "message": "API key regenerated successfully"
+      }

@@ -1,0 +1,450 @@
+# POST /v1/speech-to-text
+# Speech to text
+
+method: POST
+path: /v1/speech-to-text
+group: Speech to text
+title: Speech to text
+description: |
+  Convert speech audio to text using ElevenLabs Scribe v2 model.
+  All optional parameters fall back to ElevenLabs defaults when omitted.
+order: 1
+
+# Authentication
+auth:
+  type: xi-api-key
+  required: true
+
+# Path Parameters
+path_parameters: []
+
+# Query Parameters
+query_parameters: []
+
+# Request Body
+request_body:
+  content_type: multipart/form-data
+  required: true
+  properties:
+
+    file:
+      type: file (binary)
+      required: true
+      description: |
+        Audio/video file to transcribe. Max 100MB.
+        Supported formats: AAC, AIFF, OGG, MP3, Opus, WAV, WebM, FLAC, M4A.
+
+    # ── Language ───────────────────────────────────────────────────────────
+    language_code:
+      type: string
+      required: false
+      description: |
+        ISO-639-1 or ISO-639-3 language code (e.g. "en", "eng", "vi", "vie").
+        If omitted, the language is auto-detected. Providing this can improve accuracy.
+      example: "en"
+
+    # ── Timestamps ─────────────────────────────────────────────────────────
+    timestamps_granularity:
+      type: string
+      required: false
+      default: word
+      description: |
+        Granularity level for timestamps in the response.
+        - `none` — no timestamps
+        - `word` — timestamp per word (default)
+        - `character` — timestamp per character
+      options:
+        - none
+        - word
+        - character
+
+    # ── Speaker diarization ────────────────────────────────────────────────
+    diarize:
+      type: boolean
+      required: false
+      default: false
+      description: |
+        Enable speaker diarization — annotates each word with a `speaker_id` ("speaker_0", "speaker_1", …).
+        Use `num_speakers` for better accuracy when the number of speakers is known.
+
+    num_speakers:
+      type: integer
+      required: false
+      description: |
+        Hint for the maximum number of speakers present (1–32).
+        When provided, improves diarization accuracy. Only relevant when `diarize=true`.
+      range:
+        - 1
+        - 32
+
+    diarization_threshold:
+      type: number
+      required: false
+      description: |
+        Threshold for speaker separation (0.0–1.5). Default: 0.22.
+        Higher values reduce the chance of one speaker being split into two,
+        but increase the chance of merging two different speakers.
+        Only applies when `diarize=true` and `num_speakers` is not set.
+      range:
+        - 0.0
+        - 1.5
+
+    # ── Transcript control ─────────────────────────────────────────────────
+    tag_audio_events:
+      type: boolean
+      required: false
+      default: true
+      description: |
+        Include non-speech audio event tags in the transcript, e.g. (laughter), (footsteps), (applause).
+        Defaults to `true` — set to `false` to suppress them.
+
+    no_verbatim:
+      type: boolean
+      required: false
+      default: false
+      description: |
+        Remove filler words and false starts ("um", "uh", "like", restarted sentences) for a cleaner transcript.
+        Only supported on `scribe_v2`.
+
+    temperature:
+      type: number
+      required: false
+      description: |
+        Sampling temperature (0.0–2.0). Higher values produce more diverse output; lower values are more deterministic.
+        Default is model-specific.
+      range:
+        - 0.0
+        - 2.0
+
+    seed:
+      type: integer
+      required: false
+      description: |
+        Integer seed (0–2147483647) for deterministic output. Same seed + same input produces the same transcript.
+      range:
+        - 0
+        - 2147483647
+
+    file_format:
+      type: string
+      required: false
+      default: other
+      description: |
+        Input audio format hint. Use `pcm_s16le_16` for raw 16-bit PCM at 16kHz; `other` for all other formats.
+      options:
+        - other
+        - pcm_s16le_16
+
+    use_multi_channel:
+      type: boolean
+      required: false
+      default: false
+      description: |
+        Transcribe each audio channel independently (up to 5 channels).
+        Each channel is assigned a `speaker_id` based on its channel number.
+        Cannot be used together with `diarize=true`.
+
+    # ── Recognition bias ───────────────────────────────────────────────────
+    keyterms:
+      type: array of strings
+      required: false
+      description: |
+        List of terms to bias the model toward (e.g. product names, technical jargon, proper nouns).
+        Max 1000 terms, each under 50 characters.
+        Send as repeated form fields: `keyterms=Term1&keyterms=Term2`.
+      example: "Acme Corp"
+
+    # ── Entity detection & redaction ───────────────────────────────────────
+    entity_detection:
+      type: array of strings
+      required: false
+      description: |
+        Detect named entities in the transcript. Pass `all` to detect everything, or specify categories/types.
+        Categories: `pii`, `phi`, `pci`, `other`, `offensive_language`.
+        Send as repeated form fields: `entity_detection=pii&entity_detection=phi`.
+      options:
+        - all
+        - pii
+        - phi
+        - pci
+        - other
+        - offensive_language
+
+    entity_redaction:
+      type: array of strings
+      required: false
+      description: |
+        Redact detected entities from the transcript. Must be a subset of `entity_detection`.
+        Send as repeated form fields: `entity_redaction=pii`.
+
+    entity_redaction_mode:
+      type: string
+      required: false
+      default: enumerated_entity_type
+      description: |
+        Format used to replace redacted entities in the transcript text.
+        - `redacted` — replaced with `[redacted]`
+        - `entity_type` — replaced with the entity type, e.g. `[PERSON_NAME]`
+        - `enumerated_entity_type` — replaced with type + index, e.g. `[PERSON_NAME_1]`
+      options:
+        - redacted
+        - entity_type
+        - enumerated_entity_type
+
+    # ── Additional output formats ──────────────────────────────────────────
+    additional_formats:
+      type: array of strings
+      required: false
+      description: |
+        Request the transcript in additional export formats alongside the JSON response.
+        The content is returned in the `additional_formats` array in the response.
+        Send as repeated form fields: `additional_formats=srt&additional_formats=txt`.
+      options:
+        - srt
+        - txt
+        - docx
+        - html
+        - pdf
+        - segmented_json
+
+# Code Examples
+examples:
+  curl: |
+    # Basic transcription
+    curl -X POST "https://api.genmax.io/v1/speech-to-text" \
+      -H "xi-api-key: YOUR_API_KEY" \
+      -F "file=@recording.mp3"
+
+    # With speaker diarization (identify who speaks when)
+    curl -X POST "https://api.genmax.io/v1/speech-to-text" \
+      -H "xi-api-key: YOUR_API_KEY" \
+      -F "file=@interview.mp3" \
+      -F "diarize=true" \
+      -F "num_speakers=2"
+
+    # Clean transcript with SRT export, no filler words
+    curl -X POST "https://api.genmax.io/v1/speech-to-text" \
+      -H "xi-api-key: YOUR_API_KEY" \
+      -F "file=@recording.mp3" \
+      -F "no_verbatim=true" \
+      -F "additional_formats=srt"
+
+    # With keyterms and language hint
+    curl -X POST "https://api.genmax.io/v1/speech-to-text" \
+      -H "xi-api-key: YOUR_API_KEY" \
+      -F "file=@recording.mp3" \
+      -F "language_code=en" \
+      -F "keyterms=Acme Corp" \
+      -F "keyterms=Q4 Report"
+
+  javascript: |
+    // Basic transcription
+    const formData = new FormData();
+    formData.append('file', audioBlob, 'recording.mp3');
+
+    const response = await fetch('https://api.genmax.io/v1/speech-to-text', {
+      method: 'POST',
+      headers: { 'xi-api-key': 'YOUR_API_KEY' },
+      body: formData
+    });
+    const data = await response.json();
+    console.log(data.text);
+
+    // With speaker diarization
+    const form = new FormData();
+    form.append('file', audioBlob, 'interview.mp3');
+    form.append('diarize', 'true');
+    form.append('num_speakers', '2');
+
+    const res = await fetch('https://api.genmax.io/v1/speech-to-text', {
+      method: 'POST',
+      headers: { 'xi-api-key': 'YOUR_API_KEY' },
+      body: form
+    });
+    const result = await res.json();
+
+    // Group transcript by speaker
+    const bySpeaker = {};
+    for (const word of result.words) {
+      if (word.type === 'word') {
+        const spk = word.speaker_id ?? 'unknown';
+        (bySpeaker[spk] ??= []).push(word.text);
+      }
+    }
+    for (const [spk, words] of Object.entries(bySpeaker)) {
+      console.log(`${spk}: ${words.join(' ')}`);
+    }
+
+    // With keyterms + SRT export
+    const f = new FormData();
+    f.append('file', audioBlob, 'recording.mp3');
+    ['Acme Corp', 'Q4 Report'].forEach(t => f.append('keyterms', t));
+    f.append('no_verbatim', 'true');
+    f.append('additional_formats', 'srt');
+
+    const r = await fetch('https://api.genmax.io/v1/speech-to-text', {
+      method: 'POST',
+      headers: { 'xi-api-key': 'YOUR_API_KEY' },
+      body: f
+    });
+    const out = await r.json();
+    const srt = out.additional_formats?.find(x => x.file_extension === 'srt');
+    if (srt) console.log(srt.content);
+
+  python: |
+    import requests
+
+    # Basic transcription
+    response = requests.post(
+        'https://api.genmax.io/v1/speech-to-text',
+        headers={'xi-api-key': 'YOUR_API_KEY'},
+        files={'file': open('recording.mp3', 'rb')},
+    )
+    data = response.json()
+    print(data['text'])
+
+    # With speaker diarization
+    response = requests.post(
+        'https://api.genmax.io/v1/speech-to-text',
+        headers={'xi-api-key': 'YOUR_API_KEY'},
+        files={'file': open('interview.mp3', 'rb')},
+        data={
+            'diarize': 'true',
+            'num_speakers': '2',
+        }
+    )
+    data = response.json()
+
+    # Group transcript by speaker
+    by_speaker = {}
+    for word in data['words']:
+        if word['type'] == 'word':
+            spk = word.get('speaker_id', 'unknown')
+            by_speaker.setdefault(spk, []).append(word['text'])
+    for spk, words in by_speaker.items():
+        print(f"{spk}: {' '.join(words)}")
+
+    # With keyterms + SRT export
+    response = requests.post(
+        'https://api.genmax.io/v1/speech-to-text',
+        headers={'xi-api-key': 'YOUR_API_KEY'},
+        files={'file': open('recording.mp3', 'rb')},
+        data=[
+            ('no_verbatim', 'true'),
+            ('keyterms', 'Acme Corp'),
+            ('keyterms', 'Q4 Report'),
+            ('additional_formats', 'srt'),
+        ]
+    )
+    data = response.json()
+    for fmt in data.get('additional_formats', []):
+        if fmt['file_extension'] == 'srt':
+            print(fmt['content'])
+
+# Responses
+responses:
+  - status: 200
+    description: |
+      Transcription completed successfully.
+
+      Key response fields:
+      - `language_code`: detected language in ISO-639-3 (e.g. "eng", "vie").
+      - `language_probability`: 0.0–1.0 confidence in language detection.
+      - `text`: full transcript as a plain string.
+      - `transcription_id`: unique ID for this transcription job.
+      - `words[].type`: `"word"` (spoken), `"spacing"` (gap), `"audio_event"` (non-speech).
+      - `words[].start` / `words[].end`: timestamp in seconds for each token.
+      - `words[].logprob`: log-probability confidence per word (0 = 100%, -0.5 ≈ 61%, -1.0 ≈ 37%).
+      - `words[].speaker_id`: present when `diarize=true` — e.g. `"speaker_0"`, `"speaker_1"`.
+      - `additional_formats[].file_extension`: format identifier (e.g. `"srt"`, `"txt"`).
+      - `additional_formats[].content`: transcript in the requested format (SRT, TXT, etc.).
+    example: |
+      {
+        "language_code": "eng",
+        "language_probability": 0.9746,
+        "text": "Hello everyone. My name is John. Thanks for joining.",
+        "words": [
+          {
+            "text": "Hello",
+            "start": 0.0,
+            "end": 0.32,
+            "type": "word",
+            "logprob": -0.002,
+            "speaker_id": "speaker_0"
+          },
+          {
+            "text": " ",
+            "start": 0.32,
+            "end": 0.4,
+            "type": "spacing",
+            "logprob": -0.001,
+            "speaker_id": "speaker_0"
+          },
+          {
+            "text": "everyone.",
+            "start": 0.4,
+            "end": 0.92,
+            "type": "word",
+            "logprob": -0.04,
+            "speaker_id": "speaker_0"
+          },
+          {
+            "text": "My",
+            "start": 1.1,
+            "end": 1.22,
+            "type": "word",
+            "logprob": -0.0001,
+            "speaker_id": "speaker_0"
+          },
+          {
+            "text": "name",
+            "start": 1.22,
+            "end": 1.36,
+            "type": "word",
+            "logprob": -0.0001,
+            "speaker_id": "speaker_0"
+          },
+          {
+            "text": "is",
+            "start": 1.36,
+            "end": 1.44,
+            "type": "word",
+            "logprob": -0.0008,
+            "speaker_id": "speaker_0"
+          },
+          {
+            "text": "John.",
+            "start": 1.44,
+            "end": 1.98,
+            "type": "word",
+            "logprob": -0.03,
+            "speaker_id": "speaker_0"
+          },
+          {
+            "text": "Thanks",
+            "start": 3.1,
+            "end": 3.4,
+            "type": "word",
+            "logprob": -0.01,
+            "speaker_id": "speaker_1"
+          },
+          {
+            "text": "for",
+            "start": 3.4,
+            "end": 3.5,
+            "type": "word",
+            "logprob": -0.005,
+            "speaker_id": "speaker_1"
+          },
+          {
+            "text": "joining.",
+            "start": 3.5,
+            "end": 4.1,
+            "type": "word",
+            "logprob": -0.008,
+            "speaker_id": "speaker_1"
+          }
+        ],
+        "additional_formats": [],
+        "transcription_id": "Qe71uRUkuArC2JNlRsGy"
+      }

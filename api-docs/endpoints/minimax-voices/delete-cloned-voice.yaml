@@ -1,0 +1,60 @@
+# DELETE /v1/minimax/voices/{id}
+# Delete a cloned voice
+
+method: DELETE
+path: /v1/minimax/voices/{id}
+group: MiniMax Voices
+title: Delete cloned voice
+description: Delete a cloned voice. The voice will no longer appear in the list.
+order: 3
+
+# Authentication
+auth:
+  type: xi-api-key
+  required: true
+
+# Path Parameters
+path_parameters:
+  - name: id
+    type: string
+    required: true
+    description: Voice ID (UUID)
+
+# Query Parameters
+query_parameters: []
+
+# Request Body
+request_body: null
+
+# Code Examples
+examples:
+  curl: |
+    curl -X DELETE "https://api.genmax.io/v1/minimax/voices/{voice_id}" \
+      -H "xi-api-key: YOUR_API_KEY"
+
+  javascript: |
+    const response = await fetch('https://api.genmax.io/v1/minimax/voices/{voice_id}', {
+      method: 'DELETE',
+      headers: { 'xi-api-key': 'YOUR_API_KEY' }
+    });
+    const data = await response.json();
+
+  python: |
+    import requests
+
+    response = requests.delete(
+        'https://api.genmax.io/v1/minimax/voices/{voice_id}',
+        headers={'xi-api-key': 'YOUR_API_KEY'},
+    )
+    data = response.json()
+
+# Responses
+responses:
+  - status: 200
+    description: Voice deleted
+    example: |
+      {
+        "success": true,
+        "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+      }
+

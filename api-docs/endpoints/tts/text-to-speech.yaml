@@ -1,0 +1,251 @@
+# POST /v1/text-to-speech/{voice_id}
+# Text to speech
+
+method: POST
+path: /v1/text-to-speech/{voice_id}
+group: Text to speech
+title: Text to speech
+description: Convert text to speech with a specific voice. Supports ElevenLabs, MiniMax, and CapCut providers.
+order: 1
+
+# Authentication
+auth:
+  type: xi-api-key
+  required: true
+
+# Path Parameters
+path_parameters:
+  - name: voice_id
+    type: string
+    required: true
+    description: |
+      Voice ID.
+      For ElevenLabs: use the voice ID from the voice library.
+      For MiniMax: use numeric voice_id (e.g. '226905123659939'), uniq_id (e.g. 'English_ManWithDeepVoice'), or UUID for cloned voices.
+      For CapCut: use the voice_id from the CapCut voice library (see "List system voices" under CapCut Voices).
+
+# Query Parameters
+query_parameters: []
+
+# Request Body
+request_body:
+  content_type: application/json
+  required: true
+  properties:
+    text:
+      type: string
+      required: true
+      description: The text to convert to speech
+    model_id:
+      type: string
+      required: false
+      description: "Support full model options from ElevenLabs and MiniMax. For CapCut use 'capcut' (the default when provider is 'capcut')."
+      default: eleven_multilingual_v2
+    provider:
+      type: string
+      required: false
+      description: "TTS provider to use: 'elevenlabs' (default), 'minimax', or 'capcut'"
+      default: elevenlabs
+    language_code:
+      type: string
+      required: true
+      description: Language code from elevenlabs or language name from minimax
+    voice_settings:
+      type: object
+      required: false
+      description: "Voice settings. Available fields depend on the provider and model."
+      properties:
+        stability:
+          type: number
+          description: "[ElevenLabs] Stability (0.0 - 1.0)"
+        similarity_boost:
+          type: number
+          description: "[ElevenLabs] Similarity boost (0.0 - 1.0)"
+        style:
+          type: number
+          description: "[ElevenLabs] Style (0.0 - 1.0). Only supported by some models."
+        use_speaker_boost:
+          type: boolean
+          description: "[ElevenLabs] Enable speaker boost. Only supported by some models."
+        speed:
+          type: number
+          description: "Speed. ElevenLabs: 0.7-1.2 (default 1.0). MiniMax & CapCut: 0.5-2.0 (default 1.0)."
+        pitch:
+          type: integer
+          description: "[MiniMax & CapCut] Pitch adjustment (-12 to 12, default 0)"
+        vol:
+          type: number
+          description: "[MiniMax] Volume (0.01 - 10, default 1.0)"
+    export_transcript:
+      type: boolean
+      required: false
+      description: "Generate SRT transcript alongside the audio. Adds ~15% to credit cost."
+      default: false
+
+# Code Examples
+examples:
+  curl: |
+    # ElevenLabs (default provider)
+    curl -X POST "https://api.genmax.io/v1/text-to-speech/{voice_id}" \
+      -H "xi-api-key: YOUR_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "text": "Hello world",
+        "model_id": "eleven_multilingual_v2",
+        "language_code": "en",
+        "voice_settings": {
+          "stability": 0.5,
+          "similarity_boost": 0.75,
+          "speed": 1.0
+        }
+      }'
+
+    # MiniMax provider
+    curl -X POST "https://api.genmax.io/v1/text-to-speech/{voice_id}" \
+      -H "xi-api-key: YOUR_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "text": "Hello world",
+        "model_id": "speech-2.8-turbo",
+        "provider": "minimax",
+        "language_code": "English",
+        "voice_settings": {
+          "speed": 1.0,
+          "pitch": 0,
+          "vol": 1.0
+        }
+      }'
+
+    # CapCut provider
+    curl -X POST "https://api.genmax.io/v1/text-to-speech/{voice_id}" \
+      -H "xi-api-key: YOUR_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "text": "Hello world",
+        "provider": "capcut",
+        "language_code": "en",
+        "voice_settings": {
+          "speed": 1.0,
+          "pitch": 0
+        }
+      }'
+
+  javascript: |
+    // ElevenLabs (default provider)
+    const response = await fetch('https://api.genmax.io/v1/text-to-speech/{voice_id}', {
+      method: 'POST',
+      headers: {
+        'xi-api-key': 'YOUR_API_KEY',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        text: 'Hello world',
+        model_id: 'eleven_multilingual_v2',
+        provider: 'elevenlabs',
+        language_code: 'en',
+        voice_settings: {
+          stability: 0.5,
+          similarity_boost: 0.75,
+          speed: 1.0
+        }
+      })
+    });
+    const data = await response.json();
+
+    // MiniMax provider
+    const response = await fetch('https://api.genmax.io/v1/text-to-speech/{voice_id}', {
+      method: 'POST',
+      headers: {
+        'xi-api-key': 'YOUR_API_KEY',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        text: 'Hello world',
+        model_id: 'speech-2.8-turbo',
+        provider: 'minimax',
+        language_code: 'English',
+        voice_settings: { speed: 1.0, pitch: 0, vol: 1.0 }
+      })
+    });
+    const data = await response.json();
+
+    // CapCut provider
+    const response = await fetch('https://api.genmax.io/v1/text-to-speech/{voice_id}', {
+      method: 'POST',
+      headers: {
+        'xi-api-key': 'YOUR_API_KEY',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        text: 'Hello world',
+        provider: 'capcut',
+        language_code: 'en',
+        voice_settings: { speed: 1.0, pitch: 0 }
+      })
+    });
+    const data = await response.json();
+
+  python: |
+    import requests
+
+    # ElevenLabs (default provider)
+    response = requests.post(
+        'https://api.genmax.io/v1/text-to-speech/{voice_id}',
+        headers={'xi-api-key': 'YOUR_API_KEY'},
+        json={
+            'text': 'Hello world',
+            'model_id': 'eleven_multilingual_v2',
+            'provider': 'elevenlabs',
+            'language_code': 'en',
+            'voice_settings': {
+                'stability': 0.5,
+                'similarity_boost': 0.75,
+                'speed': 1.0
+            }
+        }
+    )
+    data = response.json()
+
+    # MiniMax provider
+    response = requests.post(
+        'https://api.genmax.io/v1/text-to-speech/{voice_id}',
+        headers={'xi-api-key': 'YOUR_API_KEY'},
+        json={
+            'text': 'Hello world',
+            'model_id': 'speech-2.8-turbo',
+            'provider': 'minimax',
+            'language_code': 'English',
+            'voice_settings': {
+                'speed': 1.0,
+                'pitch': 0,
+                'vol': 1.0
+            }
+        }
+    )
+    data = response.json()
+
+    # CapCut provider
+    response = requests.post(
+        'https://api.genmax.io/v1/text-to-speech/{voice_id}',
+        headers={'xi-api-key': 'YOUR_API_KEY'},
+        json={
+            'text': 'Hello world',
+            'provider': 'capcut',
+            'language_code': 'en',
+            'voice_settings': {
+                'speed': 1.0,
+                'pitch': 0
+            }
+        }
+    )
+    data = response.json()
+
+# Responses
+responses:
+  - status: 202
+    description: Accepted - Task queued for processing
+    example: |
+      {
+        "id": "9b19d3e2-7c68-4eca-be48-e9917682d73e",
+        "status": "pending"
+      }

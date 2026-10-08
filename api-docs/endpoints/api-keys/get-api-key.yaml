@@ -1,0 +1,56 @@
+# GET /v1/api-keys
+# Get API key
+
+method: GET
+path: /v1/api-keys
+group: API Keys
+title: Get API key
+description: Get current user's API key
+order: 1
+
+# Authentication
+auth:
+  type: BearerAuth
+  required: true
+
+# Path Parameters
+path_parameters: []
+
+# Query Parameters
+query_parameters: []
+
+# Request Body
+request_body: null
+
+# Code Examples
+examples:
+  curl: |
+    curl -X GET "https://api.genmax.io/v1/api-keys" \
+      -H "Authorization: Bearer YOUR_TOKEN"
+
+  javascript: |
+    const response = await fetch('https://api.genmax.io/v1/api-keys', {
+      method: 'GET',
+      headers: {
+        'Authorization': 'Bearer YOUR_TOKEN'
+      }
+    });
+    const data = await response.json();
+
+  python: |
+    import requests
+
+    response = requests.get(
+        'https://api.genmax.io/v1/api-keys',
+        headers={'Authorization': 'Bearer YOUR_TOKEN'},
+    )
+    data = response.json()
+
+# Responses
+responses:
+  - status: 200
+    description: OK
+    example: |
+      {
+        "api_key": "sk_abc..."
+      }

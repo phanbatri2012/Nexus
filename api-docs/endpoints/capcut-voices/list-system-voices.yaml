@@ -1,0 +1,163 @@
+# GET /v1/capcut/system-voices
+# List CapCut system voices
+
+method: GET
+path: /v1/capcut/system-voices
+group: CapCut Voices
+title: List system voices
+description: Browse the CapCut voice library with filters and page-based pagination. Each returned voice_id can be used directly with the Text to speech endpoint (provider 'capcut').
+order: 0
+
+# Authentication
+auth:
+  type: xi-api-key
+  required: true
+
+# Path Parameters
+path_parameters: []
+
+# Query Parameters
+query_parameters:
+  - name: page
+    type: integer
+    required: false
+    default: 1
+    description: Page number (1-indexed)
+  - name: page_size
+    type: integer
+    required: false
+    default: 30
+    description: Number of voices per page
+  - name: search
+    type: string
+    required: false
+    description: Case-insensitive substring match on the voice name
+  - name: language
+    type: string
+    required: false
+    description: "Language code filter. Values: en, vi, zh, id, es, pt, ja, th (or omit for all)"
+  - name: gender
+    type: string
+    required: false
+    description: "Gender filter. Values: Male, Female, Gender Diversity (or omit for all)"
+  - name: age
+    type: string
+    required: false
+    description: "Age filter. Values: Elderly, Middle-aged, Teenager, Children, Baby, No Age (or omit for all)"
+  - name: emotion
+    type: string
+    required: false
+    description: "Emotion filter. Values: Excited, Plain, Pleasure, Shy, Proud, Admire, Angery, Sad, Disgust, Flattery, Fear, Embarrassing, Confused (or omit for all)"
+  - name: accent
+    type: string
+    required: false
+    description: "Tone/accent filter. Values: Gentle / Kind, Cute, Steady, Freaky, Terrorism, Stupid, Atmosphere, Sexy, Mysterious, Magnetic, Deep, ASMR, High, Weak, Technology, Mistress, Refreshing/Fierce, Chinese Style, Retro (or omit for all)"
+
+# Request Body
+request_body: null
+
+# Code Examples
+examples:
+  curl: |
+    # Basic request (first page)
+    curl -X GET "https://api.genmax.io/v1/capcut/system-voices?page=1&page_size=30" \
+      -H "xi-api-key: YOUR_API_KEY"
+
+    # With filters
+    curl -X GET "https://api.genmax.io/v1/capcut/system-voices\
+      ?page=1\
+      &page_size=30\
+      &language=en\
+      &gender=Male\
+      &age=Middle-aged\
+      &emotion=Excited\
+      &accent=Deep\
+      &search=narrator" \
+      -H "xi-api-key: YOUR_API_KEY"
+
+  javascript: |
+    // Basic request (first page)
+    const response = await fetch('https://api.genmax.io/v1/capcut/system-voices?page=1&page_size=30', {
+      method: 'GET',
+      headers: { 'xi-api-key': 'YOUR_API_KEY' }
+    });
+    const data = await response.json();
+
+    // With filters
+    const params = new URLSearchParams({
+      page: '1',
+      page_size: '30',
+      language: 'en',
+      gender: 'Male',
+      age: 'Middle-aged',
+      emotion: 'Excited',
+      accent: 'Deep',
+      search: 'narrator',
+    });
+    const filtered = await fetch(`https://api.genmax.io/v1/capcut/system-voices?${params}`, {
+      method: 'GET',
+      headers: { 'xi-api-key': 'YOUR_API_KEY' }
+    });
+    const filteredData = await filtered.json();
+
+  python: |
+    import requests
+
+    headers = {'xi-api-key': 'YOUR_API_KEY'}
+
+    # Basic request (first page)
+    response = requests.get(
+        'https://api.genmax.io/v1/capcut/system-voices',
+        headers=headers,
+        params={'page': 1, 'page_size': 30},
+    )
+    data = response.json()
+
+    # With filters
+    response = requests.get(
+        'https://api.genmax.io/v1/capcut/system-voices',
+        headers=headers,
+        params={
+            'page': 1,
+            'page_size': 30,
+            'language': 'en',
+            'gender': 'Male',
+            'age': 'Middle-aged',
+            'emotion': 'Excited',
+            'accent': 'Deep',
+            'search': 'narrator',
+        },
+    )
+    data = response.json()
+
+# Responses
+responses:
+  - status: 200
+    description: OK
+    example: |
+      {
+        "voice_list": [
+          {
+            "voice_id": "7036989371643923969",
+            "name": "Energetic Narrator",
+            "language": "en",
+            "gender": "Male",
+            "platform": "sami",
+            "image_url": "https://p16-capcut.../avatar.png",
+            "tags": ["male", "steady", "narration"],
+            "preview_url": "https://api.genmax.io/v1/capcut/voices/7036989371643923969/preview"
+          },
+          {
+            "voice_id": "7036989371643923970",
+            "name": "Warm Storyteller",
+            "language": "en",
+            "gender": "Female",
+            "platform": "11labs",
+            "image_url": "https://p16-capcut.../avatar2.png",
+            "tags": ["female", "gentle / kind", "audiobook"],
+            "preview_url": "https://api.genmax.io/v1/capcut/voices/7036989371643923970/preview"
+          }
+        ],
+        "total": 480,
+        "has_more": true
+      }

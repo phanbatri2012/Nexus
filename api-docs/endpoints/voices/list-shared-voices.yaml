@@ -1,0 +1,190 @@
+# GET /v1/shared-voices
+# List shared voices from the ElevenLabs voice library
+
+method: GET
+path: /v1/shared-voices
+group: Elevenlabs Voices
+title: List shared voices
+description: Browse the ElevenLabs shared voice library with filters, pagination, and sorting. Supports both cursor-based and page-based pagination.
+order: 0
+
+# Authentication
+auth:
+  type: xi-api-key
+  required: true
+
+# Path Parameters
+path_parameters: []
+
+# Query Parameters
+query_parameters:
+  - name: page_size
+    type: integer
+    required: false
+    default: 30
+    description: Number of voices per page (max 100)
+  - name: page
+    type: integer
+    required: false
+    default: 0
+    description: Page number (0-indexed). Used for page-based pagination.
+  - name: search
+    type: string
+    required: false
+    description: Search term to filter voices by name or description
+  - name: sort
+    type: string
+    required: false
+    default: trending
+    description: "Sort order: trending, created_date, cloned_by_count, usage_character_count_1y"
+  - name: category
+    type: string
+    required: false
+    description: "Quality filter: high_quality (or omit for all)"
+  - name: gender
+    type: string
+    required: false
+    description: "Gender filter: male, female, neutral (or omit for all)"
+  - name: age
+    type: string
+    required: false
+    description: "Age filter: young, middle_aged, old (or omit for all)"
+  - name: accent
+    type: string
+    required: false
+    description: "Accent filter (e.g. american, british, australian). Omit for all"
+  - name: required_languages
+    type: string
+    required: false
+    description: "Language code filter (e.g. en, es, fr)"
+  - name: "use_cases[]"
+    type: array
+    required: false
+    description: "Use case filter (array). Values: conversational, narrative_and_story, characters_and_animation, social_media, entertainment_and_tv, advertisement, informative_and_educational. Omit for all"
+
+# Request Body
+request_body: null
+
+# Code Examples
+examples:
+  curl: |
+    # Basic request (trending voices)
+    curl -X GET "https://api.genmax.io/v1/shared-voices?page_size=30&sort=trending" \
+      -H "xi-api-key: YOUR_API_KEY"
+
+    # With filters
+    curl -X GET "https://api.genmax.io/v1/shared-voices\
+      ?page_size=30\
+      &gender=male\
+      &age=young\
+      &accent=British\
+      &required_languages=en\
+      &category=high_quality\
+      &use_cases%5B%5D=entertainment_and_tv\
+      &use_cases%5B%5D=narrative_and_story\
+      &sort=cloned_by_count\
+      &page=0" \
+      -H "xi-api-key: YOUR_API_KEY"
+
+  javascript: |
+    // Basic request (trending voices)
+    const response = await fetch('https://api.genmax.io/v1/shared-voices?page_size=30&sort=trending', {
+      method: 'GET',
+      headers: { 'xi-api-key': 'YOUR_API_KEY' }
+    });
+    const data = await response.json();
+
+    // With filters
+    const params = new URLSearchParams({
+      page_size: '30',
+      gender: 'male',
+      age: 'young',
+      accent: 'British',
+      required_languages: 'en',
+      category: 'high_quality',
+      sort: 'cloned_by_count',
+      page: '0'
+    });
+    params.append('use_cases[]', 'entertainment_and_tv');
+    params.append('use_cases[]', 'narrative_and_story');
+
+    const filtered = await fetch(`https://api.genmax.io/v1/shared-voices?${params}`, {
+      method: 'GET',
+      headers: { 'xi-api-key': 'YOUR_API_KEY' }
+    });
+    const filteredData = await filtered.json();
+
+  python: |
+    import requests
+
+    headers = {'xi-api-key': 'YOUR_API_KEY'}
+
+    # Basic request (trending voices)
+    response = requests.get(
+        'https://api.genmax.io/v1/shared-voices',
+        headers=headers,
+        params={'page_size': 30, 'sort': 'trending'}
+    )
+    data = response.json()
+
+    # With filters
+    response = requests.get(
+        'https://api.genmax.io/v1/shared-voices',
+        headers=headers,
+        params={
+            'page_size': 30,
+            'gender': 'male',
+            'age': 'young',
+            'accent': 'British',
+            'required_languages': 'en',
+            'category': 'high_quality',
+            'use_cases[]': ['entertainment_and_tv', 'narrative_and_story'],
+            'sort': 'cloned_by_count',
+            'page': 0
+        }
+    )
+    data = response.json()
+
+# Responses
+responses:
+  - status: 200
+    description: OK
+    example: |
+      {
+        "voices": [
+          {
+            "voice_id": "pNInz6obpgDQGcFmaJgB",
+            "name": "Adam",
+            "description": "A warm, friendly male voice with an American accent.",
+            "preview_url": "https://storage.googleapis.com/eleven-public-prod/audio/adam.mp3",
+            "category": "professional",
+            "gender": "male",
+            "age": "middle_aged",
+            "accent": "american",
+            "language": "en",
+            "use_case": "narration",
+            "descriptive": "warm",
+            "free_users_allowed": true,
+            "usage_character_count_1y": 1500000,
+            "usage_character_count_7d": 25000,
+            "cloned_by_count": 1200,
+            "featured": false,
+            "rate": 0,
+            "live_moderation_enabled": false,
+            "date_unix": 1700000000,
+            "verified_languages": [
+              {
+                "language_id": "en",
+                "language": "English",
+                "model_id": "eleven_multilingual_v2",
+                "accent": "American",
+                "locale": "en-US",
+                "preview_url": "https://storage.googleapis.com/audio/adam-en.mp3"
+              }
+            ],
+            "image_url": "https://storage.googleapis.com/images/adam.jpg"
+          }
+        ],
+        "has_more": true,
+        "last_sort_id": "abc123def456"
+      }

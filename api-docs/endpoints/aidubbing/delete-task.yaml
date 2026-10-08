@@ -1,0 +1,66 @@
+# DELETE /v1/aidubbing/history/{id}
+# Delete AI dubbing task
+
+method: DELETE
+path: /v1/aidubbing/history/{id}
+group: Dubbing
+title: Delete task
+description: Delete an AI dubbing task and its stored files.
+order: 7
+
+# Authentication
+auth:
+  type: xi-api-key
+  required: true
+
+# Path Parameters
+path_parameters:
+  - name: id
+    type: string
+    required: true
+    description: Task ID to delete
+    example: 9b19d3e2-7c68-4eca-be48-e9917682d73e
+
+# Query Parameters
+query_parameters: []
+
+# Request Body
+request_body: null
+
+# Code Examples
+examples:
+  curl: |
+    curl -X DELETE "https://api.genmax.io/v1/aidubbing/history/{id}" \
+      -H "xi-api-key: YOUR_API_KEY"
+
+  javascript: |
+    const response = await fetch('https://api.genmax.io/v1/aidubbing/history/{id}', {
+      method: 'DELETE',
+      headers: { 'xi-api-key': 'YOUR_API_KEY' }
+    });
+    const data = await response.json();
+
+  python: |
+    import requests
+
+    response = requests.delete(
+        'https://api.genmax.io/v1/aidubbing/history/{id}',
+        headers={'xi-api-key': 'YOUR_API_KEY'},
+    )
+    result = response.json()
+
+# Responses
+responses:
+  - status: 200
+    description: OK - task deleted
+    example: |
+      {
+        "status": "deleted"
+      }
+
+  - status: 404
+    description: Not found - task does not exist or belongs to another user
+    example: |
+      {
+        "error": "task not found"
+      }

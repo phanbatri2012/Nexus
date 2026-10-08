@@ -1,0 +1,338 @@
+QUY TRÌNH RESTART AUTO_YT AN TOÀN SAU KHI SỬA CODE
+==================================================
+
+Phạm vi dự án:
+
+E:\yt\Tool\Auto_YT
+
+Sau khi sửa code, phải áp dụng đúng quy trình dưới đây. Không được restart ngay nếu chưa xác nhận hệ thống đang idle.
+
+
+1. QUY TẮC BẮT BUỘC
+--------------------
+
+1. Không làm gián đoạn job đang render, tạo scene, tạo audio, upload hoặc publish.
+2. Không tự thay đổi trạng thái job trong SQLite để vượt qua kiểm tra idle.
+3. Không dùng taskkill hàng loạt đối với python.exe, node.exe hoặc chrome.exe.
+4. Không đóng Chrome cá nhân của người dùng.
+5. Chỉ dùng entrypoint:
+
+   E:\yt\Tool\Auto_YT\run_autoyt_restart.bat
+
+6. Không gọi riêng stop và start nếu wrapper restart vẫn sử dụng được.
+7. Không kết luận thành công chỉ dựa vào exit code hoặc dòng chữ "restarted successfully".
+8. Phải xác minh đủ năm thành phần:
+
+   - Backend API.
+   - Frontend UI.
+   - OmniVoice TTS.
+   - ChatGPT Browser Service.
+   - Google Flow Browser Service.
+
+
+2. KIỂM TRA CODE TRƯỚC RESTART
+------------------------------
+
+Trước khi restart:
+
+- Xem lại diff.
+- Chạy test, lint, build hoặc kiểm tra cú pháp phù hợp với phần vừa sửa.
+- Nếu test liên quan thất bại, dừng lại và sửa lỗi trước.
+- Không đưa thêm thay đổi ngoài phạm vi chỉ để phục vụ restart.
+
+
+3. KIỂM TRA MAINTENANCE STATUS
+------------------------------
+
+Mở PowerShell tại thư mục dự án:
+
+Set-Location 'E:\yt\Tool\Auto_YT'
+
+Nếu backend đang chạy, kiểm tra bằng endpoint:
+
+$maintenanceStatus = Invoke-RestMethod `
+    'http://127.0.0.1:8080/api/system/maintenance-status'
+
+$maintenanceStatus | ConvertTo-Json -Depth 10
+
+Đọc các trường:
+
+safe_to_restart
+total_blocking_jobs
+blocking_jobs
+reasons
+
+Chỉ tiếp tục nếu:
+
+safe_to_restart = true
+total_blocking_jobs = 0
+
+Nếu backend không phản hồi, chạy maintenance guard trực tiếp:
+
+Set-Location 'E:\yt\Tool\Auto_YT\Tool-auto-login-GPT'
+
+$previousProjectPythonPath = $env:PYTHONPATH
+
+try {
+    $env:PYTHONPATH = "$PWD\src"
+
+    $maintenanceJson = & '.\.venv\Scripts\python.exe' `
+        -m auto_yt.services.maintenance_guard
+
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Maintenance guard failed.'
+    }
+
+    $maintenanceStatus = $maintenanceJson | ConvertFrom-Json
+    $maintenanceStatus | ConvertTo-Json -Depth 10
+}
+finally {
+    if ($null -eq $previousProjectPythonPath) {
+        Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:PYTHONPATH = $previousProjectPythonPath
+    }
+}
+
+Nếu maintenance guard không chạy được hoặc không trả về trạng thái hợp lệ, không được restart.
+
+
+4. XỬ LÝ KHI CÒN JOB HOẠT ĐỘNG
+------------------------------
+
+Nếu safe_to_restart = false:
+
+1. Liệt kê reasons và blocking_jobs.
+2. Thông báo ngắn gọn cho người dùng rằng restart đang được trì hoãn vì có job hoạt động.
+3. Không gọi restart.
+4. Không kill process của job.
+5. Không đổi trạng thái job trong database.
+6. Kiểm tra lại maintenance status sau mỗi khoảng thời gian hợp lý.
+7. Tiếp tục đến khi safe_to_restart = true.
+
+Các blocker có thể bao gồm:
+
+- system_jobs đang queued/running/processing.
+- Video hoặc scene artifact đang được tạo.
+- Upload hoặc publish YouTube đang chạy.
+- Facebook cross-post đang upload.
+- Tác vụ comment sử dụng GPM profile.
+- Google Flow đang tạo media.
+
+Nếu job không tiến triển trong thời gian dài, báo tình trạng cho người dùng. Không tự ý đánh dấu job thất bại hoặc hủy job nếu chưa được yêu cầu.
+
+
+5. KIỂM TRA PROCESS VÀ PORT TRƯỚC RESTART
+-----------------------------------------
+
+Kiểm tra các listener chính:
+
+Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+    Where-Object LocalPort -In 8080, 5173, 8011 |
+    Select-Object LocalAddress, LocalPort, OwningProcess
+
+Kiểm tra process liên quan:
+
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.CommandLine -and (
+            $_.CommandLine -match 'PROFILE_GPT_' -or
+            $_.CommandLine -match 'PROFILE_GOOGLE_FLOW_' -or
+            $_.CommandLine -match 'auto_yt' -or
+            $_.CommandLine -match 'api_server:app'
+        )
+    } |
+    Select-Object ProcessId, ParentProcessId, Name, CommandLine
+
+Không kill các process này bằng tay. Thông tin trên chỉ dùng để đối chiếu trạng thái trước và sau restart.
+
+
+6. THỰC HIỆN RESTART
+--------------------
+
+Chỉ sau khi maintenance status xác nhận idle:
+
+Set-Location 'E:\yt\Tool\Auto_YT'
+
+& '.\run_autoyt_restart.bat'
+$restartExitCode = $LASTEXITCODE
+
+Chờ lệnh kết thúc và theo dõi toàn bộ output.
+
+Wrapper restart sẽ tự:
+
+1. Thiết lập kiểm tra idle bắt buộc.
+2. Gọi stop script.
+3. Chạy lại maintenance guard ngay trước khi dừng.
+4. Dừng backend, frontend, OmniVoice và browser services.
+5. Dọn state marker, PID file và Chromium lock thuộc dự án.
+6. Kiểm tra giải phóng các port.
+7. Chỉ gọi startup nếu stop thành công.
+8. Khởi động lại các service và chờ readiness.
+
+Nếu $restartExitCode khác 0, không chạy lại restart ngay lập tức.
+
+
+7. XỬ LÝ KHI RESTART THẤT BẠI
+------------------------------
+
+Đọc log:
+
+Get-Content `
+    'E:\yt\Tool\Auto_YT\Tool-auto-login-GPT\data\logs\backend.current.stderr.log' `
+    -Tail 100 `
+    -ErrorAction SilentlyContinue
+
+Get-Content `
+    'E:\yt\Tool\Auto_YT\Tool-auto-login-GPT\data\logs\frontend.current.stderr.log' `
+    -Tail 100 `
+    -ErrorAction SilentlyContinue
+
+Đồng thời kiểm tra port:
+
+Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+    Where-Object LocalPort -In 8080, 5173, 8011 |
+    Select-Object LocalAddress, LocalPort, OwningProcess
+
+Không tiếp tục bằng cách kill toàn bộ Python, Node hoặc Chrome. Xác định service cụ thể thất bại rồi báo nguyên nhân.
+
+
+8. XÁC MINH BACKEND
+-------------------
+
+$backendHealth = Invoke-RestMethod `
+    'http://127.0.0.1:8080/health' `
+    -TimeoutSec 5
+
+$backendHealth | ConvertTo-Json -Depth 10
+
+Backend chỉ đạt yêu cầu khi:
+
+status = ok
+production_coordinator.ready = true
+
+
+9. XÁC MINH FRONTEND
+--------------------
+
+$frontendResponse = Invoke-WebRequest `
+    'http://127.0.0.1:5173/' `
+    -UseBasicParsing `
+    -TimeoutSec 5
+
+$frontendResponse.StatusCode
+
+Kết quả phải là 200, và nội dung phải là trang Auto_YT/Vite hợp lệ.
+
+
+10. XÁC MINH OMNIVOICE
+----------------------
+
+try {
+    $omniVoiceResponse = Invoke-WebRequest `
+        'http://127.0.0.1:8011/health' `
+        -UseBasicParsing `
+        -TimeoutSec 5
+
+    $omniVoiceResponse.StatusCode
+}
+catch {
+    $statusCode = $_.Exception.Response.StatusCode.value__
+
+    if ($statusCode -ne 401) {
+        throw
+    }
+
+    Write-Output 'OmniVoice reachable; health endpoint requires authentication.'
+}
+
+HTTP 200 là ready. HTTP 401 cũng chứng minh server đang phản hồi, nhưng cần ghi rõ endpoint yêu cầu xác thực.
+
+
+11. XÁC MINH CHATGPT BROWSER SERVICE
+------------------------------------
+
+$chatgptStatePath = `
+    'E:\yt\Tool\Auto_YT\Tool-auto-login-GPT\data\chatgpt_browser_service.json'
+
+$chatgptState = Get-Content $chatgptStatePath -Raw | ConvertFrom-Json
+$chatgptState | ConvertTo-Json -Depth 10
+
+Yêu cầu:
+
+ready = true
+cdp_url không rỗng
+
+Kiểm tra CDP port:
+
+$chatgptCdpUri = [uri]$chatgptState.cdp_url
+
+Test-NetConnection `
+    -ComputerName $chatgptCdpUri.Host `
+    -Port $chatgptCdpUri.Port `
+    -InformationLevel Quiet
+
+Kết quả phải là True.
+
+
+12. XÁC MINH GOOGLE FLOW BROWSER SERVICE
+----------------------------------------
+
+$flowStatePath = `
+    'E:\yt\Tool\Auto_YT\Tool-auto-login-GPT\data\google_flow_browser_service.json'
+
+$flowState = Get-Content $flowStatePath -Raw | ConvertFrom-Json
+$flowState | ConvertTo-Json -Depth 10
+
+Yêu cầu:
+
+ready = true
+cdp_url không rỗng
+
+Kiểm tra CDP port:
+
+$flowCdpUri = [uri]$flowState.cdp_url
+
+Test-NetConnection `
+    -ComputerName $flowCdpUri.Host `
+    -Port $flowCdpUri.Port `
+    -InformationLevel Quiet
+
+Kết quả phải là True.
+
+
+13. KIỂM TRA CUỐI CÙNG
+----------------------
+
+Kiểm tra ba port chính:
+
+Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+    Where-Object LocalPort -In 8080, 5173, 8011 |
+    Select-Object LocalAddress, LocalPort, OwningProcess
+
+Kiểm tra maintenance status lần cuối:
+
+$finalMaintenanceStatus = Invoke-RestMethod `
+    'http://127.0.0.1:8080/api/system/maintenance-status'
+
+$finalMaintenanceStatus | ConvertTo-Json -Depth 10
+
+
+14. ĐIỀU KIỆN ĐƯỢC PHÉP BÁO THÀNH CÔNG
+--------------------------------------
+
+Chỉ báo restart hoàn tất khi đồng thời thỏa mãn:
+
+- Restart wrapper trả exit code 0.
+- Backend health trả status = ok.
+- Production Coordinator có ready = true.
+- Frontend trả HTTP 200.
+- OmniVoice phản hồi trên port 8011.
+- ChatGPT Browser Service có ready = true và CDP port đang listen.
+- Google Flow Browser Service có ready = true và CDP port đang listen.
+- Không có lỗi startup nghiêm trọng trong log.
+- Không có process hoặc listener cũ bị trùng.
+- Maintenance status cuối cùng không có blocker bất thường.
+
+Nếu script in "ChatGPT connecting", "Google Flow connecting" hoặc "OmniVoice offline", không được báo hệ thống đã hoàn toàn sẵn sàng dù exit code là 0.
