@@ -611,7 +611,7 @@ def strip_outline_preamble(outline: str) -> str:
     if not clean_outline:
         return ""
     first_marker = re.search(
-        r"(?:^|\n|\r\n)\s*(?:(?:#{1,6}\s*)?(?:\*\*)?(?:\[\s*)?(?:phần|phan|part|section|mục|đoạn)\s*\d*(?:[:\-–—.\s].*?)?(?:\])?(?:\*\*)?|(?:#{1,6}\s*)?(?:\*\*)?\d+[\.\)\/\-–—]\s+)",
+        r"(?:^|\n|\r\n)\s*(?:(?:#{1,6}\s*)?(?:\*\*)?(?:\\?\[\s*)?(?:phần|phan|part|section|mục|đoạn)\s*\d*(?:[:\-–—.\s].*?)?(?:\\?\])?(?:\*\*)?|(?:#{1,6}\s*)?(?:\*\*)?\d+[\.\)\/\-–—]\s+)",
         clean_outline,
         flags=re.IGNORECASE,
     )
@@ -629,15 +629,15 @@ def split_outline_parts(
     if not clean_outline or looks_like_chatgpt_error(clean_outline):
         return []
 
-    # Priority 1: Delimiters with [PHẦN ...], [PHAN ...], [PART ...], [SECTION ...]
+    # Priority 1: Delimiters with [PHẦN ...], [PHAN ...], [PART ...], [SECTION ...], including LaTeX escapes \[...\]
     bracket_tag_pattern = re.compile(
-        r"\[\s*(?:phần|phan|part|section)\s*(?:\d+)?(?:\s*[:\-–—].*?)?\s*\]",
+        r"(?:^|\n|\r\n|\s)*(?:#{1,6}\s*)?(?:\*\*)?\\?\[\s*(?:phần|phan|part|section)\s*(?:\d+)?(?:\s*[:\-–—].*?)?\s*\\?\](?:\*\*)?",
         flags=re.IGNORECASE,
     )
 
-    # Priority 2: Line-based numbered headers like PHẦN 1:, ### Phần 1, **Phần 1:**, [Phần 1], Mục 1:, Đoạn 1:
+    # Priority 2: Line-based numbered headers like PHẦN 1:, ### Phần 1, **Phần 1:**, \[Phần 1\], Mục 1:, Đoạn 1:
     header_tag_pattern = re.compile(
-        r"(?:^|\n|\r\n)\s*(?:#{1,6}\s*)?(?:\*\*)?(?:\[\s*)?(?:phần|phan|part|section|mục|đoạn)\s*\d+[:\-–—.\s]*(?:\])?(?:\*\*)?",
+        r"(?:^|\n|\r\n)\s*(?:#{1,6}\s*)?(?:\*\*)?(?:\\?\[\s*)?(?:phần|phan|part|section|mục|đoạn)\s*\d+[:\-–—.\s]*(?:\\?\])?(?:\*\*)?",
         flags=re.IGNORECASE,
     )
 
@@ -647,35 +647,44 @@ def split_outline_parts(
         flags=re.IGNORECASE,
     )
 
+    # Pattern to clean remaining section tags inside extracted chunks
+    tag_cleaner_pattern = re.compile(
+        r"(?:^|\n|\r\n)\s*(?:#{1,6}\s*)?(?:\*\*)?\\?\[\s*(?:phần|phan|part|section|intro|outro|body)\s*(?:\d+)?(?:\s*[:\-–—].*?)?\s*\\?\](?:\*\*)?\s*",
+        flags=re.IGNORECASE,
+    )
+
     if bracket_tag_pattern.search(clean_outline):
         raw_parts = [
-            part.strip()
+            tag_cleaner_pattern.sub("", part).strip()
             for part in bracket_tag_pattern.split(clean_outline)
-            if part.strip()
+            if tag_cleaner_pattern.sub("", part).strip()
         ]
     elif header_tag_pattern.search(clean_outline):
         raw_parts = [
-            part.strip()
+            tag_cleaner_pattern.sub("", part).strip()
             for part in header_tag_pattern.split(clean_outline)
-            if part.strip()
+            if tag_cleaner_pattern.sub("", part).strip()
         ]
     elif len(numbered_tag_pattern.findall(clean_outline)) >= 2:
         raw_parts = [
-            part.strip()
+            tag_cleaner_pattern.sub("", part).strip()
             for part in numbered_tag_pattern.split(clean_outline)
-            if part.strip()
+            if tag_cleaner_pattern.sub("", part).strip()
         ]
     else:
+        fallback_split = re.split(r"\\?\[\s*(?:phần|phan|part|section)\s*\\?\]", clean_outline, flags=re.IGNORECASE)
         raw_parts = [
-            part.strip()
-            for part in clean_outline.split("[PHAN]")
-            if part.strip()
+            tag_cleaner_pattern.sub("", part).strip()
+            for part in fallback_split
+            if tag_cleaner_pattern.sub("", part).strip()
         ]
     
     # Strip any leading doc artifact markers if separated alone
     cleaned_raw_parts = []
     for part in raw_parts:
         p = part.strip()
+        if not p:
+            continue
         if p.startswith(":::writing") and "\n" not in p:
             continue
         cleaned_raw_parts.append(p)
@@ -1826,7 +1835,7 @@ def build_metadata_generation_prompt(metadata_prompt: str) -> str:
 
 def find_missing_metadata_sections(response_text: str) -> list[str]:
     metadata = response_text.strip()
-    heading_prefix = r"(?im)^\s*(?:#{1,6}\s*)?(?:[-*]\s*)?(?:\*{1,2})?"
+    heading_prefix = r"(?im)^\s*(?:#{1,6}\s*)?(?:[-*]\s*)?(?:\*{1,2})?(?:\\?\[\s*)?"
     required_patterns = {
         "TIÊU ĐỀ": heading_prefix + r"TIÊU ĐỀ",
         "URL SLUG": heading_prefix + r"(?:URL\s+SLUG|SLUG)",
@@ -1846,7 +1855,7 @@ def find_missing_metadata_sections(response_text: str) -> list[str]:
 
 
 def validate_metadata_response(response_text: str) -> str:
-    metadata = response_text.strip()
+    metadata = clean_text(response_text).strip()
     missing_sections = find_missing_metadata_sections(metadata)
     if missing_sections:
         raise RuntimeError(
@@ -1931,7 +1940,11 @@ EDITORIAL_ACTION_WORDS = (
     "mở rộng", "nhấn mạnh", "thay đổi", "thêm", "sắp xếp", "viết lại",
     "chuyển ý", "đào sâu", "khai thác", "kết nối", "dẫn dắt", "sửa", "chia đoạn",
     "bỏ", "giữ nhịp", "nêu bật", "tách", "triển khai", "mở đầu bằng", "làm rõ",
-    "giải thích",
+    "giải thích", "giảm tiết lộ", "làm rõ mốc",
+    "refined", "refining", "updated", "updating", "polished", "polishing",
+    "edited", "editing", "revised", "revising", "created", "creating",
+    "rewrote", "rewriting", "added", "adding", "summarized", "summarizing",
+    "expanded", "expanding",
 )
 
 TRAILING_ACTION_PILLS_PATTERN = re.compile(
@@ -1941,14 +1954,23 @@ TRAILING_ACTION_PILLS_PATTERN = re.compile(
 
 
 def clean_text(text: str) -> str:
-    """Removes 'Edit', citations, search badges, Canvas artifacts, and common AI conversational fillers from the output."""
+    """Removes 'Edit', citations, search badges, Canvas artifacts, LaTeX backslash escapes, and common AI conversational fillers from the output."""
     if not isinstance(text, str) or not text:
         return ""
     text = remove_citation_artifacts(text)
     
+    # Strip unnecessary LaTeX/Markdown backslash escapes: \!, \:, \#, \[, \], \(, \), \., \?, \-, \*, \_, \`
+    text = re.sub(r"\\([!:#\[\]\(\)\.\?\-\*_`])", r"\1", text)
+    
     # Strip inline structural/canvas headers prepended to paragraphs (e.g. "Nội dung chính: ...", "Mở đầu video: ...", "Mở đầu:")
     canvas_inline_header = re.compile(
         r"^(?:(?:mở\s+(?:đầu|bài)|kết\s+(?:thúc|bài|luận)|intro|body|outro|thân\s+bài)\s+(?:video|kịch\s+bản|bài\s+viết)\s*[:\-–—]?|(?:mở\s+(?:đầu|bài)|kết\s+(?:thúc|bài|luận)|intro|body|outro|thân\s+bài|nội\s+dung\s+chính|dàn\s+ý(?:\s+chi\s+tiết)?)\s*[:\-–—])\s*",
+        flags=re.IGNORECASE,
+    )
+    
+    # Strip standalone section delimiters leaking into narrative lines
+    section_delimiter_line = re.compile(
+        r"^(?:#{1,6}\s*)?(?:\*\*)?\\?\[\s*(?:phần|phan|part|section|intro|outro|body)\s*(?:\d+)?(?:\s*[:\-–—].*?)?\s*\\?\](?:\*\*)?$",
         flags=re.IGNORECASE,
     )
     
@@ -1966,6 +1988,8 @@ def clean_text(text: str) -> str:
             continue
         lower_line = stripped.lower()
         if lower_line == "edit":
+            continue
+        if section_delimiter_line.match(stripped):
             continue
         if any(lower_line.startswith(kw) for kw in skip_keywords):
             continue
@@ -1999,15 +2023,8 @@ def _is_short_narrative_artifact(block: str) -> tuple[bool, bool]:
             line,
         ).strip()
         word_count = len(re.findall(r"\w+", normalized_line, re.UNICODE))
-        if (
-            not normalized_line
-            or word_count > NARRATIVE_ARTIFACT_MAX_WORDS
-            or re.search(r'[.!?…;]["”’\])]*$', normalized_line)
-        ):
-            return False, False
-
         lowered_line = normalized_line.lower()
-        explicit_editorial_note = explicit_editorial_note or (
+        is_editorial = (
             has_markdown_heading
             or looks_like_editorial_artifact(lowered_line)
             or looks_like_citation_artifact(lowered_line)
@@ -2016,6 +2033,12 @@ def _is_short_narrative_artifact(block: str) -> tuple[bool, bool]:
                 lowered_line,
             ))
         )
+        if not normalized_line or word_count > NARRATIVE_ARTIFACT_MAX_WORDS:
+            return False, False
+        if not is_editorial and re.search(r'[.!?…;]["”’\])]*$', normalized_line):
+            return False, False
+
+        explicit_editorial_note = explicit_editorial_note or is_editorial
 
     return True, explicit_editorial_note
 
@@ -2072,9 +2095,10 @@ def sanitize_narrative_response(response_text: str) -> str:
             continue
         kept_blocks.append(block)
 
-    # Never turn a non-empty response into an empty section. The prompt guard
-    # remains the first line of defence, while this filter only removes notes
-    # when genuine narrative text is left behind.
+    # If all blocks were pure explicit editorial notes/artifacts, do NOT return them!
+    if not kept_blocks and all(is_explicit for _, is_explicit in block_checks):
+        return ""
+
     if not kept_blocks:
         return dedup_consecutive_paragraphs(cleaned_text)
     return dedup_consecutive_paragraphs("\n\n".join(kept_blocks).strip())
@@ -4011,11 +4035,11 @@ def _run_complete(transcript: str, state: dict) -> dict:
                     prompt3,
                 )
             ))
-            if not intro:
+            if not intro or len(intro.split()) < 15:
                 clear_pending_generation_prompt(state, "intro", prompt3)
                 persist_generation_state(state)
                 raise RuntimeError(
-                    "ChatGPT returned no narrative INTRO content."
+                    f"ChatGPT returned insufficient or non-narrative INTRO content (got: {repr(intro[:60])})."
                 )
             state["intro"] = intro
             clear_pending_generation_prompt(state, "intro", prompt3)
@@ -4047,11 +4071,11 @@ def _run_complete(transcript: str, state: dict) -> dict:
                     prompt4,
                 )
             ))
-            if not res:
+            if not res or len(res.split()) < 15:
                 clear_pending_generation_prompt(state, body_step, prompt4)
                 persist_generation_state(state)
                 raise RuntimeError(
-                    "ChatGPT returned no narrative BODY content."
+                    f"ChatGPT returned insufficient or non-narrative BODY content for {body_step} (got: {repr(res[:60])})."
                 )
             body_parts_result.append(res)
             clear_pending_generation_prompt(state, body_step, prompt4)
@@ -4074,11 +4098,11 @@ def _run_complete(transcript: str, state: dict) -> dict:
                     prompt5,
                 )
             ))
-            if not outro:
+            if not outro or len(outro.split()) < 15:
                 clear_pending_generation_prompt(state, "outro", prompt5)
                 persist_generation_state(state)
                 raise RuntimeError(
-                    "ChatGPT returned no narrative OUTRO content."
+                    f"ChatGPT returned insufficient or non-narrative OUTRO content (got: {repr(outro[:60])})."
                 )
             state["outro"] = outro
             clear_pending_generation_prompt(state, "outro", prompt5)
