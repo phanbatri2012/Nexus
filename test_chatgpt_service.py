@@ -12,6 +12,40 @@ from auto_yt.services import chatgpt_service, chatgpt_worker
 from auto_yt.services.chatgpt_runtime import ChatGPTAttentionRequiredError
 
 
+def make_dil_conversation_payload(
+    prompt_text="Prompt metadata",
+    fallback_text="Metadata from DIL fallback",
+    *,
+    status="finished_successfully",
+):
+    return {
+        "current_node": "assistant-current",
+        "messages": [
+            {
+                "id": "user-current",
+                "author": {"role": "user"},
+                "status": "finished_successfully",
+                "content": {"content_type": "text", "parts": [prompt_text]},
+                "metadata": {"parent_id": "assistant-old"},
+            },
+            {
+                "id": "assistant-current",
+                "author": {"role": "assistant"},
+                "status": status,
+                "end_turn": True,
+                "content": {
+                    "content_type": "text",
+                    "parts": ["Payload text that should not outrank DIL fallback"],
+                },
+                "metadata": {
+                    "parent_id": "user-current",
+                    "model_dil_v2": {"fallbackMarkdown": fallback_text},
+                },
+            },
+        ],
+    }
+
+
 class ChatGptServiceTests(unittest.TestCase):
     def test_markdown_extraction_preserves_block_boundaries(self):
         html = (
@@ -216,6 +250,11 @@ class ChatGptServiceTests(unittest.TestCase):
         page.locator.return_value = prompt_locator
 
         with (
+            patch.object(
+                chatgpt_worker,
+                "_reload_and_capture_conversation_payload",
+                return_value={},
+            ) as reload_and_capture,
             patch.object(chatgpt_worker, "check_chatgpt_page_attention"),
             patch.object(
                 chatgpt_worker,
@@ -237,12 +276,167 @@ class ChatGptServiceTests(unittest.TestCase):
             )
 
         self.assertEqual(response, "Metadata recovered")
+        reload_and_capture.assert_called_once_with(
+            page,
+            page.url,
+        )
+        ensure_conversation.assert_called_once_with(page.url, page.url)
+        wait_for_history.assert_called_once_with(page, composer_ready=True)
+
+    def test_dil_payload_extraction_requires_current_finished_branch(self):
+        payload = make_dil_conversation_payload(
+            fallback_text="Current branch response",
+        )
+        payload["messages"].extend([
+            {
+                "id": "user-sibling",
+                "author": {"role": "user"},
+                "status": "finished_successfully",
+                "content": {"content_type": "text", "parts": ["Other prompt"]},
+                "metadata": {"parent_id": "assistant-old"},
+            },
+            {
+                "id": "assistant-sibling",
+                "author": {"role": "assistant"},
+                "status": "finished_successfully",
+                "end_turn": True,
+                "content": {"content_type": "text", "parts": ["Wrong branch"]},
+                "metadata": {"parent_id": "user-sibling"},
+            },
+        ])
+
+        response = chatgpt_worker.extract_assistant_response_from_conversation_payload(
+            payload,
+            "Prompt metadata",
+        )
+
+        self.assertEqual(response, "Current branch response")
+        payload["messages"][1]["status"] = "in_progress"
+        self.assertEqual(
+            chatgpt_worker.extract_assistant_response_from_conversation_payload(
+                payload,
+                "Prompt metadata",
+            ),
+            "",
+        )
+
+    def test_response_recovery_uses_dil_payload_when_dom_render_fails(self):
+        page = Mock(url="https://chatgpt.com/c/saved-chat")
+        prompt_locator = Mock(first=Mock())
+        page.locator.return_value = prompt_locator
+
+        with (
+            patch.object(
+                chatgpt_worker,
+                "_reload_and_capture_conversation_payload",
+                return_value=make_dil_conversation_payload(
+                    fallback_text="Metadata recovered from DIL",
+                ),
+            ),
+            patch.object(chatgpt_worker, "check_chatgpt_page_attention"),
+            patch.object(chatgpt_worker, "ensure_expected_conversation_page"),
+            patch.object(chatgpt_worker, "wait_for_conversation_history"),
+        ):
+            response = chatgpt_worker.recover_assistant_response_after_reload(
+                page,
+                "Prompt metadata",
+            )
+
+        self.assertEqual(response, "Metadata recovered from DIL")
+
+    def test_response_wait_recovers_dil_render_error_without_resending(self):
+        page = Mock()
+
+        with (
+            patch.object(
+                chatgpt_worker,
+                "accept_external_app_permission_dialog",
+                return_value=False,
+            ),
+            patch.object(
+                chatgpt_worker,
+                "is_chatgpt_generation_active",
+                return_value=False,
+            ),
+            patch.object(
+                chatgpt_worker,
+                "get_new_assistant_response",
+                return_value="This response couldn’t load",
+            ),
+            patch.object(
+                chatgpt_worker,
+                "recover_assistant_response_after_reload",
+                return_value="Metadata recovered from DIL",
+            ) as recover_response,
+            patch.object(chatgpt_worker, "ASSISTANT_RESPONSE_STABLE_SECONDS", 0),
+            patch.object(chatgpt_worker, "send_prompt") as send_prompt,
+        ):
+            response = chatgpt_worker.wait_for_assistant_response(
+                page,
+                previous_assistant_turn=4,
+                submitted_prompt_text="Prompt metadata",
+            )
+
+        self.assertEqual(response, "Metadata recovered from DIL")
+        recover_response.assert_called_once_with(page, "Prompt metadata")
+        send_prompt.assert_not_called()
+
+    def test_pending_prompt_render_error_recovers_without_resending(self):
+        page = Mock()
+        render_error = chatgpt_worker.ChatGPTResponseError(
+            chatgpt_worker.CHATGPT_RESPONSE_RENDER_ERROR_CODE,
+            "this response couldn't load",
+        )
+
+        with (
+            patch.object(
+                chatgpt_worker,
+                "wait_for_existing_assistant_response",
+                side_effect=render_error,
+            ),
+            patch.object(
+                chatgpt_worker,
+                "recover_assistant_response_after_reload",
+                return_value="Metadata recovered from DIL",
+            ) as recover_response,
+            patch.object(chatgpt_worker, "send_prompt") as send_prompt,
+        ):
+            response = chatgpt_worker.recover_pending_prompt_response(
+                page,
+                "Prompt metadata",
+            )
+
+        self.assertEqual(response, "Metadata recovered from DIL")
+        recover_response.assert_called_once_with(page, "Prompt metadata")
+        send_prompt.assert_not_called()
+
+    def test_reload_capture_uses_playwright_conversation_response(self):
+        page = Mock()
+        response = Mock(
+            url="https://chatgpt.com/backend-api/conversations/saved-chat?num_turns=10",
+            status=200,
+        )
+        response.request = Mock(method="GET", resource_type="xhr")
+        payload = make_dil_conversation_payload()
+        response.json.return_value = payload
+        response_info = Mock(value=response)
+        response_context = Mock()
+        response_context.__enter__ = Mock(return_value=response_info)
+        response_context.__exit__ = Mock(return_value=False)
+        page.expect_response.return_value = response_context
+
+        result = chatgpt_worker._reload_and_capture_conversation_payload(
+            page,
+            "https://chatgpt.com/c/saved-chat",
+        )
+
+        self.assertEqual(result, payload)
+        predicate = page.expect_response.call_args.args[0]
+        self.assertTrue(predicate(response))
         page.reload.assert_called_once_with(
             wait_until="domcontentloaded",
             timeout=chatgpt_worker.CHATGPT_NAVIGATION_TIMEOUT_MS,
         )
-        ensure_conversation.assert_called_once_with(page.url, page.url)
-        wait_for_history.assert_called_once_with(page, composer_ready=True)
 
     def test_pending_generation_prompt_is_recovered_without_resending(self):
         prompt_text = "Prompt metadata"

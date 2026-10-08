@@ -73,6 +73,7 @@ CHATGPT_COMPOSER_RECOVERY_ATTEMPTS = 3
 CHATGPT_COMPOSER_WAIT_PER_ATTEMPT_MS = 20_000
 CHATGPT_PAGE_RECOVERY_SETTLE_MS = 1_500
 CHATGPT_NAVIGATION_TIMEOUT_MS = 60_000
+CHATGPT_CONVERSATION_PAYLOAD_WAIT_MS = 15_000
 CHATGPT_PROJECT_NAVIGATION_ATTEMPTS = 2
 CHATGPT_PROMPT_SUBMISSION_TIMEOUT_MS = 30_000
 EXTERNAL_APP_PERMISSION_CLICK_TIMEOUT_MS = 5_000
@@ -113,6 +114,13 @@ NARRATIVE_ARTIFACT_MAX_WORDS = 14
 THUMBNAIL_IMAGE_WAIT_TIMEOUT_SECONDS = 5 * 60
 THUMBNAIL_TURN_WAIT_TIMEOUT_SECONDS = 30
 MAX_THUMBNAIL_IMAGES_PER_RESPONSE = 2
+CHATGPT_RESPONSE_ERROR_CODE = "chatgpt_response_error"
+CHATGPT_RESPONSE_RENDER_ERROR_CODE = "chatgpt_response_render_failed"
+CHATGPT_SUCCESSFUL_MESSAGE_STATUSES = frozenset({
+    "completed",
+    "finished",
+    "finished_successfully",
+})
 NARRATIVE_ONLY_INSTRUCTION = (
     "\n\nYÊU CẦU ĐẦU RA CHO PHẦN NỘI DUNG: Chỉ viết văn xuôi liền mạch trong tin nhắn chat thông thường. "
     "TUYỆT ĐỐI KHÔNG mở Canvas, KHÔNG tạo document/tài liệu rời hay artifact riêng. "
@@ -133,6 +141,14 @@ THUMBNAIL_IMAGE_SELECTOR = (
     'img[src^="blob:https://chatgpt.com/"], '
     'img[src^="blob:https://"]'
 )
+
+
+class ChatGPTResponseError(RuntimeError):
+    def __init__(self, code: str, detail: str):
+        self.code = code
+        super().__init__(f"{code}: ChatGPT ERROR detected: {detail}")
+
+
 THUMBNAIL_REPAIR_PROMPT = (
     "hãy chỉ ra điểm vi phạm prompt của tôi. sau đó sửa prompt  sao cho không vi phạm nữa."
 )
@@ -2640,6 +2656,11 @@ CHATGPT_ERROR_PATTERNS = (
     "unusual activity has been detected",
     "please try again later",
 )
+CHATGPT_RENDER_ERROR_PATTERNS = (
+    "this response couldn't load",
+    "this response couldn’t load",
+    "this response could not load",
+)
 
 
 def looks_like_chatgpt_error(text: str) -> bool:
@@ -2655,7 +2676,136 @@ def _check_for_chatgpt_errors(text: str) -> None:
     lowered = text.strip().lower()
     for err in CHATGPT_ERROR_PATTERNS:
         if err in lowered:
-            raise Exception(f"ChatGPT ERROR detected: {err}")
+            error_code = (
+                CHATGPT_RESPONSE_RENDER_ERROR_CODE
+                if err in CHATGPT_RENDER_ERROR_PATTERNS
+                else CHATGPT_RESPONSE_ERROR_CODE
+            )
+            raise ChatGPTResponseError(error_code, err)
+
+
+def _get_payload_content_text(message: dict) -> str:
+    content = message.get("content")
+    if not isinstance(content, dict):
+        return ""
+    parts = content.get("parts")
+    if not isinstance(parts, list):
+        return ""
+    return "\n".join(part for part in parts if isinstance(part, str)).strip()
+
+
+def _get_payload_assistant_text(message: dict) -> str:
+    metadata = message.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    dil_payload = metadata.get("model_dil_v2")
+    fallback_markdown = (
+        dil_payload.get("fallbackMarkdown", "")
+        if isinstance(dil_payload, dict)
+        else ""
+    )
+
+    for candidate in (fallback_markdown, _get_payload_content_text(message)):
+        cleaned = clean_text(candidate)
+        if (
+            cleaned
+            and not _is_pure_thinking_indicator(cleaned)
+            and not looks_like_chatgpt_error(cleaned)
+        ):
+            return cleaned
+    return ""
+
+
+def extract_assistant_response_from_conversation_payload(
+    payload: dict,
+    expected_user_text: str,
+) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return ""
+    messages = [message for message in messages if isinstance(message, dict)]
+
+    message_by_id = {
+        str(message.get("id")): message
+        for message in messages
+        if message.get("id")
+    }
+    current_node = str(payload.get("current_node") or "")
+    if current_node:
+        if current_node not in message_by_id:
+            return ""
+        branch = []
+        seen = set()
+        node_id = current_node
+        while node_id and node_id not in seen:
+            seen.add(node_id)
+            message = message_by_id.get(node_id)
+            if message is None:
+                break
+            branch.append(message)
+            metadata = message.get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            node_id = str(
+                message.get("parent_id")
+                or message.get("parent")
+                or metadata.get("parent_id")
+                or ""
+            )
+        messages = list(reversed(branch))
+
+    latest_user_index = -1
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        author = message.get("author")
+        role = author.get("role") if isinstance(author, dict) else ""
+        if role != "user":
+            continue
+        user_text = _get_payload_content_text(message)
+        if not expected_user_text or history_prompt_text_matches(
+            expected_user_text,
+            user_text,
+        ):
+            latest_user_index = index
+            break
+    if latest_user_index < 0:
+        return ""
+
+    response_text = ""
+    for message in messages[latest_user_index + 1:]:
+        author = message.get("author")
+        role = author.get("role") if isinstance(author, dict) else ""
+        if role == "user":
+            break
+        if role != "assistant":
+            continue
+        status = str(message.get("status") or "").casefold()
+        if status and status not in CHATGPT_SUCCESSFUL_MESSAGE_STATUSES:
+            continue
+        if message.get("end_turn") is False:
+            continue
+        candidate = _get_payload_assistant_text(message)
+        if candidate:
+            response_text = candidate
+    return response_text
+
+
+def _accept_or_recover_assistant_response(
+    page: Page,
+    response_text: str,
+    expected_user_text: str,
+) -> str:
+    if not looks_like_chatgpt_error(response_text):
+        return response_text
+    if expected_user_text:
+        recovered_response = recover_assistant_response_after_reload(
+            page,
+            expected_user_text,
+        )
+        if recovered_response:
+            return recovered_response
+    _check_for_chatgpt_errors(response_text)
+    return response_text
 
 
 def wait_for_assistant_response(
@@ -2706,8 +2856,11 @@ def wait_for_assistant_response(
             and not busy
             and now - last_change_at >= required_stability
         ):
-            _check_for_chatgpt_errors(last_response)
-            return last_response
+            return _accept_or_recover_assistant_response(
+                page,
+                last_response,
+                submitted_prompt_text,
+            )
 
         if (
             allow_empty_response
@@ -2717,8 +2870,11 @@ def wait_for_assistant_response(
                 or now >= empty_response_deadline
             )
         ):
-            _check_for_chatgpt_errors(last_response)
-            return last_response
+            return _accept_or_recover_assistant_response(
+                page,
+                last_response,
+                submitted_prompt_text,
+            )
 
         if now >= deadline:
             if busy:
@@ -2786,6 +2942,71 @@ def wait_for_existing_assistant_response(
         time.sleep(ASSISTANT_RESPONSE_POLL_SECONDS)
 
 
+def _get_conversation_id_from_url(url: str) -> str:
+    parsed_url = urlparse(str(url or ""))
+    match = re.search(r"/c/([a-zA-Z0-9_-]+)", parsed_url.path)
+    return match.group(1) if match else ""
+
+
+def _is_conversation_payload_response(response, conversation_id: str) -> bool:
+    try:
+        parsed_url = urlparse(response.url)
+        request = response.request
+        return bool(
+            parsed_url.scheme == "https"
+            and parsed_url.netloc == "chatgpt.com"
+            and "/backend-api/" in parsed_url.path
+            and conversation_id in parsed_url.path
+            and response.status == 200
+            and request.method.upper() == "GET"
+            and request.resource_type in {"fetch", "xhr"}
+        )
+    except Exception:
+        return False
+
+
+def _reload_and_capture_conversation_payload(
+    page: Page,
+    expected_url: str,
+) -> dict:
+    conversation_id = _get_conversation_id_from_url(expected_url)
+    if not conversation_id:
+        page.reload(
+            wait_until="domcontentloaded",
+            timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+        )
+        return {}
+
+    try:
+        with page.expect_response(
+            lambda response: _is_conversation_payload_response(
+                response,
+                conversation_id,
+            ),
+            timeout=CHATGPT_CONVERSATION_PAYLOAD_WAIT_MS,
+        ) as response_info:
+            page.reload(
+                wait_until="domcontentloaded",
+                timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+            )
+        payload = response_info.value.json()
+        return payload if isinstance(payload, dict) else {}
+    except PlaywrightError:
+        print(
+            ">>> ChatGPT conversation payload was unavailable after reload; "
+            "continuing with DOM recovery.",
+            file=sys.stderr,
+        )
+        return {}
+    except (TypeError, ValueError):
+        print(
+            ">>> ChatGPT conversation payload was not valid JSON; continuing "
+            "with DOM recovery.",
+            file=sys.stderr,
+        )
+        return {}
+
+
 def recover_assistant_response_after_reload(
     page: Page,
     expected_user_text: str,
@@ -2795,9 +3016,9 @@ def recover_assistant_response_after_reload(
     if not is_chatgpt_conversation_url(expected_url):
         return ""
     try:
-        page.reload(
-            wait_until="domcontentloaded",
-            timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+        payload = _reload_and_capture_conversation_payload(
+            page,
+            expected_url,
         )
         check_chatgpt_page_attention(page)
         ensure_expected_conversation_page(page.url, expected_url)
@@ -2806,12 +3027,25 @@ def recover_assistant_response_after_reload(
             timeout=CHATGPT_COMPOSER_WAIT_PER_ATTEMPT_MS,
         )
         wait_for_conversation_history(page, composer_ready=True)
+        payload_response = extract_assistant_response_from_conversation_payload(
+            payload,
+            expected_user_text,
+        )
+        if payload_response:
+            print(
+                ">>> Recovered completed ChatGPT response from the browser "
+                "conversation payload after the rendered response was unavailable.",
+                file=sys.stderr,
+            )
+            return payload_response
         return wait_for_existing_assistant_response(
             page,
             expected_user_text,
             ASSISTANT_RESPONSE_RELOAD_WAIT_SECONDS,
         )
     except ChatGPTAttentionRequiredError:
+        raise
+    except ChatGPTResponseError:
         raise
     except Exception as exc:
         print(
@@ -3245,11 +3479,16 @@ def recover_pending_prompt_response(
     prompt_text: str,
     on_prompt_submitted = None,
 ) -> str:
-    response_text = wait_for_existing_assistant_response(
-        page,
-        prompt_text,
-        PENDING_RESPONSE_WAIT_SECONDS,
-    )
+    try:
+        response_text = wait_for_existing_assistant_response(
+            page,
+            prompt_text,
+            PENDING_RESPONSE_WAIT_SECONDS,
+        )
+    except ChatGPTResponseError as exc:
+        if exc.code != CHATGPT_RESPONSE_RENDER_ERROR_CODE:
+            raise
+        response_text = ""
     if not response_text:
         response_text = recover_assistant_response_after_reload(page, prompt_text)
     if response_text:
