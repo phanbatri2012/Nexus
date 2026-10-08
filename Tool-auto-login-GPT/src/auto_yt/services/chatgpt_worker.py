@@ -266,14 +266,20 @@ MIN_CORRUPTED_UNICODE_MARKERS = 3
 THINKING_INDICATOR_PATTERN = re.compile(
     r"^(?:stopped\s+thinking|thought\s+for\s+\d+.*|worked\s+for\s+\d+.*|thinking\.{0,3}|"
     r"đã\s+dừng\s+suy\s+nghĩ|đang\s+suy\s+nghĩ\.{0,3}|đã\s+suy\s+nghĩ\s+trong\s+\d+.*|"
-    r"(?:verifying|checking|searching(?:\s+for)?|analyzing|researching|looking\s+up|refining|reading|drafting)\s+[a-z0-9\s.,'’\-–—]{1,60})$",
-    re.IGNORECASE,
+    r"(?:verif(?:y|ying|ied)|check(?:ing|ed|s)?|search(?:ing|ed|es)?(?:\s+for)?|analyz(?:e|ing|ed|es)|research(?:ing|ed|es)?|look(?:ing|ed)?\s+up|refin(?:e|ing|ed)|read(?:ing)?|draft(?:ing|ed)?|explor(?:e|ing|ed)|review(?:ing|ed)?|find(?:ing)?|found|compar(?:e|ing|ed)|synthesiz(?:e|ing|ed)|gather(?:ing|ed)?|identif(?:y|ying|ied)|evaluat(?:e|ing|ed)|investigat(?:e|ing|ed)|summariz(?:e|ing|ed)|generat(?:e|ing|ed)|"
+    r"(?:đã\s+)?(?:kiểm\s+tra|tìm\s+kiếm|tra\s+cứu|phân\s+tích|nghiên\s+cứu|đọc|xác\s+minh|tổng\s+hợp|đánh\s+giá|so\s+sánh|thu\s+thập))\s+[^\r\n]{1,80})$",
+    re.IGNORECASE | re.UNICODE,
 )
 
 
 def _is_pure_thinking_indicator(text: str) -> bool:
     cleaned = text.strip()
-    return bool(not cleaned or THINKING_INDICATOR_PATTERN.match(cleaned))
+    if not cleaned:
+        return True
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    if not lines:
+        return True
+    return all(bool(THINKING_INDICATOR_PATTERN.match(line)) for line in lines)
 
 
 def download_chatgpt_image_via_page(page: Page, chatgpt_url: str) -> str:
@@ -2711,6 +2717,24 @@ def looks_like_chatgpt_error(text: str) -> bool:
     return any(err in lowered for err in CHATGPT_ERROR_PATTERNS)
 
 
+def is_chatgpt_render_error_present(page: Page) -> bool:
+    """Check if the rendered page contains a ChatGPT client-side render crash message."""
+    try:
+        return bool(page.evaluate("""() => {
+            const errorMarkers = [
+                "this response couldn't load",
+                "this response couldn’t load",
+                "this response could not load",
+                "failed to get response",
+                "there was an error generating a response"
+            ];
+            const text = (document.body?.innerText || '').toLowerCase();
+            return errorMarkers.some(marker => text.includes(marker));
+        }"""))
+    except Exception:
+        return False
+
+
 def _check_for_chatgpt_errors(text: str) -> None:
     if not text:
         return
@@ -2738,7 +2762,13 @@ def _get_payload_content_text(message: dict) -> str:
     parts = content.get("parts")
     if not isinstance(parts, list):
         return ""
-    return "\n".join(part for part in parts if isinstance(part, str)).strip()
+    text_parts = []
+    for part in parts:
+        if isinstance(part, str):
+            text_parts.append(part)
+        elif isinstance(part, dict) and isinstance(part.get("text"), str):
+            text_parts.append(part["text"])
+    return "\n".join(text_parts).strip()
 
 
 def _get_payload_assistant_text(message: dict) -> str:
@@ -3037,16 +3067,28 @@ def _accept_or_recover_assistant_response(
     response_text: str,
     expected_user_text: str,
 ) -> str:
-    if not looks_like_chatgpt_error(response_text):
+    if (
+        response_text
+        and not looks_like_chatgpt_error(response_text)
+        and not _is_pure_thinking_indicator(response_text)
+        and not is_chatgpt_render_error_present(page)
+    ):
         return response_text
-    if expected_user_text:
+
+    # If response is missing, error, thinking indicator, or render crash, attempt backend extraction
+    if expected_user_text or is_chatgpt_conversation_url(page.url):
+        backend_response = recover_assistant_response_from_backend(page, expected_user_text)
+        if backend_response:
+            return backend_response
         recovered_response = recover_assistant_response_after_reload(
             page,
             expected_user_text,
         )
         if recovered_response:
             return recovered_response
-    _check_for_chatgpt_errors(response_text)
+
+    if response_text and not _is_pure_thinking_indicator(response_text):
+        _check_for_chatgpt_errors(response_text)
     return response_text
 
 
@@ -3090,14 +3132,16 @@ def wait_for_assistant_response(
 
         if (
             last_response
-            and looks_like_chatgpt_error(last_response)
+            and (looks_like_chatgpt_error(last_response) or _is_pure_thinking_indicator(last_response))
             and now - last_change_at >= 1.5
         ):
-            return _accept_or_recover_assistant_response(
+            recovered = _accept_or_recover_assistant_response(
                 page,
                 last_response,
                 submitted_prompt_text,
             )
+            if recovered and not _is_pure_thinking_indicator(recovered):
+                return recovered
 
         required_stability = (
             ASSISTANT_RESPONSE_SETTLE_AFTER_BUSY_SECONDS
@@ -3106,6 +3150,7 @@ def wait_for_assistant_response(
         )
         if (
             last_response
+            and not _is_pure_thinking_indicator(last_response)
             and not busy
             and now - last_change_at >= required_stability
         ):
@@ -3114,6 +3159,25 @@ def wait_for_assistant_response(
                 last_response,
                 submitted_prompt_text,
             )
+
+        if (
+            saw_busy_state
+            and not busy
+            and (
+                not last_response
+                or _is_pure_thinking_indicator(last_response)
+                or looks_like_chatgpt_error(last_response)
+                or is_chatgpt_render_error_present(page)
+            )
+            and now - last_change_at >= ASSISTANT_RESPONSE_SETTLE_AFTER_BUSY_SECONDS
+        ):
+            recovered = _accept_or_recover_assistant_response(
+                page,
+                last_response,
+                submitted_prompt_text,
+            )
+            if recovered and not _is_pure_thinking_indicator(recovered):
+                return recovered
 
         if (
             allow_empty_response
@@ -3130,8 +3194,11 @@ def wait_for_assistant_response(
             )
 
         if now >= deadline:
-            if submitted_prompt_text:
-                recovered_response = recover_assistant_response_after_reload(
+            if submitted_prompt_text or is_chatgpt_conversation_url(page.url):
+                recovered_response = recover_assistant_response_from_backend(
+                    page,
+                    submitted_prompt_text,
+                ) or recover_assistant_response_after_reload(
                     page,
                     submitted_prompt_text,
                 )
@@ -3193,11 +3260,28 @@ def wait_for_existing_assistant_response(
         )
         if (
             last_response
+            and not _is_pure_thinking_indicator(last_response)
             and not busy
             and now - last_change_at >= required_stability
         ):
             _check_for_chatgpt_errors(last_response)
             return last_response
+
+        if (
+            saw_busy_state
+            and not busy
+            and (
+                not last_response
+                or _is_pure_thinking_indicator(last_response)
+                or looks_like_chatgpt_error(last_response)
+                or is_chatgpt_render_error_present(page)
+            )
+            and now - last_change_at >= ASSISTANT_RESPONSE_SETTLE_AFTER_BUSY_SECONDS
+        ):
+            backend_resp = recover_assistant_response_from_backend(page, expected_user_text)
+            if backend_resp:
+                return backend_resp
+
         if now >= deadline:
             return ""
         time.sleep(ASSISTANT_RESPONSE_POLL_SECONDS)
@@ -3226,21 +3310,13 @@ def _is_conversation_payload_response(response, conversation_id: str) -> bool:
         return False
 
 
-def _reload_and_capture_conversation_payload(
-    page: Page,
-    expected_url: str,
-) -> dict:
-    conversation_id = _get_conversation_id_from_url(expected_url)
-    if not conversation_id:
-        page.reload(
-            wait_until="domcontentloaded",
-            timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
-        )
+def fetch_chatgpt_conversation_payload(page: Page, conversation_id: str = "") -> dict:
+    """Directly fetch full conversation payload from ChatGPT backend API using session token."""
+    conv_id = conversation_id or _get_conversation_id_from_url(page.url)
+    if not conv_id:
         return {}
-
-    # 1. Direct in-page fetch with Bearer token (faster and bypasses web stream failures)
     try:
-        direct_payload = page.evaluate("""async (convId) => {
+        direct_payload = page.evaluate("""async (cid) => {
             try {
                 let token = '';
                 try {
@@ -3255,7 +3331,7 @@ def _reload_and_capture_conversation_payload(
                 if (token) {
                     headers['Authorization'] = 'Bearer ' + token;
                 }
-                const r = await fetch('/backend-api/conversation/' + convId, { headers });
+                const r = await fetch('/backend-api/conversation/' + cid, { headers });
                 if (r.ok) {
                     return await r.json();
                 }
@@ -3263,11 +3339,51 @@ def _reload_and_capture_conversation_payload(
             } catch(e) {
                 return {};
             }
-        }""", conversation_id)
+        }""", conv_id)
         if isinstance(direct_payload, dict) and (direct_payload.get("mapping") or direct_payload.get("messages")):
             return direct_payload
     except Exception as exc:
         print(f">>> Direct in-page conversation payload fetch skipped: {exc}", file=sys.stderr)
+    return {}
+
+
+def recover_assistant_response_from_backend(page: Page, expected_user_text: str = "") -> str:
+    """Attempt direct API payload extraction from OpenAI backend without reloading page."""
+    conv_id = _get_conversation_id_from_url(page.url)
+    if not conv_id:
+        return ""
+    payload = fetch_chatgpt_conversation_payload(page, conv_id)
+    if payload:
+        response = extract_assistant_response_from_conversation_payload(payload, expected_user_text)
+        if (
+            response
+            and not looks_like_chatgpt_error(response)
+            and not _is_pure_thinking_indicator(response)
+        ):
+            print(
+                ">>> Successfully extracted complete assistant response directly from ChatGPT backend API payload.",
+                file=sys.stderr,
+            )
+            return response
+    return ""
+
+
+def _reload_and_capture_conversation_payload(
+    page: Page,
+    expected_url: str,
+) -> dict:
+    conversation_id = _get_conversation_id_from_url(expected_url)
+    if not conversation_id:
+        page.reload(
+            wait_until="domcontentloaded",
+            timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+        )
+        return {}
+
+    # 1. Direct in-page fetch with Bearer token (faster and bypasses web stream failures)
+    direct_payload = fetch_chatgpt_conversation_payload(page, conversation_id)
+    if isinstance(direct_payload, dict) and (direct_payload.get("mapping") or direct_payload.get("messages")):
+        return direct_payload
 
     # 2. Network interception fallback via page reload
     try:
@@ -3410,9 +3526,20 @@ def get_reusable_chapter_response(page: Page) -> str:
             }).filter(item => item[0] && item[1]);
         }"""
     )
-    return select_reusable_chapter_response(
+    dom_chapters = select_reusable_chapter_response(
         [(role, text) for role, text in conversation_turns]
     )
+    if dom_chapters:
+        return dom_chapters
+
+    # Fallback to backend conversation payload if DOM render was broken
+    if is_chatgpt_conversation_url(page.url):
+        backend_response = recover_assistant_response_from_backend(page)
+        if backend_response:
+            cleaned = clean_text(backend_response)
+            if is_valid_chapter_response(cleaned):
+                return sanitize_chapter_response(cleaned)
+    return ""
 
 
 def get_reusable_outline_response(page: Page) -> str:
@@ -3447,9 +3574,26 @@ def get_reusable_outline_response(page: Page) -> str:
             }).filter(item => item[0] && item[1]);
         }"""
     )
-    return select_reusable_outline_response(
+    dom_outline = select_reusable_outline_response(
         [(role, text) for role, text in conversation_turns]
     )
+    if dom_outline:
+        return dom_outline
+
+    # Fallback to backend conversation payload if DOM render was broken
+    if is_chatgpt_conversation_url(page.url):
+        backend_response = recover_assistant_response_from_backend(page)
+        if backend_response:
+            cleaned = clean_text(backend_response)
+            if (
+                not looks_like_chatgpt_error(cleaned)
+                and not _is_pure_thinking_indicator(cleaned)
+                and not looks_like_editorial_artifact(cleaned)
+                and len(cleaned.split()) >= 15
+                and split_outline_parts(cleaned)
+            ):
+                return cleaned
+    return ""
 
 
 def wait_for_conversation_history(
@@ -3783,9 +3927,16 @@ def recover_pending_prompt_response(
         if exc.code != CHATGPT_RESPONSE_RENDER_ERROR_CODE:
             raise
         response_text = ""
-    if not response_text:
-        response_text = recover_assistant_response_after_reload(page, prompt_text)
-    if response_text:
+    if response_text and not _is_pure_thinking_indicator(response_text):
+        return response_text
+
+    # Direct backend extraction without reload
+    backend_response = recover_assistant_response_from_backend(page, prompt_text)
+    if backend_response:
+        return backend_response
+
+    response_text = recover_assistant_response_after_reload(page, prompt_text)
+    if response_text and not _is_pure_thinking_indicator(response_text):
         return response_text
         
     if not is_prompt_in_conversation(page, prompt_text):
