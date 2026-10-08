@@ -21,6 +21,7 @@ DEFAULT_PROMPT_PIPELINE = {
     "pinned_comment": True,
     "quiz": True,
     "chapters": True,
+    "visual_research": False,
     "thumbnail_with_text": True,
     "thumbnail_without_text": True,
     "audio": True,

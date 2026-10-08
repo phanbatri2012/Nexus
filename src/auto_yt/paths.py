@@ -30,6 +30,9 @@ BACKGROUND_VIDEOS_DIR = DATA_DIR / "background_videos"
 ANIMATED_ICONS_DIR = DATA_DIR / "animated_icons"
 LOGS_DIR = DATA_DIR / "logs"
 DIAGNOSTICS_DIR = LOGS_DIR / "diagnostics"
+REFERENCES_DIR = DATA_DIR / "references"
+LOCAL_VAULT_DIR = DATA_DIR / "references_vault"
+
 
 
 

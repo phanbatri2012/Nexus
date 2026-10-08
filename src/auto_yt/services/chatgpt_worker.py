@@ -12,8 +12,9 @@ from contextlib import closing
 from urllib.parse import parse_qs, urlparse
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright, Page
-from auto_yt.paths import gpt_profile_dir, PROMPTS_PATH, THUMBNAILS_DIR
+from auto_yt.paths import gpt_profile_dir, PROMPTS_PATH, THUMBNAILS_DIR, REFERENCES_DIR
 from auto_yt.default_prompts import DEFAULT_PROMPTS_DATA
+from auto_yt.services import media_fetcher
 from auto_yt.services.chatgpt_projects import (
     CHATGPT_PROJECT_URL_ENV,
     DEFAULT_CHATGPT_BOOTSTRAP_URL,
@@ -138,6 +139,18 @@ THUMBNAIL_REPAIR_PROMPT = (
 THUMBNAIL_REGENERATE_PROMPT = (
     "Tạo ảnh theo prompt vừa được sửa ở ngay trên. Lưu ý: chỉ cần xuất ảnh của prompt mới sửa"
 )
+DEFAULT_VISUAL_RESEARCH_PROMPT = (
+    "Dựa trên kịch bản và bối cảnh chi tiết ở trên, hãy xác định từ 1 đến 2 đối tượng hình ảnh quan trọng nhất "
+    "(nhân vật, khí tài, trang phục hoặc địa danh) cần có hình ảnh tư liệu chuẩn xác để làm thumbnail.\n\n"
+    "Yêu cầu bắt buộc: Chỉ trả về JSON thuần theo cấu trúc sau, không viết thêm bất kỳ lời giải thích nào:\n"
+    "{\n"
+    '  "queries": [\n'
+    '    "Từ khóa tìm ảnh tư liệu 1 (kèm bối cảnh/thời gian cụ thể)",\n'
+    '    "Từ khóa tìm ảnh tư liệu 2"\n'
+    "  ]\n"
+    "}"
+)
+
 CHATGPT_COMPOSER_SELECTOR = (
     '#prompt-textarea:not([data-testid="chatgpt-writing-block"] #prompt-textarea)'
     ':not(.writing-block-editor #prompt-textarea), '
@@ -987,6 +1000,25 @@ def append_thumbnail_image_markers(
 ) -> str:
     markers = "\n\n".join(f"[IMAGE_URL:{url}]" for url in image_urls)
     return f"{response_text}\n\n{markers}".strip() if markers else response_text
+
+
+def _get_video_reference_base64(video_id: int | None = None) -> str | None:
+    """Retrieve existing base64-encoded reference images for a video if available."""
+    vid = video_id if video_id is not None else _checkpoint_video_id()
+    if not vid:
+        return None
+    ref_dir = REFERENCES_DIR / f"video_{vid}"
+    if not ref_dir.exists():
+        return None
+    image_paths = sorted(ref_dir.glob("ref_*.jpg"))
+    if not image_paths:
+        return None
+    base64_items = []
+    for p in image_paths:
+        b64 = media_fetcher.image_to_base64(p)
+        if b64:
+            base64_items.append(b64)
+    return json.dumps(base64_items) if base64_items else None
 
 
 def get_chatgpt_project_url(prompt_version: str = "") -> str:
@@ -3727,6 +3759,40 @@ def _run_complete(transcript: str, state: dict) -> dict:
             clear_pending_generation_prompt(state, "chapters", prompt7)
             persist_generation_state(state)
 
+        # Step 7.5: Visual Research (Extract entities & fetch reference images)
+        if pipeline.get("visual_research") and not state.get("visual_references"):
+            print(">>> BƯỚC 7.5: TÌM ẢNH TƯ LIỆU THAM CHIẾU (VISUAL RESEARCH)", file=sys.stderr)
+            state["current_step"] = "visual research"
+            persist_generation_state(state)
+            visual_prompt = prompts.get("visual_research") or DEFAULT_VISUAL_RESEARCH_PROMPT
+            try:
+                queries_response = send_prompt(page, visual_prompt, allow_empty_response=False)
+                extracted_queries = media_fetcher.extract_queries_from_response(queries_response)
+                print(f"    -> Đã trích xuất {len(extracted_queries)} từ khóa tư liệu: {extracted_queries}", file=sys.stderr)
+
+                vid_id = _checkpoint_video_id()
+                ref_dir = REFERENCES_DIR / f"video_{vid_id}" if vid_id else REFERENCES_DIR / "session"
+                ref_paths = media_fetcher.fetch_reference_images_for_queries(extracted_queries, output_dir=ref_dir, max_images=2)
+
+                if ref_paths:
+                    base64_items = []
+                    for rp in ref_paths:
+                        b64 = media_fetcher.image_to_base64(rp)
+                        if b64:
+                            base64_items.append(b64)
+                    state["visual_references"] = ref_paths
+                    state["visual_references_base64"] = json.dumps(base64_items) if base64_items else None
+                    print(f"    -> Đã tải và chuẩn bị {len(ref_paths)} ảnh tư liệu tham chiếu.", file=sys.stderr)
+                else:
+                    print("    -> Không tìm thấy ảnh tư liệu phù hợp, tiếp tục tạo thumbnail.", file=sys.stderr)
+                    state["visual_references"] = []
+                    state["visual_references_base64"] = None
+            except Exception as v_exc:
+                print(f"    -> Cảnh báo: Lỗi trong bước visual research ({v_exc}), tự động bỏ qua.", file=sys.stderr)
+                state["visual_references"] = []
+                state["visual_references_base64"] = None
+            persist_generation_state(state)
+
         # Helper for image extraction
         def _download_image_local(chatgpt_url: str) -> str:
             """Download image via Playwright session and save locally."""
@@ -3753,11 +3819,12 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 if image1_urls:
                     thumb1 = get_assistant_response_after_latest_user(page, expected_user_text=prompt8)
             if not image1_urls:
+                thumb_ref_b64 = state.get("visual_references_base64") or prompts.get("thumb_text_image_base64")
                 thumb1, image1_urls = send_thumbnail_prompt(
                     page,
                     prompt8,
                     _download_image_local,
-                    prompts.get("thumb_text_image_base64")
+                    thumb_ref_b64
                 )
                 if not image1_urls:
                     print(">>> THUMBNAIL CÓ CHỮ LỖI, THỬ LẠI MỘT LẦN...", file=sys.stderr)
@@ -3785,11 +3852,12 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 if image2_urls:
                     thumb2 = get_assistant_response_after_latest_user(page, expected_user_text=prompt9)
             if not image2_urls:
+                thumb_ref_b64 = state.get("visual_references_base64") or prompts.get("thumb_notext_image_base64")
                 thumb2, image2_urls = send_thumbnail_prompt(
                     page,
                     prompt9,
                     _download_image_local,
-                    prompts.get("thumb_notext_image_base64")
+                    thumb_ref_b64
                 )
                 if not image2_urls:
                     print(">>> THUMBNAIL KHÔNG CHỮ LỖI, THỬ LẠI MỘT LẦN...", file=sys.stderr)
@@ -3830,6 +3898,8 @@ def run(transcript: str) -> dict:
         "outro": "",
         "metadata": "",
         "chapters": "",
+        "visual_references": [],
+        "visual_references_base64": None,
         "thumb_text": "",
         "thumb_notext": "",
         "pending_prompt": None,
@@ -4262,11 +4332,13 @@ def generate_thumbnails_only(
             prompts.get("thumb_text", ""),
             "with_text",
         )
+        saved_ref_b64 = _get_video_reference_base64()
+        thumb1_ref_b64 = saved_ref_b64 or prompts.get("thumb_text_image_base64")
         thumb1, image1_urls = send_thumbnail_prompt(
             page,
             prompt8,
             lambda image_url: _download_image(page, image_url),
-            prompts.get("thumb_text_image_base64")
+            thumb1_ref_b64
         )
         if not image1_urls:
             thumb1, image1_urls = retry_thumbnail_generation(
@@ -4281,11 +4353,12 @@ def generate_thumbnails_only(
             prompts.get("thumb_notext", ""),
             "without_text",
         )
+        thumb2_ref_b64 = saved_ref_b64 or prompts.get("thumb_notext_image_base64")
         thumb2, image2_urls = send_thumbnail_prompt(
             page,
             prompt9,
             lambda image_url: _download_image(page, image_url),
-            prompts.get("thumb_notext_image_base64")
+            thumb2_ref_b64
         )
         if not image2_urls:
             thumb2, image2_urls = retry_thumbnail_generation(
@@ -4369,13 +4442,15 @@ def _generate_single_thumbnail(
         )
 
         print(f">>>> REGENERATE THUMBNAIL ({config['label']})", file=sys.stderr)
-        image_base64 = prompts.get(f"{config['prompt_key']}_image_base64")
+        saved_ref_b64 = _get_video_reference_base64()
+        image_base64 = saved_ref_b64 or prompts.get(f"{config['prompt_key']}_image_base64")
         response_text, image_urls = send_thumbnail_prompt(
             page,
             generation_prompt,
             download_image,
             image_base64
         )
+
         retry_succeeded = False
         if not image_urls:
             print(

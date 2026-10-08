@@ -10,6 +10,7 @@ const DEFAULT_PIPELINE = {
   pinned_comment: true,
   quiz: true,
   chapters: true,
+  visual_research: false,
   thumbnail_with_text: true,
   thumbnail_without_text: true,
   audio: true,
@@ -261,6 +262,11 @@ const PIPELINE_STEPS = [
     description: 'Tự động tạo các mốc chapter sau khi kịch bản lõi hoàn tất.'
   },
   {
+    key: 'visual_research',
+    label: 'Tìm ảnh tư liệu tham chiếu (Visual Research)',
+    description: 'Tự động trích xuất từ khóa, tìm nạp ảnh tư liệu và đính kèm vào ChatGPT khi tạo Thumbnail.'
+  },
+  {
     key: 'thumbnail_with_text',
     label: 'Thumbnail có chữ',
     description: 'Tự động gửi prompt và lấy ảnh thumbnail có chữ.'
@@ -493,16 +499,23 @@ const PROMPT_FIELD_METADATA = {
     guide: 'Nội dung này sẽ được chèn vào biến {chapters} trong mẫu mô tả video xuất bản.',
     variables: []
   },
+  visual_research: {
+    key: 'visual_research',
+    label: '13. Tìm ảnh tư liệu (Visual Research)',
+    help: 'Chỉ thị yêu cầu ChatGPT bóc tách 1-2 từ khóa tìm kiếm ảnh tư liệu lịch sử/thực tế từ kịch bản.',
+    guide: 'Dùng để tự động tra cứu Wikimedia Commons/DuckDuckGo và đính kèm ảnh thật khi tạo Thumbnail.',
+    variables: []
+  },
   thumb_text: {
     key: 'thumb_text',
-    label: '13. Thumbnail (Có chữ)',
+    label: '14. Thumbnail (Có chữ)',
     help: 'Ý tưởng thiết kế và prompt sinh ảnh nền thumbnail có kèm chữ clickbait nổi bật.',
     guide: 'Dùng cho ảnh đại diện video YouTube bản có chữ tiêu đề bắt mắt.',
     variables: []
   },
   thumb_notext: {
     key: 'thumb_notext',
-    label: '14. Thumbnail (Không chữ)',
+    label: '15. Thumbnail (Không chữ)',
     help: 'Ý tưởng thiết kế và prompt sinh ảnh nền thumbnail nghệ thuật không chữ.',
     guide: 'Dùng cho ảnh đại diện video sạch hoặc dùng làm ảnh nền mở đầu Scene 0.',
     variables: []
@@ -1346,8 +1359,9 @@ export default function Settings({
     { key: 'pinned_comment', label: '10. Bình luận ghim' },
     { key: 'quiz', label: '11. Quiz tương tác' },
     { key: 'chapters', label: '12. Phân đoạn (Chapters)' },
-    { key: 'thumb_text', label: '13. Thumbnail (Có chữ)' },
-    { key: 'thumb_notext', label: '14. Thumbnail (Không chữ)' },
+    { key: 'visual_research', label: '13. Tìm ảnh tư liệu (Visual Research)' },
+    { key: 'thumb_text', label: '14. Thumbnail (Có chữ)' },
+    { key: 'thumb_notext', label: '15. Thumbnail (Không chữ)' },
   ];
 
 

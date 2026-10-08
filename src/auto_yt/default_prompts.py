@@ -43,6 +43,7 @@ DEFAULT_PROMPTS_DATA = {
                 "pinned_comment": True,
                 "quiz": True,
                 "chapters": True,
+                "visual_research": False,
                 "thumbnail_with_text": True,
                 "thumbnail_without_text": True,
                 "audio": True,
@@ -147,6 +148,8 @@ DEFAULT_PROMPTS_DATA = {
 
                 "chapters": "Dựa vào nội dung này, hãy tạo danh sách chapter ngắn gọn, chuẩn SEO cho video talkshow. Viết hoa chữ cái đầu câu, địa danh và tên riêng.\nVí dụ:\nNội dung chính trong video:\n00:00 - Lời mở đầu của Tiến sĩ Đinh Đoàn và Khách mời\n03:30 - Biến cố đầu tiên trong cuộc hôn nhân\n08:15 - Sự thật bàng hoàng được hé lộ\n14:00 - Lời khuyên tâm lý từ Tiến sĩ Đinh Đoàn",
 
+                "visual_research": "Dựa trên kịch bản và bối cảnh chi tiết ở trên, hãy xác định từ 1 đến 2 đối tượng hình ảnh quan trọng nhất (nhân vật, khí tài, trang phục hoặc địa danh) cần có hình ảnh tư liệu chuẩn xác để làm thumbnail.\n\nYêu cầu bắt buộc: Chỉ trả về JSON thuần theo cấu trúc sau, không viết thêm bất kỳ lời giải thích nào:\n{\n  \"queries\": [\n    \"Từ khóa tìm ảnh tư liệu 1 (kèm bối cảnh/thời gian cụ thể)\",\n    \"Từ khóa tìm ảnh tư liệu 2\"\n  ]\n}",
+
                 "thumb_text_image_base64": "",
                 "thumb_text": "Dựa trên nội dung buổi trò chuyện, hãy gợi ý một ý tưởng thiết kế thumbnail YouTube phong cách Talkshow / Phim tài liệu tâm lý siêu thực:\n- Bố cục hình ảnh: Thể hiện Tiến sĩ Đinh Đoàn với biểu cảm lắng nghe trầm ngâm/phân tích và hình ảnh nhân vật khách mời (hoặc bối cảnh câu chuyện) đầy chiều sâu cảm xúc.\n- Ánh sáng: Điện ảnh 35mm, ánh sáng tự nhiên studio ấm áp hoặc tương phản kịch tính.\n- Trong thumbnail có chữ clickbait ngắn gọn (4-8 từ) nổi bật, font chữ dày, màu vàng hoặc đỏ viền đen rõ nét.\n- Viết prompt chi tiết bằng tiếng Anh (tỷ lệ 16:9, phong cách 8k raw photography, chân thực, không CGI hoạt hình) để tạo ảnh nền thu hút người xem bấm vào ngay. Sau khi viết xong prompt thì hãy tạo ảnh luôn.",
 
@@ -169,6 +172,7 @@ DEFAULT_PROMPTS_DATA = {
                 "pinned_comment": True,
                 "quiz": True,
                 "chapters": True,
+                "visual_research": False,
                 "thumbnail_with_text": True,
                 "thumbnail_without_text": True,
                 "audio": True,
@@ -273,6 +277,8 @@ DEFAULT_PROMPTS_DATA = {
                 
                 "chapters": "Dựa vào nội dung này, mình đã tạo 1 video dài, hãy tạo 1 chapter ngắn gọn, chuẩn SEO cho video. viết hoa đầu câu, viết hoa chữ cái đầu của tên riêng hoặc địa danh và viết hoa viết hoa chỗ cần viết hoa.\nví dụ:\nNội dung chính trong video:\n00:00 - N...\n04:30 - G...\n09:00 - A....",
                 
+                "visual_research": "Dựa trên kịch bản và bối cảnh chi tiết ở trên, hãy xác định từ 1 đến 2 đối tượng hình ảnh quan trọng nhất (nhân vật, khí tài, trang phục hoặc địa danh) cần có hình ảnh tư liệu chuẩn xác để làm thumbnail.\n\nYêu cầu bắt buộc: Chỉ trả về JSON thuần theo cấu trúc sau, không viết thêm bất kỳ lời giải thích nào:\n{\n  \"queries\": [\n    \"Từ khóa tìm ảnh tư liệu 1 (kèm bối cảnh/thời gian cụ thể)\",\n    \"Từ khóa tìm ảnh tư liệu 2\"\n  ]\n}",
+
                 "thumb_text_image_base64": "",
                 "thumb_text": "Dựa trên nội dung video tôi cung cấp, hãy gợi ý một ý tưởng thiết kế thumbnail YouTube thật hấp dẫn và thu hút, phù hợp với nội dung video. Ý tưởng cần mô tả rõ: bố cục hình ảnh, nhân vật hoặc chi tiết chính, cảm xúc thể hiện, màu sắc chủ đạo, điểm nhấn thị giác, và cách truyền tải thông điệp một cách mạnh mẽ. Sau khi gợi ý xong ý tưởng thiết kế, hãy viết cho tôi một prompt hình ảnh thật chi tiết để có thể dùng cho ChatGPT hoặc công cụ AI vẽ hình nền dựa trên đúng ý tưởng đó, yêu cầu Prompt không vi phạm chính sách của ChatGPT,Trong thumbnail có chữ, font chữ và mà màu chữ phải phù hợp với phong cách click bait, chữ phải nổi bật và không che đi các bối cảnh quan trọng, Prompt tạo ra ảnh bằng với kích thước thumbnail của youtube, tỷ lệ khung hình 16:9. Prompt hình ảnh cần sử dụng ngôn ngữ mô tả cụ thể về khung cảnh, ánh sáng, phong cách, nhân vật và màu sắc. Ảnh phải giống thật, siêu thực. Sau khi viết xong prompt thì hãy tạo ảnh luôn.",
                 
