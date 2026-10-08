@@ -1,0 +1,4753 @@
+import sys
+import time
+import asyncio
+import base64
+import json
+import os
+import re
+import uuid
+import hashlib
+from collections.abc import Callable
+from contextlib import closing
+from urllib.parse import parse_qs, urlparse
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import sync_playwright, Page
+from auto_yt.paths import gpt_profile_dir, PROMPTS_PATH, THUMBNAILS_DIR, REFERENCES_DIR
+from auto_yt.default_prompts import DEFAULT_PROMPTS_DATA
+from auto_yt.services import media_fetcher
+from auto_yt.services.chatgpt_projects import (
+    CHATGPT_PROJECT_URL_ENV,
+    DEFAULT_CHATGPT_BOOTSTRAP_URL,
+    DEFAULT_CHATGPT_PROJECT_URL,
+    PROMPT_PIPELINE_ENV,
+    get_project_url,
+    normalize_prompt_pipeline,
+    validate_prompt_pipeline,
+)
+from auto_yt.services.generation_checkpoint import (
+    load_checkpoint,
+    save_checkpoint,
+)
+from auto_yt.services.audio_review import looks_like_editorial_artifact
+from auto_yt.services.network_security import (
+    MAX_IMAGE_DOWNLOAD_BYTES,
+    validate_chatgpt_image_url,
+    validate_image_bytes,
+)
+from auto_yt.services import chatgpt_browser_service
+from auto_yt.services.chatgpt_runtime import (
+    ChatGPTAttentionRequiredError,
+    encode_attention_error,
+)
+from auto_yt.services.browser_diagnostics import (
+    CATEGORY_CLOUDFLARE,
+    CATEGORY_SESSION_EXPIRED,
+    CATEGORY_VERIFY_2FA,
+    capture_browser_diagnostics_sync,
+    detect_browser_blockers,
+)
+
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    if sys.stdout is not None:
+        sys.stdout.reconfigure(encoding='utf-8')
+    if sys.stderr is not None:
+        sys.stderr.reconfigure(encoding='utf-8')
+
+_HERE = __import__('pathlib').Path(__file__).resolve()
+sys.path.insert(0, str(_HERE.parent.parent.parent))
+
+DEFAULT_GPT_PROFILE = "PROFILE_GPT_1"
+CHATGPT_BROWSER_CONNECT_TIMEOUT_SECONDS = 15
+CHATGPT_BROWSER_CONNECT_RETRY_SECONDS = 1
+CHATGPT_RESPONSE_TIMEOUT_SECONDS = 20 * 60
+CHAPTER_LATE_RESPONSE_GRACE_SECONDS = 5 * 60
+ASSISTANT_RESPONSE_WAIT_SECONDS = 30
+ASSISTANT_RESPONSE_POLL_SECONDS = 0.5
+ASSISTANT_RESPONSE_STABLE_SECONDS = 5
+ASSISTANT_RESPONSE_SETTLE_AFTER_BUSY_SECONDS = 1
+ASSISTANT_RESPONSE_RELOAD_WAIT_SECONDS = 60
+PENDING_RESPONSE_WAIT_SECONDS = 90
+CHATGPT_COMPOSER_RECOVERY_ATTEMPTS = 3
+CHATGPT_COMPOSER_WAIT_PER_ATTEMPT_MS = 20_000
+CHATGPT_PAGE_RECOVERY_SETTLE_MS = 1_500
+CHATGPT_NAVIGATION_TIMEOUT_MS = 60_000
+CHATGPT_CONVERSATION_PAYLOAD_WAIT_MS = 15_000
+CHATGPT_PROJECT_NAVIGATION_ATTEMPTS = 2
+CHATGPT_PROMPT_SUBMISSION_TIMEOUT_MS = 30_000
+EXTERNAL_APP_PERMISSION_CLICK_TIMEOUT_MS = 5_000
+EXTERNAL_APP_PERMISSION_DIALOG_SELECTOR = '[role="dialog"], [role="alertdialog"]'
+EXTERNAL_APP_PERMISSION_DIALOG_MARKER_GROUPS = (
+    (
+        "search outside this project",
+        "chatgpt will use",
+        "help answer your request",
+    ),
+    (
+        "tìm kiếm bên ngoài dự án này",
+        "chatgpt sẽ sử dụng",
+        "giúp trả lời yêu cầu của bạn",
+    ),
+)
+EXTERNAL_APP_PERMISSION_DENY_LABELS = (
+    "deny",
+    "don't allow",
+    "do not allow",
+    "từ chối",
+    "không cho phép",
+)
+OUTLINE_PART_MAX_CHARS = 3000
+OUTLINE_INTRO_OUTRO_KEYWORDS = (
+    "m\u1edf b\xe0i",     # mở bài
+    "m\u1edf \u0111\u1ea7u",    # mở đầu
+    "intro",
+    "k\u1ebft b\xe0i",    # kết bài
+    "k\u1ebft lu\u1eadn",  # kết luận
+    "outro",
+    "mo bai",
+    "mo dau",
+    "ket bai",
+    "ket luan",
+)
+NARRATIVE_ARTIFACT_MAX_WORDS = 14
+THUMBNAIL_IMAGE_WAIT_TIMEOUT_SECONDS = 5 * 60
+THUMBNAIL_TURN_WAIT_TIMEOUT_SECONDS = 30
+MAX_THUMBNAIL_IMAGES_PER_RESPONSE = 2
+CHATGPT_RESPONSE_ERROR_CODE = "chatgpt_response_error"
+CHATGPT_RESPONSE_RENDER_ERROR_CODE = "chatgpt_response_render_failed"
+CHATGPT_SUCCESSFUL_MESSAGE_STATUSES = frozenset({
+    "completed",
+    "finished",
+    "finished_successfully",
+})
+NARRATIVE_ONLY_INSTRUCTION = (
+    "\n\nYÊU CẦU ĐẦU RA CHO PHẦN NỘI DUNG: Chỉ viết văn xuôi liền mạch trong tin nhắn chat thông thường. "
+    "TUYỆT ĐỐI KHÔNG mở Canvas, KHÔNG tạo document/tài liệu rời hay artifact riêng. "
+    "Không chèn tiêu đề, nhãn chuyển đoạn, dàn ý, ghi chú biên tập hoặc "
+    "chỉ dẫn về cách viết."
+)
+STRICT_NO_FILLER = (
+    "\n\nLƯU Ý QUAN TRỌNG: TRẢ LỜI TRỰC TIẾP VÀO NỘI DUNG BẰNG TIN NHẮN VĂN BẢN THƯỜNG TRONG KHUNG CHAT. "
+    "TUYỆT ĐỐI KHÔNG MỞ CANVAS, KHÔNG TẠO DOCUMENT/TÀI LIỆU RỜI. "
+    "TUYỆT ĐỐI KHÔNG CHÀO HỎI, KHÔNG DẠ VÂNG, KHÔNG THÊM BẤT KỲ CÂU DẪN HAY GIẢI THÍCH NÀO "
+    "(VD: 'Dưới đây là...', 'Trân trọng gửi bạn...'). CHỈ IN RA ĐÚNG NỘI DUNG CẦN VIẾT."
+)
+THUMBNAIL_IMAGE_SELECTOR = (
+    'img[src*="backend-api/estuary"], '
+    'img[alt*="Generated image"], '
+    'img[alt*="DALL"], '
+    'img[src*="files/"], '
+    'img[src^="blob:https://chatgpt.com/"], '
+    'img[src^="blob:https://"]'
+)
+
+
+class ChatGPTResponseError(RuntimeError):
+    def __init__(self, code: str, detail: str):
+        self.code = code
+        super().__init__(f"{code}: ChatGPT ERROR detected: {detail}")
+
+
+THUMBNAIL_REPAIR_PROMPT = (
+    "hãy chỉ ra điểm vi phạm prompt của tôi. sau đó sửa prompt  sao cho không vi phạm nữa."
+)
+THUMBNAIL_REGENERATE_PROMPT = (
+    "Tạo ảnh theo prompt vừa được sửa ở ngay trên. Lưu ý: chỉ cần xuất ảnh của prompt mới sửa"
+)
+DEFAULT_VISUAL_RESEARCH_PROMPT = (
+    "Dựa trên kịch bản và bối cảnh chi tiết ở trên, hãy xác định từ 1 đến 2 đối tượng hình ảnh quan trọng nhất "
+    "(nhân vật, khí tài, trang phục hoặc địa danh) cần có hình ảnh tư liệu chuẩn xác để làm thumbnail.\n\n"
+    "Yêu cầu bắt buộc: Chỉ trả về JSON thuần theo cấu trúc sau, không viết thêm bất kỳ lời giải thích nào:\n"
+    "{\n"
+    '  "queries": [\n'
+    '    "Từ khóa tìm ảnh tư liệu 1 (kèm bối cảnh/thời gian cụ thể)",\n'
+    '    "Từ khóa tìm ảnh tư liệu 2"\n'
+    "  ]\n"
+    "}"
+)
+
+CHATGPT_COMPOSER_SELECTOR = (
+    '#prompt-textarea:not([data-testid="chatgpt-writing-block"] #prompt-textarea)'
+    ':not(.writing-block-editor #prompt-textarea), '
+    ":is(form, [data-composer-root], [data-testid='composer'], [data-composer-body]) "
+    "div.ProseMirror[contenteditable='true']"
+    ":not([data-testid='chatgpt-writing-block'] *):not(.writing-block-editor *), "
+    ":is(form, [data-composer-root], [data-testid='composer'], [data-composer-body]) "
+    "div[role='textbox'][contenteditable='true']"
+    ":not([data-testid='chatgpt-writing-block'] *):not(.writing-block-editor *), "
+    ":is(form, [data-composer-root], [data-testid='composer'], [data-composer-body]) "
+    "div[data-composer-markdown][contenteditable='true']"
+    ":not([data-testid='chatgpt-writing-block'] *):not(.writing-block-editor *), "
+    ":is(form, [data-composer-root], [data-testid='composer'], [data-composer-body]) "
+    "textarea:not([data-testid='chatgpt-writing-block'] *):not(.writing-block-editor *)"
+)
+CHATGPT_VISIBLE_COMPOSER_SELECTOR = f":is({CHATGPT_COMPOSER_SELECTOR}):visible"
+CHATGPT_SEND_BUTTON_SELECTOR = (
+    'button[data-testid="send-button"], '
+    'button[type="submit"]:not([aria-label*="Voice"]):not([aria-label*="thoại"]):not([aria-label*="Dictate"]), '
+    'button[aria-label="Send"], '
+    'button[aria-label="Gửi"], '
+    'button[aria-label="Send prompt"], '
+    'button[aria-label="Send message"], '
+    'button.bg-composer-primary[type="submit"]:not([aria-label*="Voice"]):not([aria-label*="thoại"])'
+)
+CHATGPT_VISIBLE_SEND_BUTTON_SELECTOR = f":is({CHATGPT_SEND_BUTTON_SELECTOR}):visible"
+CHATGPT_STOP_BUTTON_SELECTOR = (
+    'button[data-testid="stop-button"], '
+    'button[aria-label*="Stop generating"], '
+    'button[aria-label*="Stop streaming"], '
+    'button[aria-label*="Dừng tạo"], '
+    'button[aria-label*="Dừng phản hồi"]'
+)
+CHATGPT_DOM_HELPERS_JS = f"""
+const isElementVisible = (element) => {{
+    if (!element) return false;
+    const style = window.getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== 'none'
+        && style.visibility !== 'hidden'
+        && rect.width > 0
+        && rect.height > 0;
+}};
+const findComposer = () => [...document.querySelectorAll(
+    {json.dumps(CHATGPT_COMPOSER_SELECTOR)}
+)].find(isElementVisible) || null;
+const isVoiceOrDictateButton = (btn) => {{
+    if (!btn) return false;
+    const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+    const testId = (btn.getAttribute('data-testid') || '').toLowerCase();
+    return label.includes('voice') || label.includes('thoại') || label.includes('dictate')
+        || testId.includes('voice') || testId.includes('dictate') || testId.includes('speech');
+}};
+const findSendButton = (editor) => {{
+    if (!editor) return null;
+    const root = editor.closest('form')
+        || editor.closest('[data-composer-root], [data-testid="composer"]')
+        || editor.closest('[data-composer-body]');
+    if (!root) return null;
+    const candidates = [...root.querySelectorAll(
+        {json.dumps(CHATGPT_SEND_BUTTON_SELECTOR)}
+    )].filter(btn => isElementVisible(btn) && !isVoiceOrDictateButton(btn));
+    return candidates.find(btn => btn.type === 'submit' || btn.getAttribute('data-testid') === 'send-button')
+        || candidates.find(btn => btn.getAttribute('aria-label') === 'Send' || btn.getAttribute('aria-label') === 'Gửi')
+        || candidates[0]
+        || null;
+}};
+"""
+
+
+def _chatgpt_dom_script(body: str, argument_name: str = "") -> str:
+    return (
+        f"({argument_name}) => {{\n"
+        f"{CHATGPT_DOM_HELPERS_JS}\n"
+        f"{body}\n"
+        "}"
+    )
+
+
+URL_LIKE_TOKEN_PATTERN = re.compile(
+    r"(?:https?://|www\.)[^\s<>{}\[\]\"']+"
+    r"|\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+"
+    r"[a-z]{2,}(?:/[^\s<>{}\[\]\"']*)?",
+    flags=re.IGNORECASE,
+)
+JSON_STRING_LITERAL_PATTERN = re.compile(r'"(?:\\.|[^"\\])*"', flags=re.DOTALL)
+CORRUPTED_UNICODE_PATTERN = re.compile(
+    r"(?:(?<=\w)\?(?=\w)|\?{2,}(?=\w))",
+    flags=re.UNICODE,
+)
+MIN_CORRUPTED_UNICODE_MARKERS = 3
+THINKING_INDICATOR_PATTERN = re.compile(
+    r"^(?:stopped\s+thinking|thought\s+for\s+\d+.*|worked\s+for\s+\d+.*|thinking\.{0,3}|đã\s+dừng\s+suy\s+nghĩ|đang\s+suy\s+nghĩ\.{0,3}|đã\s+suy\s+nghĩ\s+trong\s+\d+.*)$",
+    re.IGNORECASE,
+)
+
+
+def _is_pure_thinking_indicator(text: str) -> bool:
+    cleaned = text.strip()
+    return bool(not cleaned or THINKING_INDICATOR_PATTERN.match(cleaned))
+
+
+def download_chatgpt_image_via_page(page: Page, chatgpt_url: str) -> str:
+    """Persist one authenticated ChatGPT PNG after URL, redirect and size checks."""
+    validate_chatgpt_image_url(chatgpt_url)
+    payload = page.evaluate(
+        """
+        async ({ url, maxBytes }) => {
+            const response = await fetch(url, { credentials: 'include' });
+            if (!response.ok) throw new Error(`Image download failed: ${response.status}`);
+            const declaredSize = Number(response.headers.get('content-length') || 0);
+            if (declaredSize > maxBytes) throw new Error('Image exceeds size limit');
+            const buffer = await response.arrayBuffer();
+            if (buffer.byteLength > maxBytes) throw new Error('Image exceeds size limit');
+            const bytes = new Uint8Array(buffer);
+            let binary = '';
+            const chunkSize = 0x8000;
+            for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+                binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+            }
+            return {
+                base64: btoa(binary),
+                finalUrl: response.url,
+                contentType: response.headers.get('content-type') || ''
+            };
+        }
+        """,
+        {"url": chatgpt_url, "maxBytes": MAX_IMAGE_DOWNLOAD_BYTES},
+    )
+    validate_chatgpt_image_url(str(payload.get("finalUrl") or ""))
+    content_type = str(payload.get("contentType") or "").split(";", 1)[0].casefold()
+    if content_type != "image/png":
+        raise ValueError("Generated thumbnail did not return PNG content.")
+    image_bytes = base64.b64decode(payload.get("base64") or "", validate=True)
+    validate_image_bytes(image_bytes)
+    THUMBNAILS_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f"thumb_{uuid.uuid4().hex[:12]}.png"
+    destination = THUMBNAILS_DIR / filename
+    destination.write_bytes(image_bytes)
+    return f"/api/thumbnails/{filename}"
+THUMBNAIL_GENERATION_ERROR_MARKERS = (
+    "something went wrong",
+    "please try again",
+    "prompt may violate",
+    "may violate our content",
+    "may violate our guardrails",
+    "content policies",
+    "content policy",
+    "image generation failed",
+    "this response couldn't load",
+    "this response couldn’t load",
+    "this response could not load",
+    "failed to generate",
+    "đã xảy ra lỗi",
+    "hãy thử lại",
+)
+
+
+class ChatGPTGenerationTimeoutError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        response_text: str = "",
+        previous_assistant_turn: int = -1,
+        previous_assistant_count: int = 0,
+    ):
+        super().__init__(message)
+        self.response_text = response_text
+        self.previous_assistant_turn = previous_assistant_turn
+        self.previous_assistant_count = previous_assistant_count
+
+
+def is_valid_chapter_response(response_text: str) -> bool:
+    timestamp_lines = re.findall(
+        r"(?m)^\s*((?:\d{1,2}:)?\d{1,2}:\d{2})\s*(?:-|–|—)\s*\S+",
+        response_text,
+    )
+    if len(timestamp_lines) < 3:
+        return False
+    return all(int(part) == 0 for part in timestamp_lines[0].split(":"))
+
+
+def sanitize_chapter_response(response_text: str) -> str:
+    chapter_lines = [
+        line.strip()
+        for line in clean_text(response_text).splitlines()
+        if re.match(
+            r"^\s*(?:(?:\d{1,2}:)?\d{1,2}:\d{2})\s*(?:-|–|—)\s*\S+",
+            line,
+        )
+    ]
+    if not chapter_lines:
+        return clean_text(response_text)
+    return "Nội dung chính trong video:\n\n" + "\n".join(chapter_lines)
+
+
+def select_reusable_chapter_response(
+    conversation_turns: list[tuple[str, str]],
+) -> str:
+    for user_index in range(len(conversation_turns) - 1, -1, -1):
+        role, user_text = conversation_turns[user_index]
+        if role != "user" or "chapter" not in user_text.lower():
+            continue
+
+        next_user_index = next(
+            (
+                index
+                for index in range(user_index + 1, len(conversation_turns))
+                if conversation_turns[index][0] == "user"
+            ),
+            len(conversation_turns),
+        )
+        for response_role, response_text in reversed(
+            conversation_turns[user_index + 1:next_user_index]
+        ):
+            cleaned_response = clean_text(response_text)
+            if (
+                response_role == "assistant"
+                and is_valid_chapter_response(cleaned_response)
+            ):
+                return sanitize_chapter_response(cleaned_response)
+    return ""
+
+
+def select_reusable_outline_response(
+    conversation_turns: list[tuple[str, str]],
+) -> str:
+    for role, response_text in reversed(conversation_turns):
+        cleaned_response = clean_text(response_text)
+        if (
+            role == "assistant"
+            and split_outline_parts(cleaned_response)
+        ):
+            return cleaned_response
+    return ""
+
+
+def is_thumbnail_generation_error_response(response_text: str) -> bool:
+    normalized_response = response_text.strip().lower()
+    return any(
+        marker in normalized_response
+        for marker in THUMBNAIL_GENERATION_ERROR_MARKERS
+    )
+
+
+def select_thumbnail_response_turn_number(
+    visible_turns: list[tuple[int, str]],
+    request_turn_number: int,
+) -> int | None:
+    response_turns = [
+        turn_number
+        for turn_number, role in visible_turns
+        if role == "assistant" and turn_number > request_turn_number
+    ]
+    return min(response_turns, default=None)
+
+
+def get_visible_conversation_turns(page: Page) -> list[tuple[int, str]]:
+    visible_turns = []
+    turns = page.locator('[data-testid^="conversation-turn-"]')
+    try:
+        turn_count = turns.count()
+    except Exception:
+        turn_count = 0
+
+    if turn_count > 0:
+        for index in range(turn_count):
+            turn = turns.nth(index)
+            if not turn.is_visible():
+                continue
+            test_id = turn.get_attribute("data-testid") or ""
+            try:
+                turn_number = int(test_id.rsplit("-", 1)[-1])
+            except ValueError:
+                continue
+
+            role = turn.get_attribute("data-turn") or ""
+            if not role:
+                role_nodes = turn.locator("[data-message-author-role], [data-conversation-role]")
+                if role_nodes.count() > 0:
+                    role = (
+                        role_nodes.first.get_attribute("data-message-author-role")
+                        or role_nodes.first.get_attribute("data-conversation-role")
+                        or ""
+                    )
+            visible_turns.append((turn_number, role))
+        if visible_turns:
+            return visible_turns
+    # Modern ChatGPT DOM (or when no numbered conversation-turn elements exist):
+    try:
+        raw_turns = page.evaluate("""() => {
+            const units = Array.from(document.querySelectorAll(
+                '[data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"], .group\\/user-message, .bg-user-message, div.MarkdownRoot-rZKhxa, [data-message-author-role], img[alt*="Generated image"], img[alt*="DALL"]'
+            ));
+            const results = [];
+            let currentTurn = 0;
+            let lastRole = null;
+            for (const unit of units) {
+                const isUser = unit.matches('[data-user-message-bubble="true"], .group\\/user-message, .group\\/user-message *, .bg-user-message, .bg-user-message *')
+                    || unit.getAttribute('data-message-author-role') === 'user'
+                    || (unit.getAttribute('data-conversation-role') || '') === 'user';
+                const role = isUser ? 'user' : 'assistant';
+                if (role !== lastRole) {
+                    results.push([currentTurn++, role]);
+                    lastRole = role;
+                }
+            }
+            return results;
+        }""")
+        if raw_turns:
+            return [(int(t[0]), str(t[1])) for t in raw_turns]
+    except Exception:
+        pass
+
+    return []
+
+
+def get_latest_conversation_turn(page: Page, role: str) -> int:
+    matching_turns = [
+        turn_number
+        for turn_number, turn_role in get_visible_conversation_turns(page)
+        if turn_role == role
+    ]
+    return max(matching_turns, default=-1)
+
+
+def get_assistant_message_count(page: Page) -> int:
+    try:
+        legacy_count = page.locator('[data-message-author-role="assistant"]').count()
+        if legacy_count > 0:
+            return legacy_count
+        return page.evaluate("""() => {
+            return document.querySelectorAll(
+                '[data-markdown-text-style="assistant-message"]'
+            ).length;
+        }""")
+    except Exception:
+        return 0
+
+
+def get_user_message_count(page: Page) -> int:
+    try:
+        legacy_count = page.locator('[data-message-author-role="user"]').count()
+        if legacy_count > 0:
+            return legacy_count
+        return page.evaluate("""() => {
+            return document.querySelectorAll(
+                '[data-user-message-bubble="true"]'
+            ).length;
+        }""")
+    except Exception:
+        return 0
+
+
+def accept_external_app_permission_dialog(page: Page) -> bool:
+    """Accept action/plugin consent dialogs (like vidIQ)."""
+    target_labels = ["always allow", "luôn cho phép", "allow", "cho phép", "đồng ý", "confirm", "xác nhận"]
+    buttons = page.locator("button")
+    try:
+        count = buttons.count()
+    except Exception:
+        return False
+        
+    for button_index in range(count):
+        button = buttons.nth(button_index)
+        if not button.is_visible():
+            continue
+            
+        button_text = button.inner_text().strip()
+        if not button_text:
+            button_text = button.get_attribute("aria-label") or ""
+            
+        normalized_label = " ".join(button_text.casefold().split())
+        for target in target_labels:
+            if target in normalized_label:
+                try:
+                    button.click(timeout=EXTERNAL_APP_PERMISSION_CLICK_TIMEOUT_MS)
+                    print(
+                        f">>> Accepted ChatGPT action dialog with button '{normalized_label}'; continuing to wait for the current response.",
+                        file=sys.stderr,
+                    )
+                    return True
+                except Exception as e:
+                    print(f"Failed to click button '{normalized_label}': {e}", file=sys.stderr)
+                    
+    return False
+
+
+def _extract_base_g_identifier(identifier: str) -> str:
+    ident = str(identifier or "").strip()
+    m_proj = re.match(r"^(g-p-[0-9a-f]{32})(?:-.*)?$", ident, re.IGNORECASE)
+    if m_proj:
+        return m_proj.group(1).lower()
+    m_gpt = re.match(r"^(g-[a-z0-9]{8,})(?:-.*)?$", ident, re.IGNORECASE)
+    if m_gpt:
+        return m_gpt.group(1).lower()
+    return ident.lower()
+
+
+def _normalize_chatgpt_path(path: str) -> str:
+    cleaned = str(path or "").strip().rstrip("/")
+    if not cleaned:
+        return "/"
+    parts = cleaned.strip("/").split("/")
+    # 1. Non-project conversation: /c/<conv_id>
+    if len(parts) == 2 and parts[0] == "c":
+        return f"/c/{parts[1]}"
+    # 2. Project or Custom GPT conversation: /g/<identifier_or_slug>/c/<conv_id>
+    if len(parts) == 4 and parts[0] == "g" and parts[2] == "c":
+        base_id = _extract_base_g_identifier(parts[1])
+        return f"/g/{base_id}/c/{parts[3]}"
+    # 3. Project landing page: /g/<identifier_or_slug>/project
+    if len(parts) == 3 and parts[0] == "g" and parts[2] == "project":
+        base_id = _extract_base_g_identifier(parts[1])
+        return f"/g/{base_id}/project"
+    return "/" + "/".join(parts).lower()
+
+
+def get_response_turn_baseline(
+    page_url_before_send: str,
+    page_url_after_send: str,
+    previous_assistant_turn: int,
+) -> int:
+    before = urlparse(page_url_before_send)
+    after = urlparse(page_url_after_send)
+    if (
+        before.scheme != after.scheme
+        or before.netloc != after.netloc
+        or _normalize_chatgpt_path(before.path) != _normalize_chatgpt_path(after.path)
+    ):
+        return -1
+    return previous_assistant_turn
+
+
+def strip_outline_preamble(outline: str) -> str:
+    clean_outline = outline.strip()
+    if not clean_outline:
+        return ""
+    first_marker = re.search(
+        r"(?:^|\n|\r\n)\s*(?:(?:#{1,6}\s*)?(?:\*\*)?(?:\[\s*)?(?:phần|phan|part|section|mục|đoạn)\s*\d*(?:[:\-–—.\s].*?)?(?:\])?(?:\*\*)?|(?:#{1,6}\s*)?(?:\*\*)?\d+[\.\)\/\-–—]\s+)",
+        clean_outline,
+        flags=re.IGNORECASE,
+    )
+    if first_marker and first_marker.start() > 0:
+        return clean_outline[first_marker.start():].strip()
+    return clean_outline
+
+
+def split_outline_parts(
+    outline: str,
+    max_chars: int = OUTLINE_PART_MAX_CHARS,
+) -> list[str]:
+    _check_for_chatgpt_errors(outline)
+    clean_outline = strip_outline_preamble(outline)
+    if not clean_outline or looks_like_chatgpt_error(clean_outline):
+        return []
+
+    # Priority 1: Delimiters with [PHẦN ...], [PHAN ...], [PART ...], [SECTION ...]
+    bracket_tag_pattern = re.compile(
+        r"\[\s*(?:phần|phan|part|section)\s*(?:\d+)?(?:\s*[:\-–—].*?)?\s*\]",
+        flags=re.IGNORECASE,
+    )
+
+    # Priority 2: Line-based numbered headers like PHẦN 1:, ### Phần 1, **Phần 1:**, [Phần 1], Mục 1:, Đoạn 1:
+    header_tag_pattern = re.compile(
+        r"(?:^|\n|\r\n)\s*(?:#{1,6}\s*)?(?:\*\*)?(?:\[\s*)?(?:phần|phan|part|section|mục|đoạn)\s*\d+[:\-–—.\s]*(?:\])?(?:\*\*)?",
+        flags=re.IGNORECASE,
+    )
+
+    # Priority 3: Numbered list headers like 1. , 2. , ### 1. , **1.** (when there are at least 2 items)
+    numbered_tag_pattern = re.compile(
+        r"(?:^|\n|\r\n)\s*(?:#{1,6}\s*)?(?:\*\*)?(?:\d+|[ivxLCDM]+)[\.\)\/\-–—]\s+(?:\*\*)?",
+        flags=re.IGNORECASE,
+    )
+
+    if bracket_tag_pattern.search(clean_outline):
+        raw_parts = [
+            part.strip()
+            for part in bracket_tag_pattern.split(clean_outline)
+            if part.strip()
+        ]
+    elif header_tag_pattern.search(clean_outline):
+        raw_parts = [
+            part.strip()
+            for part in header_tag_pattern.split(clean_outline)
+            if part.strip()
+        ]
+    elif len(numbered_tag_pattern.findall(clean_outline)) >= 2:
+        raw_parts = [
+            part.strip()
+            for part in numbered_tag_pattern.split(clean_outline)
+            if part.strip()
+        ]
+    else:
+        raw_parts = [
+            part.strip()
+            for part in clean_outline.split("[PHAN]")
+            if part.strip()
+        ]
+    
+    # Strip any leading doc artifact markers if separated alone
+    cleaned_raw_parts = []
+    for part in raw_parts:
+        p = part.strip()
+        if p.startswith(":::writing") and "\n" not in p:
+            continue
+        cleaned_raw_parts.append(p)
+    if cleaned_raw_parts:
+        raw_parts = cleaned_raw_parts
+
+    if not raw_parts and clean_outline:
+        raw_parts = [clean_outline]
+
+    chunks = []
+    for raw_part in raw_parts:
+        units = [line.strip() for line in raw_part.splitlines() if line.strip()]
+        if not units:
+            continue
+
+        current_units = []
+        current_length = 0
+        for unit in units:
+            if len(unit) > max_chars:
+                words = unit.split()
+                word_chunk = []
+                word_chunk_length = 0
+                expanded_units = []
+                for word in words:
+                    added_length = len(word) + (1 if word_chunk else 0)
+                    if word_chunk and word_chunk_length + added_length > max_chars:
+                        expanded_units.append(" ".join(word_chunk))
+                        word_chunk = []
+                        word_chunk_length = 0
+                    word_chunk.append(word)
+                    word_chunk_length += len(word) + (1 if word_chunk_length else 0)
+                if word_chunk:
+                    expanded_units.append(" ".join(word_chunk))
+            else:
+                expanded_units = [unit]
+
+            for expanded_unit in expanded_units:
+                added_length = len(expanded_unit) + (1 if current_units else 0)
+                if (
+                    current_units
+                    and current_length + added_length > max_chars
+                ):
+                    chunks.append("\n".join(current_units))
+                    current_units = []
+                    current_length = 0
+                current_units.append(expanded_unit)
+                current_length += len(expanded_unit) + (
+                    1 if len(current_units) > 1 else 0
+                )
+
+        if current_units:
+            chunks.append("\n".join(current_units))
+
+    return chunks
+
+
+def is_core_script_complete(transcript: str, state: dict) -> bool:
+    body_parts = state.get("body_parts", [])
+    expected_body_parts = state.get("expected_body_parts", 0)
+    return bool(
+        state.get("intro", "").strip()
+        and state.get("outro", "").strip()
+        and expected_body_parts > 0
+        and len(body_parts) == expected_body_parts
+        and all(part.strip() for part in body_parts)
+    )
+
+
+def wait_for_new_user_turn(page: Page, previous_user_turn: int) -> int:
+    deadline = time.time() + THUMBNAIL_TURN_WAIT_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        request_turn = get_latest_conversation_turn(page, "user")
+        if request_turn > previous_user_turn:
+            return request_turn
+        time.sleep(0.25)
+    latest_turn = get_latest_conversation_turn(page, "user")
+    if latest_turn >= 0:
+        return latest_turn
+    return max(0, previous_user_turn + 1)
+
+
+def get_thumbnail_image_identity(image_url: str) -> str:
+    parsed_url = urlparse(image_url)
+    if parsed_url.scheme and parsed_url.netloc:
+        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+        query_params = parse_qs(parsed_url.query)
+        for asset_key in ("id", "file_id", "asset_id"):
+            asset_values = query_params.get(asset_key)
+            if asset_values:
+                return f"{base_url}?{asset_key}={asset_values[0]}"
+        return base_url
+    return image_url
+
+
+def scroll_chatgpt_conversation_to_bottom(page: Page) -> None:
+    """Scroll ChatGPT conversation to bottom within <main> to ensure virtualized DOM renders the latest items, without touching sidebar history."""
+    try:
+        page.evaluate(
+            """() => {
+                const mainEl = document.querySelector('main') || document.querySelector('[role="main"]');
+                if (!mainEl) {
+                    window.scrollTo(0, document.body.scrollHeight);
+                    return;
+                }
+                const scrollables = Array.from(mainEl.querySelectorAll('*')).filter(el => {
+                    if (el.closest('nav, aside, header, [aria-label*="history" i], [aria-label*="sidebar" i], #sidebar')) {
+                        return false;
+                    }
+                    const style = window.getComputedStyle(el);
+                    return (style.overflowY === 'auto' || style.overflowY === 'scroll') && el.scrollHeight > el.clientHeight;
+                });
+                scrollables.forEach(s => s.scrollTop = s.scrollHeight);
+                mainEl.scrollTop = mainEl.scrollHeight;
+                window.scrollTo(0, document.body.scrollHeight);
+            }"""
+        )
+    except Exception:
+        pass
+
+
+def get_existing_thumbnail_identities(page: Page) -> set[str]:
+    """Collect image identities currently visible in the DOM before sending a prompt."""
+    try:
+        scroll_chatgpt_conversation_to_bottom(page)
+        images = page.locator(THUMBNAIL_IMAGE_SELECTOR)
+        if images.count() == 0:
+            return set()
+        image_snapshots = images.evaluate_all(
+            """
+            elements => elements.map(image => image.getAttribute('src') || image.currentSrc || '')
+            """
+        )
+        identities = set()
+        for src in image_snapshots:
+            if src:
+                identities.add(get_thumbnail_image_identity(src))
+        return identities
+    except Exception:
+        return set()
+
+
+def wait_for_thumbnail_images(
+    page: Page,
+    request_turn: int,
+    download_image,
+    exclude_identities: set[str] | None = None,
+) -> list[str]:
+    excluded = exclude_identities or set()
+    deadline = time.time() + THUMBNAIL_IMAGE_WAIT_TIMEOUT_SECONDS
+    response_turn = None
+    snapshot_error_logged = False
+    while time.time() < deadline:
+        scroll_chatgpt_conversation_to_bottom(page)
+        if response_turn is None:
+            response_turn = select_thumbnail_response_turn_number(
+                get_visible_conversation_turns(page),
+                request_turn,
+            )
+
+        turn = None
+        if response_turn is not None:
+            turn = page.locator(f'[data-testid="conversation-turn-{response_turn}"]')
+            if turn.count() == 0:
+                turn = None
+
+        if turn is None:
+            turn = page.locator(
+                '[data-markdown-text-style="assistant-message"], '
+                '[data-message-author-role="assistant"], '
+                '[data-turn-key]'
+            ).last
+
+        if turn.count() >= 1:
+            images = turn.locator(THUMBNAIL_IMAGE_SELECTOR)
+        else:
+            images = page.locator(THUMBNAIL_IMAGE_SELECTOR)
+
+        try:
+            image_snapshots = images.evaluate_all(
+                """
+                elements => elements.map(image => ({
+                    src: image.getAttribute('src') || image.currentSrc || '',
+                    ready: image.complete && image.naturalWidth > 0,
+                }))
+                """
+            )
+            if not image_snapshots:
+                image_snapshots = page.locator(THUMBNAIL_IMAGE_SELECTOR).evaluate_all(
+                    """
+                    elements => elements.map(image => ({
+                        src: image.getAttribute('src') || image.currentSrc || '',
+                        ready: image.complete && image.naturalWidth > 0,
+                    }))
+                    """
+                )
+            if not image_snapshots:
+                image_snapshots = page.evaluate(
+                    """() => {
+                        const imgs = Array.from(document.querySelectorAll('img')).filter(img => {
+                            const src = img.getAttribute('src') || img.currentSrc || '';
+                            const alt = img.getAttribute('alt') || '';
+                            return (
+                                src.startsWith('blob:') ||
+                                src.includes('backend-api') ||
+                                src.includes('oaiusercontent') ||
+                                alt.includes('Generated image') ||
+                                alt.includes('DALL')
+                            );
+                        });
+                        return imgs.map(img => ({
+                            src: img.getAttribute('src') || img.currentSrc || '',
+                            ready: img.complete && img.naturalWidth > 0,
+                        }));
+                    }"""
+                )
+            generation_active = (
+                page.locator(CHATGPT_STOP_BUTTON_SELECTOR).count() > 0
+            )
+            snapshot_error_logged = False
+        except Exception as exc:
+            if not snapshot_error_logged:
+                print(
+                    "Thumbnail DOM changed while reading images; retrying: "
+                    f"{exc}",
+                    file=sys.stderr,
+                )
+                snapshot_error_logged = True
+            time.sleep(1)
+            continue
+
+        image_urls = []
+        image_identities = set()
+        for image_snapshot in image_snapshots:
+            image_url = image_snapshot.get("src", "")
+            image_identity = get_thumbnail_image_identity(image_url)
+            if (
+                image_url
+                and image_snapshot.get("ready")
+                and image_identity not in excluded
+                and image_identity not in image_identities
+            ):
+                image_urls.append(image_url)
+                image_identities.add(image_identity)
+
+        if image_urls and not generation_active:
+            downloaded_urls = []
+            for image_url in image_urls[:MAX_THUMBNAIL_IMAGES_PER_RESPONSE]:
+                downloaded_url = download_image(image_url) or image_url
+                if downloaded_url and downloaded_url not in downloaded_urls:
+                    downloaded_urls.append(downloaded_url)
+            if downloaded_urls:
+                return downloaded_urls
+        time.sleep(1)
+    return []
+
+
+def get_reusable_thumbnail_images(page: Page, download_image) -> list[str]:
+    """Extract and download existing thumbnail images from the page if available."""
+    try:
+        images = page.locator(THUMBNAIL_IMAGE_SELECTOR)
+        if images.count() == 0:
+            return []
+        image_snapshots = images.evaluate_all(
+            """
+            elements => elements.map(image => ({
+                src: image.getAttribute('src') || image.currentSrc || '',
+                ready: image.complete && image.naturalWidth > 0,
+            }))
+            """
+        )
+        downloaded = []
+        for snap in image_snapshots:
+            src = snap.get("src", "")
+            if src and snap.get("ready"):
+                local_url = download_image(src) or src
+                if local_url and local_url not in downloaded:
+                    downloaded.append(local_url)
+        return downloaded
+    except Exception:
+        return []
+
+
+def wait_for_thumbnail_image(
+    page: Page,
+    request_turn: int,
+    download_image,
+    exclude_identities: set[str] | None = None,
+) -> str:
+    image_urls = wait_for_thumbnail_images(
+        page,
+        request_turn,
+        download_image,
+        exclude_identities=exclude_identities,
+    )
+    return image_urls[0] if image_urls else ""
+
+
+def send_thumbnail_prompt(
+    page: Page,
+    prompt_text: str,
+    download_image,
+    reference_image_base64: str | None = None
+) -> tuple[str, list[str]]:
+    existing_identities = get_existing_thumbnail_identities(page)
+    previous_user_turn = get_latest_conversation_turn(page, "user")
+    response_text = send_prompt(
+        page,
+        prompt_text,
+        allow_empty_response=True,
+        reference_image_base64=reference_image_base64
+    )
+    request_turn = wait_for_new_user_turn(page, previous_user_turn)
+    if is_thumbnail_generation_error_response(response_text):
+        return response_text, []
+    image_urls = wait_for_thumbnail_images(
+        page,
+        request_turn,
+        download_image,
+        exclude_identities=existing_identities,
+    )
+    return response_text, image_urls
+
+
+def retry_thumbnail_generation(page: Page, download_image) -> tuple[str, list[str]]:
+    send_prompt(page, THUMBNAIL_REPAIR_PROMPT)
+    return send_thumbnail_prompt(
+        page,
+        THUMBNAIL_REGENERATE_PROMPT,
+        download_image,
+    )
+
+
+def build_thumbnail_generation_prompt(
+    base_prompt: str,
+    thumbnail_type: str,
+) -> str:
+    return base_prompt
+
+
+def append_thumbnail_image_markers(
+    response_text: str,
+    image_urls: list[str],
+) -> str:
+    markers = "\n\n".join(f"[IMAGE_URL:{url}]" for url in image_urls)
+    return f"{response_text}\n\n{markers}".strip() if markers else response_text
+
+
+def _get_video_reference_base64(video_id: int | None = None) -> str | None:
+    """Retrieve existing base64-encoded reference images for a video if available."""
+    vid = video_id if video_id is not None else _checkpoint_video_id()
+    if not vid:
+        return None
+    ref_dir = REFERENCES_DIR / f"video_{vid}"
+    if not ref_dir.exists():
+        return None
+    image_paths = sorted(ref_dir.glob("ref_*.jpg"))
+    if not image_paths:
+        return None
+    base64_items = []
+    for p in image_paths:
+        b64 = media_fetcher.image_to_base64(p)
+        if b64:
+            base64_items.append(b64)
+    return json.dumps(base64_items) if base64_items else None
+
+
+def get_chatgpt_project_url(prompt_version: str = "") -> str:
+    return get_project_url(prompt_version)
+
+
+def ensure_expected_project_page(actual_url: str, project_url: str) -> None:
+    actual = urlparse(actual_url)
+    expected = urlparse(project_url)
+    if (
+        actual.scheme != expected.scheme
+        or actual.netloc != expected.netloc
+        or _normalize_chatgpt_path(actual.path) != _normalize_chatgpt_path(expected.path)
+    ):
+        raise RuntimeError(
+            "ChatGPT did not stay on the configured Project page. "
+            "No prompt was sent."
+        )
+
+
+def is_chatgpt_conversation_url(url: str) -> bool:
+    parsed_url = urlparse(url)
+    path_parts = parsed_url.path.strip("/").split("/")
+    if parsed_url.scheme != "https" or parsed_url.netloc != "chatgpt.com":
+        return False
+    if len(path_parts) == 2 and path_parts[0] == "c":
+        return True
+    return (
+        len(path_parts) == 4
+        and path_parts[0] == "g"
+        and (path_parts[1].startswith("g-p-") or path_parts[1].startswith("g-"))
+        and path_parts[2] == "c"
+    )
+
+
+def get_video_chat_url(chat_url: str) -> str:
+    normalized_url = chat_url.strip().rstrip("/")
+    if not is_chatgpt_conversation_url(normalized_url):
+        raise RuntimeError(
+            "Video does not have a valid ChatGPT conversation URL. "
+            "No prompt was sent."
+        )
+    return normalized_url
+
+
+def get_video_thumbnail_chat_url(chat_url: str) -> str:
+    return get_video_chat_url(chat_url)
+
+
+def ensure_expected_conversation_page(
+    actual_url: str,
+    conversation_url: str,
+) -> None:
+    actual = urlparse(actual_url)
+    expected = urlparse(conversation_url)
+    m_actual = re.search(r"/c/([a-zA-Z0-9_-]+)", actual.path)
+    m_expected = re.search(r"/c/([a-zA-Z0-9_-]+)", expected.path)
+    if m_actual and m_expected and m_actual.group(1).lower() == m_expected.group(1).lower():
+        return
+    if (
+        actual.scheme != expected.scheme
+        or actual.netloc != expected.netloc
+        or _normalize_chatgpt_path(actual.path) != _normalize_chatgpt_path(expected.path)
+    ):
+        raise RuntimeError(
+            "ChatGPT did not stay on the video's conversation page. "
+            "No prompt was sent."
+        )
+
+
+def is_expected_project_conversation_url(
+    actual_url: str,
+    project_url: str,
+) -> bool:
+    actual = urlparse(str(actual_url or "").strip())
+    project = urlparse(str(project_url or "").strip())
+    actual_parts = actual.path.strip("/").split("/")
+    project_parts = project.path.strip("/").split("/")
+    if not (
+        actual.scheme == project.scheme == "https"
+        and actual.netloc == project.netloc == "chatgpt.com"
+        and len(project_parts) == 3
+        and project_parts[0] == "g"
+        and project_parts[2] == "project"
+        and len(actual_parts) == 4
+        and actual_parts[0] == "g"
+        and actual_parts[2] == "c"
+        and bool(actual_parts[3])
+    ):
+        return False
+    actual_base = _extract_base_g_identifier(actual_parts[1])
+    project_base = _extract_base_g_identifier(project_parts[1])
+    return actual_base == project_base
+
+
+def ensure_expected_project_conversation_page(
+    actual_url: str,
+    project_url: str,
+) -> None:
+    if not is_expected_project_conversation_url(actual_url, project_url):
+        raise RuntimeError(
+            "ChatGPT created or opened a conversation outside the configured "
+            "Project. No automatic resend was attempted."
+        )
+
+
+def get_project_sidebar_slug(project_url: str) -> str:
+    project_identifier = urlparse(project_url).path.strip("/").split("/")[1]
+    match = re.match(r"^g-p-[0-9a-f]{32}-(.+)$", project_identifier, re.I)
+    return match.group(1) if match else project_identifier.removeprefix("g-p-")
+
+
+def open_configured_project_from_sidebar(page: Page, project_url: str) -> bool:
+    """Open a Project through ChatGPT's healthy client-side sidebar.
+
+    Project rows are interactive ``div`` elements rather than links. Directly
+    loading ``/project`` can leave ChatGPT on its full-page "Try again" state,
+    while the same route works when reached through the hydrated home shell.
+    This helper only expands sidebar rows and clicks their non-destructive
+    "Open project home" control; it never submits a prompt.
+    """
+    project_identifier = urlparse(project_url).path.strip("/").split("/")[1]
+    project_slug = get_project_sidebar_slug(project_url)
+    result = page.evaluate(
+        """async ({ projectIdentifier, projectSlug }) => {
+            const delay = (milliseconds) => new Promise(
+                (resolve) => setTimeout(resolve, milliseconds)
+            );
+            const normalize = (value) => (value || '')
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .toLowerCase()
+                .replace(/[^a-z0-9]+/g, ' ')
+                .trim();
+            const normalizedSlug = normalize(projectSlug.replace(/-/g, ' '));
+
+            // 1. Try modern ChatGPT sidebar project data attributes
+            const modernRows = [...document.querySelectorAll(
+                '[data-app-action-sidebar-project-id], [data-app-action-sidebar-project-label], [data-sidebar-project-container-id]'
+            )];
+            for (const row of modernRows) {
+                const rowId = normalize(row.getAttribute('data-app-action-sidebar-project-id') || '');
+                const rowLabel = normalize(row.getAttribute('data-app-action-sidebar-project-label') || row.innerText || '');
+                if (rowId.includes(normalizedId) || rowLabel.includes(normalizedSlug) || normalizedSlug.includes(rowLabel)) {
+                    const newChatBtn = row.querySelector('button[aria-label*="New chat in "]')
+                        || row.parentElement?.querySelector('button[aria-label*="New chat in "]');
+                    if (newChatBtn) {
+                        newChatBtn.click();
+                        await delay(200);
+                        return true;
+                    }
+                    row.click();
+                    await delay(200);
+                    return true;
+                }
+            }
+
+            const getRows = () => [...document.querySelectorAll(
+                'button[aria-label^="Open project options for "], button[aria-label^="Project actions for "]'
+            )].map((optionsButton) => {
+                const controls = optionsButton.parentElement;
+                const group = controls?.parentElement;
+                const row = group?.querySelector(
+                    '[data-sidebar-item][role="button"]'
+                ) || group?.querySelector('[role="button"]') || controls;
+                const homeButton = controls?.querySelector(
+                    'button[aria-label="Open project home"]'
+                ) || controls?.querySelector('button[aria-label*="New chat in "]') || optionsButton;
+                const label = row?.innerText?.trim()
+                    || optionsButton.getAttribute('aria-label')
+                        ?.replace(/^Open project options for\s+/, '')
+                        ?.replace(/^Project actions for\s+/, '')
+                    || '';
+                return { group, row, homeButton, label };
+            }).filter((item) => item.row && item.homeButton);
+
+            const expandMoreSidebarItems = async () => {
+                const buttons = [...document.querySelectorAll(
+                    'button, [role="button"]'
+                )].filter((element) => {
+                    const text = normalize(
+                        element.innerText || element.textContent
+                    );
+                    const rect = element.getBoundingClientRect();
+                    return rect.width > 0
+                        && rect.height > 0
+                        && (text === 'show more' || text === 'hien them');
+                });
+                for (const button of buttons.slice(0, 4)) {
+                    button.click();
+                    await delay(150);
+                }
+            };
+
+            let rows = getRows();
+            let selected = rows.find(
+                (item) => normalize(item.label) === normalizedSlug
+            );
+            if (!selected) {
+                await expandMoreSidebarItems();
+                rows = getRows();
+                selected = rows.find(
+                    (item) => normalize(item.label) === normalizedSlug
+                );
+            }
+
+            // When the URL slug and display name differ, identify the row by
+            // expanding it and checking its project-scoped conversation links.
+            if (!selected) {
+                for (const item of rows) {
+                    if (item.row && item.row.getAttribute('aria-expanded') !== 'true') {
+                        item.row.click();
+                        await delay(200);
+                    }
+                    const expectedConversationPrefix = `/g/${projectIdentifier}/c/`;
+                    const ownsConfiguredProject = [...document.querySelectorAll(
+                        'a[href]'
+                    )].some((anchor) => {
+                        try {
+                            const url = new URL(anchor.href, location.origin);
+                            return url.pathname.startsWith(
+                                expectedConversationPrefix
+                            );
+                        } catch (_) {
+                            return false;
+                        }
+                    });
+                    if (ownsConfiguredProject) {
+                        selected = item;
+                        break;
+                    }
+                }
+            }
+
+            if (!selected) return false;
+            if (selected.row && selected.row.getAttribute('aria-expanded') !== 'true') {
+                selected.row.click();
+                await delay(200);
+            }
+            if (selected.homeButton) {
+                selected.homeButton.click();
+            }
+            return true;
+        }""",
+        {
+            "projectIdentifier": project_identifier,
+            "projectSlug": project_slug,
+        },
+    )
+    return bool(result)
+
+
+def navigate_to_chatgpt_project(
+    page: Page,
+    project_url: str,
+    bootstrap_url: str = DEFAULT_CHATGPT_BOOTSTRAP_URL,
+) -> None:
+    """Open a configured Project from direct route or healthy sidebar shell.
+
+    The exact Project route is validated before the caller can send a prompt.
+    """
+    expected_path = urlparse(project_url).path.rstrip("/")
+    normalized_expected = _normalize_chatgpt_path(expected_path)
+    last_error: Exception | None = None
+
+    for attempt in range(CHATGPT_PROJECT_NAVIGATION_ATTEMPTS):
+        try:
+            # 1. Direct navigation first (standard & fast)
+            try:
+                page.goto(
+                    project_url,
+                    wait_until="domcontentloaded",
+                    timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+                )
+                check_chatgpt_page_attention(page)
+                actual_path = urlparse(page.url).path.rstrip("/")
+                if _normalize_chatgpt_path(actual_path) == normalized_expected:
+                    wait_for_chatgpt_composer(page)
+                    return
+            except ChatGPTAttentionRequiredError:
+                raise
+            except Exception as direct_exc:
+                last_error = direct_exc
+
+            # 2. Sidebar bootstrap navigation fallback
+            page.goto(
+                bootstrap_url,
+                wait_until="domcontentloaded",
+                timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+            )
+            wait_for_chatgpt_composer(page)
+
+            if not open_configured_project_from_sidebar(page, project_url):
+                # Fallback: navigate directly to project URL
+                page.goto(
+                    project_url,
+                    wait_until="domcontentloaded",
+                    timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+                )
+
+            project_identifier = urlparse(project_url).path.strip("/").split("/")[1]
+            base_project_id = _extract_base_g_identifier(project_identifier)
+
+            page.wait_for_function(
+                """(baseProjId) => {
+                    const path = location.pathname.replace(/\/+$/, '').toLowerCase();
+                    return path.startsWith('/g/' + baseProjId) && path.endsWith('/project');
+                }""",
+                arg=base_project_id,
+                timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+            )
+
+            ensure_expected_project_page(page.url, project_url)
+            wait_for_chatgpt_composer(page)
+            return
+        except ChatGPTAttentionRequiredError:
+            # Authentication and anti-bot challenges require an explicit user
+            # action. Do not turn them into a transient navigation failure or
+            # retry the Project route, because that could open/focus another
+            # window and enqueue the same prompt again.
+            raise
+        except Exception as exc:
+            last_error = exc
+            print(
+                ">>> ChatGPT Project bootstrap attempt "
+                f"{attempt + 1}/{CHATGPT_PROJECT_NAVIGATION_ATTEMPTS} failed: {exc}",
+                file=sys.stderr,
+            )
+
+    raise RuntimeError(
+        "ChatGPT Project did not become ready after bounded bootstrap "
+        "recovery. No prompt was sent."
+    ) from last_error
+
+
+def get_chatgpt_load_state(page: Page) -> dict:
+    """Return enough DOM state to distinguish a transient full-page failure."""
+    try:
+        return page.evaluate(
+            _chatgpt_dom_script("""
+                const isVisible = (element) => {
+                    if (!element) return false;
+                    const style = window.getComputedStyle(element);
+                    const rect = element.getBoundingClientRect();
+                    return style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && rect.width > 0
+                        && rect.height > 0;
+                };
+                const normalize = (value) => (value || '')
+                    .replace(/\s+/g, ' ')
+                    .trim()
+                    .toLowerCase();
+                const retryLabels = ['try again', 'retry', 'thử lại'];
+                const loginLabels = ['log in', 'sign in', 'đăng nhập'];
+                const challengeMarkers = [
+                    'verify you are human', 'checking your browser',
+                    'security check', 'cloudflare', 'captcha', 'just a moment',
+                    'xác minh bạn là con người', 'đang kiểm tra trình duyệt'
+                ];
+                const editor = findComposer();
+                const turns = document.querySelectorAll(
+                    '[data-testid^="conversation-turn-"], '
+                    + '[data-message-author-role], '
+                    + '[data-user-message-bubble="true"], '
+                    + '[data-markdown-text-style="assistant-message"]'
+                );
+                const retryButton = [...document.querySelectorAll(
+                    'button, [role="button"]'
+                )].find((element) => {
+                    const label = normalize(
+                        element.innerText
+                        || element.textContent
+                        || element.getAttribute('aria-label')
+                    );
+                    return isVisible(element)
+                        && retryLabels.some((candidate) => label === candidate);
+                });
+                const editorPresent = Boolean(editor && isVisible(editor));
+                const visibleControls = [...document.querySelectorAll(
+                    'button, a, [role="button"]'
+                )].filter(isVisible);
+                const loginRequired = !editorPresent && turns.length === 0
+                    && visibleControls.some((element) => {
+                        const label = normalize(
+                            element.innerText
+                            || element.textContent
+                            || element.getAttribute('aria-label')
+                        );
+                        return loginLabels.some((candidate) => label === candidate);
+                    });
+                const pageText = normalize(
+                    `${document.title || ''} ${document.body?.innerText || ''}`
+                );
+                return {
+                    editor_present: editorPresent,
+                    conversation_turn_count: turns.length,
+                    login_required: loginRequired,
+                    challenge_present: !editorPresent && turns.length === 0
+                        && challengeMarkers.some((marker) => pageText.includes(marker)),
+                    full_page_retry: Boolean(
+                        !editorPresent && turns.length === 0 && retryButton
+                    ),
+                    body_preview: normalize(document.body?.innerText).slice(0, 240),
+                };
+            """)
+        )
+    except Exception as exc:
+        return {
+            "editor_present": False,
+            "conversation_turn_count": 0,
+            "full_page_retry": False,
+            "login_required": False,
+            "challenge_present": False,
+            "body_preview": "",
+            "inspection_error": str(exc),
+        }
+
+
+def raise_if_chatgpt_attention_required(state: dict) -> None:
+    """Stop safely when continuing requires an interactive browser."""
+    if not isinstance(state, dict):
+        return
+    if state.get("challenge_present") is True:
+        raise ChatGPTAttentionRequiredError(
+            "ChatGPT đang yêu cầu CAPTCHA/Cloudflare. Mở Auto Login hoặc "
+            "Open Profile để xác minh, sau đó tiếp tục job trong Trung tâm Job."
+        )
+    if state.get("login_required") is True:
+        raise ChatGPTAttentionRequiredError(
+            "Phiên đăng nhập ChatGPT đã hết hạn. Mở Auto Login hoặc Open "
+            "Profile để đăng nhập, sau đó tiếp tục job trong Trung tâm Job."
+        )
+
+
+def check_chatgpt_page_attention(page: Page) -> None:
+    """Inspect redirects before strict Project/conversation URL validation."""
+    state = get_chatgpt_load_state(page)
+    raise_if_chatgpt_attention_required(state)
+    if state.get("editor_present") is True:
+        return
+    try:
+        current_url = str(page.url or "")
+        title = str(page.title() or "")
+        html = str(page.content() or "")
+        blockers = detect_browser_blockers(url=current_url, title=title, html_text=html)
+        for blocker in blockers:
+            if blocker.get("category") in (
+                CATEGORY_CLOUDFLARE,
+                CATEGORY_SESSION_EXPIRED,
+                CATEGORY_VERIFY_2FA,
+            ):
+                capture_browser_diagnostics_sync(
+                    page=page,
+                    service="chatgpt",
+                    error=blocker.get("message"),
+                    action_name="page_attention_check",
+                )
+                raise ChatGPTAttentionRequiredError(blocker.get("message"))
+    except ChatGPTAttentionRequiredError:
+        raise
+    except Exception:
+        pass
+
+
+
+def click_chatgpt_full_page_retry(page: Page) -> bool:
+    """Click only the retry control from a full-page load failure."""
+    try:
+        return bool(
+            page.evaluate(
+                _chatgpt_dom_script("""
+                    const isVisible = (element) => {
+                        if (!element) return false;
+                        const style = window.getComputedStyle(element);
+                        const rect = element.getBoundingClientRect();
+                        return style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && rect.width > 0
+                            && rect.height > 0;
+                    };
+                    const normalize = (value) => (value || '')
+                        .replace(/\s+/g, ' ')
+                        .trim()
+                        .toLowerCase();
+                    const retryLabels = ['try again', 'retry', 'thử lại'];
+                    const editor = findComposer();
+                    const turns = document.querySelectorAll(
+                        '[data-testid^="conversation-turn-"], '
+                        + '[data-message-author-role], '
+                        + '[data-user-message-bubble="true"], '
+                        + '[data-markdown-text-style="assistant-message"]'
+                    );
+                    if (editor || turns.length > 0) return false;
+                    const retryButton = [...document.querySelectorAll(
+                        'button, [role="button"]'
+                    )].find((element) => {
+                        const label = normalize(
+                            element.innerText
+                            || element.textContent
+                            || element.getAttribute('aria-label')
+                        );
+                        return isVisible(element)
+                            && retryLabels.some((candidate) => label === candidate);
+                    });
+                    if (!retryButton) return false;
+                    retryButton.click();
+                    return true;
+                """)
+            )
+        )
+    except Exception:
+        return False
+
+
+def click_chatgpt_inline_retry(page: Page) -> bool:
+    """Click an in-conversation retry / regenerate button if an assistant turn failed."""
+    try:
+        return bool(
+            page.evaluate(
+                """() => {
+                    const isVisible = (element) => {
+                        if (!element) return false;
+                        const style = window.getComputedStyle(element);
+                        const rect = element.getBoundingClientRect();
+                        return style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && rect.width > 0
+                            && rect.height > 0;
+                    };
+                    const normalize = (value) => (value || '')
+                        .replace(/\\s+/g, ' ')
+                        .trim()
+                        .toLowerCase();
+                    const retryLabels = ['try again', 'retry', 'thử lại', 'regenerate', 'tạo lại'];
+                    // 1. Check explicit data-testid retry buttons
+                    const retryBtn = document.querySelector('[data-testid="retry-button"], [data-testid="regenerate-button"]');
+                    if (retryBtn && isVisible(retryBtn)) {
+                        retryBtn.click();
+                        return true;
+                    }
+                    // 2. Check buttons in latest assistant message turn
+                    const assistantTurns = document.querySelectorAll(
+                        '[data-message-author-role="assistant"], [data-testid^="conversation-turn-"]'
+                    );
+                    if (assistantTurns.length > 0) {
+                        const latestTurn = assistantTurns[assistantTurns.length - 1];
+                        const buttons = [...latestTurn.querySelectorAll('button, [role="button"]')];
+                        const match = buttons.find((btn) => {
+                            const label = normalize(
+                                btn.innerText
+                                || btn.textContent
+                                || btn.getAttribute('aria-label')
+                                || btn.getAttribute('title')
+                            );
+                            return isVisible(btn) && retryLabels.some((candidate) => label.includes(candidate));
+                        });
+                        if (match) {
+                            match.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
+def wait_for_chatgpt_composer(
+    page: Page,
+    attempts: int = CHATGPT_COMPOSER_RECOVERY_ATTEMPTS,
+) -> object:
+    """Wait for the composer and recover transient page-load failures safely.
+
+    Recovery occurs before any prompt text is inserted. It therefore cannot
+    duplicate a prompt, and reload always stays in the current project or
+    conversation instead of opening a new chat.
+    """
+    prompt_textarea = page.locator(CHATGPT_VISIBLE_COMPOSER_SELECTOR).first
+    retry_clicked = False
+    last_state: dict = {}
+    last_error: Exception | None = None
+
+    for attempt in range(max(1, attempts)):
+        try:
+            prompt_textarea.wait_for(
+                state="visible",
+                timeout=CHATGPT_COMPOSER_WAIT_PER_ATTEMPT_MS,
+            )
+            return prompt_textarea
+        except Exception as exc:
+            last_error = exc
+            last_state = get_chatgpt_load_state(page)
+            raise_if_chatgpt_attention_required(last_state)
+            if attempt >= max(1, attempts) - 1:
+                break
+
+            recovered = False
+            if last_state.get("full_page_retry") and not retry_clicked:
+                retry_clicked = True
+                recovered = click_chatgpt_full_page_retry(page)
+                if recovered:
+                    print(
+                        ">>> ChatGPT page failed to load; clicked the full-page "
+                        "Try again control before sending any prompt.",
+                        file=sys.stderr,
+                    )
+
+            if not recovered:
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=60000)
+                    print(
+                        ">>> ChatGPT composer was unavailable; reloaded the same "
+                        "page before sending any prompt.",
+                        file=sys.stderr,
+                    )
+                except Exception as reload_error:
+                    last_state["reload_error"] = str(reload_error)
+
+            try:
+                page.wait_for_timeout(CHATGPT_PAGE_RECOVERY_SETTLE_MS)
+            except Exception:
+                time.sleep(CHATGPT_PAGE_RECOVERY_SETTLE_MS / 1000)
+
+    preview = str(last_state.get("body_preview", "")).strip()
+    detail = f" Page preview: {preview!r}." if preview else ""
+    raise RuntimeError(
+        "ChatGPT page did not become ready after bounded same-page recovery. "
+        "No prompt was sent. Check the ChatGPT login or service status."
+        f"{detail} Last error: {last_error}"
+    ) from last_error
+
+
+def get_chatgpt_send_button(prompt_textarea):
+    composer_root = prompt_textarea.locator(
+        "xpath=ancestor::form[1] | "
+        "ancestor::*[@data-composer-root or @data-testid='composer' "
+        "or @data-composer-body][1]"
+    ).first
+    return composer_root.locator(CHATGPT_VISIBLE_SEND_BUTTON_SELECTOR).first
+
+
+def get_chatgpt_composer_diagnostics(page: Page) -> dict:
+    return page.evaluate(
+        _chatgpt_dom_script("""
+            const editor = findComposer();
+            const button = findSendButton(editor);
+            return {
+                editorTextLength: (editor?.innerText || editor?.value || '').length,
+                editorInsideForm: Boolean(editor?.closest('form')),
+                editorInsideWritingBlock: Boolean(
+                    editor?.closest('[data-testid="chatgpt-writing-block"], .writing-block-editor')
+                ),
+                sendButtonFound: Boolean(button),
+                sendButtonDisabled: button?.disabled ?? null,
+                sendButtonAriaDisabled: button?.getAttribute('aria-disabled') ?? null,
+            };
+        """)
+    )
+
+
+class SharedBrowserContextLease:
+    """Proxy a shared persistent context without letting a worker close it."""
+
+    def __init__(self, context, browser):
+        self._context = context
+        # Keep the CDP Browser wrapper alive until the Playwright client exits.
+        self._browser = browser
+
+    def __getattr__(self, name):
+        return getattr(self._context, name)
+
+    def close(self) -> None:
+        # The Browser Service is the only owner allowed to close this context.
+        # Exiting sync_playwright() disconnects this client automatically.
+        return None
+
+
+def launch_chatgpt_context(
+    browser_type,
+    profile_dir,
+    wait_timeout: float = CHATGPT_BROWSER_CONNECT_TIMEOUT_SECONDS,
+    retry_interval: float = CHATGPT_BROWSER_CONNECT_RETRY_SECONDS,
+):
+    """Attach to the long-lived Browser Service without launching a window."""
+    deadline = time.monotonic() + wait_timeout
+    last_error: Exception | None = None
+
+    while True:
+        endpoint = chatgpt_browser_service.get_browser_service_endpoint()
+        if endpoint:
+            try:
+                browser = browser_type.connect_over_cdp(
+                    endpoint,
+                    timeout=min(3_000, max(250, int(wait_timeout * 1000))),
+                )
+                if not browser.contexts:
+                    raise RuntimeError(
+                        "ChatGPT Browser Service has no persistent context."
+                    )
+                return SharedBrowserContextLease(browser.contexts[0], browser)
+            except Exception as exc:
+                last_error = exc
+
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            detail = f" Chi tiết: {last_error}" if last_error else ""
+            raise ChatGPTAttentionRequiredError(
+                "Trình duyệt ChatGPT nền chưa kết nối. Mở Settings và bấm "
+                "'Khởi động trình duyệt nền', sau đó tiếp tục job trong "
+                f"Trung tâm Job.{detail}"
+            ) from last_error
+        time.sleep(min(retry_interval, remaining_seconds))
+
+def get_active_prompts():
+    try:
+        if PROMPTS_PATH.exists():
+            data = json.loads(PROMPTS_PATH.read_text(encoding="utf-8"))
+            # Allow env var override (for per-request version selection)
+            import os
+            version_override = os.environ.get("PROMPT_VERSION", "").strip()
+            active_version = version_override if version_override else data.get("active_version", "default")
+            if active_version in data["versions"]:
+                return data["versions"][active_version]["prompts"]
+            # Fallback to configured active version
+            active_version = data.get("active_version", "default")
+            return data["versions"][active_version]["prompts"]
+    except Exception as e:
+        print(f"Error loading prompts: {e}", file=sys.stderr)
+    
+    return DEFAULT_PROMPTS_DATA["versions"]["default"]["prompts"]
+
+
+def get_active_pipeline() -> dict[str, bool]:
+    pipeline_json = os.environ.get(PROMPT_PIPELINE_ENV, "").strip()
+    if pipeline_json:
+        try:
+            return validate_prompt_pipeline(json.loads(pipeline_json))
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError("Invalid prompt pipeline snapshot.") from exc
+
+    try:
+        if PROMPTS_PATH.exists():
+            data = json.loads(PROMPTS_PATH.read_text(encoding="utf-8"))
+            version_override = os.environ.get("PROMPT_VERSION", "").strip()
+            active_version = version_override or data.get("active_version", "default")
+            version = data.get("versions", {}).get(active_version)
+            if not isinstance(version, dict):
+                version = data.get("versions", {}).get(
+                    data.get("active_version", "default"),
+                    {},
+                )
+            return normalize_prompt_pipeline(version.get("pipeline"))
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    return normalize_prompt_pipeline(None)
+
+
+def build_metadata_generation_prompt(metadata_prompt: str) -> str:
+    if not metadata_prompt.strip():
+        raise RuntimeError("The selected prompt version has no metadata prompt.")
+    return (
+        f"{metadata_prompt.strip()}\n\n"
+        "LƯU Ý QUAN TRỌNG: Hãy tạo lại đầy đủ toàn bộ phần metadata theo "
+        "đúng yêu cầu trên, bao gồm TIÊU ĐỀ, URL SLUG, MÔ TẢ, HASHTAG, "
+        "TAGS, BÌNH LUẬN GHIM và QUIZ. Trả lời trực tiếp, không chào hỏi, không "
+        "giải thích và không thêm nội dung ngoài metadata.\n\n"
+        "BẮT BUỘC trình bày theo đúng mẫu nhãn sau:\n"
+        "TIÊU ĐỀ: ...\n"
+        "URL SLUG: ...\n"
+        "MÔ TẢ VIDEO: ...\n"
+        "HASHTAG: #... #... #...\n"
+        "TAGS: từ khóa 1, từ khóa 2, từ khóa 3, ...\n"
+        "BÌNH LUẬN GHIM: ...\n"
+        "CÂU HỎI: ...\n"
+        "A. ...\nB. ...\nC. ...\nD. ...\n"
+        "CÂU TRẢ LỜI ĐÚNG: ...\n"
+        "GIẢI THÍCH: ..."
+    )
+
+
+def find_missing_metadata_sections(response_text: str) -> list[str]:
+    metadata = response_text.strip()
+    heading_prefix = r"(?im)^\s*(?:#{1,6}\s*)?(?:[-*]\s*)?(?:\*{1,2})?"
+    required_patterns = {
+        "TIÊU ĐỀ": heading_prefix + r"TIÊU ĐỀ",
+        "URL SLUG": heading_prefix + r"(?:URL\s+SLUG|SLUG)",
+        "MÔ TẢ": heading_prefix + r"MÔ TẢ",
+        "HASHTAG": r"(?i)(?<!\w)#[a-z0-9_]+",
+        "BÌNH LUẬN GHIM": heading_prefix + r"BÌNH LUẬN GHIM",
+        "QUIZ": (
+            heading_prefix
+            + r"(?:CÂU HỎI(?:\s+(?:QUIZ|KHÁN GIẢ|TƯƠNG TÁC))?|QUIZ|THEO CÁC BẠN\b)"
+        ),
+    }
+    return [
+        label
+        for label, pattern in required_patterns.items()
+        if not re.search(pattern, metadata)
+    ]
+
+
+def validate_metadata_response(response_text: str) -> str:
+    metadata = response_text.strip()
+    missing_sections = find_missing_metadata_sections(metadata)
+    if missing_sections:
+        raise RuntimeError(
+            "ChatGPT returned incomplete metadata (missing "
+            + ", ".join(missing_sections)
+            + "). The existing metadata was preserved."
+        )
+    return metadata
+
+
+def build_metadata_retry_prompt(missing_sections: list[str]) -> str:
+    return (
+        "Phản hồi metadata vừa rồi chưa đầy đủ, còn thiếu: "
+        + ", ".join(missing_sections)
+        + ". Hãy tạo lại TOÀN BỘ metadata, không chỉ bổ sung phần thiếu. "
+        "BẮT BUỘC xuất đủ các nhãn: TIÊU ĐỀ, URL SLUG, MÔ TẢ VIDEO, "
+        "HASHTAG, TAGS, BÌNH LUẬN GHIM, CÂU HỎI, bốn lựa chọn A/B/C/D, "
+        "CÂU TRẢ LỜI ĐÚNG và GIẢI THÍCH. Trả lời trực tiếp, không chào hỏi "
+        "và không thêm nội dung ngoài metadata."
+    )
+
+
+def request_complete_metadata(page, generation_prompt: str) -> str:
+    response_text = send_prompt(page, generation_prompt).strip()
+    missing_sections = find_missing_metadata_sections(response_text)
+    if not missing_sections:
+        return response_text
+
+    retry_prompt = build_metadata_retry_prompt(missing_sections)
+    retry_response = send_prompt(page, retry_prompt).strip()
+    return validate_metadata_response(retry_response)
+
+
+def remove_citation_artifacts(text: str) -> str:
+    """Removes ChatGPT search citations, source pill badges, and search indicators."""
+    if not isinstance(text, str) or not text:
+        return ""
+    # 1. OpenAI internal source markers (e.g. 【4:0†source】, 【12†source】)
+    cleaned = re.sub(r"【\d+(?::\d+)?†[a-zA-Z]+】", "", text)
+    # 2. Web search status/indicator lines
+    cleaned = re.sub(
+        r"(?im)^\s*(?:\[?\s*Searched\s+\d+\s+(?:sites?|websites?)\s*\]?|\[?\s*Đã tìm kiếm\s+\d+\s+(?:trang\s*web|website|trang)\s*\]?|Tìm kiếm:\s*.+|Search results?|Sources?|Nguồn(?:\s+tham khảo)?)(?::)?\s*$",
+        "",
+        cleaned,
+    )
+    # 3. Inline search indicator badges if attached anywhere
+    cleaned = re.sub(
+        r"(?i)\[?\bSearched\s+\d+\s+(?:sites?|websites?)\b\]?",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"(?i)\[?\bĐã tìm kiếm\s+\d+\s+(?:trang\s*web|website|trang)\b\]?",
+        "",
+        cleaned,
+    )
+    # 4. Citation pill badges: e.g. "Digital Library\n+1" or "Wikipedia\n+2"
+    cleaned = re.sub(
+        r"(?im)(?:(?<=\n)|\s+)[A-Za-z0-9\s.,'’\-–—&/]{1,80}\s*\n\s*\+[0-9]+\s*(?=\n|$)",
+        "",
+        cleaned,
+    )
+    # 5. Isolated line with +N or [+N]
+    cleaned = re.sub(r"(?m)^\s*\[?\+[0-9]+\]?\s*$", "", cleaned)
+    return cleaned
+
+
+def looks_like_citation_artifact(text: str) -> bool:
+    lowered = text.strip().lower()
+    if re.match(r"^\[?\+[0-9]+\]?$", lowered):
+        return True
+    if re.match(
+        r"^(?:\[?\s*searched\s+\d+\s+(?:sites?|websites?)|\[?\s*đã tìm kiếm\s+\d+\s+(?:trang\s*web|website|trang)|tìm kiếm:|search results?|sources?|nguồn(?:\s+tham khảo)?)\b",
+        lowered,
+    ):
+        return True
+    return False
+
+
+EDITORIAL_ACTION_WORDS = (
+    "làm", "tránh", "giảm", "tạo", "thắt chặt", "tăng", "rút gọn", "bổ sung",
+    "mở rộng", "nhấn mạnh", "thay đổi", "thêm", "sắp xếp", "viết lại",
+    "chuyển ý", "đào sâu", "khai thác", "kết nối", "dẫn dắt", "sửa", "chia đoạn",
+    "bỏ", "giữ nhịp", "nêu bật", "tách", "triển khai", "mở đầu bằng", "làm rõ",
+    "giải thích",
+)
+
+TRAILING_ACTION_PILLS_PATTERN = re.compile(
+    r'([.!?…][\"”’\']?)(?:\s*(?:' + '|'.join(re.escape(w) for w in sorted(EDITORIAL_ACTION_WORDS, key=len, reverse=True)) + r')[^.!?…\n]*)+',
+    flags=re.IGNORECASE,
+)
+
+
+def clean_text(text: str) -> str:
+    """Removes 'Edit', citations, search badges, Canvas artifacts, and common AI conversational fillers from the output."""
+    if not isinstance(text, str) or not text:
+        return ""
+    text = remove_citation_artifacts(text)
+    
+    # Strip inline structural/canvas headers prepended to paragraphs (e.g. "Nội dung chính: ...", "Mở đầu video: ...", "Mở đầu:")
+    canvas_inline_header = re.compile(
+        r"^(?:(?:mở\s+(?:đầu|bài)|kết\s+(?:thúc|bài|luận)|intro|body|outro|thân\s+bài)\s+(?:video|kịch\s+bản|bài\s+viết)\s*[:\-–—]?|(?:mở\s+(?:đầu|bài)|kết\s+(?:thúc|bài|luận)|intro|body|outro|thân\s+bài|nội\s+dung\s+chính|dàn\s+ý(?:\s+chi\s+tiết)?)\s*[:\-–—])\s*",
+        flags=re.IGNORECASE,
+    )
+    
+    lines = text.split('\n')
+    cleaned = []
+    skip_keywords = [
+        "dưới đây là", "trân trọng gửi", "chắc chắn rồi", "dạ vâng", "vâng,",
+        "đã hoàn thành", "bạn chưa cung cấp", "nội dung hoàn chỉnh", "chào bạn",
+        "thu gọn", "mở rộng"
+    ]
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            cleaned.append("")
+            continue
+        lower_line = stripped.lower()
+        if lower_line == "edit":
+            continue
+        if any(lower_line.startswith(kw) for kw in skip_keywords):
+            continue
+        if lower_line.endswith(":") and len(line) < 100 and ("đây" in lower_line or "sau" in lower_line or "hoàn chỉnh" in lower_line):
+            continue
+        if looks_like_editorial_artifact(lower_line):
+            continue
+        # Strip inline header if present at start of line
+        stripped_line = canvas_inline_header.sub("", line).strip()
+        cleaned.append(stripped_line if stripped_line else line)
+    
+    result = '\n'.join(cleaned).strip()
+    # Remove leading 'Edit' that might be left if it wasn't on its own line
+    result = re.sub(r'^\s*Edit\s*\n*', '', result)
+    # Remove trailing Canvas Action Pills or suggestions attached to narrative ends
+    result = TRAILING_ACTION_PILLS_PATTERN.sub(r'\1', result).strip()
+    return result
+
+
+def _is_short_narrative_artifact(block: str) -> tuple[bool, bool]:
+    lines = [line.strip() for line in block.splitlines() if line.strip()]
+    if not lines or len(lines) > 3:
+        return False, False
+
+    explicit_editorial_note = False
+    for line in lines:
+        has_markdown_heading = bool(re.match(r"^#{1,6}\s+", line))
+        normalized_line = re.sub(
+            r"^(?:#{1,6}\s*|[-*•]\s+|\d+[.)]\s+)",
+            "",
+            line,
+        ).strip()
+        word_count = len(re.findall(r"\w+", normalized_line, re.UNICODE))
+        if (
+            not normalized_line
+            or word_count > NARRATIVE_ARTIFACT_MAX_WORDS
+            or re.search(r'[.!?…;]["”’\])]*$', normalized_line)
+        ):
+            return False, False
+
+        lowered_line = normalized_line.lower()
+        explicit_editorial_note = explicit_editorial_note or (
+            has_markdown_heading
+            or looks_like_editorial_artifact(lowered_line)
+            or looks_like_citation_artifact(lowered_line)
+            or bool(re.match(
+                r"^(?:ghi chú|ý chính|trọng tâm)\b",
+                lowered_line,
+            ))
+        )
+
+    return True, explicit_editorial_note
+
+
+def dedup_consecutive_paragraphs(text: str, min_chars: int = 60) -> str:
+    """Remove consecutive duplicate or near-duplicate paragraphs within a text block."""
+    if not isinstance(text, str) or not text:
+        return text
+    blocks = [b.strip() for b in re.split(r"\n[ \t]*\n+", text) if b.strip()]
+    deduped = []
+    for block in blocks:
+        normalized = re.sub(r"\s+", " ", block).strip()
+        if deduped and len(normalized) >= min_chars:
+            prev_normalized = re.sub(r"\s+", " ", deduped[-1]).strip()
+            if normalized == prev_normalized:
+                continue
+            # If current block is a prefix/suffix/substring of previous or vice-versa
+            if len(prev_normalized) >= min_chars and (
+                normalized in prev_normalized
+                or prev_normalized in normalized
+            ):
+                if len(normalized) > len(prev_normalized):
+                    deduped[-1] = block
+                continue
+        deduped.append(block)
+    return "\n\n".join(deduped)
+
+
+def sanitize_narrative_response(response_text: str) -> str:
+    """Remove isolated editorial notes without rewriting narrative prose."""
+    cleaned_text = clean_text(response_text)
+    blocks = [
+        block.strip()
+        for block in re.split(r"\n[ \t]*\n+", cleaned_text)
+        if block.strip()
+    ]
+    if not blocks:
+        return ""
+
+    block_checks = [_is_short_narrative_artifact(block) for block in blocks]
+    has_substantive_narrative = any(
+        not is_short_artifact
+        for is_short_artifact, _ in block_checks
+    )
+    kept_blocks = []
+    for block, (is_short_artifact, is_explicit_note) in zip(
+        blocks,
+        block_checks,
+    ):
+        if is_short_artifact and (
+            is_explicit_note
+            or (has_substantive_narrative and len(blocks) > 1)
+        ):
+            continue
+        kept_blocks.append(block)
+
+    # Never turn a non-empty response into an empty section. The prompt guard
+    # remains the first line of defence, while this filter only removes notes
+    # when genuine narrative text is left behind.
+    if not kept_blocks:
+        return dedup_consecutive_paragraphs(cleaned_text)
+    return dedup_consecutive_paragraphs("\n\n".join(kept_blocks).strip())
+
+
+def sanitize_generated_script(script_text: str) -> str:
+    """Sanitize narrative sections while preserving all other sections."""
+    if not isinstance(script_text, str) or not script_text:
+        return script_text
+
+    section_pattern = re.compile(
+        r"(### \[(?:INTRO|BODY|OUTRO)\]\r?\n)(.*?)(?=\r?\n### \[|\Z)",
+        flags=re.DOTALL,
+    )
+    
+    seen_paragraphs = set()
+
+    def replace_section(match: re.Match) -> str:
+        section_header = match.group(1)
+        cleaned_content = sanitize_narrative_response(match.group(2))
+        
+        deduped_blocks = []
+        import re as local_re
+        for block in local_re.split(r"\n[ \t]*\n+", cleaned_content):
+            block_stripped = block.strip()
+            if not block_stripped:
+                continue
+                
+            normalized = local_re.sub(r"\s+", " ", block_stripped)
+            if len(normalized) >= 100 and len(local_re.findall(r"[^\W_]+(?:['’][^\W_]+)?", normalized, local_re.UNICODE)) >= 10:
+                if normalized in seen_paragraphs:
+                    continue
+                seen_paragraphs.add(normalized)
+            
+            deduped_blocks.append(block_stripped)
+            
+        final_content = "\n\n".join(deduped_blocks)
+        try:
+            from auto_yt.dialogue_parser import sanitize_dialogue_script
+            final_content = sanitize_dialogue_script(final_content)
+        except Exception:
+            pass
+        separator = "\n" if final_content else ""
+        return f"{section_header}{final_content}{separator}"
+
+    return section_pattern.sub(replace_section, script_text)
+
+def validate_prompt_text(prompt_text: str) -> None:
+    if not isinstance(prompt_text, str) or not prompt_text.strip():
+        raise ValueError("The ChatGPT prompt must contain text.")
+    # Query strings legitimately contain a question mark between alphanumeric
+    # characters (for example ``youtube.com/channel/...?...``). Remove URL-like
+    # tokens before looking for question marks that replaced damaged Unicode.
+    text_without_urls = URL_LIKE_TOKEN_PATTERN.sub("", prompt_text)
+    # JSON string values can contain arbitrary viewer text. A question mark
+    # between words is valid punctuation there and is not evidence that the
+    # application's own prompt text was damaged during decoding.
+    trusted_prompt_text = JSON_STRING_LITERAL_PATTERN.sub('""', text_without_urls)
+    corrupted_markers = CORRUPTED_UNICODE_PATTERN.findall(trusted_prompt_text)
+    corrupted_marker_count = sum(marker.count("?") for marker in corrupted_markers)
+    if (
+        "\ufffd" in prompt_text
+        or corrupted_marker_count >= MIN_CORRUPTED_UNICODE_MARKERS
+    ):
+        raise ValueError(
+            "The ChatGPT prompt contains corrupted Unicode text. "
+            "No prompt was sent."
+        )
+
+
+def prompt_text_matches(expected_text: str, editor_text: str) -> bool:
+    def normalize(value: str) -> str:
+        return re.sub(r"\s+", " ", value.replace("\u00a0", " ")).strip()
+
+    return normalize(expected_text) == normalize(editor_text)
+
+
+def history_prompt_text_matches(expected_text: str, rendered_text: str) -> bool:
+    def normalize(value: str) -> str:
+        return re.sub(r"\s+", " ", value.replace("\u00a0", " ")).strip()
+
+    expected = normalize(expected_text)
+    actual = normalize(rendered_text)
+
+    if not expected or not actual:
+        return False
+
+    if expected == actual:
+        return True
+
+    # Substring / prefix matching for prompts of any length
+    if (len(actual) >= 20 and expected.startswith(actual)) or (len(expected) >= 20 and actual.startswith(expected)):
+        return True
+
+    check_len = min(len(expected), len(actual), 50)
+    if check_len >= 20 and expected[:check_len] == actual[:check_len]:
+        return True
+
+    if len(actual) >= 100 and len(expected) >= 100:
+        if expected[:100] == actual[:100]:
+            return True
+
+    return False
+
+
+
+def replace_prompt_text_with_javascript(prompt_textarea, prompt_text: str) -> None:
+    prompt_textarea.evaluate("""(el, text) => {
+        el.focus();
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        document.execCommand('delete', false, null);
+        document.execCommand('insertText', false, text);
+        el.dispatchEvent(new InputEvent('beforeinput', {
+            bubbles: true,
+            cancelable: true,
+            inputType: 'insertText',
+            data: text
+        }));
+        el.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            cancelable: true,
+            inputType: 'insertText',
+            data: text
+        }));
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+    }""", prompt_text)
+
+
+def ensure_prompt_editor_integrity(prompt_textarea, prompt_text: str) -> None:
+    editor_text = prompt_textarea.inner_text()
+    if not isinstance(editor_text, str) or prompt_text_matches(
+        prompt_text,
+        editor_text,
+    ):
+        return
+
+    replace_prompt_text_with_javascript(prompt_textarea, prompt_text)
+    time.sleep(0.2)
+    editor_text = prompt_textarea.inner_text()
+    if not isinstance(editor_text, str) or not prompt_text_matches(
+        prompt_text,
+        editor_text,
+    ):
+        raise RuntimeError(
+            "The ChatGPT editor changed the prompt text during input. "
+            "No prompt was sent."
+        )
+
+
+def _extract_clean_markdown_text(node) -> str:
+    try:
+        cleaned = node.evaluate("""(el) => {
+            const clone = el.cloneNode(true);
+
+            // 1. Remove all buttons (assistant responses are pure markdown/prose; all <button> elements are UI artifacts: Copy, Collapse, Suggestions, Search, Citations, Add to library, Open editor, etc.)
+            clone.querySelectorAll('button').forEach((b) => b.remove());
+
+            // 2. Remove specific citation, search, attribution, thought, reasoning, and Canvas/Writing Block UI selectors
+            const junkSelectors = [
+                '[data-testid*="citation"]',
+                '[data-testid*="source"]',
+                '[data-testid*="attribution"]',
+                'a[class*="citation"]',
+                'div[class*="citation"]',
+                'span[class*="citation"]',
+                '.citation',
+                '[class*="citation-"]',
+                '[class*="attribution-"]',
+                '[data-citation-index]',
+                'sup.citation',
+                'header',
+                '[class*="header-"]',
+                '.title-Nx5xpW',
+                '[data-testid*="canvas-header"]',
+                '[data-testid*="document-header"]',
+                '[class*="canvas-header"]',
+                '[class*="document-header"]',
+                '[class*="suggestion"]',
+                '[class*="pill"]',
+                '[class*="chip"]',
+                '[data-testid*="suggestion"]',
+                '[data-testid*="action-pill"]',
+                '[data-testid*="canvas-action"]',
+                '[data-testid*="canvas-title"]',
+                '[data-testid*="thought"]',
+                '[data-testid*="reasoning"]',
+                '[data-testid*="thinking"]',
+                '[class*="thought"]',
+                '[class*="reasoning"]',
+                '[class*="thinking"]',
+                '.result-thinking',
+                '[data-testid*="search"]',
+                '[data-testid*="web-search"]',
+                '[class*="web-search"]',
+                '[class*="search-result"]',
+                '[class*="search_result"]',
+                'details',
+                'summary',
+                '[aria-label*="Thinking" i]',
+                '[aria-label*="Thought" i]',
+                '[aria-label*="Suy nghĩ" i]',
+                '[aria-label*="Reasoning" i]',
+            ];
+            junkSelectors.forEach((sel) => {
+                clone.querySelectorAll(sel).forEach((badEl) => badEl.remove());
+            });
+
+            // 3. Remove standalone Canvas title headers, buttons, thought summaries & action pill controls
+            clone.querySelectorAll('div, span, p, header, a, section, aside').forEach((elem) => {
+                const txt = (elem.textContent || '').trim().toLowerCase();
+                if (
+                    txt === 'nội dung chính' ||
+                    txt === 'outro video' ||
+                    txt === 'mở đầu video' ||
+                    txt === 'kết thúc video' ||
+                    txt === 'thân bài' ||
+                    txt === 'thu gọn' ||
+                    txt === 'mở rộng' ||
+                    txt === 'mô tả video youtube' ||
+                    txt === 'tiêu đề video youtube' ||
+                    txt.startsWith('mở đầu bằng cú móc') ||
+                    txt.startsWith('giảm tiết lộ') ||
+                    txt.startsWith('làm rõ mốc') ||
+                    txt.startsWith('tăng nhịp') ||
+                    txt.startsWith('rút gọn chi tiết') ||
+                    txt.startsWith('rút gọn outro') ||
+                    txt.startsWith('làm lời kết') ||
+                    txt.startsWith('sắp xếp lời kêu gọi') ||
+                    txt.startsWith('worked for ') ||
+                    txt.startsWith('thought for ') ||
+                    txt.startsWith('thinking...') ||
+                    txt.startsWith('đang suy nghĩ') ||
+                    txt.startsWith('đã suy nghĩ trong ') ||
+                    txt.startsWith('đã dừng suy nghĩ') ||
+                    txt.startsWith('stopped thinking')
+                ) {
+                    if (
+                        elem.children.length === 0 ||
+                        elem.tagName === 'HEADER' ||
+                        elem.tagName === 'SECTION' ||
+                        elem.tagName === 'ASIDE' ||
+                        txt.startsWith('worked for ') ||
+                        txt.startsWith('thought for ') ||
+                        txt.startsWith('đã suy nghĩ trong ')
+                    ) {
+                        elem.remove();
+                    }
+                }
+            });
+
+            // A detached clone has no layout, so innerText can collapse block
+            // boundaries and textContent then joins adjacent paragraphs.
+            clone.querySelectorAll('script, style, iframe, object, embed').forEach(
+                (unsafeElement) => unsafeElement.remove()
+            );
+            const extractionHost = document.createElement('div');
+            const sourceWidth = el.getBoundingClientRect().width;
+            extractionHost.setAttribute('aria-hidden', 'true');
+            Object.assign(extractionHost.style, {
+                position: 'fixed',
+                left: '0',
+                top: '0',
+                width: `${sourceWidth || document.documentElement.clientWidth}px`,
+                transform: 'translateX(-100vw)',
+                opacity: '0',
+                pointerEvents: 'none',
+                zIndex: '-1',
+            });
+            extractionHost.appendChild(clone);
+            (document.body || document.documentElement).appendChild(extractionHost);
+            try {
+                return clone.innerText || clone.textContent || '';
+            } finally {
+                extractionHost.remove();
+            }
+        }""")
+        if isinstance(cleaned, str) and cleaned.strip():
+            return clean_text(cleaned)
+    except Exception:
+        pass
+    return clean_text(node.inner_text())
+
+
+def _read_assistant_message(message) -> str:
+    markdown_nodes = message.locator(
+        '.markdown, [data-markdown-text-style="assistant-message"], [class*="MarkdownRoot"]'
+    )
+    markdown_parts = []
+    try:
+        markdown_count = markdown_nodes.count()
+    except Exception:
+        markdown_count = 0
+    if not isinstance(markdown_count, int):
+        try:
+            markdown_count = 1 if markdown_nodes.first.count() > 0 else 0
+        except Exception:
+            markdown_count = 0
+    for index in range(markdown_count):
+        try:
+            markdown_node = (
+                markdown_nodes.first
+                if markdown_count == 1
+                else markdown_nodes.nth(index)
+            )
+            markdown_text = _extract_clean_markdown_text(markdown_node)
+        except Exception:
+            continue
+        if (
+            markdown_text
+            and not _is_pure_thinking_indicator(markdown_text)
+            and markdown_text not in markdown_parts
+        ):
+            # If this markdown part is a subset of an existing one or vice versa, keep the longer one
+            is_subset = False
+            for existing_idx, existing in enumerate(markdown_parts):
+                if markdown_text in existing:
+                    is_subset = True
+                    break
+                elif existing in markdown_text:
+                    markdown_parts[existing_idx] = markdown_text
+                    is_subset = True
+                    break
+            if not is_subset:
+                markdown_parts.append(markdown_text)
+    if markdown_parts:
+        return "\n\n".join(markdown_parts)
+    fallback = _extract_clean_markdown_text(message)
+    if _is_pure_thinking_indicator(fallback):
+        return ""
+    return fallback
+
+
+def _get_message_node_role(node) -> str:
+    """Extract role string ('user' or 'assistant') from DOM node attributes."""
+    try:
+        role = (
+            node.get_attribute("data-message-author-role")
+            or node.get_attribute("data-conversation-role")
+        )
+        if role:
+            return role.casefold().strip()
+        if node.get_attribute("data-user-message-bubble") == "true":
+            return "user"
+        if node.get_attribute("data-markdown-text-style") == "assistant-message":
+            return "assistant"
+    except Exception:
+        pass
+    return ""
+
+
+def get_assistant_response_after_latest_user(
+    page: Page,
+    expected_user_text: str = "",
+) -> str:
+    """Read the reply following the latest user message without count baselines."""
+    try:
+        messages = page.locator(
+            '[data-message-author-role], [data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"]'
+        )
+        try:
+            msg_count = messages.count()
+        except Exception:
+            msg_count = 0
+
+        if msg_count > 0:
+            latest_user_index = -1
+            for index in range(msg_count - 1, -1, -1):
+                node = messages.nth(index)
+                role = _get_message_node_role(node)
+                if role == "user":
+                    if not expected_user_text or history_prompt_text_matches(
+                        expected_user_text,
+                        clean_text(node.inner_text()),
+                    ):
+                        latest_user_index = index
+                        break
+            if latest_user_index >= 0:
+                response_text = ""
+                for index in range(latest_user_index + 1, msg_count):
+                    message = messages.nth(index)
+                    role = _get_message_node_role(message)
+                    if role == "user":
+                        break
+                    if role != "assistant":
+                        continue
+                    candidate = _read_assistant_message(message)
+                    if candidate:
+                        response_text = candidate
+                if response_text:
+                    return response_text
+
+        # Modern JS fallback
+        data = page.evaluate("""() => {
+            const cleanNode = (el) => {
+                if (!el) return '';
+                const clone = el.cloneNode(true);
+                clone.querySelectorAll('button, .sr-only, [data-testid*="citation"], sup.citation, header, [class*="header-"], [class*="editorControls"], [class*="suggestion"], [class*="pill"], [data-testid*="thought"], [data-testid*="reasoning"], [data-testid*="thinking"], [class*="thought"], [class*="reasoning"], [class*="thinking"], .result-thinking, [data-testid*="search"], [data-testid*="web-search"], [class*="web-search"], details, summary').forEach(b => b.remove());
+                clone.querySelectorAll('div, span, p, header, a, section, aside').forEach((elem) => {
+                    const txt = (elem.textContent || '').trim().toLowerCase();
+                    if (txt.startsWith('worked for ') || txt.startsWith('thought for ') || txt.startsWith('đã suy nghĩ trong ') || txt.startsWith('thinking...') || txt.startsWith('đang suy nghĩ')) {
+                        elem.remove();
+                    }
+                });
+                return (clone.innerText || clone.textContent || '').trim();
+            };
+
+            const allNodes = [...document.querySelectorAll(
+                '[data-user-message-bubble="true"], [data-message-author-role="user"], [data-markdown-text-style="assistant-message"], [data-message-author-role="assistant"]'
+            )];
+            const topLevel = allNodes.filter((el, idx) => !allNodes.some((other, otherIdx) => otherIdx !== idx && other.contains(el)));
+
+            return topLevel.map(u => {
+                const isUser = u.getAttribute('data-user-message-bubble') === 'true'
+                    || (u.getAttribute('data-message-author-role') || '').toLowerCase() === 'user'
+                    || (u.getAttribute('data-conversation-role') || '').toLowerCase() === 'user';
+                const isAssistant = u.getAttribute('data-markdown-text-style') === 'assistant-message'
+                    || (u.getAttribute('data-message-author-role') || '').toLowerCase() === 'assistant'
+                    || (u.getAttribute('data-conversation-role') || '').toLowerCase() === 'assistant';
+                return {
+                    role: isUser ? 'user' : (isAssistant ? 'assistant' : ''),
+                    text: cleanNode(u)
+                };
+            }).filter(item => item.text.length > 0);
+        }""")
+
+        if not data:
+            return ""
+
+        latest_user_index = -1
+        for index in range(len(data) - 1, -1, -1):
+            item = data[index]
+            if item.get("role") == "user":
+                if not expected_user_text or history_prompt_text_matches(
+                    expected_user_text,
+                    clean_text(item.get("text", "")),
+                ):
+                    latest_user_index = index
+                    break
+
+        if latest_user_index < 0:
+            return ""
+
+        response_text = ""
+        for index in range(latest_user_index + 1, len(data)):
+            item = data[index]
+            if item.get("role") == "user":
+                break
+            if item.get("role") != "assistant":
+                continue
+            candidate = clean_text(item.get("text", ""))
+            if candidate and not _is_pure_thinking_indicator(candidate):
+                response_text = candidate
+
+        return response_text
+    except Exception:
+        return ""
+
+
+def get_new_assistant_response(
+    page: Page,
+    previous_assistant_turn: int = -1,
+    previous_assistant_count: int | None = None,
+) -> str:
+    try:
+        new_assistant_turns = [
+            turn_number
+            for turn_number, role in get_visible_conversation_turns(page)
+            if role == "assistant" and turn_number > previous_assistant_turn
+        ]
+        if new_assistant_turns:
+            turn = page.locator(
+                f'[data-testid="conversation-turn-{max(new_assistant_turns)}"]'
+            )
+            try:
+                turn_cnt = turn.count()
+                turn_exists = (turn_cnt > 0) if isinstance(turn_cnt, int) else True
+            except Exception:
+                turn_exists = True
+
+            if turn_exists:
+                assistant_nodes = turn.locator(
+                    '[data-message-author-role="assistant"], [data-markdown-text-style="assistant-message"], .markdown'
+                )
+                try:
+                    assistant_count = assistant_nodes.count()
+                    has_nodes = (assistant_count > 0) if isinstance(assistant_count, int) else True
+                except Exception:
+                    has_nodes = True
+                if has_nodes:
+                    response_text = _read_assistant_message(assistant_nodes.last)
+                    if response_text:
+                        return response_text
+
+        # Compatibility fallback for ChatGPT DOM variants without numbered
+        # turns. The count baseline survives React DOM re-renders, unlike a
+        # temporary CSS marker attached to old message nodes.
+        assistant_messages = page.locator(
+            '[data-message-author-role="assistant"], [data-markdown-text-style="assistant-message"]'
+        )
+        assistant_count = assistant_messages.count()
+        if (
+            assistant_count == 0
+            or (
+                previous_assistant_count is not None
+                and assistant_count <= previous_assistant_count
+            )
+        ):
+            return ""
+        return _read_assistant_message(assistant_messages.last)
+    except Exception:
+        return ""
+
+
+def is_chatgpt_generation_active(page: Page) -> bool:
+    try:
+        return bool(page.evaluate(
+            """() => {
+                // 1. Explicit stop button
+                if (document.querySelector('[data-testid="stop-button"]')) {
+                    return true;
+                }
+                const hasStopButton = [...document.querySelectorAll('button')].some((button) => {
+                    const label = [
+                        button.getAttribute('aria-label') || '',
+                        button.getAttribute('title') || ''
+                    ].join(' ').toLowerCase();
+                    return label.includes('stop streaming')
+                        || label.includes('stop generating')
+                        || label.includes('dừng tạo')
+                        || label.includes('dừng phản hồi');
+                });
+                if (hasStopButton) return true;
+
+                // 2. Active thinking / searching state indicators in main area
+                const isThinkingOrSearching = [...document.querySelectorAll(
+                    '[data-testid*="thinking"], [data-testid*="searching"], .result-thinking, [data-testid*="search-status"]'
+                )].some(el => {
+                    if (el.closest('nav, [aria-label="Chat history"], [class*="sidebar"], [class*="history"]')) return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                });
+                if (isThinkingOrSearching) return true;
+
+                // 3. In-progress spinner strictly inside the active message or composer (NOT history lazy-loading)
+                const hasSpinners = [...document.querySelectorAll('svg.animate-spin, [class*="animate-spin"], [class*="loading-spinner"]')].some(el => {
+                    if (el.closest('nav, [aria-label="Chat history"], [class*="sidebar"], header')) return false;
+                    const containerText = (el.parentElement?.innerText || '').toLowerCase();
+                    if (containerText.includes('loading older') || containerText.includes('đang tải tin nhắn') || containerText.includes('loading chat') || containerText.includes('loading older messages')) {
+                        return false;
+                    }
+                    if (!el.closest('main, form, [data-message-author-role="assistant"], [data-testid="composer"], [data-testid="send-button"]')) {
+                        return false;
+                    }
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                });
+                if (hasSpinners) return true;
+
+                return false;
+            }"""
+        ))
+    except Exception:
+        return False
+
+
+CHATGPT_ERROR_PATTERNS = (
+    "a network error occurred",
+    "there was an error generating a response",
+    "something went wrong",
+    "the server had an error while processing your request",
+    "conversation not found",
+    "this response couldn't load",
+    "this response couldn’t load",
+    "this response could not load",
+    "failed to get response",
+    "failed to fetch",
+    "an error occurred while generating",
+    "an error occurred",
+    "unusual activity has been detected",
+    "please try again later",
+)
+CHATGPT_RENDER_ERROR_PATTERNS = (
+    "this response couldn't load",
+    "this response couldn’t load",
+    "this response could not load",
+)
+
+
+def looks_like_chatgpt_error(text: str) -> bool:
+    if not text:
+        return False
+    lowered = text.strip().lower()
+    return any(err in lowered for err in CHATGPT_ERROR_PATTERNS)
+
+
+def _check_for_chatgpt_errors(text: str) -> None:
+    if not text:
+        return
+    lowered = text.strip().lower()
+    for err in CHATGPT_ERROR_PATTERNS:
+        if err in lowered:
+            error_code = (
+                CHATGPT_RESPONSE_RENDER_ERROR_CODE
+                if err in CHATGPT_RENDER_ERROR_PATTERNS
+                else CHATGPT_RESPONSE_ERROR_CODE
+            )
+            raise ChatGPTResponseError(error_code, err)
+
+
+def _get_payload_content_text(message: dict) -> str:
+    content = message.get("content")
+    if not isinstance(content, dict):
+        return ""
+    parts = content.get("parts")
+    if not isinstance(parts, list):
+        return ""
+    return "\n".join(part for part in parts if isinstance(part, str)).strip()
+
+
+def _get_payload_assistant_text(message: dict) -> str:
+    metadata = message.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    dil_payload = metadata.get("model_dil_v2")
+    fallback_markdown = (
+        dil_payload.get("fallbackMarkdown", "")
+        if isinstance(dil_payload, dict)
+        else ""
+    )
+
+    for candidate in (fallback_markdown, _get_payload_content_text(message)):
+        cleaned = clean_text(candidate)
+        if (
+            cleaned
+            and not _is_pure_thinking_indicator(cleaned)
+            and not looks_like_chatgpt_error(cleaned)
+        ):
+            return cleaned
+    return ""
+
+
+def extract_assistant_response_from_conversation_payload(
+    payload: dict,
+    expected_user_text: str,
+) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return ""
+    messages = [message for message in messages if isinstance(message, dict)]
+
+    message_by_id = {
+        str(message.get("id")): message
+        for message in messages
+        if message.get("id")
+    }
+    current_node = str(payload.get("current_node") or "")
+    if current_node:
+        if current_node not in message_by_id:
+            return ""
+        branch = []
+        seen = set()
+        node_id = current_node
+        while node_id and node_id not in seen:
+            seen.add(node_id)
+            message = message_by_id.get(node_id)
+            if message is None:
+                break
+            branch.append(message)
+            metadata = message.get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            node_id = str(
+                message.get("parent_id")
+                or message.get("parent")
+                or metadata.get("parent_id")
+                or ""
+            )
+        messages = list(reversed(branch))
+
+    latest_user_index = -1
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        author = message.get("author")
+        role = author.get("role") if isinstance(author, dict) else ""
+        if role != "user":
+            continue
+        user_text = _get_payload_content_text(message)
+        if not expected_user_text or history_prompt_text_matches(
+            expected_user_text,
+            user_text,
+        ):
+            latest_user_index = index
+            break
+    if latest_user_index < 0:
+        return ""
+
+    response_text = ""
+    for message in messages[latest_user_index + 1:]:
+        author = message.get("author")
+        role = author.get("role") if isinstance(author, dict) else ""
+        if role == "user":
+            break
+        if role != "assistant":
+            continue
+        status = str(message.get("status") or "").casefold()
+        if status and status not in CHATGPT_SUCCESSFUL_MESSAGE_STATUSES:
+            continue
+        if message.get("end_turn") is False:
+            continue
+        candidate = _get_payload_assistant_text(message)
+        if candidate:
+            response_text = candidate
+    return response_text
+
+
+def _accept_or_recover_assistant_response(
+    page: Page,
+    response_text: str,
+    expected_user_text: str,
+) -> str:
+    if not looks_like_chatgpt_error(response_text):
+        return response_text
+    if expected_user_text:
+        recovered_response = recover_assistant_response_after_reload(
+            page,
+            expected_user_text,
+        )
+        if recovered_response:
+            return recovered_response
+    _check_for_chatgpt_errors(response_text)
+    return response_text
+
+
+def wait_for_assistant_response(
+    page: Page,
+    previous_assistant_turn: int,
+    allow_empty_response: bool = False,
+    timeout: int = CHATGPT_RESPONSE_TIMEOUT_SECONDS,
+    previous_assistant_count: int | None = None,
+    previous_user_turn: int | None = None,
+    previous_user_count: int | None = None,
+    submitted_prompt_text: str = "",
+) -> str:
+    """Wait for a new response without relying only on the stop button."""
+    started_at = time.monotonic()
+    deadline = started_at + timeout
+    empty_response_deadline = started_at + ASSISTANT_RESPONSE_WAIT_SECONDS
+    last_response = ""
+    last_change_at = started_at
+    saw_busy_state = False
+
+    while True:
+        accept_external_app_permission_dialog(page)
+        busy = is_chatgpt_generation_active(page)
+        saw_busy_state = saw_busy_state or busy
+        response_text = get_new_assistant_response(
+            page,
+            previous_assistant_turn,
+            previous_assistant_count,
+        )
+        if not response_text:
+            response_text = get_assistant_response_after_latest_user(
+                page,
+                expected_user_text=submitted_prompt_text,
+            )
+        now = time.monotonic()
+
+        if response_text != last_response:
+            last_response = response_text
+            last_change_at = now
+
+        required_stability = (
+            ASSISTANT_RESPONSE_SETTLE_AFTER_BUSY_SECONDS
+            if saw_busy_state
+            else ASSISTANT_RESPONSE_STABLE_SECONDS
+        )
+        if (
+            last_response
+            and not busy
+            and now - last_change_at >= required_stability
+        ):
+            return _accept_or_recover_assistant_response(
+                page,
+                last_response,
+                submitted_prompt_text,
+            )
+
+        if (
+            allow_empty_response
+            and not busy
+            and (
+                saw_busy_state
+                or now >= empty_response_deadline
+            )
+        ):
+            return _accept_or_recover_assistant_response(
+                page,
+                last_response,
+                submitted_prompt_text,
+            )
+
+        if now >= deadline:
+            if busy:
+                raise ChatGPTGenerationTimeoutError(
+                    "ChatGPT generation did not finish after 20 minutes. "
+                    "No next prompt was sent.",
+                    last_response,
+                    previous_assistant_turn,
+                    previous_assistant_count or 0,
+                )
+            if submitted_prompt_text:
+                recovered_response = recover_assistant_response_after_reload(
+                    page,
+                    submitted_prompt_text,
+                )
+                if recovered_response:
+                    _check_for_chatgpt_errors(recovered_response)
+                    return recovered_response
+            raise RuntimeError(
+                "ChatGPT returned no readable text for this step. "
+                "The same conversation was reloaded once and no next prompt "
+                "was sent."
+            )
+
+        time.sleep(ASSISTANT_RESPONSE_POLL_SECONDS)
+
+
+def wait_for_existing_assistant_response(
+    page: Page,
+    expected_user_text: str,
+    timeout: int,
+) -> str:
+    started_at = time.monotonic()
+    deadline = started_at + timeout
+    last_response = ""
+    last_change_at = started_at
+    saw_busy_state = False
+
+    while True:
+        accept_external_app_permission_dialog(page)
+        busy = is_chatgpt_generation_active(page)
+        saw_busy_state = saw_busy_state or busy
+        response_text = get_assistant_response_after_latest_user(
+            page,
+            expected_user_text=expected_user_text,
+        )
+        now = time.monotonic()
+        if response_text != last_response:
+            last_response = response_text
+            last_change_at = now
+        required_stability = (
+            ASSISTANT_RESPONSE_SETTLE_AFTER_BUSY_SECONDS
+            if saw_busy_state
+            else ASSISTANT_RESPONSE_STABLE_SECONDS
+        )
+        if (
+            last_response
+            and not busy
+            and now - last_change_at >= required_stability
+        ):
+            _check_for_chatgpt_errors(last_response)
+            return last_response
+        if now >= deadline:
+            return ""
+        time.sleep(ASSISTANT_RESPONSE_POLL_SECONDS)
+
+
+def _get_conversation_id_from_url(url: str) -> str:
+    parsed_url = urlparse(str(url or ""))
+    match = re.search(r"/c/([a-zA-Z0-9_-]+)", parsed_url.path)
+    return match.group(1) if match else ""
+
+
+def _is_conversation_payload_response(response, conversation_id: str) -> bool:
+    try:
+        parsed_url = urlparse(response.url)
+        request = response.request
+        return bool(
+            parsed_url.scheme == "https"
+            and parsed_url.netloc == "chatgpt.com"
+            and "/backend-api/" in parsed_url.path
+            and conversation_id in parsed_url.path
+            and response.status == 200
+            and request.method.upper() == "GET"
+            and request.resource_type in {"fetch", "xhr"}
+        )
+    except Exception:
+        return False
+
+
+def _reload_and_capture_conversation_payload(
+    page: Page,
+    expected_url: str,
+) -> dict:
+    conversation_id = _get_conversation_id_from_url(expected_url)
+    if not conversation_id:
+        page.reload(
+            wait_until="domcontentloaded",
+            timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+        )
+        return {}
+
+    try:
+        with page.expect_response(
+            lambda response: _is_conversation_payload_response(
+                response,
+                conversation_id,
+            ),
+            timeout=CHATGPT_CONVERSATION_PAYLOAD_WAIT_MS,
+        ) as response_info:
+            page.reload(
+                wait_until="domcontentloaded",
+                timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+            )
+        payload = response_info.value.json()
+        return payload if isinstance(payload, dict) else {}
+    except PlaywrightError:
+        print(
+            ">>> ChatGPT conversation payload was unavailable after reload; "
+            "continuing with DOM recovery.",
+            file=sys.stderr,
+        )
+        return {}
+    except (TypeError, ValueError):
+        print(
+            ">>> ChatGPT conversation payload was not valid JSON; continuing "
+            "with DOM recovery.",
+            file=sys.stderr,
+        )
+        return {}
+
+
+def recover_assistant_response_after_reload(
+    page: Page,
+    expected_user_text: str,
+) -> str:
+    """Reload the same conversation once and read only the existing reply."""
+    expected_url = page.url
+    if not is_chatgpt_conversation_url(expected_url):
+        return ""
+    try:
+        payload = _reload_and_capture_conversation_payload(
+            page,
+            expected_url,
+        )
+        check_chatgpt_page_attention(page)
+        ensure_expected_conversation_page(page.url, expected_url)
+        page.locator(CHATGPT_VISIBLE_COMPOSER_SELECTOR).first.wait_for(
+            state="visible",
+            timeout=CHATGPT_COMPOSER_WAIT_PER_ATTEMPT_MS,
+        )
+        wait_for_conversation_history(page, composer_ready=True)
+        payload_response = extract_assistant_response_from_conversation_payload(
+            payload,
+            expected_user_text,
+        )
+        if payload_response:
+            print(
+                ">>> Recovered completed ChatGPT response from the browser "
+                "conversation payload after the rendered response was unavailable.",
+                file=sys.stderr,
+            )
+            return payload_response
+        return wait_for_existing_assistant_response(
+            page,
+            expected_user_text,
+            ASSISTANT_RESPONSE_RELOAD_WAIT_SECONDS,
+        )
+    except ChatGPTAttentionRequiredError:
+        raise
+    except ChatGPTResponseError:
+        raise
+    except Exception as exc:
+        print(
+            ">>> Could not recover the submitted ChatGPT response after one "
+            f"same-conversation reload: {exc}",
+            file=sys.stderr,
+        )
+        return ""
+
+
+def wait_for_valid_chapter_response(
+    page: Page,
+    previous_assistant_turn: int,
+    initial_response: str = "",
+    timeout: int = CHAPTER_LATE_RESPONSE_GRACE_SECONDS,
+    previous_assistant_count: int | None = None,
+    expected_user_text: str = "",
+) -> str:
+    deadline = time.time() + timeout
+    response_text = initial_response
+    while True:
+        if is_valid_chapter_response(response_text):
+            return sanitize_chapter_response(response_text)
+        if time.time() >= deadline:
+            return ""
+        time.sleep(1)
+        response_text = get_new_assistant_response(
+            page,
+            previous_assistant_turn,
+            previous_assistant_count,
+        )
+        if not response_text and expected_user_text:
+            response_text = get_assistant_response_after_latest_user(
+                page,
+                expected_user_text=expected_user_text,
+            )
+
+
+def get_reusable_chapter_response(page: Page) -> str:
+    conversation_turns = page.evaluate(
+        """() => {
+            const cleanNode = (el) => {
+                if (!el) return '';
+                const clone = el.cloneNode(true);
+                clone.querySelectorAll('button, .sr-only, [data-testid*="citation"], sup.citation, header, [class*="header-"], [class*="editorControls"], [class*="suggestion"], [class*="pill"], [data-testid*="thought"], [data-testid*="reasoning"], [data-testid*="thinking"], [class*="thought"], [class*="reasoning"], [class*="thinking"], .result-thinking, [data-testid*="search"], [data-testid*="web-search"], [class*="web-search"], details, summary').forEach(b => b.remove());
+                clone.querySelectorAll('div, span, p, header, a, section, aside').forEach((elem) => {
+                    const txt = (elem.textContent || '').trim().toLowerCase();
+                    if (txt.startsWith('worked for ') || txt.startsWith('thought for ') || txt.startsWith('đã suy nghĩ trong ') || txt.startsWith('thinking...') || txt.startsWith('đang suy nghĩ')) {
+                        elem.remove();
+                    }
+                });
+                return (clone.innerText || clone.textContent || '').trim();
+            };
+            const nodes = [...document.querySelectorAll(
+                '[data-message-author-role], [data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"], [data-conversation-role]'
+            )];
+            const unique = nodes.filter((el, idx) => !nodes.some((other, otherIdx) => otherIdx !== idx && other.contains(el)));
+            return unique.map(el => {
+                let role = el.getAttribute('data-message-author-role') || el.getAttribute('data-conversation-role') || '';
+                if (!role) {
+                    if (el.getAttribute('data-user-message-bubble') === 'true' || el.closest('[data-user-message-bubble="true"]')) {
+                        role = 'user';
+                    } else if (el.getAttribute('data-markdown-text-style') === 'assistant-message' || el.closest('[data-markdown-text-style="assistant-message"]')) {
+                        role = 'assistant';
+                    }
+                }
+                return [role, cleanNode(el)];
+            }).filter(item => item[0] && item[1]);
+        }"""
+    )
+    return select_reusable_chapter_response(
+        [(role, text) for role, text in conversation_turns]
+    )
+
+
+def get_reusable_outline_response(page: Page) -> str:
+    conversation_turns = page.evaluate(
+        """() => {
+            const cleanNode = (el) => {
+                if (!el) return '';
+                const clone = el.cloneNode(true);
+                clone.querySelectorAll('button, .sr-only, [data-testid*="citation"], sup.citation, header, [class*="header-"], [class*="editorControls"], [class*="suggestion"], [class*="pill"], [data-testid*="thought"], [data-testid*="reasoning"], [data-testid*="thinking"], [class*="thought"], [class*="reasoning"], [class*="thinking"], .result-thinking, [data-testid*="search"], [data-testid*="web-search"], [class*="web-search"], details, summary').forEach(b => b.remove());
+                clone.querySelectorAll('div, span, p, header, a, section, aside').forEach((elem) => {
+                    const txt = (elem.textContent || '').trim().toLowerCase();
+                    if (txt.startsWith('worked for ') || txt.startsWith('thought for ') || txt.startsWith('đã suy nghĩ trong ') || txt.startsWith('thinking...') || txt.startsWith('đang suy nghĩ')) {
+                        elem.remove();
+                    }
+                });
+                return (clone.innerText || clone.textContent || '').trim();
+            };
+            const nodes = [...document.querySelectorAll(
+                '[data-message-author-role], [data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"], [data-conversation-role]'
+            )];
+            const unique = nodes.filter((el, idx) => !nodes.some((other, otherIdx) => otherIdx !== idx && other.contains(el)));
+            return unique.map(el => {
+                let role = el.getAttribute('data-message-author-role') || el.getAttribute('data-conversation-role') || '';
+                if (!role) {
+                    if (el.getAttribute('data-user-message-bubble') === 'true' || el.closest('[data-user-message-bubble="true"]')) {
+                        role = 'user';
+                    } else if (el.getAttribute('data-markdown-text-style') === 'assistant-message' || el.closest('[data-markdown-text-style="assistant-message"]')) {
+                        role = 'assistant';
+                    }
+                }
+                return [role, cleanNode(el)];
+            }).filter(item => item[0] && item[1]);
+        }"""
+    )
+    return select_reusable_outline_response(
+        [(role, text) for role, text in conversation_turns]
+    )
+
+
+def wait_for_conversation_history(
+    page: Page,
+    composer_ready: bool = False,
+) -> None:
+    if not composer_ready:
+        wait_for_chatgpt_composer(page)
+    page.wait_for_function(
+        """() => {
+            const turns = [...document.querySelectorAll(
+                '[data-testid^="conversation-turn-"]'
+            )];
+            const roles = turns.map((turn) =>
+                turn.getAttribute('data-turn')
+                || turn.querySelector('[data-message-author-role], [data-conversation-role]')
+                    ?.getAttribute('data-message-author-role')
+                || turn.querySelector('[data-message-author-role], [data-conversation-role]')
+                    ?.getAttribute('data-conversation-role')
+                || ''
+            );
+            if (roles.includes('user') && roles.includes('assistant')) {
+                return true;
+            }
+            const fallbackRoles = [...document.querySelectorAll(
+                '[data-message-author-role]'
+            )].map((message) =>
+                message.getAttribute('data-message-author-role') || ''
+            );
+            if (fallbackRoles.includes('user') && fallbackRoles.includes('assistant')) {
+                return true;
+            }
+            const modernUser = document.querySelector(
+                '[data-user-message-bubble="true"], [data-content-search-unit-key*="user"], [data-conversation-role="user"]'
+            );
+            const modernAssistant = document.querySelector(
+                '[data-markdown-text-style="assistant-message"], [data-content-search-unit-key*="assistant"], [data-conversation-role="assistant"]'
+            );
+            return Boolean(modernUser && modernAssistant);
+        }""",
+        timeout=60000,
+    )
+
+def send_prompt(
+    page: Page,
+    prompt_text: str,
+    allow_empty_response: bool = False,
+    reference_image_base64: str | None = None,
+    on_prompt_submitted: Callable[[], None] | None = None,
+) -> str:
+    validate_prompt_text(prompt_text)
+
+    # Recover a transient ChatGPT full-page load failure before touching the
+    # composer. This is shared by every prompt-driven workflow.
+    prompt_textarea = wait_for_chatgpt_composer(page)
+
+    if is_chatgpt_conversation_url(page.url):
+        wait_for_conversation_history(page)
+
+    # Wait for any previous generation to finish (stop-button disappears)
+    try:
+        page.wait_for_function(
+            """() => {
+                return document.querySelector('[data-testid="stop-button"], button[aria-label*="Stop"], button[aria-label*="Dừng"]') === null;
+            }""",
+            timeout=CHATGPT_RESPONSE_TIMEOUT_SECONDS * 1000
+        )
+    except Exception:
+        raise Exception(
+            "Previous ChatGPT generation did not finish after 20 minutes. "
+            "No new prompt was sent."
+        )
+
+    page_url_before_send = page.url
+    previous_assistant_turn = get_latest_conversation_turn(page, "assistant")
+    previous_assistant_count = get_assistant_message_count(page)
+    previous_user_turn = get_latest_conversation_turn(page, "user")
+    previous_user_count = get_user_message_count(page)
+
+    # Mark existing messages so we can identify the new one
+    page.evaluate("document.querySelectorAll('[data-message-author-role=\"assistant\"], [data-markdown-text-style=\"assistant-message\"]').forEach(el => el.classList.add('my-old-msg'))")
+
+    # Use real editor input events so ChatGPT updates its internal composer state.
+    try:
+        prompt_textarea.click()
+        page.keyboard.press("Control+A")
+        page.keyboard.press("Backspace")
+    except Exception:
+        pass
+
+    try:
+        prompt_textarea.click()
+        page.keyboard.press("Control+A")
+        page.keyboard.insert_text(prompt_text)
+    except Exception:
+        # Fallback for unusually large prompts or transient keyboard failures.
+        replace_prompt_text_with_javascript(prompt_textarea, prompt_text)
+    time.sleep(0.3)
+    ensure_prompt_editor_integrity(prompt_textarea, prompt_text)
+
+
+    # Attach images if provided
+    if reference_image_base64:
+        js = """
+        (textarea, dataStr) => {
+            let base64Array = [];
+            if (dataStr.trim().startsWith('[')) {
+                try {
+                    base64Array = JSON.parse(dataStr);
+                } catch(e) {
+                    base64Array = [dataStr];
+                }
+            } else {
+                base64Array = [dataStr];
+            }
+
+            const dt = new DataTransfer();
+
+            base64Array.forEach((base64Data, idx) => {
+                const byteString = atob(base64Data);
+                const ab = new ArrayBuffer(byteString.length);
+                const ia = new Uint8Array(ab);
+                for (let i = 0; i < byteString.length; i++) {
+                    ia[i] = byteString.charCodeAt(i);
+                }
+                const file = new File([ab], `reference_${idx}.png`, { type: 'image/png' });
+                dt.items.add(file);
+            });
+
+            textarea.dispatchEvent(new ClipboardEvent('paste', {
+                clipboardData: dt,
+                bubbles: true,
+                cancelable: true
+            }));
+        }
+        """
+        prompt_textarea.evaluate(js, reference_image_base64)
+        page.wait_for_timeout(2000)
+
+    # Now wait for the send button to appear and be enabled
+    send_btn = get_chatgpt_send_button(prompt_textarea)
+    send_button_ready_script = _chatgpt_dom_script("""
+        const btn = findSendButton(findComposer());
+        return Boolean(
+            btn
+            && !btn.disabled
+            && btn.getAttribute('aria-disabled') !== 'true'
+        );
+    """)
+    try:
+        page.wait_for_function(send_button_ready_script, timeout=15000)
+    except Exception as e:
+        # Nudge React state: focus and dispatch input events
+        try:
+            prompt_textarea.click()
+            page.keyboard.press("Space")
+            page.keyboard.press("Backspace")
+        except Exception:
+            pass
+        prompt_textarea.evaluate("""(el, text) => {
+            el.dispatchEvent(new InputEvent('beforeinput', {
+                bubbles: true,
+                cancelable: true,
+                inputType: 'insertText',
+                data: text
+            }));
+            el.dispatchEvent(new InputEvent('input', {
+                bubbles: true,
+                cancelable: true,
+                inputType: 'insertText',
+                data: text
+            }));
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        }""", prompt_text)
+        try:
+            page.wait_for_function(send_button_ready_script, timeout=10000)
+        except Exception:
+            diagnostics = get_chatgpt_composer_diagnostics(page)
+            try:
+                if diagnostics["editorTextLength"] <= 0:
+                    raise Exception("The prompt draft was empty before recovery.")
+
+                # ChatGPT occasionally leaves the composer unmounted after a long
+                # insert. Reloading the same conversation restores its saved draft.
+                page.reload(wait_until="domcontentloaded", timeout=60000)
+                prompt_textarea = page.locator(CHATGPT_VISIBLE_COMPOSER_SELECTOR).first
+                prompt_textarea.wait_for(state="visible", timeout=60000)
+
+                restored_draft = prompt_textarea.inner_text().strip()
+                if not restored_draft:
+                    prompt_textarea.click()
+                    page.keyboard.press("Control+A")
+                    page.keyboard.insert_text(prompt_text)
+                ensure_prompt_editor_integrity(prompt_textarea, prompt_text)
+
+                # Reload removes the marker classes, so mark the existing replies
+                # again before sending to avoid returning an earlier response.
+                page.evaluate("document.querySelectorAll('[data-message-author-role=\"assistant\"], [data-markdown-text-style=\"assistant-message\"]').forEach(el => el.classList.add('my-old-msg'))")
+                page.wait_for_function(send_button_ready_script, timeout=30000)
+                send_btn = get_chatgpt_send_button(prompt_textarea)
+            except Exception as recovery_error:
+                recovery_diagnostics = get_chatgpt_composer_diagnostics(page)
+                sent_via_fallback = False
+                try:
+                    if recovery_diagnostics.get("editorTextLength", 0) > 0:
+                        prompt_textarea.focus()
+                        page.keyboard.press("Enter")
+                        sent_via_fallback = True
+                except Exception:
+                    pass
+                if not sent_via_fallback:
+                    raise Exception(
+                        "Send button did not appear/enable after typing or one same-chat reload. "
+                        f"Initial diagnostics: {diagnostics}. "
+                        f"Recovery diagnostics: {recovery_diagnostics}. "
+                        f"Initial error: {e}. Recovery error: {recovery_error}"
+                    ) from recovery_error
+
+    try:
+        send_btn.click()
+    except Exception:
+        prompt_textarea.focus()
+        page.keyboard.press("Enter")
+
+    # Confirm the single send attempt through multiple independent UI signals.
+    # Never press Enter or click again after an ambiguous delivery because the
+    # first request may already have reached ChatGPT.
+    try:
+        page.wait_for_function(
+            _chatgpt_dom_script("""
+                const editor = findComposer();
+                const userTurns = document.querySelectorAll(
+                    '[data-message-author-role="user"], [data-user-message-bubble="true"], [data-content-search-unit-key*="user"]'
+                ).length;
+                const generationStarted = Boolean(
+                    document.querySelector('[data-testid="stop-button"], button[aria-label*="Stop"], button[aria-label*="Dừng"]')
+                );
+                const editorCleared = Boolean(
+                    editor && (editor.innerText || editor.textContent || '').trim() === ''
+                );
+                return editorCleared
+                    || generationStarted
+                    || userTurns > baseline.previousUserCount
+                    || location.href !== baseline.previousUrl;
+            """, "baseline"),
+            arg={
+                "previousUrl": page_url_before_send,
+                "previousUserCount": previous_user_count,
+            },
+            timeout=CHATGPT_PROMPT_SUBMISSION_TIMEOUT_MS,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Prompt submission could not be confirmed after one send attempt. "
+            "No automatic resend was attempted to avoid duplicate ChatGPT "
+            "messages."
+        ) from exc
+
+    if on_prompt_submitted is not None:
+        on_prompt_submitted()
+
+    response_turn_baseline = get_response_turn_baseline(
+        page_url_before_send,
+        page.url,
+        previous_assistant_turn,
+    )
+    return wait_for_assistant_response(
+        page,
+        response_turn_baseline,
+        previous_assistant_count=previous_assistant_count,
+        previous_user_turn=previous_user_turn,
+        previous_user_count=previous_user_count,
+        submitted_prompt_text=prompt_text,
+        allow_empty_response=allow_empty_response,
+    )
+
+
+def get_prompt_fingerprint(prompt_text: str) -> str:
+    normalized_prompt = re.sub(r"\s+", " ", prompt_text).strip()
+    return hashlib.sha256(normalized_prompt.encode("utf-8")).hexdigest()
+
+
+def _pending_prompt_matches(state: dict, step: str, prompt_text: str) -> bool:
+    pending_prompt = state.get("pending_prompt")
+    return bool(
+        isinstance(pending_prompt, dict)
+        and pending_prompt.get("step") == step
+        and pending_prompt.get("fingerprint") == get_prompt_fingerprint(prompt_text)
+    )
+
+
+def is_prompt_in_conversation(page: Page, expected_user_text: str) -> bool:
+    try:
+        user_texts = page.evaluate("""() => {
+            const cleanNode = (el) => {
+                if (!el) return '';
+                const clone = el.cloneNode(true);
+                clone.querySelectorAll('button, .sr-only').forEach(b => b.remove());
+                return (clone.innerText || clone.textContent || '').trim();
+            };
+
+            const nodes = [...document.querySelectorAll('[data-user-message-bubble="true"], [data-message-author-role="user"]')];
+            const unique = nodes.filter((el, idx) => !nodes.some((other, otherIdx) => otherIdx !== idx && other.contains(el)));
+            return unique.map(cleanNode).filter(t => t.length > 0);
+        }""")
+        if not user_texts:
+            return False
+
+        return any(
+            history_prompt_text_matches(expected_user_text, clean_text(text))
+            for text in user_texts
+        )
+    except Exception:
+        return False
+
+
+
+def recover_pending_prompt_response(
+    page: Page, 
+    prompt_text: str,
+    on_prompt_submitted = None,
+) -> str:
+    try:
+        response_text = wait_for_existing_assistant_response(
+            page,
+            prompt_text,
+            PENDING_RESPONSE_WAIT_SECONDS,
+        )
+    except ChatGPTResponseError as exc:
+        if exc.code != CHATGPT_RESPONSE_RENDER_ERROR_CODE:
+            raise
+        response_text = ""
+    if not response_text:
+        response_text = recover_assistant_response_after_reload(page, prompt_text)
+    if response_text:
+        return response_text
+        
+    if not is_prompt_in_conversation(page, prompt_text):
+        return send_prompt(page, prompt_text, on_prompt_submitted=on_prompt_submitted)
+        
+    raise RuntimeError(
+        "A previously submitted ChatGPT prompt still has no readable response. "
+        "The existing conversation was inspected without resending the prompt."
+    )
+
+
+def send_or_recover_generation_prompt(
+    page: Page,
+    state: dict,
+    step: str,
+    prompt_text: str,
+) -> str:
+    pending_prompt = state.get("pending_prompt")
+    def mark_submitted() -> None:
+        state["pending_prompt"]["status"] = "submitted"
+        if is_chatgpt_conversation_url(page.url):
+            state["chat_url"] = page.url
+        persist_generation_state(state)
+
+    if pending_prompt:
+        if not _pending_prompt_matches(state, step, prompt_text):
+            raise RuntimeError(
+                "The checkpoint contains a different unresolved ChatGPT prompt. "
+                "No new prompt was sent."
+            )
+        return recover_pending_prompt_response(page, prompt_text, on_prompt_submitted=mark_submitted)
+
+    def mark_prompt_submitted() -> None:
+        state["pending_prompt"] = {
+            "step": step,
+            "fingerprint": get_prompt_fingerprint(prompt_text),
+        }
+        if is_chatgpt_conversation_url(page.url):
+            state["chat_url"] = page.url
+        persist_generation_state(state)
+
+    return send_prompt(
+        page,
+        prompt_text,
+        on_prompt_submitted=mark_prompt_submitted,
+    )
+
+
+def clear_pending_generation_prompt(
+    state: dict,
+    step: str,
+    prompt_text: str,
+) -> None:
+    if _pending_prompt_matches(state, step, prompt_text):
+        state.pop("pending_prompt", None)
+
+
+def build_video_script(state: dict) -> str:
+    intro = dedup_consecutive_paragraphs(sanitize_narrative_response(state.get("intro", "")))
+    body = "\n\n".join(
+        sanitized_part
+        for part in state.get("body_parts", [])
+        if (sanitized_part := dedup_consecutive_paragraphs(sanitize_narrative_response(part)))
+    )
+    outro = dedup_consecutive_paragraphs(sanitize_narrative_response(state.get("outro", "")))
+    
+    sections = [
+        f"### [INTRO]\n{intro}",
+        f"### [BODY]\n{body}",
+        f"### [OUTRO]\n{outro}",
+    ]
+    if state.get("title"):
+        sections.append(f"### [TIÊU ĐỀ]\n{state.get('title', '').strip()}")
+    if state.get("slug"):
+        sections.append(f"### [SLUG]\n{state.get('slug', '').strip()}")
+    if state.get("description"):
+        sections.append(f"### [MÔ TẢ]\n{state.get('description', '').strip()}")
+    if state.get("hashtags"):
+        sections.append(f"### [HASHTAGS]\n{state.get('hashtags', '').strip()}")
+    if state.get("tags"):
+        sections.append(f"### [TAGS]\n{state.get('tags', '').strip()}")
+    if state.get("pinned_comment"):
+        sections.append(f"### [BÌNH LUẬN GHIM]\n{state.get('pinned_comment', '').strip()}")
+    if state.get("quiz"):
+        sections.append(f"### [QUIZ]\n{state.get('quiz', '').strip()}")
+    if not any(state.get(k) for k in ("title", "slug", "description", "hashtags", "tags", "pinned_comment", "quiz")) and state.get("metadata"):
+        sections.append(f"### [METADATA & QUIZ]\n{state.get('metadata', '').strip()}")
+    if state.get("chapters"):
+        sections.append(f"### [CHAPTERS]\n{state.get('chapters', '').strip()}")
+    if state.get("thumb_text"):
+        sections.append(f"### [THUMBNAIL CÓ CHỮ]\n{state.get('thumb_text', '').strip()}")
+    if state.get("thumb_notext"):
+        sections.append(f"### [THUMBNAIL KHÔNG CHỮ]\n{state.get('thumb_notext', '').strip()}")
+    
+    raw_script = "\n\n".join(s for s in sections if s)
+    return sanitize_generated_script(raw_script)
+
+
+def _checkpoint_video_id() -> int | None:
+    raw_video_id = os.environ.get("VIDEO_ID", "").strip()
+    if not raw_video_id:
+        return None
+    try:
+        return int(raw_video_id)
+    except ValueError:
+        return None
+
+
+def persist_generation_state(state: dict) -> None:
+    """Persist both resumable worker state and the latest UI-visible draft."""
+    video_id = _checkpoint_video_id()
+    if video_id is None:
+        return
+
+    save_checkpoint(video_id, state)
+    try:
+        from auto_yt.services import database as db
+
+        db.update_video_generation(
+            video_id,
+            build_video_script(state),
+            state.get("chat_url", ""),
+        )
+    except Exception as exc:
+        # The JSON checkpoint remains the recovery source even when SQLite is
+        # temporarily unavailable (for example during an abrupt shutdown).
+        print(
+            f"Warning: could not update draft checkpoint in database: {exc}",
+            file=sys.stderr,
+        )
+
+
+def _run_complete(transcript: str, state: dict) -> dict:
+    profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
+    if not profile_dir.exists():
+        raise Exception("Profile directory not found. Please run the auto-login tool first.")
+
+    with sync_playwright() as p, closing(
+        launch_chatgpt_context(p.chromium, profile_dir)
+    ) as context:
+        page = context.pages[0] if context.pages else context.new_page()
+        project_url = get_chatgpt_project_url()
+        resume_url = state.get("chat_url", "")
+        # Safeguard: Only resume if there's a valid chat url AND existing progress (outline_parts)
+        # If state has no outline_parts, resuming an old chat url is dangerous (might re-send Part 1 into an old chat)
+        if resume_url and not state.get("outline_parts"):
+            print(">>> KHỞI TẠO PHIÊN CHAT MỚI TRONG PROJECT CHO AN TOÀN", file=sys.stderr)
+            resume_url = ""
+            state["chat_url"] = ""
+
+        is_resuming = is_chatgpt_conversation_url(resume_url)
+        if is_resuming:
+            page.goto(
+                resume_url,
+                wait_until="domcontentloaded",
+                timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+            )
+            check_chatgpt_page_attention(page)
+            ensure_expected_conversation_page(page.url, resume_url)
+            wait_for_conversation_history(page)
+            print(
+                f">>> TIẾP TỤC PHIÊN CHAT CŨ: {resume_url}",
+                file=sys.stderr,
+            )
+        else:
+            navigate_to_chatgpt_project(page, project_url)
+
+        prompts = get_active_prompts()
+        pipeline = normalize_prompt_pipeline(state.get("pipeline"))
+        state["pipeline"] = pipeline
+
+        parts = state.get("outline_parts", [])
+        if not parts:
+            # Step 2: Dàn ý
+            print(">>> BƯỚC 2: TẠO DÀN Ý", file=sys.stderr)
+            prompt2 = prompts.get("outline", "").replace("{transcript}", transcript) + STRICT_NO_FILLER
+            state["current_step"] = "outline"
+            outline = get_reusable_outline_response(page) if is_resuming else ""
+            if outline:
+                print(">>> TÁI SỬ DỤNG DÀN Ý ĐÃ HOÀN THÀNH TRONG CHAT CŨ", file=sys.stderr)
+            else:
+                try:
+                    outline = send_or_recover_generation_prompt(
+                        page,
+                        state,
+                        "outline",
+                        prompt2,
+                    )
+                finally:
+                    if is_chatgpt_conversation_url(page.url):
+                        ensure_expected_project_conversation_page(
+                            page.url,
+                            project_url,
+                        )
+                        state["chat_url"] = page.url
+                        persist_generation_state(state)
+
+            if is_chatgpt_conversation_url(page.url):
+                ensure_expected_project_conversation_page(
+                    page.url,
+                    project_url,
+                )
+                state["chat_url"] = page.url
+            if not state.get("chat_url"):
+                raise RuntimeError(
+                    "ChatGPT did not create a conversation inside the configured "
+                    "Project after the first prompt. No automatic resend was "
+                    "attempted."
+                )
+            print(f"    -> Chat URL: {state['chat_url']}", file=sys.stderr)
+
+            outline = strip_outline_preamble(outline)
+
+            parts = split_outline_parts(outline)
+            if not parts:
+                clear_pending_generation_prompt(state, "outline", prompt2)
+                persist_generation_state(state)
+                raise RuntimeError("ChatGPT returned an empty outline.")
+
+            filtered_parts = []
+            removed_count = 0
+            for part in parts:
+                lower_header = part.lower()[:80].strip()
+                words = part.split()
+                # Only filter out if it's a short boilerplate label (< 15 words) with purely meta intro/outro words
+                # NEVER remove substantive narrative/historical story content
+                is_pure_meta_intro = (
+                    len(words) < 15
+                    and any(lower_header.startswith(kw) for kw in ("intro:", "mở bài:", "lời chào:", "chào mừng"))
+                )
+                is_pure_meta_outro = (
+                    len(words) < 15
+                    and any(lower_header.startswith(kw) for kw in ("outro:", "kết bài:", "kêu gọi:", "like và subscribe"))
+                )
+                if len(parts) > 2 and (is_pure_meta_intro or is_pure_meta_outro):
+                    removed_count += 1
+                    continue
+                filtered_parts.append(part)
+
+            if removed_count > 0:
+                print(f"    -> Đã loại bỏ {removed_count} phần nhãn Intro/Outro thuần túy.", file=sys.stderr)
+                parts = filtered_parts if filtered_parts else parts
+
+            state["outline_parts"] = parts
+            state["expected_body_parts"] = len(parts)
+            clear_pending_generation_prompt(state, "outline", prompt2)
+            persist_generation_state(state)
+            print(f"    -> Đã chia thành {len(parts)} phần.", file=sys.stderr)
+        else:
+            state["expected_body_parts"] = len(parts)
+
+        chat_url = state.get("chat_url", page.url)
+
+        # Step 3: Intro
+        if not state.get("intro"):
+            print(">>> BƯỚC 3: VIẾT INTRO", file=sys.stderr)
+            prompt3 = (
+                prompts.get("intro", "")
+                + STRICT_NO_FILLER
+                + NARRATIVE_ONLY_INSTRUCTION
+            )
+            state["current_step"] = "intro"
+            intro = dedup_consecutive_paragraphs(sanitize_narrative_response(
+                send_or_recover_generation_prompt(
+                    page,
+                    state,
+                    "intro",
+                    prompt3,
+                )
+            ))
+            if not intro:
+                clear_pending_generation_prompt(state, "intro", prompt3)
+                persist_generation_state(state)
+                raise RuntimeError(
+                    "ChatGPT returned no narrative INTRO content."
+                )
+            state["intro"] = intro
+            clear_pending_generation_prompt(state, "intro", prompt3)
+            persist_generation_state(state)
+        else:
+            intro = state["intro"]
+
+        body_parts_result = state["body_parts"]
+        if len(body_parts_result) > len(parts):
+            body_parts_result = body_parts_result[:len(parts)]
+            state["body_parts"] = body_parts_result
+            persist_generation_state(state)
+        for i, part in enumerate(parts[len(body_parts_result):], start=len(body_parts_result)):
+            if len(body_parts_result) >= len(parts):
+                break
+            print(f">>> BƯỚC 4: VIẾT BODY PHẦN {i+1}/{len(parts)}", file=sys.stderr)
+            prompt4 = (
+                prompts.get("body", "").replace("{part}", part)
+                + STRICT_NO_FILLER
+                + NARRATIVE_ONLY_INSTRUCTION
+            )
+            body_step = f"body {i + 1}/{len(parts)}"
+            state["current_step"] = body_step
+            res = dedup_consecutive_paragraphs(sanitize_narrative_response(
+                send_or_recover_generation_prompt(
+                    page,
+                    state,
+                    body_step,
+                    prompt4,
+                )
+            ))
+            if not res:
+                clear_pending_generation_prompt(state, body_step, prompt4)
+                persist_generation_state(state)
+                raise RuntimeError(
+                    "ChatGPT returned no narrative BODY content."
+                )
+            body_parts_result.append(res)
+            clear_pending_generation_prompt(state, body_step, prompt4)
+            persist_generation_state(state)
+            
+        # Step 5: Outro
+        if not state.get("outro"):
+            print(">>> BƯỚC 5: VIẾT OUTRO", file=sys.stderr)
+            prompt5 = (
+                prompts.get("outro", "")
+                + STRICT_NO_FILLER
+                + NARRATIVE_ONLY_INSTRUCTION
+            )
+            state["current_step"] = "outro"
+            outro = dedup_consecutive_paragraphs(sanitize_narrative_response(
+                send_or_recover_generation_prompt(
+                    page,
+                    state,
+                    "outro",
+                    prompt5,
+                )
+            ))
+            if not outro:
+                clear_pending_generation_prompt(state, "outro", prompt5)
+                persist_generation_state(state)
+                raise RuntimeError(
+                    "ChatGPT returned no narrative OUTRO content."
+                )
+            state["outro"] = outro
+            clear_pending_generation_prompt(state, "outro", prompt5)
+            persist_generation_state(state)
+        else:
+            outro = state["outro"]
+
+        if not is_core_script_complete(transcript, state):
+            state["current_step"] = "core completeness"
+            raise RuntimeError(
+                "The rewritten core script is missing one or more required sections. "
+                "No metadata, thumbnail, or audio request was sent."
+            )
+
+        # Step 6: Tiêu đề (Title)
+        if pipeline.get("title", True) and not state.get("title"):
+            print(">>> BƯỚC 6: TẠO TIÊU ĐỀ", file=sys.stderr)
+            prompt_title = (prompts.get("title", "") or prompts.get("metadata", "")) + STRICT_NO_FILLER
+            state["current_step"] = "title"
+            title = send_or_recover_generation_prompt(
+                page,
+                state,
+                "title",
+                prompt_title,
+            )
+            state["title"] = title
+            clear_pending_generation_prompt(state, "title", prompt_title)
+            persist_generation_state(state)
+
+        # Step 7: URL Slug
+        if pipeline.get("slug", True) and not state.get("slug"):
+            print(">>> BƯỚC 7: TẠO URL SLUG", file=sys.stderr)
+            prompt_slug = (prompts.get("slug", "") or prompts.get("metadata", "")) + STRICT_NO_FILLER
+            state["current_step"] = "slug"
+            slug = send_or_recover_generation_prompt(
+                page,
+                state,
+                "slug",
+                prompt_slug,
+            )
+            state["slug"] = slug
+            clear_pending_generation_prompt(state, "slug", prompt_slug)
+            persist_generation_state(state)
+
+        # Step 8: Mô tả (Description)
+        if pipeline.get("description", True) and not state.get("description"):
+            print(">>> BƯỚC 8: TẠO MÔ TẢ", file=sys.stderr)
+            prompt_desc = (prompts.get("description", "") or prompts.get("metadata", "")) + STRICT_NO_FILLER
+            state["current_step"] = "description"
+            description = send_or_recover_generation_prompt(
+                page,
+                state,
+                "description",
+                prompt_desc,
+            )
+            state["description"] = description
+            clear_pending_generation_prompt(state, "description", prompt_desc)
+            persist_generation_state(state)
+
+        # Step 9: Hashtags (cho mô tả)
+        if pipeline.get("hashtags", True) and not state.get("hashtags"):
+            print(">>> BƯỚC 9: TẠO HASHTAGS", file=sys.stderr)
+            prompt_hashtags = (prompts.get("hashtags", "") or prompts.get("tags", "") or prompts.get("metadata", "")) + STRICT_NO_FILLER
+            state["current_step"] = "hashtags"
+            hashtags = send_or_recover_generation_prompt(
+                page,
+                state,
+                "hashtags",
+                prompt_hashtags,
+            )
+            state["hashtags"] = hashtags
+            clear_pending_generation_prompt(state, "hashtags", prompt_hashtags)
+            persist_generation_state(state)
+
+        # Step 10: Thẻ từ khóa (Tags YouTube)
+        if pipeline.get("tags", True) and not state.get("tags"):
+            print(">>> BƯỚC 10: TẠO THẺ TỪ KHÓA (TAGS)", file=sys.stderr)
+            prompt_tags = (prompts.get("tags", "") or prompts.get("metadata", "")) + STRICT_NO_FILLER
+            state["current_step"] = "tags"
+            tags = send_or_recover_generation_prompt(
+                page,
+                state,
+                "tags",
+                prompt_tags,
+            )
+            state["tags"] = tags
+            clear_pending_generation_prompt(state, "tags", prompt_tags)
+            persist_generation_state(state)
+
+        # Step 11: Bình luận ghim (Pinned comment)
+        if pipeline.get("pinned_comment", True) and not state.get("pinned_comment"):
+            print(">>> BƯỚC 11: TẠO BÌNH LUẬN GHIM", file=sys.stderr)
+            prompt_pinned = (prompts.get("pinned_comment", "") or prompts.get("metadata", "")) + STRICT_NO_FILLER
+            state["current_step"] = "pinned_comment"
+            pinned = send_or_recover_generation_prompt(
+                page,
+                state,
+                "pinned_comment",
+                prompt_pinned,
+            )
+            state["pinned_comment"] = pinned
+            clear_pending_generation_prompt(state, "pinned_comment", prompt_pinned)
+            persist_generation_state(state)
+
+        # Step 12: Quiz tương tác
+        if pipeline.get("quiz", True) and not state.get("quiz"):
+            print(">>> BƯỚC 12: TẠO QUIZ TƯƠNG TÁC", file=sys.stderr)
+            prompt_quiz = (prompts.get("quiz", "") or prompts.get("metadata", "")) + STRICT_NO_FILLER
+            state["current_step"] = "quiz"
+            quiz = send_or_recover_generation_prompt(
+                page,
+                state,
+                "quiz",
+                prompt_quiz,
+            )
+            state["quiz"] = quiz
+            clear_pending_generation_prompt(state, "quiz", prompt_quiz)
+            persist_generation_state(state)
+
+        # Legacy metadata fallback if individual steps are not configured but metadata is on
+        if pipeline.get("metadata") and not any(state.get(k) for k in ("title", "slug", "description", "hashtags", "tags", "pinned_comment", "quiz")) and not state.get("metadata"):
+            print(">>> BƯỚC CŨ: TẠO METADATA & QUIZ", file=sys.stderr)
+            prompt6 = prompts.get("metadata", "") + STRICT_NO_FILLER
+            state["current_step"] = "metadata"
+            metadata = send_or_recover_generation_prompt(
+                page,
+                state,
+                "metadata",
+                prompt6,
+            )
+            state["metadata"] = metadata
+            clear_pending_generation_prompt(state, "metadata", prompt6)
+            persist_generation_state(state)
+
+        # Step 13: Chapters
+        if pipeline.get("chapters", True) and not state.get("chapters"):
+            print(">>> BƯỚC 13: TẠO CHAPTERS", file=sys.stderr)
+            prompt7 = prompts.get("chapters", "") + STRICT_NO_FILLER
+            state["current_step"] = "chapters"
+            try:
+                chapters = send_or_recover_generation_prompt(
+                    page,
+                    state,
+                    "chapters",
+                    prompt7,
+                )
+            except ChatGPTGenerationTimeoutError as exc:
+                recovered_chapters = wait_for_valid_chapter_response(
+                    page,
+                    exc.previous_assistant_turn,
+                    initial_response=exc.response_text.strip(),
+                    previous_assistant_count=exc.previous_assistant_count,
+                    expected_user_text=prompt7,
+                )
+                if recovered_chapters:
+                    state["chapters"] = recovered_chapters
+                    state["current_step"] = "thumbnail with text"
+                    clear_pending_generation_prompt(state, "chapters", prompt7)
+                    persist_generation_state(state)
+                    raise RuntimeError(
+                        "Chapter content was preserved, but ChatGPT remained busy. "
+                        "No thumbnail prompt was sent."
+                    ) from exc
+                raise
+            state["chapters"] = chapters
+            clear_pending_generation_prompt(state, "chapters", prompt7)
+            persist_generation_state(state)
+
+        # Step 7.5: Visual Research (Extract entities & fetch reference images)
+        if pipeline.get("visual_research") and not state.get("visual_references"):
+            print(">>> BƯỚC 7.5: TÌM ẢNH TƯ LIỆU THAM CHIẾU (VISUAL RESEARCH)", file=sys.stderr)
+            state["current_step"] = "visual research"
+            persist_generation_state(state)
+            visual_prompt = prompts.get("visual_research") or DEFAULT_VISUAL_RESEARCH_PROMPT
+            try:
+                queries_response = send_prompt(page, visual_prompt, allow_empty_response=False)
+                extracted_queries = media_fetcher.extract_queries_from_response(queries_response)
+                print(f"    -> Đã trích xuất {len(extracted_queries)} từ khóa tư liệu: {extracted_queries}", file=sys.stderr)
+
+                vid_id = _checkpoint_video_id()
+                ref_dir = REFERENCES_DIR / f"video_{vid_id}" if vid_id else REFERENCES_DIR / "session"
+                ref_paths = media_fetcher.fetch_reference_images_for_queries(extracted_queries, output_dir=ref_dir, max_images=2)
+
+                if ref_paths:
+                    base64_items = []
+                    for rp in ref_paths:
+                        b64 = media_fetcher.image_to_base64(rp)
+                        if b64:
+                            base64_items.append(b64)
+                    state["visual_references"] = ref_paths
+                    state["visual_references_base64"] = json.dumps(base64_items) if base64_items else None
+                    print(f"    -> Đã tải và chuẩn bị {len(ref_paths)} ảnh tư liệu tham chiếu.", file=sys.stderr)
+                else:
+                    print("    -> Không tìm thấy ảnh tư liệu phù hợp, tiếp tục tạo thumbnail.", file=sys.stderr)
+                    state["visual_references"] = []
+                    state["visual_references_base64"] = None
+            except Exception as v_exc:
+                print(f"    -> Cảnh báo: Lỗi trong bước visual research ({v_exc}), tự động bỏ qua.", file=sys.stderr)
+                state["visual_references"] = []
+                state["visual_references_base64"] = None
+            persist_generation_state(state)
+
+        # Helper for image extraction
+        def _download_image_local(chatgpt_url: str) -> str:
+            """Download image via Playwright session and save locally."""
+            try:
+                local_path = download_chatgpt_image_via_page(page, chatgpt_url)
+                print(f"    -> Đã download ảnh về local: {local_path}", file=sys.stderr)
+                return local_path
+            except Exception as e:
+                print(f"    -> Lỗi download ảnh: {e}", file=sys.stderr)
+                return ""
+
+        # Step 8: Thumbnail Idea 1 (With Text)
+        if pipeline["thumbnail_with_text"] and not state.get("thumb_text"):
+            print(">>> BƯỚC 8: TẠO Ý TƯỞNG THUMBNAIL (CÓ CHỮ)", file=sys.stderr)
+            prompt8 = build_thumbnail_generation_prompt(
+                prompts.get("thumb_text", ""),
+                "with_text",
+            )
+            state["current_step"] = "thumbnail with text"
+            image1_urls = []
+            thumb1 = ""
+            if is_prompt_in_conversation(page, prompt8):
+                image1_urls = get_reusable_thumbnail_images(page, _download_image_local)
+                if image1_urls:
+                    thumb1 = get_assistant_response_after_latest_user(page, expected_user_text=prompt8)
+            if not image1_urls:
+                thumb_ref_b64 = state.get("visual_references_base64") or prompts.get("thumb_text_image_base64")
+                thumb1, image1_urls = send_thumbnail_prompt(
+                    page,
+                    prompt8,
+                    _download_image_local,
+                    thumb_ref_b64
+                )
+                if not image1_urls:
+                    print(">>> THUMBNAIL CÓ CHỮ LỖI, THỬ LẠI MỘT LẦN...", file=sys.stderr)
+                    thumb1, image1_urls = retry_thumbnail_generation(
+                        page,
+                        _download_image_local,
+                    )
+
+            thumb1 = append_thumbnail_image_markers(thumb1, image1_urls)
+            state["thumb_text"] = thumb1
+            persist_generation_state(state)
+
+        # Step 9: Thumbnail Idea 2 (No Text)
+        if pipeline["thumbnail_without_text"] and not state.get("thumb_notext"):
+            print(">>> BƯỚC 9: TẠO Ý TƯỞNG THUMBNAIL (KHÔNG CHỮ)", file=sys.stderr)
+            prompt9 = build_thumbnail_generation_prompt(
+                prompts.get("thumb_notext", ""),
+                "without_text",
+            )
+            state["current_step"] = "thumbnail without text"
+            image2_urls = []
+            thumb2 = ""
+            if is_prompt_in_conversation(page, prompt9):
+                image2_urls = get_reusable_thumbnail_images(page, _download_image_local)
+                if image2_urls:
+                    thumb2 = get_assistant_response_after_latest_user(page, expected_user_text=prompt9)
+            if not image2_urls:
+                thumb_ref_b64 = state.get("visual_references_base64") or prompts.get("thumb_notext_image_base64")
+                thumb2, image2_urls = send_thumbnail_prompt(
+                    page,
+                    prompt9,
+                    _download_image_local,
+                    thumb_ref_b64
+                )
+                if not image2_urls:
+                    print(">>> THUMBNAIL KHÔNG CHỮ LỖI, THỬ LẠI MỘT LẦN...", file=sys.stderr)
+                    thumb2, image2_urls = retry_thumbnail_generation(
+                        page,
+                        _download_image_local,
+                    )
+
+            thumb2 = append_thumbnail_image_markers(thumb2, image2_urls)
+            state["thumb_notext"] = thumb2
+            persist_generation_state(state)
+
+        state["current_step"] = "complete"
+        persist_generation_state(state)
+        complete_for_audio = is_core_script_complete(transcript, state)
+        warning = "" if complete_for_audio else "The core video script is incomplete."
+        return {
+            "script": build_video_script(state),
+            "chat_url": chat_url,
+            "warning": warning,
+            "failed_step": "" if complete_for_audio else state["current_step"],
+            "complete_for_audio": complete_for_audio,
+            "pipeline": pipeline,
+        }
+
+
+def run(transcript: str) -> dict:
+    transcript_fingerprint = hashlib.sha256(
+        transcript.encode("utf-8")
+    ).hexdigest()
+    state = {
+        "chat_url": "",
+        "current_step": "startup",
+        "expected_body_parts": 0,
+        "outline_parts": [],
+        "intro": "",
+        "body_parts": [],
+        "outro": "",
+        "metadata": "",
+        "chapters": "",
+        "visual_references": [],
+        "visual_references_base64": None,
+        "thumb_text": "",
+        "thumb_notext": "",
+        "pending_prompt": None,
+        "pipeline": get_active_pipeline(),
+        "transcript_fingerprint": transcript_fingerprint,
+    }
+    video_id = _checkpoint_video_id()
+    if video_id is not None:
+        saved_state = load_checkpoint(video_id)
+        if saved_state and saved_state.get("transcript_fingerprint") == transcript_fingerprint:
+            state.update(saved_state)
+            if os.environ.get(PROMPT_PIPELINE_ENV, "").strip():
+                # The persistent queue snapshot is authoritative for automatic
+                # recovery, even if Settings changed while the job was waiting.
+                state["pipeline"] = get_active_pipeline()
+            else:
+                state["pipeline"] = normalize_prompt_pipeline(
+                    state.get("pipeline")
+                )
+            print(
+                f">>> KHÔI PHỤC CHECKPOINT VIDEO #{video_id}: "
+                f"{state.get('current_step', 'unknown')}",
+                file=sys.stderr,
+            )
+        elif saved_state:
+            print(
+                f"Warning: ignored mismatched checkpoint for video #{video_id}.",
+                file=sys.stderr,
+            )
+    try:
+        return _run_complete(transcript, state)
+    except ChatGPTAttentionRequiredError:
+        persist_generation_state(state)
+        raise
+    except Exception as exc:
+        has_recoverable_content = bool(
+            state["chat_url"]
+            or state["intro"]
+            or state["body_parts"]
+            or state["outro"]
+        )
+        if not has_recoverable_content:
+            raise
+
+        failed_step = state["current_step"]
+        warning = f"{failed_step}: {exc}"
+        print(
+            f">>> RECOVERED PARTIAL VIDEO AFTER {failed_step.upper()}: {exc}",
+            file=sys.stderr,
+        )
+        complete_for_audio = is_core_script_complete(transcript, state)
+        persist_generation_state(state)
+        return {
+            "script": build_video_script(state),
+            "chat_url": state["chat_url"],
+            "warning": warning,
+            "failed_step": failed_step,
+            "complete_for_audio": complete_for_audio,
+            "pipeline": normalize_prompt_pipeline(state.get("pipeline")),
+        }
+
+
+def generate_chapters_only(
+    script_text: str,
+    chat_url: str = "",
+    prompt_version: str = "",
+    reuse_existing_response: bool = False,
+) -> str:
+    profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
+    if not profile_dir.exists():
+        raise Exception("Profile directory not found. Please run the auto-login tool first.")
+
+    with sync_playwright() as p:
+        context = launch_chatgpt_context(p.chromium, profile_dir)
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            is_original_chat = is_chatgpt_conversation_url(chat_url)
+            target_url = (
+                chat_url
+                if is_original_chat
+                else get_chatgpt_project_url(prompt_version)
+            )
+            if is_original_chat:
+                page.goto(
+                    target_url,
+                    wait_until="domcontentloaded",
+                    timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+                )
+                check_chatgpt_page_attention(page)
+                ensure_expected_conversation_page(page.url, target_url)
+                wait_for_conversation_history(page)
+            else:
+                navigate_to_chatgpt_project(page, target_url)
+
+            if is_original_chat and reuse_existing_response:
+                try:
+                    page.wait_for_function(
+                        """() => document.querySelector(
+                            '[data-testid="stop-button"], button[aria-label*="Stop"], button[aria-label*="Dừng"]'
+                        ) === null""",
+                        timeout=CHATGPT_RESPONSE_TIMEOUT_SECONDS * 1000,
+                    )
+                except Exception as exc:
+                    raise ChatGPTGenerationTimeoutError(
+                        "Previous ChatGPT generation did not finish after "
+                        "20 minutes. No new prompt was sent."
+                    ) from exc
+
+                reusable_chapters = get_reusable_chapter_response(page)
+                if reusable_chapters:
+                    print(
+                        ">>> REUSED COMPLETED CHAPTER RESPONSE FROM THE SAME CHAT",
+                        file=sys.stderr,
+                    )
+                    return reusable_chapters
+
+            import os
+            original_prompt_version = os.environ.get("PROMPT_VERSION")
+            if prompt_version:
+                os.environ["PROMPT_VERSION"] = prompt_version
+            try:
+                prompts = get_active_prompts()
+            finally:
+                if original_prompt_version is not None:
+                    os.environ["PROMPT_VERSION"] = original_prompt_version
+                else:
+                    os.environ.pop("PROMPT_VERSION", None)
+
+            if not is_original_chat:
+                send_prompt(
+                    page,
+                    "Đây là nội dung kịch bản video YouTube cần tạo chapter:\n\n"
+                    f"{script_text[:12000]}",
+                )
+
+            chapter_prompt = prompts.get("chapters", "")
+            chapter_prompt += (
+                "\n\nLƯU Ý QUAN TRỌNG: Trả lời trực tiếp bằng danh sách chapter. "
+                "Không chào hỏi, không giải thích, không thêm nội dung ngoài chapter."
+            )
+            chapters = send_prompt(page, chapter_prompt).strip()
+            if not chapters:
+                raise RuntimeError("ChatGPT did not return chapter content.")
+            return sanitize_chapter_response(chapters)
+        finally:
+            context.close()
+
+
+def generate_single_component_only(
+    chat_url: str,
+    prompt_key: str,
+    prompt_version: str = "",
+) -> str:
+    profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
+    if not profile_dir.exists():
+        raise Exception("Profile directory not found. Please run the auto-login tool first.")
+
+    conversation_url = get_video_chat_url(chat_url)
+    with sync_playwright() as p:
+        context = launch_chatgpt_context(p.chromium, profile_dir)
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto(conversation_url, wait_until="domcontentloaded")
+            check_chatgpt_page_attention(page)
+            ensure_expected_conversation_page(page.url, conversation_url)
+            time.sleep(2)
+
+            original_prompt_version = os.environ.get("PROMPT_VERSION")
+            if prompt_version:
+                os.environ["PROMPT_VERSION"] = prompt_version
+            try:
+                prompts = get_active_prompts()
+            finally:
+                if original_prompt_version is not None:
+                    os.environ["PROMPT_VERSION"] = original_prompt_version
+                else:
+                    os.environ.pop("PROMPT_VERSION", None)
+
+            raw_prompt = prompts.get(prompt_key, "")
+            if not raw_prompt:
+                from auto_yt.default_prompts import DEFAULT_PROMPTS_DATA
+                raw_prompt = DEFAULT_PROMPTS_DATA["versions"]["default"]["prompts"].get(prompt_key, "")
+
+            full_prompt = raw_prompt.strip() + STRICT_NO_FILLER
+            response = send_prompt(page, full_prompt).strip()
+            if not response:
+                raise RuntimeError(f"ChatGPT did not return content for {prompt_key}.")
+            return response
+        finally:
+            context.close()
+
+
+def generate_title_only(chat_url: str, prompt_version: str = "") -> str:
+    return generate_single_component_only(chat_url, "title", prompt_version)
+
+
+def generate_slug_only(chat_url: str, prompt_version: str = "") -> str:
+    return generate_single_component_only(chat_url, "slug", prompt_version)
+
+
+def generate_description_only(chat_url: str, prompt_version: str = "") -> str:
+    return generate_single_component_only(chat_url, "description", prompt_version)
+
+
+def generate_hashtags_only(chat_url: str, prompt_version: str = "") -> str:
+    return generate_single_component_only(chat_url, "hashtags", prompt_version)
+
+
+def generate_tags_only(chat_url: str, prompt_version: str = "") -> str:
+    return generate_single_component_only(chat_url, "tags", prompt_version)
+
+
+def generate_pinned_comment_only(chat_url: str, prompt_version: str = "") -> str:
+    return generate_single_component_only(chat_url, "pinned_comment", prompt_version)
+
+
+def generate_quiz_only(chat_url: str, prompt_version: str = "") -> str:
+    return generate_single_component_only(chat_url, "quiz", prompt_version)
+
+
+def generate_metadata_only(
+    chat_url: str,
+    prompt_version: str = "",
+) -> str:
+    profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
+    if not profile_dir.exists():
+        raise Exception("Profile directory not found. Please run the auto-login tool first.")
+
+    conversation_url = get_video_chat_url(chat_url)
+    with sync_playwright() as p:
+        context = launch_chatgpt_context(p.chromium, profile_dir)
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto(conversation_url, wait_until="domcontentloaded")
+            check_chatgpt_page_attention(page)
+            ensure_expected_conversation_page(page.url, conversation_url)
+            time.sleep(2)
+
+            original_prompt_version = os.environ.get("PROMPT_VERSION")
+            if prompt_version:
+                os.environ["PROMPT_VERSION"] = prompt_version
+            try:
+                prompts = get_active_prompts()
+            finally:
+                if original_prompt_version is not None:
+                    os.environ["PROMPT_VERSION"] = original_prompt_version
+                else:
+                    os.environ.pop("PROMPT_VERSION", None)
+
+            generation_prompt = build_metadata_generation_prompt(
+                prompts.get("metadata", "")
+            )
+            return request_complete_metadata(page, generation_prompt)
+        finally:
+            context.close()
+
+
+def generate_comment_replies(
+    chat_url: str,
+    comments: list[dict],
+    reply_instruction: str = "",
+    recent_replies: list[str] | None = None,
+) -> dict[str, str]:
+    """Draft replies inside the video's existing ChatGPT conversation only."""
+    from auto_yt.services.youtube_comments import (
+        build_comment_reply_prompt,
+        parse_comment_reply_response,
+    )
+
+    conversation_url = get_video_chat_url(chat_url)
+    expected_ids = {str(comment["comment_id"]) for comment in comments}
+    profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
+    if not profile_dir.exists():
+        raise Exception(
+            "Profile directory not found. Please run the auto-login tool first."
+        )
+
+    with sync_playwright() as playwright, closing(
+        launch_chatgpt_context(playwright.chromium, profile_dir)
+    ) as context:
+        page = context.pages[0] if context.pages else context.new_page()
+        page.goto(
+            conversation_url,
+            wait_until="domcontentloaded",
+            timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+        )
+        check_chatgpt_page_attention(page)
+        ensure_expected_conversation_page(page.url, conversation_url)
+        wait_for_conversation_history(page)
+        response_text = send_prompt(
+            page,
+            build_comment_reply_prompt(comments, reply_instruction, recent_replies),
+        )
+        return parse_comment_reply_response(response_text, expected_ids)
+
+
+def initialize_comment_video_chat(
+    *,
+    title: str,
+    description: str,
+    transcript: str,
+    prompt_version: str,
+) -> str:
+    """Create one dedicated Project conversation for a legacy YouTube video.
+
+    A single prompt carries the complete available source context. If delivery
+    becomes ambiguous after ChatGPT has already created the conversation, the
+    new URL is returned instead of sending the prompt a second time.
+    """
+    profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
+    if not profile_dir.exists():
+        raise Exception(
+            "Profile directory not found. Please run the auto-login tool first."
+        )
+    project_url = get_chatgpt_project_url(prompt_version)
+    normalized_title = str(title or "").strip()
+    normalized_description = str(description or "").strip()
+    normalized_transcript = str(transcript or "").strip()
+    if not normalized_title:
+        raise ValueError("Legacy video title is required.")
+    if not normalized_description and not normalized_transcript:
+        raise ValueError(
+            "Legacy video must have a description or transcript before Chat creation."
+        )
+    context_prompt = (
+        "Đây là phiên Chat riêng dành duy nhất cho một video YouTube đã đăng. "
+        "Hãy dùng tiêu đề, mô tả và transcript bên dưới làm nền tảng nội dung "
+        "để trả lời các bình luận của người xem ở những lượt sau. Không trộn "
+        "nội dung với video khác. Ở lượt này chỉ xác nhận ngắn gọn rằng bạn đã "
+        "nhận nội dung, không phân tích và không viết lại kịch bản.\n\n"
+        f"TIÊU ĐỀ VIDEO:\n{normalized_title}\n\n"
+        f"MÔ TẢ VIDEO:\n{normalized_description or '(Không có mô tả)'}\n\n"
+        f"TRANSCRIPT VIDEO:\n{normalized_transcript or '(Không có transcript)'}"
+    )
+
+    with sync_playwright() as playwright, closing(
+        launch_chatgpt_context(playwright.chromium, profile_dir)
+    ) as context:
+        page = context.pages[0] if context.pages else context.new_page()
+        navigate_to_chatgpt_project(page, project_url)
+        try:
+            send_prompt(page, context_prompt)
+        except Exception:
+            # One send may have succeeded even if the response watcher failed.
+            # Saving the resulting conversation is safer than creating a second
+            # chat or duplicating the context prompt.
+            if is_expected_project_conversation_url(page.url, project_url):
+                return page.url.strip().rstrip("/")
+            raise
+        ensure_expected_project_conversation_page(page.url, project_url)
+        return page.url.strip().rstrip("/")
+
+
+def generate_thumbnails_only(
+    script_text: str,
+    chat_url: str = '',
+    prompt_version: str = '',
+    thumbnail_type: str | None = None,
+) -> dict:
+    """Run only thumbnail generation steps (8 & 9).
+    If chat_url is provided, navigates to that session to keep context.
+    Otherwise opens a new chat.
+    Uses the specified prompt_version if provided.
+    """
+    if thumbnail_type in ("with_text", "without_text"):
+        return _generate_single_thumbnail(
+            script_text,
+            chat_url,
+            prompt_version,
+            thumbnail_type,
+        )
+
+    profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
+    if not profile_dir.exists():
+        raise Exception("Profile directory not found. Please run the auto-login tool first.")
+
+    with sync_playwright() as p, closing(
+        launch_chatgpt_context(p.chromium, profile_dir)
+    ) as context:
+        page = context.pages[0] if context.pages else context.new_page()
+        
+        # Navigate to the original chat session if URL provided, otherwise open new chat
+        is_original_chat = is_chatgpt_conversation_url(chat_url)
+        target_url = (
+            chat_url
+            if is_original_chat
+            else get_chatgpt_project_url(prompt_version)
+        )
+        print(f"    -> Navigating to: {target_url}", file=sys.stderr)
+        if is_original_chat:
+            page.goto(
+                target_url,
+                wait_until="domcontentloaded",
+                timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+            )
+            check_chatgpt_page_attention(page)
+            ensure_expected_conversation_page(page.url, target_url)
+        else:
+            navigate_to_chatgpt_project(page, target_url)
+        time.sleep(2)  # Let the page settle
+
+        # Temporarily set PROMPT_VERSION env var so get_active_prompts() reads it
+        import os
+        original_env = os.environ.get("PROMPT_VERSION")
+        if prompt_version:
+            os.environ["PROMPT_VERSION"] = prompt_version
+            
+        try:
+            prompts = get_active_prompts()
+        finally:
+            if original_env is not None:
+                os.environ["PROMPT_VERSION"] = original_env
+            elif "PROMPT_VERSION" in os.environ:
+                del os.environ["PROMPT_VERSION"]
+
+        def _download_image(page, chatgpt_url: str) -> str:
+            """Download image via Playwright session (has ChatGPT cookies) and save locally."""
+            try:
+                local_path = download_chatgpt_image_via_page(page, chatgpt_url)
+                print(f"    -> Đã download ảnh về local: {local_path}", file=sys.stderr)
+                return local_path
+            except Exception as e:
+                print(f"    -> Lỗi download ảnh: {e}", file=sys.stderr)
+                return ""
+
+        print("    -> Dùng trực tiếp prompt thumbnail đã lưu.", file=sys.stderr)
+
+        print(">>>> GEN THUMBNAIL (CÓ CHỮ)", file=sys.stderr)
+        prompt8 = build_thumbnail_generation_prompt(
+            prompts.get("thumb_text", ""),
+            "with_text",
+        )
+        saved_ref_b64 = _get_video_reference_base64()
+        thumb1_ref_b64 = saved_ref_b64 or prompts.get("thumb_text_image_base64")
+        thumb1, image1_urls = send_thumbnail_prompt(
+            page,
+            prompt8,
+            lambda image_url: _download_image(page, image_url),
+            thumb1_ref_b64
+        )
+        if not image1_urls:
+            thumb1, image1_urls = retry_thumbnail_generation(
+                page,
+                lambda image_url: _download_image(page, image_url),
+            )
+
+        time.sleep(3)  # Brief settle delay between consecutive DALL-E prompts
+
+        print(">>> GEN THUMBNAIL (KHÔNG CHỮ)", file=sys.stderr)
+        prompt9 = build_thumbnail_generation_prompt(
+            prompts.get("thumb_notext", ""),
+            "without_text",
+        )
+        thumb2_ref_b64 = saved_ref_b64 or prompts.get("thumb_notext_image_base64")
+        thumb2, image2_urls = send_thumbnail_prompt(
+            page,
+            prompt9,
+            lambda image_url: _download_image(page, image_url),
+            thumb2_ref_b64
+        )
+        if not image2_urls:
+            thumb2, image2_urls = retry_thumbnail_generation(
+                page,
+                lambda image_url: _download_image(page, image_url),
+            )
+
+        return {
+            "thumb_text": thumb1,
+            "thumb_notext": thumb2,
+            "image1_urls": image1_urls,
+            "image2_urls": image2_urls,
+            "image1_url": image1_urls[0] if image1_urls else "",
+            "image2_url": image2_urls[0] if image2_urls else "",
+        }
+
+
+def _generate_single_thumbnail(
+    script_text: str,
+    chat_url: str,
+    prompt_version: str,
+    thumbnail_type: str,
+) -> dict:
+    thumbnail_configs = {
+        "with_text": {
+            "prompt_key": "thumb_text",
+            "text_result_key": "thumb_text",
+            "image_result_key": "image1_url",
+            "images_result_key": "image1_urls",
+            "label": "CÓ CHỮ",
+        },
+        "without_text": {
+            "prompt_key": "thumb_notext",
+            "text_result_key": "thumb_notext",
+            "image_result_key": "image2_url",
+            "images_result_key": "image2_urls",
+            "label": "KHÔNG CHỮ",
+        },
+    }
+    config = thumbnail_configs.get(thumbnail_type)
+    if config is None:
+        raise ValueError(f"Unsupported thumbnail type: {thumbnail_type}")
+
+    profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
+    if not profile_dir.exists():
+        raise Exception("Profile directory not found. Please run the auto-login tool first.")
+
+    with sync_playwright() as p, closing(
+        launch_chatgpt_context(p.chromium, profile_dir)
+    ) as context:
+        page = context.pages[0] if context.pages else context.new_page()
+        target_url = get_video_thumbnail_chat_url(chat_url)
+        print(f"    -> Navigating to: {target_url}", file=sys.stderr)
+        page.goto(target_url, wait_until="domcontentloaded")
+        check_chatgpt_page_attention(page)
+        ensure_expected_conversation_page(page.url, target_url)
+        time.sleep(2)
+
+        import os
+        original_prompt_version = os.environ.get("PROMPT_VERSION")
+        if prompt_version:
+            os.environ["PROMPT_VERSION"] = prompt_version
+        try:
+            prompts = get_active_prompts()
+        finally:
+            if original_prompt_version is not None:
+                os.environ["PROMPT_VERSION"] = original_prompt_version
+            else:
+                os.environ.pop("PROMPT_VERSION", None)
+
+        def download_image(chatgpt_url: str) -> str:
+            try:
+                return download_chatgpt_image_via_page(page, chatgpt_url)
+            except Exception as exc:
+                print(f"    -> Image download failed: {exc}", file=sys.stderr)
+                return ""
+
+        generation_prompt = build_thumbnail_generation_prompt(
+            prompts.get(config["prompt_key"], ""),
+            thumbnail_type,
+        )
+
+        print(f">>>> REGENERATE THUMBNAIL ({config['label']})", file=sys.stderr)
+        saved_ref_b64 = _get_video_reference_base64()
+        image_base64 = saved_ref_b64 or prompts.get(f"{config['prompt_key']}_image_base64")
+        response_text, image_urls = send_thumbnail_prompt(
+            page,
+            generation_prompt,
+            download_image,
+            image_base64
+        )
+
+        retry_succeeded = False
+        if not image_urls:
+            print(
+                f">>>> THUMBNAIL {config['label']} LỖI, THỬ LẠI MỘT LẦN...",
+                file=sys.stderr,
+            )
+            retry_response_text, image_urls = retry_thumbnail_generation(
+                page,
+                download_image,
+            )
+            retry_succeeded = bool(image_urls)
+
+        result = {
+            "thumb_text": None,
+            "thumb_notext": None,
+            "image1_url": "",
+            "image2_url": "",
+            "image1_urls": [],
+            "image2_urls": [],
+        }
+        result[config["text_result_key"]] = (
+            None if retry_succeeded else response_text
+        )
+        result[config["images_result_key"]] = image_urls
+        result[config["image_result_key"]] = image_urls[0] if image_urls else ""
+        return result
+
+
+if __name__ == "__main__":
+    transcript = sys.stdin.buffer.read().decode("utf-8")
+    try:
+        result = run(transcript)
+        script = result["script"] if isinstance(result, dict) else result
+        chat_url = result.get("chat_url", "") if isinstance(result, dict) else ""
+        worker_meta = {
+            "warning": result.get("warning", "") if isinstance(result, dict) else "",
+            "failed_step": result.get("failed_step", "") if isinstance(result, dict) else "",
+            "complete_for_audio": (
+                result.get("complete_for_audio", True)
+                if isinstance(result, dict)
+                else True
+            ),
+            "pipeline": (
+                result.get("pipeline", normalize_prompt_pipeline(None))
+                if isinstance(result, dict)
+                else normalize_prompt_pipeline(None)
+            ),
+        }
+        # Print script then marker then chat_url for the service to parse
+        sys.stdout.buffer.write(script.encode("utf-8"))
+        if chat_url:
+            sys.stdout.buffer.write(f"\n###CHAT_URL###{chat_url}".encode("utf-8"))
+        sys.stdout.buffer.write(
+            f"\n###WORKER_META###{json.dumps(worker_meta)}".encode("utf-8")
+        )
+    except Exception as e:
+        if isinstance(e, ChatGPTAttentionRequiredError):
+            sys.stderr.write(encode_attention_error(str(e)))
+        else:
+            sys.stderr.write(str(e))
+        sys.exit(1)

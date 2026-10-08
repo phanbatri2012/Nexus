@@ -1,0 +1,324 @@
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).parent / "src"))
+
+from auto_yt import main
+from auto_yt.services import database
+from auto_yt.services.audio_review import audit_script_for_audio
+
+
+SCRIPT = """
+### [INTRO]
+Mở đầu ngắn gọn nhưng đầy đủ.
+
+### [BODY]
+Đây là nội dung chính của video và được viết thành câu hoàn chỉnh.
+
+### [OUTRO]
+Kết thúc câu chuyện và cảm ơn khán giả.
+
+### [METADATA & QUIZ]
+TIÊU ĐỀ: Video kiểm tra
+""".strip()
+
+
+class AudioReviewTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.database_patch = patch.object(
+            database,
+            "DB_PATH",
+            Path(self.temporary_directory.name) / "database.db",
+        )
+        self.database_patch.start()
+        self.checkpoint_patch = patch.object(main, "load_checkpoint", return_value=None)
+        self.checkpoint_patch.start()
+        database.init_db()
+        self.video_id = database.save_video(
+            "https://youtube.test/review",
+            "Video review",
+            "Transcript",
+            SCRIPT,
+            voice_id="Vietnamese_crisp_announcer_v2",
+            voice_name="Giọng kiểm thử",
+        )
+
+    def tearDown(self):
+        self.checkpoint_patch.stop()
+        self.database_patch.stop()
+        self.temporary_directory.cleanup()
+
+    def test_complete_short_script_is_reviewable_without_length_threshold(self):
+        report = audit_script_for_audio(SCRIPT)
+
+        self.assertTrue(report["can_approve"])
+        self.assertEqual(report["errors"], [])
+        self.assertGreater(report["metrics"]["word_count"], 0)
+
+    def test_review_removes_detected_editorial_artifacts_before_approval(self):
+        intro_narrative = (
+            "Điều giữ hai con người ở lại với nhau vẫn là sự tôn trọng, "
+            "khả năng lắng nghe và mong muốn cùng nhau gìn giữ gia đình. " * 3
+        )
+        body_narrative = (
+            "Những quyết định quan trọng cần được cân nhắc từ nhiều góc độ, "
+            "đặc biệt khi chúng ảnh hưởng lâu dài đến cả một gia đình. " * 3
+        )
+        outro_narrative = (
+            "Bài học sau cùng giúp mỗi người bình tĩnh quan sát, lắng nghe "
+            "và lựa chọn điều phù hợp với hoàn cảnh của chính mình. " * 3
+        )
+        editorial_note = (
+            "Chia đoạn dài thành các nhịp dễ đọc\n"
+            "Thêm câu chuyển ý giữa các luận điểm"
+        )
+        script = (
+            f"### [INTRO]\n{intro_narrative}\n\n"
+            f"### [BODY]\n{body_narrative}\n\n"
+            f"{editorial_note}\n\n"
+            f"### [OUTRO]\n{outro_narrative}\n\n"
+            "### [METADATA & QUIZ]\nTIÊU ĐỀ: Video kiểm tra"
+        )
+        database.update_script(self.video_id, script)
+
+        review = main._prepare_audio_review(self.video_id)
+        saved_script = database.get_video(self.video_id)["generated_script"]
+
+        self.assertEqual(review["status"], "pending")
+        self.assertNotIn(editorial_note, saved_script)
+        self.assertNotIn(
+            "editorial_artifact",
+            {item["code"] for item in review["report"]["warnings"]},
+        )
+
+    def test_review_removes_standalone_structural_labels_before_approval(self):
+        intro_narrative = (
+            "Nội dung được viết thành văn xuôi liền mạch, đủ dấu câu và giữ "
+            "đúng các dữ kiện quan trọng của câu chuyện. " * 3
+        )
+        body_narrative = (
+            "Phần thân bài tiếp tục phân tích các sự kiện theo đúng trình tự, "
+            "giúp người nghe hiểu rõ nguyên nhân và kết quả của câu chuyện. " * 3
+        )
+        outro_narrative = (
+            "Phần kết đúc kết thông điệp chính bằng lời văn tự nhiên, rõ ràng "
+            "và phù hợp để chuyển trực tiếp thành giọng đọc cho video. " * 3
+        )
+        script = (
+            f"### [INTRO]\nMở đầu\n\n{intro_narrative}\n\n"
+            f"### [BODY]\n{body_narrative}\n\n"
+            f"### [OUTRO]\n{outro_narrative}\n\n"
+            "### [METADATA & QUIZ]\nTIÊU ĐỀ: Video kiểm tra"
+        )
+        database.update_script(self.video_id, script)
+
+        review = main._prepare_audio_review(self.video_id)
+        saved_script = database.get_video(self.video_id)["generated_script"]
+
+        self.assertEqual(review["status"], "pending")
+        self.assertNotIn("### [INTRO]\nMở đầu", saved_script)
+        self.assertNotIn(
+            "editorial_artifact",
+            {item["code"] for item in review["report"]["warnings"]},
+        )
+
+    def test_missing_section_and_corrupted_unicode_are_blocking(self):
+        report = audit_script_for_audio(
+            "### [INTRO]\nN?i dung ?? l?i\n\n### [BODY]\nNội dung"
+        )
+
+        self.assertFalse(report["can_approve"])
+        self.assertIn("missing_section", {item["code"] for item in report["errors"]})
+        self.assertIn("corrupted_unicode", {item["code"] for item in report["errors"]})
+
+    def test_non_adjacent_duplicate_paragraph_is_blocking(self):
+        repeated_paragraph = (
+            "Đoạn nội dung này đủ dài để đại diện cho một phần lời đọc hoàn chỉnh "
+            "và không được phép xuất hiện nguyên văn nhiều lần trong kịch bản. " * 3
+        ).strip()
+        bridge = (
+            "Nội dung chuyển tiếp trình bày một luận điểm khác với đầy đủ dữ kiện "
+            "để hai đoạn lặp không còn nằm sát nhau trong phần lời đọc. " * 3
+        ).strip()
+        script = (
+            "### [INTRO]\nMở đầu ngắn gọn nhưng đầy đủ.\n\n"
+            f"### [BODY]\n{repeated_paragraph}\n\n{bridge}\n\n"
+            f"{repeated_paragraph}\n\n"
+            "### [OUTRO]\nKết thúc câu chuyện và cảm ơn khán giả."
+        )
+
+        report = audit_script_for_audio(script)
+
+        self.assertFalse(report["can_approve"])
+        self.assertIn(
+            "duplicate_paragraph",
+            {item["code"] for item in report["errors"]},
+        )
+
+    def test_audio_submission_rechecks_duplicate_content_after_approval(self):
+        review = main._prepare_audio_review(self.video_id)
+        database.upsert_audio_review(
+            self.video_id,
+            review["script_hash"],
+            "approved",
+            review["report"],
+            database.utc_now(),
+        )
+        repeated_paragraph = (
+            "Phần lời đọc bị lặp này đủ dài để quality gate nhận diện trước khi "
+            "hệ thống bắt đầu chia nội dung và gửi yêu cầu tạo giọng nói. " * 3
+        ).strip()
+        bridge = (
+            "Một đoạn chuyển tiếp khác được đặt ở giữa để lỗi không bị bộ lọc "
+            "trùng liền nhau tự động loại bỏ trước bước kiểm duyệt. " * 3
+        ).strip()
+        database.update_script(
+            self.video_id,
+            (
+                "### [INTRO]\nMở đầu ngắn gọn nhưng đầy đủ.\n\n"
+                f"### [BODY]\n{repeated_paragraph}\n\n{bridge}\n\n"
+                f"{repeated_paragraph}\n\n"
+                "### [OUTRO]\nKết thúc câu chuyện và cảm ơn khán giả."
+            ),
+        )
+
+        with patch.object(main.tts, "split_text_for_tts") as split_text:
+            with self.assertRaises(RuntimeError):
+                main._ensure_audio_task(self.video_id)
+
+        split_text.assert_not_called()
+
+    def test_approval_survives_metadata_change_but_not_narrative_change(self):
+        review = main._prepare_audio_review(self.video_id)
+        database.upsert_audio_review(
+            self.video_id,
+            review["script_hash"],
+            "approved",
+            review["report"],
+            database.utc_now(),
+        )
+
+        database.update_script(
+            self.video_id,
+            SCRIPT.replace("TIÊU ĐỀ: Video kiểm tra", "TIÊU ĐỀ: Tiêu đề mới"),
+        )
+        self.assertEqual(main._prepare_audio_review(self.video_id)["status"], "approved")
+
+        database.update_script(
+            self.video_id,
+            SCRIPT.replace("Đây là nội dung chính", "Nội dung chính đã thay đổi"),
+        )
+        self.assertEqual(main._prepare_audio_review(self.video_id)["status"], "pending")
+
+    def test_generate_audio_automatically_approves_before_submission(self):
+        task = {
+            "video_id": self.video_id,
+            "task_id": "task-id",
+            "status": "pending",
+            "audio_url": "",
+            "error": "",
+            "voice_id": "Vietnamese_crisp_announcer_v2",
+            "voice_name": "Giọng kiểm thử",
+            "segments_json": "",
+            "updated_at": "2026-09-08T00:00:00+00:00",
+        }
+        with patch.object(main, "_ensure_audio_task", return_value=task) as ensure_audio:
+            response = main.generate_audio_for_video(self.video_id)
+
+        self.assertTrue(response["success"])
+        self.assertEqual(response["audio_review"]["status"], "approved")
+        self.assertEqual(database.get_audio_review(self.video_id)["status"], "approved")
+        ensure_audio.assert_called_once_with(
+            self.video_id,
+            requested_voice_id="",
+            requested_voice_name="",
+        )
+
+    def test_failed_automatic_review_never_submits_to_genmax(self):
+        database.update_script(
+            self.video_id,
+            "### [INTRO]\nN?i dung ?? l?i\n\n### [BODY]\nNội dung",
+        )
+        with patch.object(main, "_ensure_audio_task") as ensure_audio:
+            response = main.generate_audio_for_video(self.video_id)
+
+        self.assertFalse(response["success"])
+        self.assertTrue(response["quality_blocked"])
+        self.assertEqual(response["audio_review"]["status"], "blocked")
+        ensure_audio.assert_not_called()
+
+    def test_approval_is_saved_before_audio_submission(self):
+        task = {
+            "video_id": self.video_id,
+            "task_id": "task-id",
+            "status": "pending",
+            "audio_url": "",
+            "error": "",
+            "voice_id": "Vietnamese_crisp_announcer_v2",
+            "voice_name": "Giọng kiểm thử",
+            "segments_json": "",
+            "updated_at": "2026-09-08T00:00:00+00:00",
+        }
+        with (
+            patch.object(
+                main.voice_config,
+                "get_voice",
+                return_value={
+                    "id": "Vietnamese_crisp_announcer_v2",
+                    "name": "Giọng kiểm thử",
+                },
+            ),
+            patch.object(main, "_ensure_audio_task", return_value=task) as ensure_audio,
+        ):
+            response = main.approve_audio_review(
+                self.video_id,
+                main.ApproveAudioReviewRequest(
+                    confirm_credit_charge=True,
+                    voice_id="Vietnamese_crisp_announcer_v2",
+                ),
+            )
+
+        self.assertTrue(response["success"])
+        self.assertEqual(database.get_audio_review(self.video_id)["status"], "approved")
+        ensure_audio.assert_called_once()
+
+    def test_audit_script_blocks_chatgpt_response_load_error(self):
+        error_script = """
+### [INTRO]
+This response couldn’t load
+
+### [BODY]
+This response couldn’t load
+
+### [OUTRO]
+This response couldn’t load
+""".strip()
+        report = audit_script_for_audio(error_script)
+        self.assertFalse(report["can_approve"])
+        error_codes = {item["code"] for item in report["errors"]}
+        self.assertIn("system_error_artifact", error_codes)
+
+    def test_audit_script_blocks_too_short_script(self):
+        short_script = """
+### [INTRO]
+Chào bạn.
+
+### [BODY]
+Nội dung ngắn.
+
+### [OUTRO]
+Hết rồi.
+""".strip()
+        report = audit_script_for_audio(short_script)
+        self.assertFalse(report["can_approve"])
+        error_codes = {item["code"] for item in report["errors"]}
+        self.assertTrue("insufficient_content" in error_codes or "section_too_short" in error_codes)
+
+
+if __name__ == "__main__":
+    unittest.main()
+

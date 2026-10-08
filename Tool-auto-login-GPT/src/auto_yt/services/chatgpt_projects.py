@@ -1,0 +1,797 @@
+import json
+import os
+import re
+from urllib.parse import urlparse
+
+from auto_yt.paths import PROMPTS_PATH
+
+CHATGPT_PROJECT_URL_ENV = "CHATGPT_PROJECT_URL"
+DEFAULT_CHATGPT_BOOTSTRAP_URL = "https://chatgpt.com/"
+DEFAULT_CHATGPT_PROJECT_URL = (
+    "https://chatgpt.com/g/"
+    "g-p-6a1f9204f2d88191b39b64eb7f2dbb97-dd-vn2-phan-tich/project"
+)
+PROMPT_PIPELINE_ENV = "PROMPT_PIPELINE_JSON"
+DEFAULT_PROMPT_PIPELINE = {
+    "title": True,
+    "slug": True,
+    "description": True,
+    "hashtags": True,
+    "tags": True,
+    "pinned_comment": True,
+    "quiz": True,
+    "chapters": True,
+    "visual_research": False,
+    "thumbnail_with_text": True,
+    "thumbnail_without_text": True,
+    "audio": True,
+    "video_render": False,
+    "youtube_upload": False,
+    "youtube_schedule": False,
+}
+
+THUMBNAIL_VARIANTS = {"with_text", "without_text"}
+DEFAULT_THUMBNAIL_VARIANT = "with_text"
+SCENE_0_SOURCES = {"from_thumbnail_without_text", "from_thumbnail_with_text", "from_intro_transcript"}
+DEFAULT_SCENE_0_SOURCE = "from_thumbnail_without_text"
+DEFAULT_IMAGE_MODEL = "nano_banana_pro"
+DEFAULT_VIDEO_MODEL = "veo_3_1_lite"
+
+SUPPORTED_ASPECT_RATIOS = {"16:9", "4:3", "1:1", "3:4", "9:16"}
+SUPPORTED_VIDEO_ASPECT_RATIOS = {"16:9", "9:16"}
+SUPPORTED_OUTPUT_COUNTS = {1, 2, 3, 4}
+
+GOOGLE_FLOW_IMAGE_MODELS = {
+    "nano_banana_2": {
+        "id": "nano_banana_2",
+        "name": "🍌 Nano Banana 2",
+        "provider": "google_flow",
+        "badge": "🟢 Chuẩn Google Flow",
+        "credit_tier": "low",
+        "credit_label": "🟢 Tiết kiệm (~1 credit/ảnh)",
+        "speed": "⚡ 3–5s",
+        "description": "⭐ Model tạo ảnh mặc định mới nhất trên Google Flow. Tốc độ sinh nhanh, màu sắc chân thực, chi tiết sắc nét, phù hợp tạo 30–50 cảnh visual cho video dài.",
+        "is_default": False,
+    },
+    "nano_banana_pro": {
+        "id": "nano_banana_pro",
+        "name": "Nano Banana Pro (Legacy)",
+        "provider": "google_flow",
+        "badge": "🟢 Tiết kiệm Credit",
+        "credit_tier": "low",
+        "credit_label": "🟢 Thấp nhất (~1 credit/ảnh)",
+        "speed": "⚡ 3–5s",
+        "description": "Model thế hệ tiền nhiệm, tương thích hoàn toàn với các prompt version cũ.",
+        "is_default": True,
+    },
+    "imagen_3_standard": {
+        "id": "imagen_3_standard",
+        "name": "Google Imagen 3 (High-Fidelity)",
+        "provider": "google_flow",
+        "badge": "🟡 Chất lượng cao",
+        "credit_tier": "medium",
+        "credit_label": "🟡 Trung bình (~2–3 credit/ảnh)",
+        "speed": "⏳ 8–12s",
+        "description": "Chất lượng siêu thực cao cấp. Tái tạo biểu cảm nhân vật, bàn tay, ánh sáng và chi tiết da xuất sắc; bám sát prompt phức tạp.",
+        "is_default": False,
+    },
+    "imagen_3_photoreal": {
+        "id": "imagen_3_photoreal",
+        "name": "Google Imagen 3 (Photorealistic / 35mm)",
+        "provider": "google_flow",
+        "badge": "🟡 Tư liệu thực tế",
+        "credit_tier": "standard",
+        "credit_label": "🟡 Tiêu chuẩn (~2 credit/ảnh)",
+        "speed": "⏳ 6–10s",
+        "description": "Phong cách ảnh tư liệu / Điện ảnh thực tế. Tối ưu đặc biệt cho video kể chuyện, phim tài liệu, hạn chế cảm giác bóng bẩy 3D/CGI.",
+        "is_default": False,
+    },
+}
+
+GOOGLE_FLOW_VIDEO_MODELS = {
+    "omni_1_1_flash": {
+        "id": "omni_1_1_flash",
+        "name": "Omni 1.1 Flash",
+        "provider": "google_flow",
+        "badge": "⚡ Mặc định / Siêu tốc",
+        "credit_tier": "medium",
+        "credit_label": "🟡 Tiêu chuẩn (~10 credit/clip)",
+        "speed": "⚡ 15–25s",
+        "description": "⭐ Model tạo video AI mặc định mới nhất của Google Flow. Tốc độ sinh siêu nhanh, chuyển động mượt mà và phối cảnh nhất quán.",
+        "is_default": False,
+    },
+    "veo_3_1_lite": {
+        "id": "veo_3_1_lite",
+        "name": "Veo 3.1 – Lite",
+        "provider": "google_flow",
+        "badge": "🟢 Tiết kiệm Credit",
+        "credit_tier": "low",
+        "credit_label": "🟢 Thấp (~8 credit/clip)",
+        "speed": "⏳ 20–30s",
+        "description": "Bản rút gọn của Veo 3.1, tối ưu chi phí credit cho các cảnh intro ngắn.",
+        "is_default": True,
+    },
+    "veo_3_1_fast": {
+        "id": "veo_3_1_fast",
+        "name": "Veo 3.1 – Fast",
+        "provider": "google_flow",
+        "badge": "🟡 Tốc độ cao",
+        "credit_tier": "medium",
+        "credit_label": "🟡 Trung bình (~12 credit/clip)",
+        "speed": "⏳ 25–40s",
+        "description": "Veo 3.1 phiên bản tối ưu tốc độ, cân bằng chuyển động điện ảnh và thời gian chờ.",
+        "is_default": False,
+    },
+    "veo_3_1_quality": {
+        "id": "veo_3_1_quality",
+        "name": "Veo 3.1 – Quality",
+        "provider": "google_flow",
+        "badge": "🔴 Chất lượng Điện ảnh",
+        "credit_tier": "high",
+        "credit_label": "🔴 Cao (~15–20 credit/clip)",
+        "speed": "🐌 45–75s",
+        "description": "Veo 3.1 chất lượng cao nhất với độ sâu trường ảnh và ánh sáng chân thực tối đa.",
+        "is_default": False,
+    },
+    "google_veo_intro": {
+        "id": "google_veo_intro",
+        "name": "Google Veo (Intro Video Generator)",
+        "provider": "google_flow",
+        "badge": "🔴 Video AI Legacy",
+        "credit_tier": "high",
+        "credit_label": "🔴 Cao (~10–20 credit/clip)",
+        "speed": "🐌 30–60s",
+        "description": "Sinh video chuyển động AI 4–8 giây cho cảnh mở đầu để giữ chân người xem (Legacy ID).",
+        "is_default": False,
+    },
+}
+
+GOOGLE_FLOW_MODELS = {**GOOGLE_FLOW_IMAGE_MODELS, **GOOGLE_FLOW_VIDEO_MODELS}
+
+DEFAULT_IMAGE_GENERATION_SETTINGS = {
+    "render_mode": "google_flow",
+    "stock_video_settings": {
+        "background_videos_dir": "",
+        "custom_stock_videos_path": "",
+        "thumbnail_corner_mode": "random",
+        "show_waveform": True,
+        "show_animated_icon": True,
+    },
+    "provider": "google_flow",
+    "model": DEFAULT_IMAGE_MODEL,
+    "aspect_ratio": "16:9",
+    "output_count": 1,
+    "video_model": DEFAULT_VIDEO_MODEL,
+    "video_aspect_ratio": "16:9",
+    "video_output_count": 1,
+    "style_prompt": "Cinematic documentary film still, 35mm photography, atmospheric natural lighting, realistic textures, cinematic composition, shallow depth of field, balanced color grading, high visual fidelity, 8k raw photo.",
+    "avoid_prompt": "cartoon, anime, 3D CGI render, illustration, drawing, plastic skin, oversaturated, blown-out highlights, deformed hands, extra fingers, missing limbs, duplicate faces, distorted anatomy, text, watermark, signature, logo, blurry, low resolution.",
+    "negative_prompt": "cartoon, anime, 3D CGI render, illustration, drawing, plastic skin, oversaturated, blown-out highlights, deformed hands, extra fingers, missing limbs, duplicate faces, distorted anatomy, text, watermark, signature, logo, blurry, low resolution.",
+    "density": 30,
+    "outputs_per_scene": 1,
+    "thumbnail_variant": DEFAULT_THUMBNAIL_VARIANT,
+    "scene_0_source": DEFAULT_SCENE_0_SOURCE,
+    "enable_intro_video": True,
+    "intro_scene_target_seconds": 8.0,
+    "intro_crop_watermark": True,
+    "video_style_prompt": "Cinematic documentary film, 35mm motion picture composition, natural atmospheric lighting, realistic textures, balanced color grading, 4k cinematic video footage.",
+    "video_negative_prompt": "still image, static photo, cartoon, anime, 3D CGI render, illustration, deformed hands, distorted anatomy, text, watermark, signature, logo, blurry, low resolution.",
+    "video_prompt_template": "{frame_directive} Scene action: {action}. Visual style: {style}. {motion} Clean video without any text, letters, watermark, or subtitles.",
+    "video_motion_prompt": "Motion: smooth cinematic camera movement, natural realistic motion, 4k 24fps high-fidelity video.",
+    "scene_0_prompt_template": "A cinematic movie still: {style}, opening scene hook. {reference} Story visual core: {thumbnail_concept}. 16:9 widescreen, photorealistic 8k, authentic documentary realism, clean framing without text.",
+    "scene_body_prompt_template": "A still photograph: {style}, scene {scene_index}. {reference} Narrative scene: {action}. 16:9 widescreen still photograph, authentic documentary realism, natural lighting, clean visual without text.",
+    "scene_duration_min_seconds": 25,
+    "scene_duration_target_seconds": 30,
+    "scene_duration_max_seconds": 35,
+}
+UPLOAD_METHODS = ("browser", "api")
+DEFAULT_UPLOAD_METHOD = "browser"
+PUBLISH_MODES = {"public", "schedule", "private"}
+DEFAULT_PUBLISH_MODE = "schedule"
+MONETIZATION_MODES = {
+    "auto_enable_if_available",
+    "keep_off",
+    "require_on",
+}
+AD_SUITABILITY_MODES = {"none_of_the_above"}
+REMIX_POLICIES = {"video_and_audio", "audio_only", "disabled"}
+COMMENT_MODERATION_LEVELS = {"none", "basic", "strict", "hold_all"}
+COMMENT_ACCESS_LEVELS = {"anyone", "subscribers", "members"}
+COMMENT_SORT_ORDERS = {"top", "newest"}
+CHECKS_POLICIES = {"schedule_immediately"}
+CAPTION_CERTIFICATIONS = {
+    "none",
+    "never_aired_us",
+    "aired_us_without_captions",
+    "not_aired_us_with_captions_since_2012",
+    "fcc_not_required",
+    "fcc_exempt",
+}
+
+DEFAULT_PUBLISHING_SETTINGS = {
+    "upload_method": DEFAULT_UPLOAD_METHOD,
+    "publish_mode": "schedule",
+    "category_id": "",
+    "language": "vi",
+    "made_for_kids": None,
+    "notify_subscribers": True,
+    "include_tags": True,
+    "default_tags": "",
+    "contains_synthetic_media": True,
+    "monetization_mode": "auto_enable_if_available",
+    "midroll_ads": True,
+    "ad_suitability_mode": "none_of_the_above",
+    "playlist_name": "",
+    "age_restriction": False,
+    "paid_promotion": False,
+    "automatic_chapters": True,
+    "automatic_places": True,
+    "automatic_concepts": True,
+    "title_description_language": "vi",
+    "caption_certification": "none",
+    "license": "youtube",
+    "allow_embedding": True,
+    "remix_policy": "video_and_audio",
+    "comments_enabled": True,
+    "comment_moderation": "basic",
+    "comment_access": "anyone",
+    "comment_sort": "top",
+    "show_ratings": True,
+    "upload_captions": True,
+    "end_screen_source_video_id": "",
+    "premiere": False,
+    "checks_policy": "schedule_immediately",
+    "description_template": "{description}\n\n{chapters}\n\n{hashtags}",
+}
+
+
+def _pipeline_dependencies(thumbnail_variant: str) -> dict[str, tuple[str, ...]]:
+    thumbnail_step = (
+        "thumbnail_with_text"
+        if thumbnail_variant == "with_text"
+        else "thumbnail_without_text"
+    )
+    return {
+        "video_render": ("audio",),
+        "youtube_upload": ("video_render", "title", "description", "tags", thumbnail_step),
+        "youtube_schedule": ("youtube_upload",),
+    }
+
+
+def resolve_prompt_pipeline_dependencies(
+    pipeline: dict[str, bool],
+    thumbnail_variant: str = DEFAULT_THUMBNAIL_VARIANT,
+) -> tuple[dict[str, bool], list[str]]:
+    """Enable every prerequisite required by the selected terminal stages."""
+    variant = (
+        thumbnail_variant if thumbnail_variant in THUMBNAIL_VARIANTS else DEFAULT_THUMBNAIL_VARIANT
+    )
+    resolved = dict(pipeline)
+    auto_enabled: list[str] = []
+    dependencies = _pipeline_dependencies(variant)
+    changed = True
+    while changed:
+        changed = False
+        for step, required_steps in dependencies.items():
+            if not resolved.get(step):
+                continue
+            for required_step in required_steps:
+                if resolved.get(required_step):
+                    continue
+                resolved[required_step] = True
+                auto_enabled.append(required_step)
+                changed = True
+    return resolved, list(dict.fromkeys(auto_enabled))
+
+
+def normalize_prompt_pipeline(
+    value: object,
+    thumbnail_variant: str | None = None,
+) -> dict[str, bool]:
+    """Return a complete, dependency-safe pipeline for legacy config data."""
+    pipeline = value if isinstance(value, dict) else {}
+    legacy_metadata = pipeline.get("metadata")
+    normalized = {}
+    for key, default in DEFAULT_PROMPT_PIPELINE.items():
+        if isinstance(pipeline.get(key), bool):
+            normalized[key] = pipeline[key]
+        elif (
+            key in {"title", "slug", "description", "hashtags", "tags", "pinned_comment", "quiz"}
+            and isinstance(legacy_metadata, bool)
+        ):
+            normalized[key] = legacy_metadata
+        else:
+            normalized[key] = default
+
+    resolved_variant = thumbnail_variant
+    if resolved_variant is None and normalized.get("youtube_upload"):
+        with_text = normalized.get("thumbnail_with_text", False)
+        without_text = normalized.get("thumbnail_without_text", False)
+        if with_text != without_text:
+            resolved_variant = "with_text" if with_text else "without_text"
+    return resolve_prompt_pipeline_dependencies(
+        normalized, resolved_variant or "without_text"
+    )[0]
+
+
+def validate_prompt_pipeline(
+    value: object,
+    thumbnail_variant: str | None = None,
+) -> dict[str, bool]:
+    """Validate pipeline writes while still filling keys added in newer releases."""
+    if value is None:
+        return dict(DEFAULT_PROMPT_PIPELINE)
+    if not isinstance(value, dict):
+        raise ValueError("Cấu hình pipeline của bộ prompt không hợp lệ.")
+    cleaned_value = {k: v for k, v in value.items() if v is not None}
+    allowed_keys = set(DEFAULT_PROMPT_PIPELINE) | {"metadata"}
+    unknown_keys = set(cleaned_value) - allowed_keys
+    if unknown_keys:
+        raise ValueError(
+            "Pipeline chứa bước không được hỗ trợ: " + ", ".join(sorted(unknown_keys))
+        )
+    invalid_keys = [
+        key for key, enabled in cleaned_value.items() if not isinstance(enabled, bool)
+    ]
+    if invalid_keys:
+        raise ValueError(
+            "Trạng thái bước pipeline phải là bật hoặc tắt: "
+            + ", ".join(sorted(invalid_keys))
+        )
+    return normalize_prompt_pipeline(cleaned_value, thumbnail_variant)
+
+
+def normalize_image_generation_settings(value: object) -> dict:
+    settings = value if isinstance(value, dict) else {}
+    normalized = dict(DEFAULT_IMAGE_GENERATION_SETTINGS)
+
+    # Image Model normalization
+    model = str(settings.get("model") or "").strip()
+    if model in GOOGLE_FLOW_IMAGE_MODELS:
+        normalized["model"] = model
+    elif model == "google_veo_intro":
+        normalized["model"] = DEFAULT_IMAGE_MODEL
+        normalized["video_model"] = "omni_1_1_flash"
+    else:
+        normalized["model"] = DEFAULT_IMAGE_MODEL
+
+    # Video Model normalization
+    video_model = str(settings.get("video_model") or "").strip()
+    if video_model == "google_veo_intro":
+        normalized["video_model"] = "omni_1_1_flash"
+    elif video_model in GOOGLE_FLOW_VIDEO_MODELS:
+        normalized["video_model"] = video_model
+    else:
+        normalized["video_model"] = DEFAULT_VIDEO_MODEL
+
+    # Aspect Ratio & Output Count (Image)
+    aspect_ratio = str(settings.get("aspect_ratio") or "").strip()
+    normalized["aspect_ratio"] = aspect_ratio if aspect_ratio in SUPPORTED_ASPECT_RATIOS else "16:9"
+
+    try:
+        output_count = int(settings.get("output_count", 1))
+        normalized["output_count"] = output_count if output_count in SUPPORTED_OUTPUT_COUNTS else 1
+    except (TypeError, ValueError):
+        normalized["output_count"] = 1
+
+    # Aspect Ratio & Output Count (Video)
+    video_aspect_ratio = str(settings.get("video_aspect_ratio") or "").strip()
+    normalized["video_aspect_ratio"] = video_aspect_ratio if video_aspect_ratio in SUPPORTED_VIDEO_ASPECT_RATIOS else "16:9"
+
+    try:
+        video_output_count = int(settings.get("video_output_count", 1))
+        normalized["video_output_count"] = video_output_count if video_output_count in SUPPORTED_OUTPUT_COUNTS else 1
+    except (TypeError, ValueError):
+        normalized["video_output_count"] = 1
+
+    render_mode = str(settings.get("render_mode") or "google_flow").strip().lower()
+    normalized["render_mode"] = render_mode if render_mode in {"google_flow", "stock_video"} else "google_flow"
+
+    stock_settings = settings.get("stock_video_settings") or {}
+    if not isinstance(stock_settings, dict):
+        stock_settings = {}
+    normalized["stock_video_settings"] = {
+        "background_videos_dir": str(stock_settings.get("background_videos_dir") or "").strip(),
+        "custom_stock_videos_path": str(stock_settings.get("custom_stock_videos_path") or "").strip(),
+        "thumbnail_corner_mode": str(stock_settings.get("thumbnail_corner_mode") or "random").strip(),
+        "show_waveform": bool(stock_settings.get("show_waveform", True)),
+        "show_animated_icon": bool(stock_settings.get("show_animated_icon", True)),
+    }
+
+    provider = str(settings.get("provider") or "").strip()
+    normalized["provider"] = provider if provider else "google_flow"
+
+    # Both negative_prompt (used by frontend) and avoid_prompt (backend alias) are supported.
+    avoid = str(settings.get("avoid_prompt") or "").strip()
+    neg = str(settings.get("negative_prompt") or "").strip()
+    avoid_value = neg if neg else avoid
+
+    normalized["style_prompt"] = str(settings.get("style_prompt") or "").strip()
+    normalized["avoid_prompt"] = avoid_value
+    normalized["negative_prompt"] = avoid_value  # mirror for frontend compatibility
+
+    density = settings.get("density", 30)
+    normalized["density"] = density if density in {25, 30, 35} else 30
+
+    normalized["thumbnail_variant"] = (
+        settings.get("thumbnail_variant")
+        if settings.get("thumbnail_variant") in THUMBNAIL_VARIANTS
+        else DEFAULT_THUMBNAIL_VARIANT
+    )
+    normalized["scene_0_source"] = (
+        settings.get("scene_0_source")
+        if settings.get("scene_0_source") in SCENE_0_SOURCES
+        else DEFAULT_SCENE_0_SOURCE
+    )
+    normalized["enable_intro_video"] = bool(settings.get("enable_intro_video", True))
+    try:
+        normalized["intro_scene_target_seconds"] = max(4.0, min(15.0, float(settings.get("intro_scene_target_seconds", 8.0) or 8.0)))
+    except (TypeError, ValueError):
+        normalized["intro_scene_target_seconds"] = 8.0
+    normalized["intro_crop_watermark"] = bool(settings.get("intro_crop_watermark", True))
+    normalized["video_style_prompt"] = str(
+        settings.get("video_style_prompt") if settings.get("video_style_prompt") is not None
+        else DEFAULT_IMAGE_GENERATION_SETTINGS["video_style_prompt"]
+    ).strip()
+    normalized["video_negative_prompt"] = str(
+        settings.get("video_negative_prompt") if settings.get("video_negative_prompt") is not None
+        else DEFAULT_IMAGE_GENERATION_SETTINGS["video_negative_prompt"]
+    ).strip()
+    normalized["video_prompt_template"] = str(
+        settings.get("video_prompt_template") if settings.get("video_prompt_template") is not None
+        else DEFAULT_IMAGE_GENERATION_SETTINGS["video_prompt_template"]
+    ).strip()
+    normalized["video_motion_prompt"] = str(
+        settings.get("video_motion_prompt") if settings.get("video_motion_prompt") is not None
+        else DEFAULT_IMAGE_GENERATION_SETTINGS["video_motion_prompt"]
+    ).strip()
+    normalized["scene_0_prompt_template"] = str(
+        settings.get("scene_0_prompt_template") if settings.get("scene_0_prompt_template") is not None
+        else DEFAULT_IMAGE_GENERATION_SETTINGS["scene_0_prompt_template"]
+    ).strip()
+    normalized["scene_body_prompt_template"] = str(
+        settings.get("scene_body_prompt_template") if settings.get("scene_body_prompt_template") is not None
+        else DEFAULT_IMAGE_GENERATION_SETTINGS["scene_body_prompt_template"]
+    ).strip()
+    return normalized
+
+
+def validate_image_generation_settings(value: object) -> dict:
+    if value is not None and not isinstance(value, dict):
+        raise ValueError("Cấu hình tạo ảnh của bộ prompt không hợp lệ.")
+    settings = value or {}
+    # Allow unknown keys from old ComfyUI snapshots during migration read; only validate writable keys
+    allowed_write_keys = set(DEFAULT_IMAGE_GENERATION_SETTINGS) | {
+        "negative_prompt",  # migrated -> avoid_prompt
+        "workflow_profile_id",  # legacy, silently ignored
+        "reference_workflow_profile_id",  # legacy, silently ignored
+        "seed_mode",  # legacy, silently ignored
+        "scene_duration_min_seconds",  # legacy, silently ignored
+        "scene_duration_target_seconds",  # legacy, silently ignored
+        "scene_duration_max_seconds",  # legacy, silently ignored
+    }
+    unknown = set(settings) - allowed_write_keys
+    if unknown:
+        raise ValueError(
+            "Cấu hình tạo ảnh chứa trường không được hỗ trợ: "
+            + ", ".join(sorted(unknown))
+        )
+    if settings.get("thumbnail_variant", DEFAULT_THUMBNAIL_VARIANT) not in THUMBNAIL_VARIANTS:
+        raise ValueError("Loại thumbnail upload không được hỗ trợ.")
+    if settings.get("scene_0_source", DEFAULT_SCENE_0_SOURCE) not in SCENE_0_SOURCES:
+        raise ValueError("Nguồn ảnh Scene 0 không được hỗ trợ.")
+    return normalize_image_generation_settings(settings)
+
+
+
+def normalize_publishing_settings(value: object) -> dict:
+    settings = value if isinstance(value, dict) else {}
+    normalized = dict(DEFAULT_PUBLISHING_SETTINGS)
+    upload_method = str(settings.get("upload_method") or DEFAULT_UPLOAD_METHOD).strip().lower()
+    normalized["upload_method"] = (
+        upload_method if upload_method in UPLOAD_METHODS else DEFAULT_UPLOAD_METHOD
+    )
+    publish_mode = str(settings.get("publish_mode") or DEFAULT_PUBLISH_MODE).strip().lower()
+    normalized["publish_mode"] = (
+        publish_mode if publish_mode in PUBLISH_MODES else DEFAULT_PUBLISH_MODE
+    )
+    normalized["category_id"] = str(settings.get("category_id") or "").strip()
+    normalized["language"] = str(settings.get("language") or "vi").strip() or "vi"
+    normalized["made_for_kids"] = (
+        settings.get("made_for_kids")
+        if isinstance(settings.get("made_for_kids"), bool)
+        else None
+    )
+    normalized["notify_subscribers"] = (
+        settings.get("notify_subscribers")
+        if isinstance(settings.get("notify_subscribers"), bool)
+        else True
+    )
+    normalized["include_tags"] = (
+        settings.get("include_tags")
+        if isinstance(settings.get("include_tags"), bool)
+        else True
+    )
+    normalized["default_tags"] = str(settings.get("default_tags") or "").strip()
+    # All videos produced by this pipeline use synthetic scene images.
+    normalized["contains_synthetic_media"] = True
+    monetization_mode = str(
+        settings.get("monetization_mode") or "auto_enable_if_available"
+    ).strip()
+    normalized["monetization_mode"] = (
+        monetization_mode
+        if monetization_mode in MONETIZATION_MODES
+        else "auto_enable_if_available"
+    )
+    normalized["midroll_ads"] = bool(settings.get("midroll_ads", True))
+    ad_suitability_mode = str(
+        settings.get("ad_suitability_mode") or "none_of_the_above"
+    ).strip()
+    normalized["ad_suitability_mode"] = (
+        ad_suitability_mode
+        if ad_suitability_mode in AD_SUITABILITY_MODES
+        else "none_of_the_above"
+    )
+    normalized["playlist_name"] = str(settings.get("playlist_name") or "").strip()
+    normalized["age_restriction"] = bool(settings.get("age_restriction", False))
+    normalized["paid_promotion"] = bool(settings.get("paid_promotion", False))
+    for key in ("automatic_chapters", "automatic_places", "automatic_concepts"):
+        normalized[key] = bool(settings.get(key, True))
+    normalized["title_description_language"] = str(
+        settings.get("title_description_language")
+        or normalized["language"]
+    ).strip() or normalized["language"]
+    caption_certification = str(
+        settings.get("caption_certification") or "none"
+    ).strip()
+    normalized["caption_certification"] = (
+        caption_certification
+        if caption_certification in CAPTION_CERTIFICATIONS
+        else "none"
+    )
+    normalized["license"] = (
+        "creative_common"
+        if str(settings.get("license") or "youtube").strip() == "creative_common"
+        else "youtube"
+    )
+    normalized["allow_embedding"] = bool(settings.get("allow_embedding", True))
+    remix_policy = str(settings.get("remix_policy") or "video_and_audio").strip()
+    normalized["remix_policy"] = (
+        remix_policy if remix_policy in REMIX_POLICIES else "video_and_audio"
+    )
+    normalized["comments_enabled"] = bool(settings.get("comments_enabled", True))
+    comment_moderation = str(settings.get("comment_moderation") or "basic").strip()
+    normalized["comment_moderation"] = (
+        comment_moderation
+        if comment_moderation in COMMENT_MODERATION_LEVELS
+        else "basic"
+    )
+    comment_access = str(settings.get("comment_access") or "anyone").strip()
+    normalized["comment_access"] = (
+        comment_access if comment_access in COMMENT_ACCESS_LEVELS else "anyone"
+    )
+    comment_sort = str(settings.get("comment_sort") or "top").strip()
+    normalized["comment_sort"] = (
+        comment_sort if comment_sort in COMMENT_SORT_ORDERS else "top"
+    )
+    normalized["show_ratings"] = bool(settings.get("show_ratings", True))
+    normalized["upload_captions"] = bool(settings.get("upload_captions", True))
+    normalized["end_screen_source_video_id"] = str(
+        settings.get("end_screen_source_video_id") or ""
+    ).strip()
+    normalized["premiere"] = bool(settings.get("premiere", False))
+    checks_policy = str(
+        settings.get("checks_policy") or "schedule_immediately"
+    ).strip()
+    normalized["checks_policy"] = (
+        checks_policy
+        if checks_policy in CHECKS_POLICIES
+        else "schedule_immediately"
+    )
+    template_val = settings.get("description_template")
+    if isinstance(template_val, str):
+        normalized["description_template"] = template_val
+    else:
+        normalized["description_template"] = DEFAULT_PUBLISHING_SETTINGS["description_template"]
+    return normalized
+
+
+def validate_publishing_settings(value: object) -> dict:
+    if value is not None and not isinstance(value, dict):
+        raise ValueError("Cấu hình đăng YouTube của bộ prompt không hợp lệ.")
+    settings = value or {}
+    unknown = set(settings) - set(DEFAULT_PUBLISHING_SETTINGS)
+    if unknown:
+        raise ValueError(
+            "Cấu hình đăng YouTube chứa trường không được hỗ trợ: "
+            + ", ".join(sorted(unknown))
+        )
+    upload_method = str(settings.get("upload_method") or DEFAULT_UPLOAD_METHOD).strip().lower()
+    if upload_method not in UPLOAD_METHODS:
+        raise ValueError("Phương thức upload YouTube không hợp lệ (chỉ hỗ trợ 'browser' hoặc 'api').")
+    category_id = str(settings.get("category_id") or "").strip()
+    if category_id and (not category_id.isdigit() or len(category_id) > 10):
+        raise ValueError("YouTube Category ID không hợp lệ.")
+    language = str(settings.get("language") or "vi").strip()
+    if not re.fullmatch(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", language):
+        raise ValueError("Mã ngôn ngữ YouTube không hợp lệ.")
+    made_for_kids = settings.get("made_for_kids")
+    if made_for_kids is not None and not isinstance(made_for_kids, bool):
+        raise ValueError("Lựa chọn dành cho trẻ em phải là Có hoặc Không.")
+    notify_subscribers = settings.get("notify_subscribers", True)
+    if not isinstance(notify_subscribers, bool):
+        raise ValueError("Thiết lập thông báo người đăng ký không hợp lệ.")
+    include_tags = settings.get("include_tags", True)
+    if not isinstance(include_tags, bool):
+        raise ValueError("Thiết lập đính kèm thẻ từ khóa (include_tags) phải là Có hoặc Không.")
+    default_tags = settings.get("default_tags", "")
+    if default_tags is not None and not isinstance(default_tags, str):
+        raise ValueError("Thẻ từ khóa mặc định phải là chuỗi ký tự.")
+    if isinstance(default_tags, str) and len(default_tags) > 500:
+        raise ValueError("Thẻ từ khóa mặc định không được vượt quá 500 ký tự.")
+    enum_fields = {
+        "publish_mode": PUBLISH_MODES,
+        "monetization_mode": MONETIZATION_MODES,
+        "ad_suitability_mode": AD_SUITABILITY_MODES,
+        "remix_policy": REMIX_POLICIES,
+        "comment_moderation": COMMENT_MODERATION_LEVELS,
+        "comment_access": COMMENT_ACCESS_LEVELS,
+        "comment_sort": COMMENT_SORT_ORDERS,
+        "checks_policy": CHECKS_POLICIES,
+        "license": {"youtube", "creative_common"},
+        "caption_certification": CAPTION_CERTIFICATIONS,
+    }
+    for field, choices in enum_fields.items():
+        if field in settings and str(settings.get(field) or "") not in choices:
+            raise ValueError(f"Thiết lập {field} không hợp lệ.")
+    boolean_fields = {
+        "midroll_ads",
+        "age_restriction",
+        "paid_promotion",
+        "automatic_chapters",
+        "automatic_places",
+        "automatic_concepts",
+        "allow_embedding",
+        "comments_enabled",
+        "show_ratings",
+        "upload_captions",
+        "premiere",
+    }
+    invalid_boolean_fields = [
+        field
+        for field in boolean_fields
+        if field in settings and not isinstance(settings.get(field), bool)
+    ]
+    if invalid_boolean_fields:
+        raise ValueError(
+            "Thiết lập upload phải là Có hoặc Không: "
+            + ", ".join(sorted(invalid_boolean_fields))
+        )
+    for language_field in ("title_description_language",):
+        language_value = str(settings.get(language_field) or language).strip()
+        if not re.fullmatch(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", language_value):
+            raise ValueError(f"Mã ngôn ngữ {language_field} không hợp lệ.")
+    for text_field, max_length in {
+        "playlist_name": 150,
+        "end_screen_source_video_id": 32,
+    }.items():
+        text_value = settings.get(text_field, "")
+        if text_value is not None and not isinstance(text_value, str):
+            raise ValueError(f"Thiết lập {text_field} phải là chuỗi ký tự.")
+        if isinstance(text_value, str) and len(text_value) > max_length:
+            raise ValueError(f"Thiết lập {text_field} vượt quá {max_length} ký tự.")
+    end_screen_video_id = str(settings.get("end_screen_source_video_id") or "").strip()
+    if end_screen_video_id and not re.fullmatch(r"[A-Za-z0-9_-]{6,32}", end_screen_video_id):
+        raise ValueError("YouTube Video ID dùng cho màn hình kết thúc không hợp lệ.")
+    desc_template = settings.get("description_template")
+    if desc_template is not None and not isinstance(desc_template, str):
+        raise ValueError("Mẫu mô tả YouTube phải là chuỗi ký tự.")
+    if isinstance(desc_template, str) and len(desc_template) > 5000:
+        raise ValueError("Mẫu mô tả YouTube không được vượt quá 5000 ký tự.")
+    return normalize_publishing_settings(settings)
+
+
+def validate_project_url(value: str) -> str:
+    project_url = str(value or "").strip().rstrip("/")
+    parsed_url = urlparse(project_url)
+    path_parts = parsed_url.path.strip("/").split("/")
+    is_project_url = (
+        parsed_url.scheme == "https"
+        and parsed_url.netloc == "chatgpt.com"
+        and len(path_parts) == 3
+        and path_parts[0] == "g"
+        and path_parts[1].startswith("g-p-")
+        and path_parts[2] == "project"
+        and not parsed_url.query
+        and not parsed_url.fragment
+    )
+    if not is_project_url:
+        raise ValueError("Phải nhập đúng URL ChatGPT Project.")
+    return project_url
+
+
+def get_project_url(prompt_version: str = "") -> str:
+    selected_version = (
+        prompt_version.strip() or os.environ.get("PROMPT_VERSION", "").strip()
+    )
+    if PROMPTS_PATH.exists():
+        try:
+            data = json.loads(PROMPTS_PATH.read_text(encoding="utf-8"))
+            versions = data.get("versions", {})
+            version_key = selected_version or data.get("active_version", "default")
+            version = versions.get(version_key, {})
+            configured_url = str(version.get("project_url", "")).strip()
+            if configured_url:
+                return validate_project_url(configured_url)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    environment_url = os.environ.get(CHATGPT_PROJECT_URL_ENV, "").strip()
+    if environment_url:
+        return validate_project_url(environment_url)
+
+    return DEFAULT_CHATGPT_PROJECT_URL
+
+
+def add_project_defaults(data: dict) -> dict:
+    normalized = json.loads(json.dumps(data))
+    for version in normalized.get("versions", {}).values():
+        version.setdefault("project_url", DEFAULT_CHATGPT_PROJECT_URL)
+        version.setdefault("default_voice_id", "")
+        version.setdefault("default_youtube_channel_id", "")
+        version.setdefault(
+            "content_mode",
+            "dialogue"
+            if "cast_settings" in version or "talkshow" in str(version.get("name", "")).casefold()
+            else "monologue",
+        )
+        version.setdefault("cast_settings", {})
+        version["image_generation_settings"] = normalize_image_generation_settings(
+            version.get("image_generation_settings")
+        )
+        version["publishing_settings"] = normalize_publishing_settings(
+            version.get("publishing_settings")
+        )
+        version["pipeline"] = normalize_prompt_pipeline(
+            version.get("pipeline"),
+            version["image_generation_settings"]["thumbnail_variant"],
+        )
+    return normalized
+
+
+def validate_prompt_projects(data: dict) -> dict:
+    normalized = add_project_defaults(data)
+    source_versions = data.get("versions", {}) if isinstance(data, dict) else {}
+    for version_id, version in normalized.get("versions", {}).items():
+        version["project_url"] = validate_project_url(version["project_url"])
+        default_channel_id = str(
+            version.get("default_youtube_channel_id", "") or ""
+        ).strip()
+        if len(default_channel_id) > 100:
+            raise ValueError(f"YouTube Channel ID của bộ prompt {version_id} quá dài.")
+        version["default_youtube_channel_id"] = default_channel_id
+        source_version = source_versions.get(version_id, {})
+        source_pipeline = (
+            source_version.get("pipeline") if isinstance(source_version, dict) else None
+        )
+        source_image_settings = (
+            source_version.get("image_generation_settings")
+            if isinstance(source_version, dict)
+            else None
+        )
+        source_publishing_settings = (
+            source_version.get("publishing_settings")
+            if isinstance(source_version, dict)
+            else None
+        )
+        version["image_generation_settings"] = validate_image_generation_settings(
+            source_image_settings
+        )
+        version["publishing_settings"] = validate_publishing_settings(
+            source_publishing_settings
+        )
+        version["pipeline"] = validate_prompt_pipeline(
+            source_pipeline,
+            version["image_generation_settings"]["thumbnail_variant"],
+        )
+    return normalized
