@@ -108,5 +108,68 @@ Giải thích: 1979
         self.assertNotIn(r"\#", validated)
 
 
+    def test_thinking_indicator_dynamic_patterns(self):
+        from auto_yt.services.chatgpt_worker import _is_pure_thinking_indicator
+        self.assertTrue(_is_pure_thinking_indicator("Verifying historical figures"))
+        self.assertTrue(_is_pure_thinking_indicator("Checking historical dates"))
+        self.assertTrue(_is_pure_thinking_indicator("Searching for references"))
+        self.assertTrue(_is_pure_thinking_indicator("Analyzing outline structure"))
+        self.assertTrue(_is_pure_thinking_indicator("Worked for 20s"))
+        self.assertTrue(_is_pure_thinking_indicator("thought for 5 seconds"))
+        self.assertTrue(_is_pure_thinking_indicator("đang suy nghĩ..."))
+        # Genuine Vietnamese outline should not be treated as a thinking indicator
+        self.assertFalse(_is_pure_thinking_indicator("Bối cảnh lịch sử và sự phức tạp trong quan hệ Việt - Trung những năm 1954-1979"))
+
+    def test_payload_content_ignores_thoughts_and_tools(self):
+        from auto_yt.services.chatgpt_worker import _get_payload_content_text, _get_completed_payload_assistant_text
+        thought_msg = {
+            "author": {"role": "assistant"},
+            "content": {"content_type": "thoughts", "parts": ["Verifying historical figures"]},
+            "status": "finished_successfully",
+            "end_turn": True
+        }
+        self.assertEqual(_get_payload_content_text(thought_msg), "")
+        self.assertEqual(_get_completed_payload_assistant_text(thought_msg), "")
+
+        tool_msg = {
+            "author": {"role": "assistant"},
+            "recipient": "browser",
+            "content": {"content_type": "text", "parts": ["search('Le Duan 1979')"]},
+            "status": "finished_successfully",
+            "end_turn": True
+        }
+        self.assertEqual(_get_payload_content_text(tool_msg), "")
+        self.assertEqual(_get_completed_payload_assistant_text(tool_msg), "")
+
+    def test_select_reusable_outline_rejects_short_thought_status(self):
+        from auto_yt.services.chatgpt_worker import select_reusable_outline_response
+        turns = [
+            ("user", "Hãy tạo dàn ý cho kịch bản..."),
+            ("assistant", "Verifying historical figures")
+        ]
+        self.assertEqual(select_reusable_outline_response(turns), "")
+
+    def test_is_core_script_complete_requires_substantive_parts(self):
+        from auto_yt.services.chatgpt_worker import is_core_script_complete
+        state_incomplete = {
+            "intro": "Mở đầu kịch bản...",
+            "outro": "Kết thúc video...",
+            "expected_body_parts": 2,
+            "body_parts": ["Refined framing of historical tensions"]
+        }
+        self.assertFalse(is_core_script_complete("transcript", state_incomplete))
+
+        state_complete = {
+            "intro": "Chào mừng quý vị đến với kênh Góc Khuất Việt Sử trong video hôm nay về bài học lịch sử sâu sắc.",
+            "outro": "Cảm ơn quý vị đã theo dõi toàn bộ video hôm nay. Hãy like và subscribe kênh để đón xem tiếp.",
+            "expected_body_parts": 2,
+            "body_parts": [
+                "Nội dung phần 1 kể về hoàn cảnh lịch sử đầy biến động của hiệp định Genève năm 1954 và những bài học xương máu.",
+                "Nội dung phần 2 tiếp tục với cuộc chiến tranh bảo vệ biên giới phía Bắc năm 1979 và bản lĩnh của Tổng Bí thư Lê Duẩn."
+            ]
+        }
+        self.assertTrue(is_core_script_complete("transcript", state_complete))
+
+
 if __name__ == "__main__":
     unittest.main()

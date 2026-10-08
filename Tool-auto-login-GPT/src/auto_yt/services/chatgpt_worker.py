@@ -264,7 +264,9 @@ CORRUPTED_UNICODE_PATTERN = re.compile(
 )
 MIN_CORRUPTED_UNICODE_MARKERS = 3
 THINKING_INDICATOR_PATTERN = re.compile(
-    r"^(?:stopped\s+thinking|thought\s+for\s+\d+.*|worked\s+for\s+\d+.*|thinking\.{0,3}|đã\s+dừng\s+suy\s+nghĩ|đang\s+suy\s+nghĩ\.{0,3}|đã\s+suy\s+nghĩ\s+trong\s+\d+.*)$",
+    r"^(?:stopped\s+thinking|thought\s+for\s+\d+.*|worked\s+for\s+\d+.*|thinking\.{0,3}|"
+    r"đã\s+dừng\s+suy\s+nghĩ|đang\s+suy\s+nghĩ\.{0,3}|đã\s+suy\s+nghĩ\s+trong\s+\d+.*|"
+    r"(?:verifying|checking|searching(?:\s+for)?|analyzing|researching|looking\s+up|refining|reading|drafting)\s+[a-z0-9\s.,'’\-–—]{1,60})$",
     re.IGNORECASE,
 )
 
@@ -403,6 +405,10 @@ def select_reusable_outline_response(
         cleaned_response = clean_text(response_text)
         if (
             role == "assistant"
+            and not looks_like_chatgpt_error(cleaned_response)
+            and not _is_pure_thinking_indicator(cleaned_response)
+            and not looks_like_editorial_artifact(cleaned_response)
+            and len(cleaned_response.split()) >= 15
             and split_outline_parts(cleaned_response)
         ):
             return cleaned_response
@@ -694,6 +700,10 @@ def split_outline_parts(
     if not raw_parts and clean_outline:
         raw_parts = [clean_outline]
 
+    if len(raw_parts) > 1:
+        # Delimiters were found: respect the natural sectioning completely without artificial chopping
+        return [part.strip() for part in raw_parts if part.strip()]
+
     chunks = []
     for raw_part in raw_parts:
         units = [line.strip() for line in raw_part.splitlines() if line.strip()]
@@ -746,10 +756,12 @@ def is_core_script_complete(transcript: str, state: dict) -> bool:
     expected_body_parts = state.get("expected_body_parts", 0)
     return bool(
         state.get("intro", "").strip()
+        and len(state.get("intro", "").split()) >= 15
         and state.get("outro", "").strip()
+        and len(state.get("outro", "").split()) >= 15
         and expected_body_parts > 0
         and len(body_parts) == expected_body_parts
-        and all(part.strip() for part in body_parts)
+        and all(part.strip() and len(part.split()) >= 15 for part in body_parts)
     )
 
 
@@ -2717,6 +2729,12 @@ def _get_payload_content_text(message: dict) -> str:
     content = message.get("content")
     if not isinstance(content, dict):
         return ""
+    content_type = str(content.get("content_type") or "").lower()
+    if content_type in ("thoughts", "reasoning", "tether_quote", "tether_browsing_code", "execution_output"):
+        return ""
+    recipient = str(message.get("recipient") or "").lower()
+    if recipient in ("browser", "python", "dalle", "interpreter"):
+        return ""
     parts = content.get("parts")
     if not isinstance(parts, list):
         return ""
@@ -2766,6 +2784,9 @@ def _get_payload_parent_id(message: dict) -> str:
 
 def _get_completed_payload_assistant_text(message: dict) -> str:
     if _get_payload_message_role(message) != "assistant":
+        return ""
+    recipient = str(message.get("recipient") or "").lower()
+    if recipient in ("browser", "python", "dalle", "interpreter"):
         return ""
     status = str(message.get("status") or "").casefold()
     if status not in CHATGPT_SUCCESSFUL_MESSAGE_STATUSES:
@@ -3975,8 +3996,22 @@ def _run_complete(transcript: str, state: dict) -> dict:
                     "attempted."
                 )
             print(f"    -> Chat URL: {state['chat_url']}", file=sys.stderr)
-
             outline = strip_outline_preamble(outline)
+
+            # Strict Outline Validation:
+            # Reject if outline is an error, pure thinking status, editorial note, or lacks substantive content
+            if (
+                not outline
+                or looks_like_chatgpt_error(outline)
+                or _is_pure_thinking_indicator(outline)
+                or looks_like_editorial_artifact(outline)
+                or len(outline.split()) < 15
+            ):
+                clear_pending_generation_prompt(state, "outline", prompt2)
+                persist_generation_state(state)
+                raise RuntimeError(
+                    f"ChatGPT returned an invalid or incomplete outline (got: {repr(outline[:60])})."
+                )
 
             parts = split_outline_parts(outline)
             if not parts:
