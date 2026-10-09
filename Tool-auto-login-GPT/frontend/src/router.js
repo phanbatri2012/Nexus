@@ -40,7 +40,7 @@ export const ROUTE_REGISTRY = {
     id: 'trustbuilder',
     canonicalPath: '/trust-builder',
     aliases: ['/trust-builder', '/trustbuilder', '/channel-warmup', '/nuoi-kenh'],
-    title: 'Trust Builder'
+    title: 'Channel & Profile Readiness'
   },
   crossposter: {
     id: 'crossposter',

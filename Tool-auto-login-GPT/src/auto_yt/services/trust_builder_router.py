@@ -1,28 +1,23 @@
-"""FastAPI APIRouter for Channel Trust Builder module.
-
-Provides endpoints for managing trust plans, reviewing activity logs,
-triggering automated warmup sessions, and inspecting channel branding.
-"""
+"""FastAPI routes for explainable channel and profile readiness."""
 
 from __future__ import annotations
 
 from typing import List, Literal, Optional
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Response
 from pydantic import BaseModel, Field, field_validator
 
-from auto_yt.services import database as db
+from auto_yt.services import database as db, security_logging
 from auto_yt.services.proxy_utils import parse_proxy_url
 from auto_yt.services.trust_builder_service import (
-    audit_channel_branding_for_plan,
-    audit_feature_eligibility_for_plan,
-    calculate_trust_score,
+    create_guided_readiness_session,
     get_active_plan_job,
     request_cancel_plan_jobs,
-    validate_plan_browser_configuration,
+    run_interactive_readiness_check,
+    run_passive_readiness_check,
 )
 from auto_yt.services import trust_builder_scheduler
 
-router = APIRouter(tags=["Trust Builder"])
+router = APIRouter(tags=["Channel & Profile Readiness"])
 
 
 def _public_plan(plan: dict | None) -> dict | None:
@@ -30,8 +25,9 @@ def _public_plan(plan: dict | None) -> dict | None:
     if plan is None:
         return None
     public_plan = dict(plan)
-    proxy_info = str(public_plan.pop("gpm_proxy_info", "") or "").strip()
-    public_plan["gpm_proxy_configured"] = bool(parse_proxy_url(proxy_info))
+    public_plan.pop("gpm_proxy_info", None)
+    channel = db.get_youtube_channel(int(public_plan.get("channel_db_id") or 0))
+    public_plan["gpm_proxy_configured"] = bool(parse_proxy_url(str((channel or {}).get("gpm_proxy_info") or "")))
     return public_plan
 
 
@@ -53,6 +49,9 @@ class TrustPlanCreateRequest(BaseModel):
     daily_subscribe_target: int = Field(default=0, ge=0, le=5)
     min_watch_minutes: int = Field(default=10, ge=1, le=30)
     warmup_phase: Literal["phase_1_consumer", "phase_2_engage"] = "phase_1_consumer"
+    approved_sources: List[str] = Field(default_factory=list, max_length=20)
+    reminder_enabled: bool = False
+    reminder_time_local: str = Field(default="09:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
     @field_validator("niche_keywords", "target_channels")
     @classmethod
@@ -69,6 +68,21 @@ class TrustPlanCreateRequest(BaseModel):
                 normalized.append(clean_value)
         return normalized
 
+    @field_validator("approved_sources")
+    @classmethod
+    def validate_sources(cls, values: List[str]) -> List[str]:
+        from urllib.parse import urlparse
+
+        normalized: list[str] = []
+        for value in values:
+            clean_value = str(value or "").strip()
+            parsed = urlparse(clean_value)
+            if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+                raise ValueError("Nguồn đã duyệt phải là URL HTTPS công khai, không chứa credential.")
+            if clean_value not in normalized:
+                normalized.append(clean_value)
+        return normalized
+
 
 class TrustPlanUpdateRequest(BaseModel):
     niche_keywords: Optional[List[str]] = Field(default=None, max_length=20)
@@ -79,6 +93,9 @@ class TrustPlanUpdateRequest(BaseModel):
     daily_comment_target: Optional[int] = Field(default=None, ge=0, le=5)
     daily_subscribe_target: Optional[int] = Field(default=None, ge=0, le=5)
     min_watch_minutes: Optional[int] = Field(default=None, ge=1, le=30)
+    approved_sources: Optional[List[str]] = Field(default=None, max_length=20)
+    reminder_enabled: Optional[bool] = None
+    reminder_time_local: Optional[str] = Field(default=None, pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
     @field_validator("niche_keywords", "target_channels")
     @classmethod
@@ -87,17 +104,30 @@ class TrustPlanUpdateRequest(BaseModel):
             return None
         return TrustPlanCreateRequest.validate_tags(values)
 
+    @field_validator("approved_sources")
+    @classmethod
+    def validate_optional_sources(cls, values: Optional[List[str]]) -> Optional[List[str]]:
+        return None if values is None else TrustPlanCreateRequest.validate_sources(values)
+
+
+class GuidedSessionUpdateRequest(BaseModel):
+    status: Optional[Literal["ready", "in_progress", "completed", "abandoned"]] = None
+    checklist: Optional[dict[str, bool]] = None
+    notes: Optional[str] = Field(default=None, max_length=4000)
+
 
 @router.get("/plans")
-def list_plans():
+def list_plans(response: Response):
     """List all channel trust plans with channel info and estimated trust score."""
+    response.headers["Cache-Control"] = "no-store"
     plans = [_public_plan(plan) for plan in db.list_channel_trust_plans()]
     return {"plans": plans, "total": len(plans)}
 
 
 @router.get("/plans/{plan_id}")
-def get_plan_detail(plan_id: int):
+def get_plan_detail(plan_id: int, response: Response):
     """Get single trust plan detail with latest stats."""
+    response.headers["Cache-Control"] = "no-store"
     plan = db.get_channel_trust_plan(plan_id)
     if not plan:
         raise HTTPException(status_code=404, detail="Không tìm thấy Trust Plan.")
@@ -137,8 +167,16 @@ def create_plan(req: TrustPlanCreateRequest):
         daily_comment_target=req.daily_comment_target,
         daily_subscribe_target=req.daily_subscribe_target,
         min_watch_minutes=req.min_watch_minutes,
+        approved_sources=req.approved_sources,
         warmup_phase=req.warmup_phase,
-        status="draft",
+        status="paused",
+    )
+    new_plan = db.update_channel_trust_plan(
+        int(new_plan["id"]),
+        mode="guided",
+        requires_review=False,
+        reminder_enabled=req.reminder_enabled,
+        reminder_time_local=req.reminder_time_local,
     )
     return {"success": True, "plan": _public_plan(new_plan)}
 
@@ -168,33 +206,8 @@ def delete_plan(plan_id: int):
 
 @router.post("/plans/{plan_id}/start")
 def start_plan(plan_id: int):
-    """Start automated trust building for a plan."""
-    plan = db.get_channel_trust_plan(plan_id)
-    if not plan:
-        raise HTTPException(status_code=404, detail="Không tìm thấy Trust Plan.")
-    if plan.get("status") == "completed":
-        raise HTTPException(
-            status_code=400,
-            detail="Plan đã hoàn tất. Hãy tạo plan mới nếu cần warm-up lại.",
-        )
-    try:
-        validate_plan_browser_configuration(plan)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    
-    current_phase = plan.get("warmup_phase")
-    if current_phase == "idle":
-        current_phase = "phase_1_consumer"
-
-    updated = db.update_channel_trust_plan(
-        plan_id,
-        status="active",
-        warmup_phase=current_phase,
-        phase_started_at=plan.get("phase_started_at") or db.utc_now(),
-        next_run_at="",
-        error_message="",
-    )
-    return {"success": True, "plan": _public_plan(updated)}
+    """Retired: automated engagement is intentionally unavailable."""
+    raise HTTPException(status_code=410, detail="Automated warm-up đã ngừng. Hãy dùng Guided Readiness.")
 
 
 @router.post("/plans/{plan_id}/pause")
@@ -204,55 +217,90 @@ def pause_plan(plan_id: int):
     if not plan:
         raise HTTPException(status_code=404, detail="Không tìm thấy Trust Plan.")
     request_cancel_plan_jobs(plan_id)
-    updated = db.update_channel_trust_plan(plan_id, status="paused")
+    updated = db.update_channel_trust_plan(plan_id, status="paused", reminder_enabled=False, next_run_at="")
     return {"success": True, "plan": _public_plan(updated)}
 
 
 @router.post("/plans/{plan_id}/resume")
 def resume_plan(plan_id: int):
-    """Resume paused trust building for a plan."""
-    plan = db.get_channel_trust_plan(plan_id)
-    if not plan:
-        raise HTTPException(status_code=404, detail="Không tìm thấy Trust Plan.")
-    try:
-        validate_plan_browser_configuration(plan)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    updated = db.update_channel_trust_plan(
-        plan_id,
-        status="active",
-        next_run_at="",
-        error_message="",
-    )
-    return {"success": True, "plan": _public_plan(updated)}
+    """Retired: automated engagement is intentionally unavailable."""
+    raise HTTPException(status_code=410, detail="Automated warm-up đã ngừng. Hãy bật reminder cho Guided Readiness.")
 
 
 @router.post("/plans/{plan_id}/run-session")
 async def trigger_run_session(plan_id: int):
-    """Manually trigger one immediate warmup session."""
+    """Retired: automated engagement is intentionally unavailable."""
+    raise HTTPException(status_code=410, detail="Automated warm-up đã ngừng. Hãy tạo Guided Session.")
+
+
+@router.get("/plans/{plan_id}/readiness")
+def get_readiness(plan_id: int):
     plan = db.get_channel_trust_plan(plan_id)
     if not plan:
-        raise HTTPException(status_code=404, detail="Không tìm thấy Trust Plan.")
-    
+        raise HTTPException(status_code=404, detail="Không tìm thấy kế hoạch readiness.")
+    return {
+        "state": plan.get("readiness_state") or "not_checked",
+        "profile": plan.get("profile_readiness") or {},
+        "channel": plan.get("channel_readiness") or {},
+        "last_checked_at": plan.get("last_readiness_check_at") or "",
+    }
+
+
+@router.post("/plans/{plan_id}/checks/passive")
+def check_passive_readiness(plan_id: int):
     try:
-        job, created = trust_builder_scheduler.enqueue_trust_builder_session(
-            plan_id,
-            source="manual",
-            run_immediately=True,
-        )
+        result = run_passive_readiness_check(plan_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {
-        "success": True,
-        "created": created,
-        "message": (
-            "Đã xếp Trust Builder session vào hàng đợi."
-            if created
-            else "Plan đã có một Trust Builder session đang hoạt động."
-        ),
-        "plan_id": plan_id,
-        "job": job,
-    }
+    result["plan"] = _public_plan(result.get("plan"))
+    return result
+
+
+@router.post("/plans/{plan_id}/checks/interactive")
+async def check_interactive_readiness(plan_id: int):
+    try:
+        result = await run_interactive_readiness_check(plan_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        error_id = security_logging.report_exception("interactive readiness check", exc)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Không thể kiểm tra Studio. Mã lỗi: {error_id}.",
+        ) from exc
+    result["plan"] = _public_plan(result.get("plan"))
+    return result
+
+
+@router.post("/plans/{plan_id}/guided-sessions")
+def create_guided_session(plan_id: int):
+    try:
+        session = create_guided_readiness_session(plan_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"success": True, "session": session}
+
+
+@router.get("/plans/{plan_id}/guided-sessions")
+def list_guided_sessions(plan_id: int, limit: int = Query(30, ge=1, le=200)):
+    if not db.get_channel_trust_plan(plan_id):
+        raise HTTPException(status_code=404, detail="Không tìm thấy kế hoạch readiness.")
+    return {"sessions": db.list_trust_guided_sessions(plan_id, limit=limit)}
+
+
+@router.patch("/plans/{plan_id}/guided-sessions/{session_id}")
+def update_guided_session(plan_id: int, session_id: int, req: GuidedSessionUpdateRequest):
+    session = db.get_trust_guided_session(session_id)
+    if not session or int(session.get("plan_id") or 0) != plan_id:
+        raise HTTPException(status_code=404, detail="Không tìm thấy Guided Session.")
+    changes = req.model_dump(exclude_unset=True)
+    now = db.utc_now()
+    if changes.get("status") == "in_progress" and not session.get("started_at"):
+        changes["started_at"] = now
+    if changes.get("status") in {"completed", "abandoned"}:
+        changes["completed_at"] = now
+    updated = db.update_trust_guided_session(session_id, **changes)
+    return {"success": True, "session": updated}
 
 
 @router.get("/plans/{plan_id}/activities")
@@ -270,34 +318,26 @@ def list_activities(
 
 @router.get("/plans/{plan_id}/stats")
 def get_stats(plan_id: int):
-    """Get aggregated activity stats for a trust plan."""
+    """Expose legacy activity only as historical context, never as trust."""
     plan = db.get_channel_trust_plan(plan_id)
     if not plan:
         raise HTTPException(status_code=404, detail="Không tìm thấy Trust Plan.")
     stats = db.get_trust_activity_stats(plan_id)
-    score = calculate_trust_score(plan, stats)
-    return {"stats": stats, "trust_score_estimated": score}
+    return {
+        "legacy_activity": stats,
+        "profile_readiness_pct": int(plan.get("profile_readiness_pct") or 0),
+        "channel_readiness_pct": int(plan.get("channel_readiness_pct") or 0),
+    }
 
 
 @router.post("/plans/{plan_id}/branding-audit")
 async def audit_branding(plan_id: int):
-    """Audit channel profile branding elements via GPM browser session."""
-    res = await audit_channel_branding_for_plan(plan_id)
-    if not res.get("success"):
-        raise HTTPException(status_code=400, detail=res.get("message", "Lỗi khi audit kênh."))
-    return _public_audit_result(res)
+    raise HTTPException(status_code=410, detail="Dùng endpoint checks/interactive để kiểm tra có đối chiếu danh tính.")
 
 
 @router.post("/plans/{plan_id}/verify-features")
 async def verify_features(plan_id: int):
-    """Inspect YouTube Studio and preserve unknown when eligibility is not provable."""
-    result = await audit_feature_eligibility_for_plan(plan_id)
-    if not result.get("success"):
-        raise HTTPException(
-            status_code=400,
-            detail=result.get("message", "Không thể kiểm tra cấp tính năng."),
-        )
-    return _public_audit_result(result)
+    raise HTTPException(status_code=410, detail="Dùng endpoint checks/interactive để kiểm tra có đối chiếu danh tính.")
 
 
 @router.get("/scheduler-status")
@@ -346,6 +386,12 @@ def get_safety_config_endpoint():
 def update_safety_config_endpoint(req: SafetyConfigRequest):
     """Update Vietnam Safety Shield settings."""
     changes = req.model_dump(exclude_unset=True)
+    if changes.get("remote_sync_url"):
+        from auto_yt.services import trust_builder_safety as safety
+        try:
+            changes["remote_sync_url"] = safety.validate_remote_sync_url(changes["remote_sync_url"])
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     updated = db.update_safety_config(**changes)
     return {"success": True, "config": updated}
 
@@ -385,9 +431,13 @@ def list_safety_blacklist_endpoint(
 def create_safety_blacklist_endpoint(req: SafetyBlacklistCreateRequest):
     """Add a new custom rule or block a channel in 1-click."""
     try:
+        entry_value = req.entry_value
+        if req.entry_type == "regex_pattern":
+            from auto_yt.services import trust_builder_safety as safety
+            entry_value = safety.validate_regex_pattern(entry_value)
         entry = db.create_safety_blacklist_entry(
             entry_type=req.entry_type,
-            entry_value=req.entry_value,
+            entry_value=entry_value,
             reason=req.reason or "Người dùng thêm thủ công",
             is_custom=req.is_custom,
             is_enabled=1 if req.is_enabled else 0,
@@ -405,4 +455,3 @@ def delete_safety_blacklist_endpoint(entry_id: int):
         raise HTTPException(status_code=404, detail="Không tìm thấy quy tắc chặn.")
     deleted = db.delete_safety_blacklist_entry(entry_id)
     return {"success": deleted}
-

@@ -997,6 +997,10 @@ async def action_audit_feature_eligibility(
             r"""() => {
                 const normalize = value => (value || '').replace(/\s+/g, ' ').trim().toLowerCase();
                 const enabledTerms = ['enabled', 'eligible', 'đã bật', 'đủ điều kiện'];
+                const disabledTerms = [
+                    'not enabled', 'not eligible', 'disabled', 'ineligible',
+                    'chưa bật', 'không đủ điều kiện', 'không được bật'
+                ];
                 const nodes = Array.from(document.querySelectorAll(
                     'ytcp-feature-eligibility-card, ytcp-feature-eligibility-item, '
                     + '[class*="feature-eligibility"], [id*="feature-eligibility"]'
@@ -1009,6 +1013,7 @@ async def action_audit_feature_eligibility(
                     });
                     if (!node) return false;
                     const text = normalize(node.innerText || node.textContent || '');
+                    if (disabledTerms.some(term => text.includes(term))) return false;
                     return enabledTerms.some(term => text.includes(term));
                 };
                 const advanced = readLevel(['advanced features', 'tính năng nâng cao']);

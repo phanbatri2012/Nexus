@@ -386,7 +386,7 @@ async def run_interactive_readiness_check(plan_id: int) -> dict[str, Any]:
         profile_id,
         expected_channel_id=channel_id,
     )
-    if identity.get("logged_in"):
+    if identity.get("identity_verified"):
         await audit_channel_branding_for_plan(plan_id)
         await audit_feature_eligibility_for_plan(plan_id)
     return run_passive_readiness_check(plan_id, identity_result=identity)

@@ -8,6 +8,8 @@ from auto_yt.services.trust_builder_safety import (
     ensure_default_safety_rules_seeded,
     is_safe_for_interaction,
     sync_safety_blacklist_from_remote,
+    validate_regex_pattern,
+    validate_remote_sync_url,
 )
 
 
@@ -192,6 +194,17 @@ class TestTrustBuilderSafetyShield(unittest.TestCase):
         # Built-in rules should still exist and protect
         rules = db.get_all_active_safety_rules()
         self.assertGreater(len(rules.get("channels", [])), 10)
+
+    def test_remote_sync_rejects_private_or_non_allowlisted_hosts(self):
+        with self.assertRaises(ValueError):
+            validate_remote_sync_url("http://127.0.0.1/internal.json")
+        with self.assertRaises(ValueError):
+            validate_remote_sync_url("https://example.com/blacklist.json")
+
+    def test_regex_validation_rejects_nested_quantifiers(self):
+        with self.assertRaises(ValueError):
+            validate_regex_pattern("(a+)+$")
+        self.assertEqual(validate_regex_pattern(r"\btrusted\s+term\b"), r"\btrusted\s+term\b")
 
 
 if __name__ == "__main__":

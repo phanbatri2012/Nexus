@@ -188,12 +188,12 @@ test('wires Universal Router engine into App and sub-components for persistent U
 })
 
 
-test('wires Trust Builder into navigation and view rendering', async () => {
+test('wires Readiness into navigation and view rendering', async () => {
   const appSource = await readFile(new URL('./App.jsx', import.meta.url), 'utf8')
   const trustSource = await readFile(new URL('./TrustBuilder.jsx', import.meta.url), 'utf8')
 
   assert.match(appSource, /import TrustBuilder from ['"]\.\/TrustBuilder['"]/)
-  assert.match(appSource, />Trust Builder<\/li>/)
+  assert.match(appSource, />Readiness<\/li>/)
   assert.match(appSource, /activeView === ['"]trustbuilder['"][\s\S]*<TrustBuilder/)
   assert.match(trustSource, /import\s*\{\s*useSubRoute\s*\}\s*from\s*['"]\.\/router\.js['"]/)
   assert.match(trustSource, /useSubRoute\(['"]trustbuilder['"],\s*['"]['"]\)/)

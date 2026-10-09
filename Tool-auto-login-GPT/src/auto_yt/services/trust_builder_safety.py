@@ -20,6 +20,40 @@ from auto_yt.services import database as db, security_logging
 
 logger = logging.getLogger(__name__)
 
+ALLOWED_REMOTE_SYNC_HOSTS = {"raw.githubusercontent.com"}
+MAX_REMOTE_PAYLOAD_BYTES = 1_000_000
+MAX_REMOTE_RULES_PER_TYPE = 500
+MAX_REGEX_LENGTH = 120
+
+
+def validate_remote_sync_url(value: str) -> str:
+    """Allow only the fixed public HTTPS host used for signed-off rule feeds."""
+    clean_value = str(value or "").strip()
+    parsed = urllib.parse.urlparse(clean_value)
+    if (
+        parsed.scheme != "https"
+        or str(parsed.hostname or "").lower() not in ALLOWED_REMOTE_SYNC_HOSTS
+        or parsed.username
+        or parsed.password
+        or parsed.port not in {None, 443}
+    ):
+        raise ValueError("URL đồng bộ chỉ được phép dùng HTTPS trên raw.githubusercontent.com.")
+    return clean_value
+
+
+def validate_regex_pattern(value: str) -> str:
+    """Reject oversized and obvious nested-quantifier patterns before persistence."""
+    pattern = str(value or "").strip()
+    if not pattern or len(pattern) > MAX_REGEX_LENGTH:
+        raise ValueError(f"Regex phải dài từ 1 đến {MAX_REGEX_LENGTH} ký tự.")
+    if re.search(r"\([^)]*[+*][^)]*\)\s*(?:[+*]|\{)", pattern):
+        raise ValueError("Regex có nested quantifier không an toàn.")
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        raise ValueError("Regex không hợp lệ.") from exc
+    return pattern
+
 # Bundled fallback core blacklist (pre-loaded offline)
 DEFAULT_CORE_CHANNELS: list[dict[str, str]] = [
     {"handle": "@viettan", "name": "Việt Tân", "reason": "Tổ chức phản động / chống phá"},
@@ -230,6 +264,11 @@ def sync_safety_blacklist_from_remote(remote_url: str | None = None) -> dict[str
     if not url:
         return {"success": False, "message": "Chưa cấu hình URL đồng bộ từ xa."}
 
+    try:
+        url = validate_remote_sync_url(url)
+    except ValueError as exc:
+        return {"success": False, "message": str(exc)}
+
     logger.info("Đang đồng bộ Core Safety Blacklist từ URL: %s", url)
     entries_to_upsert: list[dict[str, Any]] = []
 
@@ -242,13 +281,15 @@ def sync_safety_blacklist_from_remote(remote_url: str | None = None) -> dict[str
             },
         )
         with urllib.request.urlopen(req, timeout=12) as response:
-            payload_bytes = response.read()
+            payload_bytes = response.read(MAX_REMOTE_PAYLOAD_BYTES + 1)
+            if len(payload_bytes) > MAX_REMOTE_PAYLOAD_BYTES:
+                raise ValueError("Payload blacklist vượt quá giới hạn 1 MB.")
             data = json.loads(payload_bytes.decode("utf-8"))
 
         if not isinstance(data, dict):
             raise ValueError("Dữ liệu Blacklist tải về không đúng định dạng JSON Object.")
 
-        channels = data.get("channels") or []
+        channels = (data.get("channels") or [])[:MAX_REMOTE_RULES_PER_TYPE]
         for ch in channels:
             if isinstance(ch, dict):
                 handle = str(ch.get("handle") or ch.get("name") or "").strip()
@@ -270,7 +311,7 @@ def sync_safety_blacklist_from_remote(remote_url: str | None = None) -> dict[str
                     "is_enabled": True,
                 })
 
-        keywords = data.get("keywords") or []
+        keywords = (data.get("keywords") or [])[:MAX_REMOTE_RULES_PER_TYPE]
         for kw in keywords:
             if isinstance(kw, dict):
                 val = str(kw.get("keyword") or "").strip()
@@ -292,12 +333,13 @@ def sync_safety_blacklist_from_remote(remote_url: str | None = None) -> dict[str
                     "is_enabled": True,
                 })
 
-        patterns = data.get("regex_patterns") or []
+        patterns = (data.get("regex_patterns") or [])[:MAX_REMOTE_RULES_PER_TYPE]
         for pt in patterns:
             if isinstance(pt, dict):
                 val = str(pt.get("pattern") or "").strip()
                 reason = str(pt.get("reason") or "Remote Sync Pattern").strip()
                 if val:
+                    val = validate_regex_pattern(val)
                     entries_to_upsert.append({
                         "entry_type": "regex_pattern",
                         "entry_value": val,
@@ -306,9 +348,10 @@ def sync_safety_blacklist_from_remote(remote_url: str | None = None) -> dict[str
                         "is_enabled": True,
                     })
             elif isinstance(pt, str) and pt.strip():
+                safe_pattern = validate_regex_pattern(pt)
                 entries_to_upsert.append({
                     "entry_type": "regex_pattern",
-                    "entry_value": pt.strip(),
+                    "entry_value": safe_pattern,
                     "reason": "Remote Sync Pattern",
                     "is_custom": 0,
                     "is_enabled": True,
