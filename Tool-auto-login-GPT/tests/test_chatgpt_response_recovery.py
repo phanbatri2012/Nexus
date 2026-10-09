@@ -421,3 +421,82 @@ def test_get_reusable_outline_response_ignores_busy_page(monkeypatch):
     )
     assert get_reusable_outline_response(page) == ""
 
+
+def test_history_prompt_text_matches_distinct_pipeline_prompts():
+    from auto_yt.services.chatgpt_worker import history_prompt_text_matches
+
+    p_title = "Dựa vào toàn bộ nội dung kịch bản lịch sử vừa viết, hãy đặt một tiêu đề video YouTube cực kỳ giật gân"
+    p_slug = "Dựa vào nội dung kịch bản lịch sử vừa viết, hãy tạo một URL slug ngắn gọn, chuẩn SEO"
+    p_tags = "Dựa vào toàn bộ nội dung video vừa viết, hãy tạo danh sách từ 10 đến 15 thẻ từ khóa (tags)"
+    p_pinned = "Với vai trò là chủ kênh 'Góc Khuất Việt Sử', hãy viết một bình luận ghim (Pinned Comment)"
+    p_quiz = "Dựa vào nội dung lịch sử vừa viết, hãy tạo 1 câu hỏi trắc nghiệm lịch sử hấp dẫn"
+    p_hashtags = "Dựa vào nội dung video lịch sử vừa viết, hãy đề xuất chính xác từ 3 đến 5 hashtag"
+
+    # Self matching
+    assert history_prompt_text_matches(p_title, p_title) is True
+    assert history_prompt_text_matches(p_slug, p_slug) is True
+    assert history_prompt_text_matches(p_tags, p_tags) is True
+    assert history_prompt_text_matches(p_pinned, p_pinned) is True
+    assert history_prompt_text_matches(p_quiz, p_quiz) is True
+    assert history_prompt_text_matches(p_hashtags, p_hashtags) is True
+
+    # Cross matching MUST be False
+    assert history_prompt_text_matches(p_title, p_slug) is False
+    assert history_prompt_text_matches(p_title, p_tags) is False
+    assert history_prompt_text_matches(p_slug, p_tags) is False
+    assert history_prompt_text_matches(p_quiz, p_pinned) is False
+    assert history_prompt_text_matches(p_hashtags, p_tags) is False
+
+
+def test_sanitize_and_repair_metadata():
+    from auto_yt.services.chatgpt_worker import sanitize_and_repair_metadata, build_video_script
+
+    state = {
+        "intro": "Đoạn mở đầu",
+        "body_parts": ["Phần thân bài 1"],
+        "outro": "Đoạn kết luận lịch sử.",
+        "title": "Lịch sử có thể lùi xa, những cuộc chiến có thể khép lại... Hẹn gặp lại quý vị trong những hành trình khám phá lịch sử tiếp theo của Góc Khuất Việt Sử.",
+        "slug": "LÊ DUẨN ĐÃ NHÌN THẤU TRUNG QUỐC? Góc Khuất Trước CHIẾN TRANH 1979",
+        "description": "le-duan-nhin-thau-trung-quoc-chien-tranh-1979",
+        "pinned_comment": "🇻🇳 Bình luận ghim chuẩn.",
+        "quiz": "🇻🇳 Bình luận ghim chuẩn.",
+    }
+
+    sanitize_and_repair_metadata(state)
+
+    assert state["title"] == "LÊ DUẨN ĐÃ NHÌN THẤU TRUNG QUỐC? Góc Khuất Trước CHIẾN TRANH 1979"
+    assert state["slug"] == "le-duan-nhin-thau-trung-quoc-chien-tranh-1979"
+    assert state["description"] == ""
+    assert state["quiz"] == ""
+    assert "Hẹn gặp lại quý vị" in state["outro"]
+
+    script = build_video_script(state)
+    assert "### [TIÊU ĐỀ]\nLÊ DUẨN ĐÃ NHÌN THẤU TRUNG QUỐC? Góc Khuất Trước CHIẾN TRANH 1979" in script
+    assert "### [SLUG]\nle-duan-nhin-thau-trung-quoc-chien-tranh-1979" in script
+
+
+def test_extract_generated_video_title_with_outro_fallback():
+    from auto_yt.services.database import extract_generated_video_title
+
+    script_corrupted = """### [INTRO]
+Intro text
+
+### [BODY]
+Body text
+
+### [OUTRO]
+Outro text
+
+### [TIÊU ĐỀ]
+Lịch sử có thể lùi xa, những cuộc chiến có thể khép lại, nhưng bài học về độc lập, chủ quyền và quyền tự quyết của dân tộc sẽ không bao giờ mất đi giá trị. Hẹn gặp lại quý vị trong những hành trình khám phá lịch sử tiếp theo của Góc Khuất Việt Sử.
+
+### [SLUG]
+LÊ DUẨN ĐÃ NHÌN THẤU TRUNG QUỐC? Góc Khuất Trước CHIẾN TRANH 1979
+
+### [MÔ TẢ]
+le-duan-nhin-thau-trung-quoc-chien-tranh-1979
+"""
+    title = extract_generated_video_title(script_corrupted)
+    assert title == "LÊ DUẨN ĐÃ NHÌN THẤU TRUNG QUỐC? Góc Khuất Trước CHIẾN TRANH 1979"
+
+

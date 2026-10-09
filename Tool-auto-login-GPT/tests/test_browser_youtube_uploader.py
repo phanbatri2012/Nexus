@@ -163,6 +163,49 @@ class TestBrowserYouTubeUploader(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(len(progress_called) > 0)
         self.assertEqual(progress_called[-1][1], "upload_complete")
 
+    async def test_wait_for_file_upload_complete_dict_success(self):
+        from auto_yt.services.browser_youtube_uploader import _wait_for_file_upload_complete
+        page = AsyncMock()
+        page.evaluate.return_value = {
+            "isDone": True,
+            "isInterrupted": False,
+            "pctVal": 100,
+            "cleanText": "Đã tải lên 100%",
+        }
+        progress_called = []
+        def on_prog(msg, st, pct):
+            progress_called.append((msg, st, pct))
+
+        await _wait_for_file_upload_complete(page, timeout_seconds=5.0, progress=on_prog)
+        self.assertTrue(len(progress_called) > 0)
+        self.assertEqual(progress_called[-1][1], "upload_complete")
+
+    async def test_wait_for_file_upload_complete_timeout_raises_error(self):
+        from auto_yt.services.browser_youtube_uploader import _wait_for_file_upload_complete, BrowserUploadError
+        page = AsyncMock()
+        page.evaluate.return_value = {
+            "isDone": False,
+            "isInterrupted": False,
+            "pctVal": 35,
+            "cleanText": "Đang tải lên 35% ... Còn 10 phút",
+        }
+        with self.assertRaises(BrowserUploadError) as ctx:
+            await _wait_for_file_upload_complete(page, timeout_seconds=0.1)
+        self.assertIn("Hết thời gian chờ", str(ctx.exception))
+
+    async def test_wait_for_file_upload_complete_interrupted_raises_error(self):
+        from auto_yt.services.browser_youtube_uploader import _wait_for_file_upload_complete, BrowserUploadError
+        page = AsyncMock()
+        page.evaluate.return_value = {
+            "isDone": False,
+            "isInterrupted": True,
+            "pctVal": None,
+            "cleanText": "Quá trình tải lên bị gián đoạn",
+        }
+        with self.assertRaises(BrowserUploadError) as ctx:
+            await _wait_for_file_upload_complete(page, timeout_seconds=5.0)
+        self.assertIn("gián đoạn", str(ctx.exception).lower())
+
     def test_completion_dialog_selectors(self):
         from auto_yt.services.browser_youtube_uploader import UPLOAD_COMPLETION_DIALOG_SELECTOR
         self.assertIn("ytcp-video-share-dialog", UPLOAD_COMPLETION_DIALOG_SELECTOR)

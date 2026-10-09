@@ -744,43 +744,64 @@ def _parse_schedule_at(schedule_at: str, timezone_name: str) -> dt.datetime:
 
 async def _wait_for_file_upload_complete(
     page,
-    timeout_seconds: float = 600.0,
+    timeout_seconds: float = 1800.0,
     progress: Callable[[str, str, int], None] | None = None,
     cancel_check: Callable[[], None] | None = None,
 ) -> None:
     """Wait until Chromium finishes uploading the MP4 file bytes to YouTube before scheduling."""
     start_time = time.monotonic()
     last_pct = 0
+    last_progress_time = start_time
+    stall_timeout_seconds = 900.0  # 15 minutes without progress movement
+
     while (time.monotonic() - start_time) < timeout_seconds:
         if cancel_check:
             cancel_check()
         status_info = await page.evaluate("""
         () => {
             const dialog = document.querySelector('ytcp-uploads-dialog, ytcp-video-upload-dialog, ytcp-video-metadata-editor');
-            if (!dialog) return { isDone: true, cleanText: 'no_dialog', pctVal: 100 };
+            const bottomMonitor = document.querySelector('ytcp-multi-progress-monitor, ytcp-upload-progress, ytcp-toast, .progress-label');
 
-            const progressEl = dialog.querySelector('ytcp-video-upload-progress, .progress-label, ytcp-badge, #dialog-title + *');
-            const footerEl = dialog.querySelector('ytcp-video-metadata-editor-footer, #dialog-footer, .footer, ytcp-animatable');
+            if (!dialog && !bottomMonitor) {
+                const bodyText = (document.body?.innerText || '').toLowerCase();
+                const hasInterrupted = bodyText.includes('quá trình tải lên bị gián đoạn')
+                    || bodyText.includes('upload process interrupted')
+                    || bodyText.includes('upload interrupted');
+                return { isDone: !hasInterrupted, isInterrupted: hasInterrupted, cleanText: 'no_dialog', pctVal: hasInterrupted ? null : 100 };
+            }
 
-            const rawText = (dialog.innerText || '').toLowerCase();
+            const progressEl = (dialog ? dialog.querySelector('ytcp-video-upload-progress, .progress-label, ytcp-badge, #dialog-title + *') : null)
+                || document.querySelector('ytcp-video-upload-progress, ytcp-multi-progress-monitor .progress-label, .progress-label');
+            const footerEl = dialog ? dialog.querySelector('ytcp-video-metadata-editor-footer, #dialog-footer, .footer, ytcp-animatable') : null;
+
             const progressText = progressEl ? (progressEl.innerText || progressEl.textContent || '').trim() : '';
             const footerText = footerEl ? (footerEl.innerText || footerEl.textContent || '').trim() : '';
+            const monitorText = bottomMonitor ? (bottomMonitor.innerText || bottomMonitor.textContent || '').trim() : '';
+
+            const combinedProgress = (progressText + ' ' + footerText + ' ' + monitorText).toLowerCase();
+
+            const isInterrupted = combinedProgress.includes('quá trình tải lên bị gián đoạn')
+                || combinedProgress.includes('upload process interrupted')
+                || combinedProgress.includes('upload interrupted')
+                || combinedProgress.includes('tạm dừng')
+                || combinedProgress.includes('upload paused');
 
             let pctVal = null;
-            const m = (progressText + ' ' + footerText + ' ' + rawText).match(/(\\d+)%/);
+            const m = (progressText + ' ' + footerText + ' ' + monitorText).match(/(\\d+)\\s*%/);
             if (m) {
                 pctVal = parseInt(m[1], 10);
             }
 
             const doneKeywords = [
                 "đã hoàn tất quá trình tải lên",
-                "đã hoàn tất",
                 "upload complete",
                 "đã tải lên 100%",
                 "100% uploaded",
+                "đã tải được 100%",
                 "quá trình xử lý sắp bắt đầu",
                 "processing will begin shortly",
                 "quá trình kiểm tra sắp bắt đầu",
+                "đang xử lý phiên bản",
                 "đang xử lý",
                 "processing",
                 "đã xử lý xong",
@@ -797,42 +818,45 @@ async def _wait_for_file_upload_complete(
             if (pctVal !== null) {
                 isDone = (pctVal >= 100);
             } else {
-                const combinedStatus = (progressText + ' ' + footerText).toLowerCase();
-                isDone = doneKeywords.some(k => combinedStatus.includes(k));
+                isDone = doneKeywords.some(k => combinedProgress.includes(k));
             }
 
             return {
-                isDone: Boolean(isDone),
+                isDone: Boolean(isDone && !isInterrupted),
+                isInterrupted: Boolean(isInterrupted),
                 pctVal: pctVal,
-                cleanText: progressText || footerText || (m ? m[0] : (isDone ? 'Đã tải lên và xử lý xong' : ''))
+                cleanText: progressText || footerText || monitorText || (pctVal !== null ? `${pctVal}%` : (isDone ? 'Đã tải lên và xử lý xong' : ''))
             };
         }
         """)
 
         clean_text = ""
         is_done = False
+        is_interrupted = False
         pct_val = None
 
         if isinstance(status_info, dict):
             is_done = bool(status_info.get("isDone"))
+            is_interrupted = bool(status_info.get("isInterrupted"))
             pct_val = status_info.get("pctVal")
             clean_text = str(status_info.get("cleanText") or "").strip()
         elif isinstance(status_info, str):
             clean_text = status_info.strip()
-            pct_match = re.search(r"(\d+)%", clean_text)
+            pct_match = re.search(r"(\d+)\s*%", clean_text)
             if pct_match:
                 pct_val = int(pct_match.group(1))
+            is_interrupted = "gián đoạn" in clean_text.lower() or "interrupted" in clean_text.lower()
             if pct_val is not None:
-                is_done = (pct_val >= 100)
+                is_done = (pct_val >= 100 and not is_interrupted)
             else:
-                is_done = any(
+                is_done = not is_interrupted and any(
                     k in clean_text.lower()
                     for k in [
                         "đã hoàn tất quá trình tải lên",
-                        "đã hoàn tất",
                         "upload complete",
                         "đã tải lên 100%",
                         "100% uploaded",
+                        "đã tải được 100%",
                         "quá trình xử lý sắp bắt đầu",
                         "processing will begin shortly",
                         "quá trình kiểm tra sắp bắt đầu",
@@ -849,11 +873,19 @@ async def _wait_for_file_upload_complete(
                     ]
                 )
 
-        if pct_val is not None and pct_val != last_pct:
-            last_pct = pct_val
-            mapped_pct = int(20 + (pct_val * 0.45))
-            if progress:
-                progress(f"Đang tải video lên YouTube ({clean_text or f'{pct_val}%'})...", "uploading_file", mapped_pct)
+        if is_interrupted:
+            raise BrowserUploadError(
+                f"Quá trình tải lên YouTube bị gián đoạn ({clean_text or 'Upload process interrupted'})."
+            )
+
+        if pct_val is not None:
+            if pct_val > last_pct:
+                last_progress_time = time.monotonic()
+            if pct_val != last_pct:
+                last_pct = pct_val
+                mapped_pct = int(20 + (pct_val * 0.45))
+                if progress:
+                    progress(f"Đang tải video lên YouTube ({clean_text or f'{pct_val}%'})...", "uploading_file", mapped_pct)
 
         if is_done or (pct_val is not None and pct_val >= 100) or last_pct >= 100:
             logger.info("Quá trình upload file MP4 lên YouTube đã hoàn tất (%s)", clean_text)
@@ -861,9 +893,17 @@ async def _wait_for_file_upload_complete(
                 progress("Đã tải xong 100% file video lên YouTube.", "upload_complete", 65)
             return
 
+        # Check for stalled upload (no progress change for 15+ minutes)
+        if (time.monotonic() - last_progress_time) > stall_timeout_seconds and last_pct < 100:
+            raise BrowserUploadError(
+                f"Tiến độ upload video lên YouTube bị treo ở {last_pct}% trong hơn {int(stall_timeout_seconds // 60)} phút."
+            )
+
         await asyncio.sleep(2.0)
 
-    logger.warning("Hết thời gian chờ upload file 100%% sau %.1fs; tiếp tục tiến trình...", timeout_seconds)
+    raise BrowserUploadError(
+        f"Hết thời gian chờ upload file video 100% lên YouTube sau {int(timeout_seconds)}s (tiến độ hiện tại: {clean_text or f'{last_pct}%'}). Dừng quy trình để tránh gián đoạn dữ liệu."
+    )
 
 
 async def _resume_interrupted_upload_if_present(
@@ -2838,6 +2878,19 @@ async def upload_video_via_browser(
     if not video_path.exists():
         raise BrowserUploadError(f"File video không tồn tại: {video_path}")
 
+    file_size_bytes = 0
+    try:
+        if video_path and video_path.exists():
+            file_size_bytes = video_path.stat().st_size
+    except Exception:
+        pass
+    file_size_mb = file_size_bytes / (1024 * 1024) if file_size_bytes else 0.0
+    effective_upload_timeout = max(
+        float(timeout_seconds),
+        (file_size_mb / 0.3) + 600.0 if file_size_mb else 1800.0,
+        1800.0,
+    )
+
     tags_list = tags or []
     settings = dict(publishing_settings or {})
     monetization_mode = str(
@@ -2851,7 +2904,7 @@ async def upload_video_via_browser(
     clean_channel_id = str(expected_channel_id or "").strip()
     clean_existing_video_id = str(existing_video_id or "").strip()
     progress("Đang kết nối trình duyệt của kênh...", "browser_launching", 5)
-    logger.info("Bắt đầu upload qua trình duyệt profile %s cho video '%s'", clean_profile, title)
+    logger.info("Bắt đầu upload qua trình duyệt profile %s cho video '%s' (kích thước: %.1f MB, upload timeout: %.0fs)", clean_profile, title, file_size_mb, effective_upload_timeout)
 
     async with channel_browser_session(clean_profile) as (context, _browser, _profile_meta):
         cancel_check()
@@ -2918,7 +2971,7 @@ async def upload_video_via_browser(
                     resumed_from_interrupted = await _resume_interrupted_upload_if_present(
                         page,
                         video_path,
-                        timeout_seconds=timeout_seconds,
+                        timeout_seconds=effective_upload_timeout,
                         progress=progress,
                         cancel_check=cancel_check,
                     )
@@ -2938,7 +2991,7 @@ async def upload_video_via_browser(
                         resumed_from_interrupted = await _resume_interrupted_upload_if_present(
                             page,
                             video_path,
-                            timeout_seconds=timeout_seconds,
+                            timeout_seconds=effective_upload_timeout,
                             progress=progress,
                             cancel_check=cancel_check,
                         )
@@ -3015,7 +3068,7 @@ async def upload_video_via_browser(
                             resumed_ok = await _resume_interrupted_upload_if_present(
                                 page,
                                 video_path,
-                                timeout_seconds=timeout_seconds,
+                                timeout_seconds=effective_upload_timeout,
                                 progress=progress,
                                 cancel_check=cancel_check,
                             )
@@ -3032,7 +3085,7 @@ async def upload_video_via_browser(
                         resumed_ok = await _resume_interrupted_upload_if_present(
                             page,
                             video_path,
-                            timeout_seconds=timeout_seconds,
+                            timeout_seconds=effective_upload_timeout,
                             progress=progress,
                             cancel_check=cancel_check,
                         )
@@ -3818,7 +3871,7 @@ async def upload_video_via_browser(
                 progress("Đang chờ tải lên 100% file video lên YouTube...", "uploading_file", 80)
                 await _wait_for_file_upload_complete(
                     page,
-                    timeout_seconds=timeout_seconds,
+                    timeout_seconds=effective_upload_timeout,
                     progress=progress,
                     cancel_check=cancel_check,
                 )
@@ -3872,7 +3925,7 @@ async def upload_video_via_browser(
                         caption_path=None,
                         language=language,
                         settings=settings,
-                        timeout_seconds=timeout_seconds,
+                        timeout_seconds=effective_upload_timeout,
                         cancel_check=cancel_check,
                         persist_checkpoint=persist_checkpoint,
                         progress=progress,
@@ -4170,6 +4223,25 @@ async def upload_video_via_browser(
                     final_restriction = _find_blocking_restriction(editor_text)
                     if final_restriction:
                         break
+
+                    is_interrupted_on_edit = bool(
+                        re.search(r"gián đoạn|interrupted", editor_text, re.IGNORECASE)
+                    )
+                    if is_interrupted_on_edit and video_path and video_path.exists():
+                        logger.info(
+                            "Phát hiện video %s bị gián đoạn trên trang chỉnh sửa; đang tự động tiếp tục upload MP4...",
+                            youtube_video_id,
+                        )
+                        await _resume_interrupted_upload_if_present(
+                            page,
+                            video_path,
+                            timeout_seconds=effective_upload_timeout,
+                            progress=progress,
+                            cancel_check=cancel_check,
+                        )
+                        editor_text = str(await page.locator("body").inner_text() or "")
+                        page_html = await page.content()
+
                     if schedule_at:
                         schedule_verified_on_page, schedule_matches = _detect_schedule_verification(
                             editor_text,
@@ -4289,7 +4361,7 @@ async def upload_video_via_browser(
                             caption_path=caption_path,
                             language=language,
                             settings=settings,
-                            timeout_seconds=timeout_seconds,
+                            timeout_seconds=effective_upload_timeout,
                             cancel_check=cancel_check,
                             persist_checkpoint=persist_checkpoint,
                             progress=progress,

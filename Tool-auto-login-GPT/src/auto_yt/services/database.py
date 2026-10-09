@@ -101,6 +101,28 @@ def _clean_generated_title(value: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
+def _looks_like_outro_or_cta(val: str) -> bool:
+    v = str(val or "").lower()
+    markers = [
+        "hẹn gặp lại quý vị",
+        "hẹn gặp lại các bạn",
+        "nhấn like",
+        "đăng ký kênh",
+        "bật chuông thông báo",
+        "hội viên",
+        "chia sẻ góc nhìn",
+        "để lại ý kiến dưới phần bình luận",
+    ]
+    return len(str(val or "")) > 200 or any(m in v for m in markers)
+
+
+def _is_likely_slug(val: str) -> bool:
+    v = str(val or "").strip()
+    if not v or len(v) > 100 or " " in v or "\n" in v:
+        return False
+    return bool(re.match(r"^[a-z0-9\-_]+$", v))
+
+
 def extract_generated_video_title(generated_script: str) -> str:
     if not generated_script:
         return ""
@@ -114,10 +136,22 @@ def extract_generated_video_title(generated_script: str) -> str:
             label, separator, inline_value = line_clean.partition(":")
             if separator and _normalize_metadata_label(label) in GENERATED_TITLE_LABELS:
                 title = _clean_generated_title(inline_value)
-                if title:
+                if title and not _looks_like_outro_or_cta(title):
                     return title
             cleaned = _clean_generated_title(line_clean)
-            if cleaned:
+            if cleaned and not _looks_like_outro_or_cta(cleaned):
+                return cleaned
+
+    # Fallback: Check if SLUG section contains a title if title section was empty or outro
+    slug_match = SLUG_SECTION_PATTERN.search(generated_script)
+    if slug_match:
+        slug_content = slug_match.group(1).strip()
+        for line in slug_content.splitlines():
+            line_clean = line.strip("#*` ")
+            label, separator, inline_value = line_clean.partition(":")
+            candidate = inline_value if separator and _normalize_metadata_label(label) in {"SLUG", "URL SLUG"} else line_clean
+            cleaned = _clean_generated_title(candidate)
+            if cleaned and len(cleaned.split()) >= 3 and not _is_likely_slug(cleaned) and not _looks_like_outro_or_cta(cleaned):
                 return cleaned
 
     metadata_match = METADATA_SECTION_PATTERN.search(generated_script)
@@ -132,7 +166,7 @@ def extract_generated_video_title(generated_script: str) -> str:
 
         if separator:
             title = _clean_generated_title(inline_value)
-            if title:
+            if title and not _looks_like_outro_or_cta(title):
                 return title
 
         for following_line in lines[index + 1:]:
@@ -146,7 +180,8 @@ def extract_generated_video_title(generated_script: str) -> str:
                 "HASHTAG",
             }:
                 break
-            return candidate
+            if not _looks_like_outro_or_cta(candidate):
+                return candidate
     return ""
 
 
@@ -168,8 +203,9 @@ def extract_generated_video_description(generated_script: str) -> str:
             else:
                 desc_lines.append(line)
         result = "\n".join(desc_lines).strip()
-        if result:
+        if result and not _is_likely_slug(result):
             return result
+
 
     metadata_match = METADATA_SECTION_PATTERN.search(generated_script)
     metadata = metadata_match.group(1) if metadata_match else generated_script

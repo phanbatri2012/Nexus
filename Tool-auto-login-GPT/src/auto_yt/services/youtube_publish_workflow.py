@@ -735,6 +735,18 @@ def execute_browser_publish_workflow(
         context["publishing_settings"].get("notify_subscribers", True)
     )
 
+    file_size_bytes = 0
+    try:
+        video_p = context.get("video_path")
+        if video_p and Path(video_p).exists():
+            file_size_bytes = Path(video_p).stat().st_size
+        elif isinstance(context.get("final_artifact"), dict):
+            file_size_bytes = int(context["final_artifact"].get("size_bytes") or 0)
+    except Exception:
+        pass
+    file_size_mb = file_size_bytes / (1024 * 1024) if file_size_bytes else 0.0
+    dynamic_timeout = max(1800.0, (file_size_mb / 0.3) + 600.0 if file_size_mb else 1800.0)
+
     try:
         browser_result = asyncio.run(
             browser_youtube_uploader.upload_video_via_browser(
@@ -763,6 +775,7 @@ def execute_browser_publish_workflow(
                 cancel_check=cancel_check,
                 persist_video_id=persist_browser_video_id,
                 persist_checkpoint=persist_browser_checkpoint,
+                timeout_seconds=dynamic_timeout,
             )
         )
     except browser_youtube_uploader.BrowserUploadNeedsReview as exc:

@@ -2211,7 +2211,10 @@ def prompt_text_matches(expected_text: str, editor_text: str) -> bool:
 
 def history_prompt_text_matches(expected_text: str, rendered_text: str) -> bool:
     def normalize(value: str) -> str:
-        return re.sub(r"\s+", " ", value.replace("\u00a0", " ")).strip()
+        v = value.replace("\u00a0", " ")
+        v = re.sub(r"LƯU Ý QUAN TRỌNG:.*", "", v, flags=re.DOTALL | re.IGNORECASE)
+        v = re.sub(r"YÊU CẦU ĐẦU RA.*", "", v, flags=re.DOTALL | re.IGNORECASE)
+        return re.sub(r"\s+", " ", v).strip()
 
     expected = normalize(expected_text)
     actual = normalize(rendered_text)
@@ -2222,19 +2225,38 @@ def history_prompt_text_matches(expected_text: str, rendered_text: str) -> bool:
     if expected == actual:
         return True
 
-    # Substring / prefix matching for prompts of any length
-    if (len(actual) >= 20 and expected.startswith(actual)) or (len(expected) >= 20 and actual.startswith(expected)):
-        return True
+    distinctive_markers = (
+        ("tiêu đề", "title"),
+        ("url slug", "slug"),
+        ("mô tả", "description"),
+        ("thẻ từ khóa", "tags"),
+        ("bình luận ghim", "pinned"),
+        ("câu hỏi trắc nghiệm", "quiz"),
+        ("hashtag", "hashtags"),
+        ("chapter", "chapters"),
+    )
+    for marker_vn, _ in distinctive_markers:
+        if marker_vn in expected.lower() and marker_vn not in actual.lower():
+            return False
+        if marker_vn in actual.lower() and marker_vn not in expected.lower():
+            return False
 
-    check_len = min(len(expected), len(actual), 50)
-    if check_len >= 20 and expected[:check_len] == actual[:check_len]:
-        return True
+    if expected in actual or actual in expected:
+        min_len = min(len(expected), len(actual))
+        max_len = max(len(expected), len(actual))
+        if min_len >= 30 and (min_len / max_len) >= 0.6:
+            return True
 
-    if len(actual) >= 100 and len(expected) >= 100:
-        if expected[:100] == actual[:100]:
+    exp_words = set(expected.lower().split())
+    act_words = set(actual.lower().split())
+    if exp_words and act_words:
+        intersection = exp_words.intersection(act_words)
+        overlap = len(intersection) / min(len(exp_words), len(act_words))
+        if overlap >= 0.85 and len(intersection) >= 8:
             return True
 
     return False
+
 
 
 
@@ -4070,7 +4092,94 @@ def clear_pending_generation_prompt(
         state.pop("pending_prompt", None)
 
 
+def is_likely_slug(val: str) -> bool:
+    v = str(val or "").strip()
+    if not v or len(v) > 100 or " " in v or "\n" in v:
+        return False
+    return bool(re.match(r"^[a-z0-9\-_]+$", v))
+
+
+def is_likely_title(val: str) -> bool:
+    v = str(val or "").strip()
+    if not v or len(v) > 150 or "\n" in v:
+        return False
+    return len(v.split()) >= 3 and not is_likely_slug(v)
+
+
+def looks_like_outro_or_cta(val: str) -> bool:
+    v = str(val or "").lower()
+    markers = [
+        "hẹn gặp lại quý vị",
+        "hẹn gặp lại các bạn",
+        "nhấn like",
+        "đăng ký kênh",
+        "bật chuông thông báo",
+        "hội viên",
+        "chia sẻ góc nhìn",
+        "để lại ý kiến dưới phần bình luận",
+    ]
+    return len(str(val or "")) > 200 or any(m in v for m in markers)
+
+
+def sanitize_and_repair_metadata(state: dict) -> None:
+    if not isinstance(state, dict):
+        return
+
+    title = str(state.get("title") or "").strip()
+    slug = str(state.get("slug") or "").strip()
+    desc = str(state.get("description") or "").strip()
+    outro = str(state.get("outro") or "").strip()
+    pinned = str(state.get("pinned_comment") or "").strip()
+    quiz = str(state.get("quiz") or "").strip()
+
+    # Case 1: Title contains Outro/CTA text, while Slug contains actual Title
+    if looks_like_outro_or_cta(title) and (is_likely_title(slug) or not is_likely_slug(slug)):
+        if title and title not in outro:
+            state["outro"] = (outro + "\n\n" + title).strip() if outro else title
+
+        state["title"] = slug
+        if is_likely_slug(desc):
+            state["slug"] = desc
+            state["description"] = ""
+        else:
+            state["slug"] = ""
+
+    # Case 2: Slug contains title and description contains slug
+    elif is_likely_title(slug) and is_likely_slug(desc):
+        if not state.get("title") or looks_like_outro_or_cta(state.get("title", "")):
+            state["title"] = slug
+            state["slug"] = desc
+            state["description"] = ""
+
+    # Case 3: Title cleanup
+    if state.get("title"):
+        cleaned_title = re.sub(
+            r"^(?:tiêu đề(?:\s*video)?\s*:\s*|\*\*\s*tiêu đề\s*:\s*\*\*|#+\s*)",
+            "",
+            str(state["title"]),
+            flags=re.IGNORECASE,
+        ).strip().strip('"“”\'`#* ')
+        if len(cleaned_title) > 120 and looks_like_outro_or_cta(cleaned_title):
+            pass
+        else:
+            state["title"] = cleaned_title
+
+    # Case 4: Slug cleanup
+    if state.get("slug"):
+        cleaned_slug = str(state["slug"]).strip().strip("`*#\"' ")
+        cleaned_slug = re.sub(r"^(?:url\s*slug|slug)\s*:\s*", "", cleaned_slug, flags=re.IGNORECASE).strip()
+        if not is_likely_slug(cleaned_slug):
+            cleaned_slug = re.sub(r"[^a-zA-Z0-9\-_]+", "-", cleaned_slug.lower()).strip("-")
+        state["slug"] = cleaned_slug[:80]
+
+    # Case 5: Quiz is identical to Pinned comment
+    if quiz and pinned and (quiz == pinned or quiz.strip() == pinned.strip()):
+        if not re.search(r"\b[A-D]\.\s+", quiz) and "đáp án" not in quiz.lower():
+            state["quiz"] = ""
+
+
 def build_video_script(state: dict) -> str:
+    sanitize_and_repair_metadata(state)
     intro = dedup_consecutive_paragraphs(sanitize_narrative_response(state.get("intro", "")))
     body = "\n\n".join(
         sanitized_part
@@ -4109,6 +4218,7 @@ def build_video_script(state: dict) -> str:
     
     raw_script = "\n\n".join(s for s in sections if s)
     return sanitize_generated_script(raw_script)
+
 
 
 def _checkpoint_video_id() -> int | None:

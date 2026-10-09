@@ -9,7 +9,7 @@
 ## 2. Communication
 
 - Communicate with the user concisely in Vietnamese. Use English for identifiers, code comments, and technical artifacts unless localization is part of the task.
-- Before a related group of tool calls, provide one concise Vietnamese progress update. Update again only when the approach changes, work runs long, or a material result is found.
+- **Action Transparency & Purpose**: Before executing any tool call, file inspection, or command, output 1 concise line in Vietnamese stating clearly WHAT is being done and WHY/FOR WHAT PURPOSE (e.g. "Đang đọc file X... để kiểm tra cấu hình cổng Y", "Đang chạy lệnh Z... nhằm xác định tiến trình có hoạt động hay không"). Update again when the approach changes, work runs long, or a material result is found.
 - State assumptions only when they materially affect the result. Ask for clarification only when different answers would change the implementation or risk.
 - For multi-step work, give a brief plan and proceed unless approval is required for a destructive, external, or materially ambiguous action.
 - Label suggestions outside the requested scope as optional; do not mix them into the main deliverable.
