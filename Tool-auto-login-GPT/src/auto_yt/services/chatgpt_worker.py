@@ -4526,6 +4526,11 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 "title",
                 prompt_title,
             )
+            title = title.strip() if isinstance(title, str) else ""
+            if not title or looks_like_chatgpt_error(title) or _is_pure_thinking_indicator(title) or len(title) < 10:
+                clear_pending_generation_prompt(state, "title", prompt_title)
+                persist_generation_state(state)
+                raise RuntimeError(f"ChatGPT returned an invalid or incomplete title (got: {repr(title[:60])}).")
             state["title"] = title
             clear_pending_generation_prompt(state, "title", prompt_title)
             persist_generation_state(state)
@@ -4541,6 +4546,11 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 "slug",
                 prompt_slug,
             )
+            slug = slug.strip() if isinstance(slug, str) else ""
+            if not slug or looks_like_chatgpt_error(slug) or _is_pure_thinking_indicator(slug) or len(slug) < 3:
+                clear_pending_generation_prompt(state, "slug", prompt_slug)
+                persist_generation_state(state)
+                raise RuntimeError(f"ChatGPT returned an invalid or incomplete slug (got: {repr(slug[:60])}).")
             state["slug"] = slug
             clear_pending_generation_prompt(state, "slug", prompt_slug)
             persist_generation_state(state)
@@ -4556,6 +4566,11 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 "description",
                 prompt_desc,
             )
+            description = description.strip() if isinstance(description, str) else ""
+            if not description or looks_like_chatgpt_error(description) or _is_pure_thinking_indicator(description) or len(description) < 80:
+                clear_pending_generation_prompt(state, "description", prompt_desc)
+                persist_generation_state(state)
+                raise RuntimeError(f"ChatGPT returned an invalid or incomplete description (got: {repr(description[:60])}).")
             state["description"] = description
             clear_pending_generation_prompt(state, "description", prompt_desc)
             persist_generation_state(state)
@@ -4571,6 +4586,11 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 "hashtags",
                 prompt_hashtags,
             )
+            hashtags = hashtags.strip() if isinstance(hashtags, str) else ""
+            if not hashtags or looks_like_chatgpt_error(hashtags) or _is_pure_thinking_indicator(hashtags) or "#" not in hashtags:
+                clear_pending_generation_prompt(state, "hashtags", prompt_hashtags)
+                persist_generation_state(state)
+                raise RuntimeError(f"ChatGPT returned invalid hashtags (got: {repr(hashtags[:60])}).")
             state["hashtags"] = hashtags
             clear_pending_generation_prompt(state, "hashtags", prompt_hashtags)
             persist_generation_state(state)
@@ -4586,6 +4606,11 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 "tags",
                 prompt_tags,
             )
+            tags = tags.strip() if isinstance(tags, str) else ""
+            if not tags or looks_like_chatgpt_error(tags) or _is_pure_thinking_indicator(tags) or len(tags) < 10:
+                clear_pending_generation_prompt(state, "tags", prompt_tags)
+                persist_generation_state(state)
+                raise RuntimeError(f"ChatGPT returned invalid tags (got: {repr(tags[:60])}).")
             state["tags"] = tags
             clear_pending_generation_prompt(state, "tags", prompt_tags)
             persist_generation_state(state)
@@ -4601,6 +4626,11 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 "pinned_comment",
                 prompt_pinned,
             )
+            pinned = pinned.strip() if isinstance(pinned, str) else ""
+            if not pinned or looks_like_chatgpt_error(pinned) or _is_pure_thinking_indicator(pinned) or len(pinned) < 20:
+                clear_pending_generation_prompt(state, "pinned_comment", prompt_pinned)
+                persist_generation_state(state)
+                raise RuntimeError(f"ChatGPT returned an invalid pinned comment (got: {repr(pinned[:60])}).")
             state["pinned_comment"] = pinned
             clear_pending_generation_prompt(state, "pinned_comment", prompt_pinned)
             persist_generation_state(state)
@@ -4616,6 +4646,11 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 "quiz",
                 prompt_quiz,
             )
+            quiz = quiz.strip() if isinstance(quiz, str) else ""
+            if not quiz or looks_like_chatgpt_error(quiz) or _is_pure_thinking_indicator(quiz) or len(quiz) < 30:
+                clear_pending_generation_prompt(state, "quiz", prompt_quiz)
+                persist_generation_state(state)
+                raise RuntimeError(f"ChatGPT returned an invalid quiz (got: {repr(quiz[:60])}).")
             state["quiz"] = quiz
             clear_pending_generation_prompt(state, "quiz", prompt_quiz)
             persist_generation_state(state)
@@ -4665,6 +4700,11 @@ def _run_complete(transcript: str, state: dict) -> dict:
                         "No thumbnail prompt was sent."
                     ) from exc
                 raise
+            chapters = sanitize_chapter_response(chapters.strip()) if isinstance(chapters, str) else ""
+            if not chapters or looks_like_chatgpt_error(chapters) or _is_pure_thinking_indicator(chapters) or not is_valid_chapter_response(chapters):
+                clear_pending_generation_prompt(state, "chapters", prompt7)
+                persist_generation_state(state)
+                raise RuntimeError(f"ChatGPT returned invalid chapters (got: {repr(chapters[:60])}).")
             state["chapters"] = chapters
             clear_pending_generation_prompt(state, "chapters", prompt7)
             persist_generation_state(state)
