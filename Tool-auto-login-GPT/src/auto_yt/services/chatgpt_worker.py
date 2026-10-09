@@ -1030,6 +1030,10 @@ def send_thumbnail_prompt(
         reference_image_base64=reference_image_base64
     )
     request_turn = wait_for_new_user_turn(page, previous_user_turn)
+    if is_valid_chapter_response(response_text) or (
+        "đáp án" in response_text.lower() and ("a." in response_text.lower() or "b." in response_text.lower())
+    ):
+        response_text = ""
     if is_thumbnail_generation_error_response(response_text):
         return response_text, []
     image_urls = wait_for_thumbnail_images(
@@ -2225,26 +2229,44 @@ def history_prompt_text_matches(expected_text: str, rendered_text: str) -> bool:
     if expected == actual:
         return True
 
-    distinctive_markers = (
-        ("tiêu đề", "title"),
-        ("url slug", "slug"),
-        ("mô tả", "description"),
-        ("thẻ từ khóa", "tags"),
-        ("bình luận ghim", "pinned"),
-        ("câu hỏi trắc nghiệm", "quiz"),
-        ("hashtag", "hashtags"),
-        ("chapter", "chapters"),
-    )
-    for marker_vn, _ in distinctive_markers:
-        if marker_vn in expected.lower() and marker_vn not in actual.lower():
+    marker_groups = {
+        "title": ("tiêu đề", "1 tiêu đề", "title"),
+        "slug": ("url slug", "slug"),
+        "description": ("mô tả video", "mô tả", "tóm tắt cốt truyện", "description"),
+        "hashtags": ("hashtag", "hashtags"),
+        "tags": ("thẻ từ khóa", "danh sách từ khóa", "tags"),
+        "pinned": ("bình luận ghim", "pinned comment", "pinned"),
+        "quiz": ("câu hỏi trắc nghiệm", "4 lựa chọn", "4 câu trả lời", "trắc nghiệm", "quiz"),
+        "chapters": ("chapter", "dòng thời gian", "mốc thời gian", "timestamps", "timestamp"),
+        "thumbnail": ("thumbnail", "hình thu nhỏ", "ảnh bìa", "prompt tạo ảnh", "dall-e"),
+    }
+
+    exp_lower = expected.lower()
+    act_lower = actual.lower()
+
+    # Detect which marker group expected and actual belong to
+    exp_matched_groups = {
+        group for group, markers in marker_groups.items()
+        if any(m in exp_lower for m in markers)
+    }
+    act_matched_groups = {
+        group for group, markers in marker_groups.items()
+        if any(m in act_lower for m in markers)
+    }
+
+    # If both have detected metadata groups and they do not overlap, reject
+    if exp_matched_groups and act_matched_groups:
+        if not exp_matched_groups.intersection(act_matched_groups):
             return False
-        if marker_vn in actual.lower() and marker_vn not in expected.lower():
-            return False
+
+    # If one has a distinct metadata group and the other has none or different, reject
+    if exp_matched_groups != act_matched_groups:
+        return False
 
     if expected in actual or actual in expected:
         min_len = min(len(expected), len(actual))
         max_len = max(len(expected), len(actual))
-        if min_len >= 30 and (min_len / max_len) >= 0.6:
+        if min_len >= 30 and (min_len / max_len) >= 0.7:
             return True
 
     exp_words = set(expected.lower().split())
@@ -2252,7 +2274,7 @@ def history_prompt_text_matches(expected_text: str, rendered_text: str) -> bool:
     if exp_words and act_words:
         intersection = exp_words.intersection(act_words)
         overlap = len(intersection) / min(len(exp_words), len(act_words))
-        if overlap >= 0.85 and len(intersection) >= 8:
+        if overlap >= 0.88 and len(intersection) >= 12:
             return True
 
     return False
@@ -3212,12 +3234,16 @@ def wait_for_assistant_response(
                 return backend_text
 
         # 2. Extract DOM candidate
+        is_new_turn_node = False
         response_text = get_new_assistant_response(
             page,
             previous_assistant_turn,
             previous_assistant_count,
         )
-        if not response_text:
+        if response_text:
+            is_new_turn_node = True
+        elif saw_busy_state or (now - started_at >= 4.0):
+            # Only use fallback after initial grace period or after seeing busy state
             response_text = get_assistant_response_after_latest_user(
                 page,
                 expected_user_text=submitted_prompt_text,
@@ -3233,8 +3259,10 @@ def wait_for_assistant_response(
             if saw_busy_state
             else ASSISTANT_RESPONSE_STABLE_SECONDS
         )
+        has_verified_new_turn = saw_busy_state or is_new_turn_node or (now - started_at >= 10.0)
         if (
             last_response
+            and has_verified_new_turn
             and not _is_pure_thinking_indicator(last_response)
             and not looks_like_chatgpt_error(last_response)
             and not render_crashed

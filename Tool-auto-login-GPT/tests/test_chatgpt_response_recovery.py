@@ -500,3 +500,74 @@ le-duan-nhin-thau-trung-quoc-chien-tranh-1979
     assert title == "LÊ DUẨN ĐÃ NHÌN THẤU TRUNG QUỐC? Góc Khuất Trước CHIẾN TRANH 1979"
 
 
+def test_cross_metadata_prompt_matching_isolation():
+    from auto_yt.services.chatgpt_worker import history_prompt_text_matches
+
+    tag_prompt = "Hãy tạo 15 thẻ từ khóa (tags) chuẩn SEO cho video YouTube này, ngăn cách bằng dấu phẩy."
+    hashtag_prompt = "Hãy tạo 5-8 hashtag chuẩn SEO cho video YouTube này, bắt đầu bằng dấu #."
+    slug_prompt = "Hãy tạo 1 URL slug ngắn gọn, không dấu, nối bằng gạch ngang cho video này."
+    desc_prompt = "Hãy viết phần mô tả video chi tiết khoảng 1000-1500 ký tự tóm tắt câu chuyện."
+    pinned_prompt = "Hãy viết 1 bình luận ghim kêu gọi khán giả tương tác cho video này."
+    quiz_prompt = "Hãy tạo 1 câu hỏi trắc nghiệm tương tác với 4 lựa chọn A, B, C, D và đáp án giải thích."
+    chapter_prompt = "Hãy tạo các mốc thời gian (chapters / dòng thời gian) cho video này từ 00:00."
+    thumb_prompt = "Hãy tạo prompt tạo ảnh thumbnail cho video này để vẽ trên DALL-E."
+
+    # All distinct metadata prompt pairs MUST NOT match each other
+    assert not history_prompt_text_matches(tag_prompt, hashtag_prompt)
+    assert not history_prompt_text_matches(hashtag_prompt, tag_prompt)
+    assert not history_prompt_text_matches(slug_prompt, desc_prompt)
+    assert not history_prompt_text_matches(desc_prompt, slug_prompt)
+    assert not history_prompt_text_matches(pinned_prompt, quiz_prompt)
+    assert not history_prompt_text_matches(quiz_prompt, chapter_prompt)
+    assert not history_prompt_text_matches(chapter_prompt, thumb_prompt)
+    assert not history_prompt_text_matches(thumb_prompt, chapter_prompt)
+
+    # Identical or slightly formatted prompts in same category MUST match
+    assert history_prompt_text_matches(tag_prompt, tag_prompt + "\n\nLƯU Ý QUAN TRỌNG: STRICT_NO_FILLER")
+    assert history_prompt_text_matches(slug_prompt, "url slug: " + slug_prompt)
+
+
+def test_self_healing_extractors_on_shifted_metadata():
+    from auto_yt.services.database import (
+        extract_generated_video_quiz,
+        extract_generated_video_chapters,
+    )
+
+    # Simulated shifted script where Quiz is inside CHAPTERS section
+    shifted_script = """### [INTRO]
+Mở đầu video
+
+### [BODY]
+Thân bài video
+
+### [OUTRO]
+Kết thúc video
+
+### [QUIZ]
+Cảm ơn quý vị đã theo dõi video. Hãy để lại bình luận nhé!
+
+### [CHAPTERS]
+Câu hỏi: Nhân vật chính giữ cấp bậc gì?
+A. Thiếu úy
+B. Trung úy
+C. Đại úy
+D. Thiếu tá
+Đáp án: C. Đại úy
+
+### [THUMBNAIL_PROMPT_TEXT]
+00:00 - Mở đầu
+10:00 - Diễn biến kịch tính
+20:00 - Sự thật hé lộ
+"""
+
+    quiz = extract_generated_video_quiz(shifted_script)
+    assert "Đáp án: C. Đại úy" in quiz
+    assert "A. Thiếu úy" in quiz
+
+    chapters = extract_generated_video_chapters(shifted_script)
+    assert "00:00 - Mở đầu" in chapters
+    assert "10:00 - Diễn biến kịch tính" in chapters
+    assert "20:00 - Sự thật hé lộ" in chapters
+
+
+

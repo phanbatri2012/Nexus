@@ -3383,7 +3383,7 @@ def _ensure_audio_task(
         stored_task = db.get_audio_task(video_id)
         if stored_task:
             if stored_task["request_hash"] != request_hash:
-                if stored_task["status"] in {"pending", "processing"}:
+                if stored_task["status"] in {"pending", "processing", "queued"}:
                     raise RuntimeError(
                         "Video đang có một audio task cho phiên bản kịch bản trước."
                     )
@@ -3396,7 +3396,7 @@ def _ensure_audio_task(
                         voice_name,
                         voice_fields,
                     )
-                elif stored_task["status"] in {"pending", "processing"}:
+                elif stored_task["status"] in {"pending", "processing", "queued"}:
                     _start_audio_watcher(video_id)
                 return stored_task
 
@@ -3451,7 +3451,7 @@ def _ensure_audio_task(
                     voice_name,
                     voice_fields,
                 )
-            elif task["status"] in {"pending", "processing"}:
+            elif task["status"] in {"pending", "processing", "queued"}:
                 _start_audio_watcher(video_id)
             return task
 
@@ -3511,6 +3511,11 @@ COMMENT_JOB_LABELS = {
     "comment_video_import": "Khởi tạo Chat cho video cũ",
 }
 
+FLOW_MEDIA_JOB_TYPES = ("flow_media_generation",)
+FLOW_MEDIA_JOB_LABELS = {
+    "flow_media_generation": "Tạo media Google Flow",
+}
+
 PRODUCTION_JOB_TYPES = (
     "video_render",
     "visual_scene_plan",
@@ -3538,6 +3543,7 @@ TRUST_BUILDER_JOB_LABELS = {
 ALL_JOB_LABELS = {
     "video_generation": "Tạo video",
     **COMMENT_JOB_LABELS,
+    **FLOW_MEDIA_JOB_LABELS,
     **PRODUCTION_JOB_LABELS,
     **TRUST_BUILDER_JOB_LABELS,
 }
@@ -4775,6 +4781,7 @@ def resume_background_jobs() -> None:
     for job_type in COMMENT_JOB_TYPES:
         db.recover_interrupted_system_jobs(job_type)
     for prod_job in (
+        "flow_media_generation",
         "video_render",
         "visual_scene_plan",
         "youtube_upload",
@@ -4783,6 +4790,12 @@ def resume_background_jobs() -> None:
         "fb_crosspost_sync",
     ):
         db.recover_interrupted_system_jobs(prod_job)
+    migrated_flow_jobs = _migrate_legacy_google_flow_render_jobs()
+    if migrated_flow_jobs:
+        logger.info(
+            "Đã chuyển %d job Google Flow legacy sang hàng đợi media.",
+            migrated_flow_jobs,
+        )
     db.recover_interrupted_system_jobs("trust_builder_session")
     recovered_browser_jobs = _recover_legacy_browser_cdp_blocked_jobs()
     if recovered_browser_jobs:
@@ -4793,6 +4806,7 @@ def resume_background_jobs() -> None:
     _reconcile_active_comment_draft_job_duplicates()
     db.pause_queued_attention_jobs()
     _kick_video_queue()
+    _kick_flow_media_queue()
     _kick_production_queue()
     _comment_sync_stop_event.clear()
     # Do not activate channel jobs during application startup. A due comment
@@ -4844,6 +4858,8 @@ def stop_video_queue_wakeup_timer() -> None:
     _tts_preview_cleanup_stop_event.set()
     _system_cleanup_stop_event.set()
     trust_builder_scheduler.stop_trust_builder_scheduler()
+    if _flow_media_coordinator is not None:
+        _flow_media_coordinator.stop()
     if _production_coordinator is not None:
         _production_coordinator.stop()
     chatgpt_browser_service.stop_browser_service()
@@ -5416,8 +5432,62 @@ def _enqueue_youtube_publish_if_enabled(
     return job
 
 
-def _execute_video_render_job(job: dict) -> None:
+def _execute_flow_media_generation_job(job: dict) -> None:
     from auto_yt.services import video_production
+
+    payload = job.get("payload") or {}
+    video_id = int(job.get("video_id") or payload.get("video_id") or 0)
+    snapshot = payload.get("snapshot") or _get_prompt_production_snapshot(
+        job.get("prompt_version") or ""
+    )
+
+    def update(message: str, stage: str = "", *args, **kwargs) -> None:
+        del args, kwargs
+        db.update_system_job(job["id"], progress=message)
+        db.update_video_production_state(
+            video_id,
+            render_status="media_generation",
+            current_stage=stage or "flow_media_generation",
+            production_progress=message,
+            blocking_reason="",
+        )
+
+    result = video_production.prepare_google_flow_media(
+        video_id,
+        snapshot,
+        update,
+        lambda: _raise_if_video_job_canceled(job["id"]),
+        force_new_project=bool(payload.get("force_new_project", False)),
+    )
+    _raise_if_video_job_canceled(job["id"])
+    render_job, _ = _enqueue_video_render_job(
+        video_id=video_id,
+        snapshot=snapshot,
+        mode=str(payload.get("mode") or "resume"),
+        source_media_job_id=job["id"],
+    )
+    result = {
+        **result,
+        "render_job_id": render_job["id"],
+    }
+    db.update_system_job(
+        job["id"],
+        status="completed",
+        progress="Media Google Flow đã sẵn sàng; đã chuyển sang hàng đợi MP4",
+        result_json=result,
+        finished_at=db.utc_now(),
+    )
+    db.update_video_production_state(
+        video_id,
+        render_status="queued",
+        current_stage="video_render_queue",
+        production_progress="Media đã sẵn sàng; đang chờ dựng MP4",
+        blocking_reason="",
+    )
+
+
+def _execute_video_render_job(job: dict) -> None:
+    from auto_yt.services import stock_video_renderer, video_production
 
     payload = job.get("payload") or {}
     video_id = int(job.get("video_id") or payload.get("video_id") or 0)
@@ -5436,13 +5506,21 @@ def _execute_video_render_job(job: dict) -> None:
             blocking_reason="",
         )
 
-    result = video_production.produce_video(
-        video_id,
-        snapshot,
-        update,
-        lambda: _raise_if_video_job_canceled(job["id"]),
-        force_new_project=bool(payload.get("force_new_project", False)),
-    )
+    if video_production.get_render_mode(snapshot) == "stock_video":
+        result = stock_video_renderer.produce_stock_video(
+            video_id=video_id,
+            snapshot=snapshot,
+            progress=update,
+            cancel_check=lambda: _raise_if_video_job_canceled(job["id"]),
+            force_new_project=bool(payload.get("force_new_project", False)),
+        )
+    else:
+        result = video_production.render_prepared_google_flow_video(
+            video_id,
+            snapshot,
+            update,
+            lambda: _raise_if_video_job_canceled(job["id"]),
+        )
     db.update_system_job(
         job["id"],
         status="completed",
@@ -5639,6 +5717,18 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
             cancel_requested=0,
             finished_at=db.utc_now(),
         )
+        if (
+            str(job.get("job_type") or "")
+            in {"flow_media_generation", "video_render"}
+            and job.get("video_id")
+        ):
+            db.update_video_production_state(
+                int(job["video_id"]),
+                render_status="canceled",
+                current_stage=str(job.get("job_type") or "video_render"),
+                production_progress="Đã dừng theo yêu cầu của người dùng",
+                blocking_reason=safe_error,
+            )
         return
     if isinstance(exc, youtube_publish_workflow.PublishConfigurationRequired):
         _pause_youtube_publish_job(
@@ -5762,6 +5852,18 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
         cancel_requested=0,
         finished_at=db.utc_now(),
     )
+    if (
+        str(job.get("job_type") or "")
+        in {"flow_media_generation", "video_render"}
+        and job.get("video_id")
+    ):
+        db.update_video_production_state(
+            int(job["video_id"]),
+            render_status="error",
+            current_stage=str(job.get("job_type") or "video_render"),
+            production_progress="Tác vụ dựng video thất bại",
+            blocking_reason=safe_error,
+        )
     if workflow and job.get("video_id"):
         db.update_video_production_state(
             int(job["video_id"]),
@@ -6029,9 +6131,159 @@ _production_coordinator = production_coordinator_service.ProductionCoordinator(
     maintenance_handler=_resume_browser_waiting_publish_jobs,
 )
 
+_flow_media_coordinator = production_coordinator_service.ProductionCoordinator(
+    {"flow_media_generation": _execute_flow_media_generation_job},
+    error_handler=_handle_production_job_error,
+)
+
 
 def _kick_production_queue() -> None:
     _production_coordinator.wake()
+
+
+def _kick_flow_media_queue() -> None:
+    if db.has_claimable_system_jobs("flow_media_generation"):
+        _flow_media_coordinator.wake()
+
+
+def _enqueue_video_render_job(
+    *,
+    video_id: int,
+    snapshot: dict,
+    mode: str = "resume",
+    force_new_project: bool = False,
+    source_media_job_id: str = "",
+) -> tuple[dict, bool]:
+    prompt_version = str(
+        snapshot.get("prompt_version")
+        or snapshot.get("version")
+        or (db.get_video(video_id) or {}).get("prompt_version")
+        or ""
+    )
+    payload = {
+        "video_id": video_id,
+        "snapshot": snapshot,
+        "mode": mode,
+        "force_new_project": bool(force_new_project),
+    }
+    if source_media_job_id:
+        payload.update(
+            {
+                "media_prepared": True,
+                "source_media_job_id": source_media_job_id,
+                "force_new_project": False,
+            }
+        )
+    job, created = db.create_system_job_if_absent(
+        job_id=f"video-render-{uuid.uuid4().hex}",
+        job_type="video_render",
+        title=(
+            f"Dựng video MP4 cho #{video_id}"
+            + (" (Tạo mới)" if force_new_project else "")
+        ),
+        payload=payload,
+        video_id=video_id,
+        prompt_version=prompt_version,
+    )
+    if created:
+        _kick_production_queue()
+    return job, created
+
+
+def _enqueue_flow_media_job(
+    *,
+    video_id: int,
+    snapshot: dict,
+    mode: str = "resume",
+    force_new_project: bool = False,
+) -> tuple[dict, bool]:
+    prompt_version = str(
+        snapshot.get("prompt_version")
+        or snapshot.get("version")
+        or (db.get_video(video_id) or {}).get("prompt_version")
+        or ""
+    )
+    job, created = db.create_system_job_if_absent(
+        job_id=f"flow-media-{uuid.uuid4().hex}",
+        job_type="flow_media_generation",
+        title=(
+            f"Tạo media Google Flow cho #{video_id}"
+            + (" (Tạo mới)" if force_new_project else "")
+        ),
+        payload={
+            "video_id": video_id,
+            "snapshot": snapshot,
+            "mode": mode,
+            "force_new_project": bool(force_new_project),
+        },
+        video_id=video_id,
+        prompt_version=prompt_version,
+        dedupe_job_types=("flow_media_generation", "video_render"),
+    )
+    if created:
+        _kick_flow_media_queue()
+    return job, created
+
+
+def _route_video_render_job(
+    *,
+    video_id: int,
+    snapshot: dict,
+    mode: str = "resume",
+    force_new_project: bool = False,
+) -> tuple[dict, bool, str]:
+    if video_production.get_render_mode(snapshot) == "stock_video":
+        job, created = _enqueue_video_render_job(
+            video_id=video_id,
+            snapshot=snapshot,
+            mode=mode,
+            force_new_project=force_new_project,
+        )
+        return job, created, "render"
+    job, created = _enqueue_flow_media_job(
+        video_id=video_id,
+        snapshot=snapshot,
+        mode=mode,
+        force_new_project=force_new_project,
+    )
+    phase = (
+        "render" if job.get("job_type") == "video_render" else "media_generation"
+    )
+    return job, created, phase
+
+
+def _migrate_legacy_google_flow_render_jobs() -> int:
+    migrated = 0
+    for job in db.list_active_system_jobs("video_render"):
+        payload = job.get("payload") or {}
+        if payload.get("media_prepared"):
+            continue
+        snapshot = payload.get("snapshot") or {}
+        if video_production.get_render_mode(snapshot) == "stock_video":
+            continue
+        video_id = int(job.get("video_id") or payload.get("video_id") or 0)
+        if not video_id:
+            continue
+        if db.has_active_system_job_for_video("flow_media_generation", video_id):
+            db.update_system_job(
+                job["id"],
+                status="canceled",
+                progress="Đã thay thế bằng job media Google Flow hiện có",
+                error="",
+                cancel_requested=0,
+                finished_at=db.utc_now(),
+            )
+            continue
+        updated = db.reclassify_active_system_job(
+            job["id"],
+            expected_job_type="video_render",
+            new_job_type="flow_media_generation",
+            title=f"Tạo media Google Flow cho #{video_id}",
+            progress="Đã chuyển sang hàng đợi media Google Flow",
+        )
+        if updated and updated.get("job_type") == "flow_media_generation":
+            migrated += 1
+    return migrated
 
 
 def _trigger_video_render_if_enabled(video_id: int) -> dict | None:
@@ -6048,22 +6300,17 @@ def _trigger_video_render_if_enabled(video_id: int) -> dict | None:
     pipeline = snapshot.get("pipeline") or {}
     if not pipeline.get("video_render"):
         return None
-    
-    existing_jobs = db.list_system_jobs(video_id=video_id, limit=None)
-    for j in existing_jobs:
-        if j.get("job_type") == "video_render" and j.get("status") in {"queued", "running", "completed"}:
-            return j
-            
-    job_id = f"video-render-{uuid.uuid4().hex}"
-    job = db.create_system_job(
-        job_id=job_id,
-        job_type="video_render",
-        title=f"Dựng video MP4 cho #{video_id}",
-        payload={"video_id": video_id, "snapshot": snapshot},
-        prompt_version=prompt_version,
+
+    for existing in db.list_system_jobs(video_id=video_id, limit=None):
+        if (
+            existing.get("job_type") == "video_render"
+            and existing.get("status") == "completed"
+        ):
+            return existing
+    job, _, _ = _route_video_render_job(
+        video_id=video_id,
+        snapshot=snapshot,
     )
-    db.update_system_job(job["id"], video_id=video_id)
-    _kick_production_queue()
     return job
 
 def _drain_video_queue() -> None:
@@ -6701,11 +6948,11 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
         "can_force_stop": (
             status == "running"
             or bool(job.get("cancel_requested"))
-            or (job_type in {"video_generation", "video_render", "visual_scene_plan", "youtube_upload", "youtube_publish"} and status in {"running", "retry_wait"})
+            or (job_type in {"video_generation", "flow_media_generation", "video_render", "visual_scene_plan", "youtube_upload", "youtube_publish"} and status in {"running", "retry_wait"})
         ),
         "can_cancel": (
             status in {"queued", "retry_wait", "paused"}
-            or (job_type in {"video_generation", "video_render", "visual_scene_plan", "youtube_upload", "youtube_publish", "fb_crosspost", "fb_crosspost_sync", "thumbnail_generation", "tiktok_publish", "trust_builder_session"} and status == "running")
+            or (job_type in {"video_generation", "flow_media_generation", "video_render", "visual_scene_plan", "youtube_upload", "youtube_publish", "fb_crosspost", "fb_crosspost_sync", "thumbnail_generation", "tiktok_publish", "trust_builder_session"} and status == "running")
         ),
         "can_retry": (
             status in {"error", "canceled"}
@@ -6782,6 +7029,7 @@ def _audio_job_center_item(task: dict) -> dict:
     provider_id = task.get("tts_provider_id") or "genmax"
     provider_name = "OmniVoice" if provider_id == "omnivoice" else "Genmax"
     status_map = {
+        "queued": "queued",
         "pending": "queued",
         "processing": "running",
         "completed": "done",
@@ -6790,6 +7038,7 @@ def _audio_job_center_item(task: dict) -> dict:
     }
     status = status_map.get(task.get("status"), task.get("status", "error"))
     progress_map = {
+        "queued": f"Đang chờ {provider_name}",
         "pending": f"Đang chờ {provider_name}",
         "processing": f"{provider_name} đang tạo audio",
         "completed": "Audio hoàn thành",
@@ -6971,6 +7220,7 @@ JOB_CENTER_ACTIONS = ("retry", "pause", "resume", "cancel", "force_stop")
 JOB_CENTER_SYSTEM_JOB_TYPES = (
     "video_generation",
     *COMMENT_JOB_TYPES,
+    *FLOW_MEDIA_JOB_TYPES,
     *PRODUCTION_JOB_TYPES,
     *TRUST_BUILDER_JOB_TYPES,
 )
@@ -7196,6 +7446,8 @@ def _kick_job_queues(job_types: set[str]) -> None:
         _kick_video_queue()
     if any(job_type in COMMENT_JOB_TYPES for job_type in job_types):
         _kick_comment_queue()
+    if any(job_type in FLOW_MEDIA_JOB_TYPES for job_type in job_types):
+        _kick_flow_media_queue()
     if any(job_type in PRODUCTION_JOB_TYPES for job_type in job_types):
         _kick_production_queue()
     if any(job_type in TRUST_BUILDER_JOB_TYPES for job_type in job_types):
@@ -7221,6 +7473,35 @@ def _run_system_job_center_action(
             "Job không hỗ trợ thao tác này ở trạng thái hiện tại."
         )
     if action == "retry":
+        if str(job.get("job_type") or "") in {
+            "flow_media_generation",
+            "video_render",
+        }:
+            video_id = int(
+                job.get("video_id")
+                or (job.get("payload") or {}).get("video_id")
+                or 0
+            )
+            active_stage_job = next(
+                (
+                    candidate
+                    for candidate in db.list_active_system_jobs()
+                    if candidate.get("id") != job_id
+                    and int(
+                        candidate.get("video_id")
+                        or (candidate.get("payload") or {}).get("video_id")
+                        or 0
+                    )
+                    == video_id
+                    and candidate.get("job_type")
+                    in {"flow_media_generation", "video_render"}
+                ),
+                None,
+            )
+            if video_id and active_stage_job:
+                raise JobCenterActionNotAllowedError(
+                    "Video đã có một job media/render đang hoạt động."
+                )
         if str(job.get("job_type") or "") == "fb_crosspost":
             item_id = int((job.get("payload") or {}).get("item_id") or 0)
             active_job = None
@@ -8372,7 +8653,7 @@ def get_audio_status(video_id: int):
 
     task = db.get_audio_task(video_id)
     if task:
-        if task["status"] in {"pending", "processing"}:
+        if task["status"] in {"pending", "processing", "queued"}:
             try:
                 # Status polling is also a recovery path. This updates local
                 # state immediately when Genmax has finished, even if a
@@ -8383,7 +8664,7 @@ def get_audio_status(video_id: int):
                     f"On-demand audio sync failed for video {video_id}: {exc}",
                     file=sys.stderr,
                 )
-            if task["status"] in {"pending", "processing"}:
+            if task["status"] in {"pending", "processing", "queued"}:
                 _start_audio_watcher(video_id)
         elif task["status"] == "completed" and task.get("audio_url"):
             # The persistent audio task is the source of truth. A long-running
@@ -8506,7 +8787,7 @@ def regenerate_audio_for_video(
             voice_config.build_voice_snapshot(selected_voice),
         )
     stored_task = db.get_audio_task(video_id)
-    if stored_task and stored_task["status"] in {"pending", "processing"}:
+    if stored_task and stored_task["status"] in {"pending", "processing", "queued"}:
         raise HTTPException(
             status_code=409,
             detail="Video đang có audio job chạy. Hãy đợi job hoàn tất.",
@@ -9001,22 +9282,20 @@ def trigger_render_video(video_id: int, mode: str = "resume"):
         cancel_render_video(video_id)
         video_production.purge_video_render_artifacts(video_id)
 
-    job_id = f"video-render-{uuid.uuid4().hex}"
-    job = db.create_system_job(
-        job_id=job_id,
-        job_type="video_render",
-        title=f"Dựng video MP4 cho #{video_id}" + (" (Tạo mới)" if force_new_project else ""),
-        payload={
-            "video_id": video_id,
-            "snapshot": snapshot,
-            "mode": mode,
-            "force_new_project": force_new_project,
-        },
-        prompt_version=prompt_version,
+    job, created, phase = _route_video_render_job(
+        video_id=video_id,
+        snapshot=snapshot,
+        mode=mode,
+        force_new_project=force_new_project,
     )
-    db.update_system_job(job["id"], video_id=video_id)
-    _kick_production_queue()
-    return {"success": True, "job_id": job["id"], "status": "queued"}
+    return {
+        "success": True,
+        "job_id": job["id"],
+        "status": job["status"],
+        "job_type": job["job_type"],
+        "phase": phase,
+        "duplicate": not created,
+    }
 
 
 @app.post("/api/videos/{video_id}/cancel-render")
@@ -9027,30 +9306,52 @@ def cancel_render_video(video_id: int):
     jobs = db.list_system_jobs(video_id=video_id, limit=None)
     active_jobs = [
         j for j in jobs
-        if j.get("job_type") == "video_render"
-        and j.get("status") in {"queued", "running", "retry_wait"}
+        if j.get("job_type") in {"flow_media_generation", "video_render"}
+        and j.get("status") in {"queued", "running", "retry_wait", "paused"}
     ]
     if not active_jobs:
         return {"success": True, "message": "Không có tác vụ render nào đang chạy."}
 
+    waiting_for_safe_stop = False
     for job in active_jobs:
         job_id = job["id"]
-        coordinator_status = _production_coordinator.status()
+        coordinator = (
+            _flow_media_coordinator
+            if job.get("job_type") == "flow_media_generation"
+            else _production_coordinator
+        )
+        coordinator_status = coordinator.status()
         if (
             coordinator_status.get("current_job_id") != job_id
-            or job.get("status") in {"queued", "retry_wait"}
+            or job.get("status") in {"queued", "retry_wait", "paused"}
         ):
             db.update_system_job(
                 job_id,
                 status="canceled",
-                progress="Đã dừng tác vụ dựng video.",
+                progress="Đã dừng tác vụ media/render video.",
                 finished_at=db.utc_now(),
                 cancel_requested=0,
             )
         else:
+            waiting_for_safe_stop = True
             db.request_cancel_system_job(job_id)
 
-    return {"success": True, "message": "Đã yêu cầu dừng tác vụ dựng video."}
+    if waiting_for_safe_stop:
+        db.update_video_production_state(
+            video_id,
+            current_stage="cancel_requested",
+            production_progress="Đang dừng tác vụ media/render tại điểm an toàn",
+        )
+    else:
+        db.update_video_production_state(
+            video_id,
+            render_status="canceled",
+            current_stage="canceled",
+            production_progress="Đã dừng tác vụ media/render video",
+            blocking_reason="",
+        )
+
+    return {"success": True, "message": "Đã yêu cầu dừng tác vụ media/render video."}
 
 
 @app.post("/api/videos/{video_id}/reset-scenes-from")
@@ -9078,6 +9379,9 @@ def reset_scenes_from(video_id: int, from_index: int = 0):
         "purged_count": purged_count,
         "job_id": render_res.get("job_id"),
         "status": render_res.get("status"),
+        "job_type": render_res.get("job_type"),
+        "phase": render_res.get("phase"),
+        "duplicate": render_res.get("duplicate", False),
     }
 
 
@@ -9120,10 +9424,26 @@ def get_render_status(video_id: int):
         raise HTTPException(status_code=404, detail="Không tìm thấy video.")
     artifact = db.get_latest_video_artifact(video_id, "final_mp4")
     jobs = db.list_system_jobs(video_id=video_id, limit=None)
-    render_jobs = [j for j in jobs if j.get("job_type") == "video_render"]
-    active_job = next((j for j in render_jobs if j.get("status") in {"queued", "running", "retry_wait"}), None)
+    render_jobs = [
+        j
+        for j in jobs
+        if j.get("job_type") in {"flow_media_generation", "video_render"}
+    ]
+    active_job = next(
+        (
+            j
+            for j in render_jobs
+            if j.get("status") in {"queued", "running", "retry_wait", "paused"}
+        ),
+        None,
+    )
     latest_job = render_jobs[0] if render_jobs else None
     render_job = active_job or latest_job
+    phase = (
+        "media_generation"
+        if render_job and render_job.get("job_type") == "flow_media_generation"
+        else "render"
+    )
 
     is_active = bool(active_job)
     latest_status = str(latest_job.get("status") or "") if latest_job else ""
@@ -9174,15 +9494,17 @@ def get_render_status(video_id: int):
     prompt_version = video.get("prompt_version") or ""
     snapshot = _get_prompt_production_snapshot(prompt_version)
     render_mode = (
-        snapshot.get("render_mode")
-        or (snapshot.get("image_generation_settings") or {}).get("render_mode")
-        or (snapshot.get("pipeline") or {}).get("render_mode")
-        or "google_flow"
+        video_production.get_render_mode(
+            (render_job.get("payload") or {}).get("snapshot")
+            if render_job
+            else snapshot
+        )
     )
 
     return {
         "video_id": video_id,
         "state": state,
+        "phase": phase,
         "render_mode": render_mode,
         "has_mp4": has_mp4,
         "is_active": is_active,

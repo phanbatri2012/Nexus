@@ -81,6 +81,14 @@ CHAPTERS_SECTION_PATTERN = re.compile(
     r"### \[(?:CHAPTERS|PHÂN ĐOẠN|CHAPTER)\]\n(.*?)(?=\n### \[|\Z)",
     flags=re.DOTALL,
 )
+THUMBNAIL_TEXT_SECTION_PATTERN = re.compile(
+    r"### \[(?:THUMBNAIL_PROMPT_TEXT|THUMBNAIL TEXT|PROMPT THUMBNAIL TEXT)\]\n(.*?)(?=\n### \[|\Z)",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+THUMBNAIL_NOTEXT_SECTION_PATTERN = re.compile(
+    r"### \[(?:THUMBNAIL_PROMPT_NOTEXT|THUMBNAIL NOTEXT|PROMPT THUMBNAIL NOTEXT)\]\n(.*?)(?=\n### \[|\Z)",
+    flags=re.DOTALL | re.IGNORECASE,
+)
 
 
 def _normalize_metadata_label(value: str) -> str:
@@ -312,12 +320,38 @@ def extract_generated_video_pinned_comment(generated_script: str) -> str:
     return ""
 
 
+def _is_likely_quiz_content(text: str) -> bool:
+    if not text:
+        return False
+    t_lower = text.lower()
+    has_choices = ("a." in t_lower or "a)" in t_lower or "a -" in t_lower) and (
+        "b." in t_lower or "b)" in t_lower or "b -" in t_lower
+    )
+    has_answer = "đáp án" in t_lower or "câu trả lời" in t_lower or "answer" in t_lower
+    return has_choices or has_answer
+
+
 def extract_generated_video_quiz(generated_script: str) -> str:
     if not generated_script:
         return ""
     quiz_match = QUIZ_SECTION_PATTERN.search(generated_script)
     if quiz_match:
-        return quiz_match.group(1).strip()
+        content = quiz_match.group(1).strip()
+        if _is_likely_quiz_content(content):
+            return content
+
+    # Self-healing fallback: Check if quiz was placed in CHAPTERS section
+    ch_match = CHAPTERS_SECTION_PATTERN.search(generated_script)
+    if ch_match:
+        ch_content = ch_match.group(1).strip()
+        if _is_likely_quiz_content(ch_content):
+            return ch_content
+
+    if quiz_match:
+        content = quiz_match.group(1).strip()
+        if content:
+            return content
+
     metadata_match = METADATA_SECTION_PATTERN.search(generated_script)
     if metadata_match:
         lines = metadata_match.group(1).splitlines()
@@ -342,7 +376,26 @@ def extract_generated_video_chapters(generated_script: str) -> str:
         return ""
     ch_match = CHAPTERS_SECTION_PATTERN.search(generated_script)
     if ch_match:
-        return ch_match.group(1).strip()
+        content = ch_match.group(1).strip()
+        timestamp_lines = [
+            line.strip()
+            for line in content.splitlines()
+            if re.match(r"^\s*(?:(?:\d{1,2}:)?\d{1,2}:\d{2})\s*(?:-|–|—)\s*\S+", line)
+        ]
+        if len(timestamp_lines) >= 3 and not (
+            "đáp án" in content.lower() and ("a." in content.lower() or "b." in content.lower())
+        ):
+            return content
+
+    # Self-healing fallback: Scan for timestamp markers in the whole script
+    all_timestamp_lines = [
+        line.strip()
+        for line in generated_script.splitlines()
+        if re.match(r"^\s*(?:(?:\d{1,2}:)?\d{1,2}:\d{2})\s*(?:-|–|—)\s*\S+", line)
+    ]
+    if len(all_timestamp_lines) >= 3:
+        return "Nội dung chính trong video:\n\n" + "\n".join(all_timestamp_lines)
+
     return ""
 
 
@@ -2255,7 +2308,7 @@ def delete_video_with_dependencies(video_id: int) -> dict | None:
         active_audio = conn.execute(
             '''
             SELECT task_id FROM audio_tasks
-            WHERE video_id = ? AND status IN ('pending', 'processing')
+            WHERE video_id = ? AND status IN ('pending', 'processing', 'queued')
             LIMIT 1
             ''',
             (video_id,),
@@ -3298,9 +3351,10 @@ def get_audio_task_by_request_hash(request_hash: str) -> dict:
             CASE audio_tasks.status
                 WHEN 'completed' THEN 0
                 WHEN 'processing' THEN 1
-                WHEN 'pending' THEN 2
-                WHEN 'failed' THEN 3
-                ELSE 4
+                WHEN 'queued' THEN 2
+                WHEN 'pending' THEN 3
+                WHEN 'failed' THEN 4
+                ELSE 5
             END,
             created_at ASC
         LIMIT 1
@@ -3320,7 +3374,7 @@ def get_active_audio_tasks() -> list[dict]:
         SELECT audio_tasks.*
         FROM audio_tasks
         JOIN videos ON videos.id = audio_tasks.video_id
-        WHERE audio_tasks.status IN ('pending', 'processing')
+        WHERE audio_tasks.status IN ('pending', 'processing', 'queued')
           AND videos.video_status = ?
         ''',
         (VIDEO_STATUS_ACTIVE,),
@@ -3630,6 +3684,7 @@ def create_system_job(
     voice_revision: int = 1,
     voice_snapshot_json: str = "{}",
     status: str = "queued",
+    video_id: int | None = None,
 ) -> dict:
     now = utc_now()
     initial_progress = "Đang chạy" if status == "running" else "Đang chờ trong hàng đợi"
@@ -3639,10 +3694,10 @@ def create_system_job(
         '''
         INSERT INTO system_jobs (
             id, job_type, status, title, progress, payload_json,
-            result_json, error, prompt_version, voice_id, voice_name,
+            result_json, error, video_id, prompt_version, voice_id, voice_name,
             tts_provider_id, voice_revision, voice_snapshot_json,
             created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, '{}', '', ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, '{}', '', ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''',
         (
             job_id,
@@ -3651,6 +3706,7 @@ def create_system_job(
             title,
             initial_progress,
             json.dumps(payload, ensure_ascii=False),
+            video_id,
             prompt_version,
             voice_id,
             voice_name,
@@ -3663,6 +3719,116 @@ def create_system_job(
     )
     conn.commit()
     conn.close()
+    return get_system_job(job_id)
+
+
+def create_system_job_if_absent(
+    *,
+    job_id: str,
+    job_type: str,
+    title: str,
+    payload: dict,
+    video_id: int,
+    prompt_version: str = "",
+    dedupe_job_types: tuple[str, ...] | None = None,
+) -> tuple[dict, bool]:
+    """Atomically return an active video job or create the requested one."""
+    job_types = tuple(dedupe_job_types or (job_type,))
+    if not job_types:
+        job_types = (job_type,)
+    placeholders = ", ".join("?" for _ in job_types)
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            f'''
+            SELECT * FROM system_jobs
+            WHERE video_id = ?
+              AND job_type IN ({placeholders})
+              AND status IN ('queued', 'running', 'retry_wait', 'paused')
+              AND cancel_requested = 0
+            ORDER BY created_at ASC, id ASC
+            LIMIT 1
+            ''',
+            (video_id, *job_types),
+        ).fetchone()
+        if existing is not None:
+            conn.execute("COMMIT")
+            return _decode_system_job(existing), False
+
+        conn.execute(
+            '''
+            INSERT INTO system_jobs (
+                id, job_type, status, title, progress, payload_json,
+                result_json, error, video_id, prompt_version,
+                created_at, updated_at
+            ) VALUES (?, ?, 'queued', ?, 'Đang chờ trong hàng đợi', ?, '{}', '', ?, ?, ?, ?)
+            ''',
+            (
+                job_id,
+                job_type,
+                title,
+                json.dumps(payload, ensure_ascii=False),
+                video_id,
+                prompt_version,
+                now,
+                now,
+            ),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+    created = get_system_job(job_id)
+    if created is None:
+        raise RuntimeError("Không thể đọc lại system job vừa tạo.")
+    return created, True
+
+
+def reclassify_active_system_job(
+    job_id: str,
+    *,
+    expected_job_type: str,
+    new_job_type: str,
+    title: str,
+    progress: str,
+) -> dict | None:
+    """Move one non-terminal job to another durable queue without changing its id."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT job_type, status FROM system_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["job_type"] != expected_job_type
+            or row["status"] not in {"queued", "running", "retry_wait", "paused"}
+        ):
+            conn.execute("COMMIT")
+            return get_system_job(job_id) if row is not None else None
+        conn.execute(
+            '''
+            UPDATE system_jobs
+            SET job_type = ?, title = ?, progress = ?, updated_at = ?
+            WHERE id = ?
+            ''',
+            (new_job_type, title, progress, utc_now(), job_id),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
     return get_system_job(job_id)
 
 

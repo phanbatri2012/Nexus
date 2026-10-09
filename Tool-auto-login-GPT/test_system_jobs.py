@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -111,6 +112,7 @@ class SystemJobTests(unittest.TestCase):
             patch.object(database, "pause_queued_attention_jobs"),
             patch.object(main, "_kick_video_queue"),
             patch.object(main, "_kick_comment_queue") as kick_comment,
+            patch.object(main, "_kick_flow_media_queue"),
             patch.object(main, "_kick_production_queue"),
             patch.object(main, "_enqueue_due_comment_syncs") as enqueue_comment_syncs,
             patch.object(main, "_cleanup_expired_tts_previews"),
@@ -1419,6 +1421,12 @@ class SystemJobTests(unittest.TestCase):
             payload={"video_id": 10},
         )
         database.create_system_job(
+            job_id="job-flow-media-1",
+            job_type="flow_media_generation",
+            title="Tạo media Google Flow #1",
+            payload={"video_id": 10},
+        )
+        database.create_system_job(
             job_id="job-upload-1",
             job_type="youtube_upload",
             title="Upload YT #1",
@@ -1435,6 +1443,7 @@ class SystemJobTests(unittest.TestCase):
         all_ids = {item["id"] for item in all_res["items"]}
         self.assertIn("job-render-1", all_ids)
         self.assertIn("job-scene-1", all_ids)
+        self.assertIn("job-flow-media-1", all_ids)
         self.assertIn("job-upload-1", all_ids)
         self.assertIn("job-fb-1", all_ids)
 
@@ -1448,6 +1457,14 @@ class SystemJobTests(unittest.TestCase):
         self.assertEqual(scene_res["items"][0]["id"], "job-scene-1")
         self.assertEqual(scene_res["items"][0]["type_label"], "Lập kế hoạch cảnh")
 
+        flow_res = main.list_jobs(job_type="flow_media_generation")
+        self.assertEqual(len(flow_res["items"]), 1)
+        self.assertEqual(flow_res["items"][0]["id"], "job-flow-media-1")
+        self.assertEqual(
+            flow_res["items"][0]["type_label"],
+            "Tạo media Google Flow",
+        )
+
         yt_res = main.list_jobs(job_type="youtube_publish")
         self.assertEqual(len(yt_res["items"]), 1)
         self.assertEqual(yt_res["items"][0]["id"], "job-upload-1")
@@ -1460,6 +1477,156 @@ class SystemJobTests(unittest.TestCase):
         self.assertEqual(len(fb_res["items"]), 1)
         self.assertEqual(fb_res["items"][0]["id"], "job-fb-1")
         self.assertEqual(fb_res["items"][0]["type_label"], "Đăng chéo Facebook")
+
+    def test_legacy_flow_render_jobs_migrate_without_touching_stock(self):
+        flow_video_id = database.save_video(
+            "https://youtube.com/watch?v=legacy-flow",
+            "Legacy Flow",
+            "transcript",
+            "script",
+        )
+        stock_video_id = database.save_video(
+            "https://youtube.com/watch?v=legacy-stock",
+            "Legacy Stock",
+            "transcript",
+            "script",
+        )
+        database.create_system_job(
+            job_id="legacy-flow-render",
+            job_type="video_render",
+            title="Legacy Flow Render",
+            payload={
+                "video_id": flow_video_id,
+                "snapshot": {"render_mode": "google_flow"},
+            },
+            video_id=flow_video_id,
+        )
+        database.create_system_job(
+            job_id="legacy-stock-render",
+            job_type="video_render",
+            title="Legacy Stock Render",
+            payload={
+                "video_id": stock_video_id,
+                "snapshot": {"render_mode": "stock_video"},
+            },
+            video_id=stock_video_id,
+        )
+
+        migrated = main._migrate_legacy_google_flow_render_jobs()
+
+        self.assertEqual(migrated, 1)
+        self.assertEqual(
+            database.get_system_job("legacy-flow-render")["job_type"],
+            "flow_media_generation",
+        )
+        self.assertEqual(
+            database.get_system_job("legacy-stock-render")["job_type"],
+            "video_render",
+        )
+
+    def test_flow_and_render_coordinators_run_independently(self):
+        flow_started = threading.Event()
+        release_flow = threading.Event()
+        render_completed = threading.Event()
+        errors = []
+
+        def run_flow(job):
+            flow_started.set()
+            if not release_flow.wait(timeout=3):
+                raise RuntimeError("Flow test timed out")
+            database.update_system_job(job["id"], status="completed")
+
+        def run_render(job):
+            database.update_system_job(job["id"], status="completed")
+            render_completed.set()
+
+        def record_error(_job, exc):
+            errors.append(exc)
+
+        flow_coordinator = main.production_coordinator_service.ProductionCoordinator(
+            {"flow_media_generation": run_flow},
+            error_handler=record_error,
+        )
+        render_coordinator = main.production_coordinator_service.ProductionCoordinator(
+            {"video_render": run_render},
+            error_handler=record_error,
+        )
+        database.create_system_job(
+            job_id="independent-flow",
+            job_type="flow_media_generation",
+            title="Flow",
+            payload={},
+        )
+        database.create_system_job(
+            job_id="independent-render",
+            job_type="video_render",
+            title="Render",
+            payload={},
+        )
+
+        try:
+            flow_coordinator.wake()
+            self.assertTrue(flow_started.wait(timeout=1))
+            render_coordinator.wake()
+            self.assertTrue(render_completed.wait(timeout=1))
+        finally:
+            release_flow.set()
+            flow_coordinator.stop(timeout=3)
+            render_coordinator.stop(timeout=3)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            database.get_system_job("independent-render")["status"],
+            "completed",
+        )
+
+    def test_video_stage_get_or_create_is_atomic_for_concurrent_triggers(self):
+        video_id = database.save_video(
+            "https://youtube.com/watch?v=atomic-flow-trigger",
+            "Atomic Flow Trigger",
+            "transcript",
+            "script",
+        )
+        barrier = threading.Barrier(2)
+        results = []
+        errors = []
+
+        def create_stage_job(suffix):
+            try:
+                barrier.wait(timeout=2)
+                results.append(
+                    database.create_system_job_if_absent(
+                        job_id=f"atomic-flow-{suffix}",
+                        job_type="flow_media_generation",
+                        title="Atomic Flow",
+                        payload={"video_id": video_id},
+                        video_id=video_id,
+                        dedupe_job_types=("flow_media_generation", "video_render"),
+                    )
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=create_stage_job, args=(index,))
+            for index in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        self.assertEqual(sum(1 for _, created in results if created), 1)
+        self.assertEqual(len({job["id"] for job, _ in results}), 1)
+        active_jobs = [
+            job
+            for job in database.list_active_system_jobs()
+            if job.get("video_id") == video_id
+            and job.get("job_type") in {"flow_media_generation", "video_render"}
+        ]
+        self.assertEqual(len(active_jobs), 1)
 
     def test_job_center_production_job_actions(self):
         database.create_system_job(
@@ -1488,6 +1655,38 @@ class SystemJobTests(unittest.TestCase):
             retried = main.retry_job("job-render-act")
             self.assertTrue(retried["success"])
             self.assertEqual(database.get_system_job("job-render-act")["status"], "queued")
+
+    def test_retry_render_stage_rejects_another_active_stage_for_video(self):
+        video_id = database.save_video(
+            "https://youtube.com/watch?v=retry-stage-conflict",
+            "Retry Stage Conflict",
+            "transcript",
+            "script",
+        )
+        database.create_system_job(
+            job_id="flow-stage-error",
+            job_type="flow_media_generation",
+            title="Flow Error",
+            payload={"video_id": video_id},
+            video_id=video_id,
+        )
+        database.update_system_job("flow-stage-error", status="error")
+        database.create_system_job(
+            job_id="render-stage-active",
+            job_type="video_render",
+            title="Render Active",
+            payload={"video_id": video_id, "media_prepared": True},
+            video_id=video_id,
+        )
+
+        with self.assertRaises(main.HTTPException) as raised:
+            main.retry_job("flow-stage-error")
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(
+            database.get_system_job("flow-stage-error")["status"],
+            "error",
+        )
 
     def test_job_center_fb_crosspost_cancel_action(self):
         database.create_system_job(

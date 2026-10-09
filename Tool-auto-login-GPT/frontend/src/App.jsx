@@ -1554,9 +1554,13 @@ function App() {
         ...(prev || {}),
         video_id: currentVideoId,
         has_mp4: false,
+        phase: data.phase || 'render',
         job: {
-          status: 'queued',
-          title: `Dựng video MP4 cho #${currentVideoId}${mode === 'recreate' ? ' (Tạo mới)' : ''}`
+          status: data.status || 'queued',
+          job_type: data.job_type || 'video_render',
+          title: data.phase === 'media_generation'
+            ? `Tạo media Google Flow cho #${currentVideoId}${mode === 'recreate' ? ' (Tạo mới)' : ''}`
+            : `Dựng video MP4 cho #${currentVideoId}${mode === 'recreate' ? ' (Tạo mới)' : ''}`
         }
       }));
     } catch (error) {
@@ -1611,9 +1615,13 @@ function App() {
         ...(prev || {}),
         video_id: currentVideoId,
         has_mp4: false,
+        phase: data.phase || 'render',
         job: {
-          status: 'queued',
-          title: `Dựng video MP4 cho #${currentVideoId} (Tạo lại từ cảnh ${Number(fromIndex) + 1})`
+          status: data.status || 'queued',
+          job_type: data.job_type || 'video_render',
+          title: data.phase === 'media_generation'
+            ? `Tạo lại media Google Flow từ cảnh ${Number(fromIndex) + 1}`
+            : `Dựng video MP4 cho #${currentVideoId} (Tạo lại từ cảnh ${Number(fromIndex) + 1})`
         }
       }));
     } catch (error) {

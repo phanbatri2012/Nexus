@@ -2914,39 +2914,24 @@ def build_default_visual_scene_plan(
     }
 
 
-def produce_video(
-    video_id: int,
-    snapshot: dict,
-    progress,
-    cancel_check,
-    force_new_project: bool = False,
-) -> dict:
+def get_render_mode(snapshot: dict | None) -> str:
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
     render_mode = (
         snapshot.get("render_mode")
         or (snapshot.get("image_generation_settings") or {}).get("render_mode")
         or (snapshot.get("pipeline") or {}).get("render_mode")
         or "google_flow"
     )
-    if str(render_mode).strip().lower() == "stock_video":
-        from auto_yt.services import stock_video_renderer
-        return stock_video_renderer.produce_stock_video(
-            video_id=video_id,
-            snapshot=snapshot,
-            progress=progress,
-            cancel_check=cancel_check,
-            force_new_project=force_new_project,
-        )
+    return str(render_mode).strip().lower() or "google_flow"
 
-    prepared = prepare_visual_plan_inputs(video_id, snapshot, progress)
-    video = prepared["video"]
-    audio_path = prepared["audio_path"]
-    srt_path = prepared["srt_path"]
-    caption_hash = prepared["caption_hash"]
-    
-    if force_new_project:
-        logger.info("force_new_project is True: Purging all scene artifacts for video %s", video_id)
-        purge_all_scene_artifacts(video_id)
 
+def _load_or_build_visual_scene_plan(
+    video_id: int,
+    snapshot: dict,
+    prepared: dict,
+    *,
+    force_new_project: bool,
+) -> dict:
     plan_payload = None
     if not force_new_project:
         try:
@@ -2957,67 +2942,284 @@ def produce_video(
             plan_payload = None
 
     if plan_payload is None:
+        video = prepared["video"]
         title = video.get("generated_title") or video.get("title") or ""
-        img_settings = snapshot.get("image_generation_settings") or {}
-        style = img_settings.get("style_prompt") or ""
-        scene_0_source = img_settings.get("scene_0_source") or "from_thumbnail_without_text"
-        prompt_version = snapshot.get("prompt_version") or snapshot.get("version") or video.get("prompt_version") or ""
-        generated_script = video.get("generated_script") or ""
+        settings = snapshot.get("image_generation_settings") or {}
+        prompt_version = (
+            snapshot.get("prompt_version")
+            or snapshot.get("version")
+            or video.get("prompt_version")
+            or ""
+        )
         plan_payload = build_default_visual_scene_plan(
             prepared["windows"],
             title,
-            style,
+            settings.get("style_prompt") or "",
             prompt_version=prompt_version,
-            generated_script=generated_script,
-            scene_0_source=scene_0_source,
-            scene_0_prompt_template=str(img_settings.get("scene_0_prompt_template") or ""),
-            scene_body_prompt_template=str(img_settings.get("scene_body_prompt_template") or ""),
+            generated_script=video.get("generated_script") or "",
+            scene_0_source=(
+                settings.get("scene_0_source") or "from_thumbnail_without_text"
+            ),
+            scene_0_prompt_template=str(
+                settings.get("scene_0_prompt_template") or ""
+            ),
+            scene_body_prompt_template=str(
+                settings.get("scene_body_prompt_template") or ""
+            ),
         )
         save_visual_scene_plan(video_id, prepared["plan_hash"], plan_payload)
 
-    validated_plan = validate_visual_scene_plan(plan_payload, prepared["windows"])
+    return validate_visual_scene_plan(plan_payload, prepared["windows"])
+
+
+def save_flow_media_manifest(
+    video_id: int,
+    *,
+    plan_hash: str,
+    caption_hash: str,
+    scenes: list[dict],
+    visual_bible: dict,
+    media_paths: list[Path],
+) -> dict:
+    if len(scenes) != len(media_paths) or not scenes:
+        raise VideoProductionError("Scene plan và media Google Flow không đồng bộ.")
+    media = []
+    for scene, media_path in zip(scenes, media_paths):
+        path = Path(media_path)
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise VideoProductionError(
+                f"Media cảnh {int(scene.get('index', 0)) + 1} không tồn tại."
+            )
+        media.append(
+            {
+                "scene_index": int(scene.get("index", len(media))),
+                "path": str(path),
+                "sha256": _sha256_file(path),
+            }
+        )
+
+    manifest = {
+        "version": 1,
+        "video_id": video_id,
+        "plan_hash": plan_hash,
+        "caption_hash": caption_hash,
+        "media": media,
+        "visual_bible": visual_bible,
+    }
+    serialized = json.dumps(
+        manifest,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+    manifest_bytes = serialized.encode("utf-8")
+    manifest_hash = _sha256_bytes(manifest_bytes)
+    target = VISUAL_PLANS_DIR / f"video_{video_id}_{plan_hash[:16]}.media.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(".json.tmp")
+    temporary.write_bytes(manifest_bytes)
+    temporary.replace(target)
+    artifact = db.upsert_video_artifact(
+        video_id=video_id,
+        artifact_type="flow_media_manifest",
+        path=str(target),
+        content_hash=manifest_hash,
+        status="ready",
+        mime_type="application/json",
+        size_bytes=target.stat().st_size,
+        metadata={"plan_hash": plan_hash, "scene_count": len(scenes)},
+    )
+    return {"artifact": artifact, "manifest": manifest}
+
+
+def load_flow_media_manifest(video_id: int) -> tuple[dict, dict]:
+    artifact = db.get_latest_video_artifact(
+        video_id,
+        "flow_media_manifest",
+        "ready",
+    )
+    path = Path((artifact or {}).get("path") or "")
+    if not artifact or not path.is_file():
+        raise VideoProductionError("Media Google Flow chưa sẵn sàng để dựng MP4.")
+    try:
+        manifest_bytes = path.read_bytes()
+        payload = json.loads(manifest_bytes.decode("utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise VideoProductionError("Manifest media Google Flow không đọc được.") from exc
+    except UnicodeDecodeError as exc:
+        raise VideoProductionError("Manifest media Google Flow sai mã hóa.") from exc
+    if _sha256_bytes(manifest_bytes) != str(artifact.get("content_hash") or ""):
+        raise VideoProductionError("Manifest media Google Flow đã bị thay đổi.")
+    if not isinstance(payload, dict) or not isinstance(payload.get("media"), list):
+        raise VideoProductionError("Manifest media Google Flow sai định dạng.")
+    if int(payload.get("video_id") or 0) != video_id:
+        raise VideoProductionError("Manifest media Google Flow trỏ sai video.")
+    return artifact, payload
+
+
+def prepare_google_flow_media(
+    video_id: int,
+    snapshot: dict,
+    progress,
+    cancel_check,
+    force_new_project: bool = False,
+) -> dict:
+    prepared = prepare_visual_plan_inputs(video_id, snapshot, progress)
+    if force_new_project:
+        logger.info(
+            "force_new_project is True: Purging all scene artifacts for video %s",
+            video_id,
+        )
+        purge_all_scene_artifacts(video_id)
+    validated_plan = _load_or_build_visual_scene_plan(
+        video_id,
+        snapshot,
+        prepared,
+        force_new_project=force_new_project,
+    )
     scenes = validated_plan["scenes"]
-    settings = snapshot.get("image_generation_settings") or {}
-    
     media_paths = generate_scene_media(
         video_id=video_id,
         scenes=scenes,
-        settings=settings,
+        settings=snapshot.get("image_generation_settings") or {},
         progress=progress,
         cancel_check=cancel_check,
         force_new_project=force_new_project,
     )
     cancel_check()
+    saved = save_flow_media_manifest(
+        video_id,
+        plan_hash=prepared["plan_hash"],
+        caption_hash=prepared["caption_hash"],
+        scenes=scenes,
+        visual_bible=validated_plan["visual_bible"],
+        media_paths=media_paths,
+    )
+    progress("Media Google Flow đã sẵn sàng để dựng MP4", "flow_media_ready")
+    return {
+        "manifest_artifact": saved["artifact"],
+        "plan_hash": prepared["plan_hash"],
+        "scene_count": len(scenes),
+    }
+
+
+def render_prepared_google_flow_video(
+    video_id: int,
+    snapshot: dict,
+    progress,
+    cancel_check,
+) -> dict:
+    prepared = prepare_visual_plan_inputs(video_id, snapshot, progress)
+    plan_artifact, plan_payload = load_visual_scene_plan(video_id)
+    if plan_artifact.get("content_hash") != prepared["plan_hash"]:
+        raise VideoProductionError(
+            "Kế hoạch cảnh đã thay đổi; cần tạo lại media Google Flow trước khi render."
+        )
+    validated_plan = validate_visual_scene_plan(
+        plan_payload,
+        prepared["windows"],
+    )
+    _, manifest = load_flow_media_manifest(video_id)
+    if manifest.get("plan_hash") != prepared["plan_hash"]:
+        raise VideoProductionError(
+            "Manifest media không khớp kế hoạch cảnh hiện tại."
+        )
+    if manifest.get("caption_hash") != prepared["caption_hash"]:
+        raise VideoProductionError(
+            "Phụ đề đã thay đổi; cần chuẩn bị lại media trước khi render."
+        )
+
+    scenes = validated_plan["scenes"]
+    media_entries = manifest.get("media") or []
+    if len(media_entries) != len(scenes):
+        raise VideoProductionError("Manifest media thiếu hoặc thừa cảnh.")
+    media_paths: list[Path] = []
+    media_hashes: list[str] = []
+    for scene, entry in zip(scenes, media_entries):
+        expected_index = int(scene.get("index", len(media_paths)))
+        if int(entry.get("scene_index", -1)) != expected_index:
+            raise VideoProductionError("Manifest media sai thứ tự cảnh.")
+        path = Path(str(entry.get("path") or ""))
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise VideoProductionError(
+                f"Media cảnh {expected_index + 1} không còn tồn tại."
+            )
+        actual_hash = _sha256_file(path)
+        if actual_hash != str(entry.get("sha256") or ""):
+            raise VideoProductionError(
+                f"Media cảnh {expected_index + 1} đã thay đổi sau khi tạo."
+            )
+        media_paths.append(path)
+        media_hashes.append(actual_hash)
+
+    cancel_check()
     input_hash = _sha256_bytes(
         json.dumps(
             {
-                "audio": _sha256_file(audio_path),
-                "captions": caption_hash,
-                "scenes": [_sha256_file(path) for path in media_paths],
+                "audio": _sha256_file(prepared["audio_path"]),
+                "captions": prepared["caption_hash"],
+                "scenes": media_hashes,
                 "plan": scenes,
                 "visual_bible": validated_plan["visual_bible"],
-                "render": {"width": TARGET_WIDTH, "height": TARGET_HEIGHT, "fps": TARGET_FPS},
+                "render": {
+                    "width": TARGET_WIDTH,
+                    "height": TARGET_HEIGHT,
+                    "fps": TARGET_FPS,
+                },
             },
             ensure_ascii=False,
             sort_keys=True,
         ).encode("utf-8")
     )
-    cancel_check()
-    crop_watermark = bool(settings.get("intro_crop_watermark", True))
+    settings = snapshot.get("image_generation_settings") or {}
     artifact = render_video(
         video_id=video_id,
-        audio_path=audio_path,
-        srt_path=srt_path,
+        audio_path=prepared["audio_path"],
+        srt_path=prepared["srt_path"],
         scenes=scenes,
         media_paths=media_paths,
         input_hash=input_hash,
         progress=progress,
         cancel_check=cancel_check,
-        crop_watermark=crop_watermark,
+        crop_watermark=bool(settings.get("intro_crop_watermark", True)),
     )
     return {
         "artifact": artifact,
-        "captions_path": str(srt_path),
+        "captions_path": str(prepared["srt_path"]),
         "scenes": scenes,
         "visual_bible": validated_plan["visual_bible"],
     }
+
+
+def produce_video(
+    video_id: int,
+    snapshot: dict,
+    progress,
+    cancel_check,
+    force_new_project: bool = False,
+) -> dict:
+    """Compatibility wrapper; durable workers use the two explicit phases."""
+    if get_render_mode(snapshot) == "stock_video":
+        from auto_yt.services import stock_video_renderer
+
+        return stock_video_renderer.produce_stock_video(
+            video_id=video_id,
+            snapshot=snapshot,
+            progress=progress,
+            cancel_check=cancel_check,
+            force_new_project=force_new_project,
+        )
+
+    prepare_google_flow_media(
+        video_id,
+        snapshot,
+        progress,
+        cancel_check,
+        force_new_project=force_new_project,
+    )
+    return render_prepared_google_flow_video(
+        video_id,
+        snapshot,
+        progress,
+        cancel_check,
+    )

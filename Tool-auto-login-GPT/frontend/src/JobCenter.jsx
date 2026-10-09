@@ -572,6 +572,7 @@ function JobCenter({ onOpenVideo, refreshKey }) {
           <option value="audio_review">Kiểm duyệt audio</option>
           <option value="audio">Tạo audio</option>
           <option value="visual_scene_plan">Lập kế hoạch cảnh</option>
+          <option value="flow_media_generation">Tạo media Google Flow</option>
           <option value="video_render">Dựng video MP4</option>
           <option value="youtube_publish">Upload / đặt lịch YouTube</option>
           <option value="youtube_download">Tải YouTube</option>

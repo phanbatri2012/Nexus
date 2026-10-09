@@ -651,15 +651,138 @@ class VideoProductionServiceTests(unittest.TestCase):
             voice_id="sample-voice",
             voice_name="Sample Voice",
         )
-        with patch.object(main, "_kick_production_queue"):
+        with (
+            patch.object(main, "_kick_production_queue"),
+            patch.object(main, "_kick_flow_media_queue"),
+        ):
             res = main.trigger_render_video(video_id)
             self.assertTrue(res["success"])
             self.assertEqual(res["status"], "queued")
+            self.assertEqual(res["job_type"], "flow_media_generation")
+            self.assertEqual(res["phase"], "media_generation")
 
             status = main.get_render_status(video_id)
             self.assertEqual(status["video_id"], video_id)
             self.assertIsNotNone(status["job"])
-            self.assertEqual(status["job"]["job_type"], "video_render")
+            self.assertEqual(status["job"]["job_type"], "flow_media_generation")
+            self.assertEqual(status["phase"], "media_generation")
+
+    def test_trigger_render_video_routes_stock_directly_to_mp4_queue(self):
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=stock-route",
+            "Stock Route Video",
+            "Transcript",
+            "Script",
+        )
+        database.upsert_audio_task(
+            video_id=video_id,
+            request_hash="hash-stock-route",
+            task_id="task-stock-route",
+            status="completed",
+            audio_url="http://127.0.0.1:8080/api/audio/stock-route.mp3",
+            error="",
+            segments_json="[]",
+            voice_id="sample-voice",
+            voice_name="Sample Voice",
+        )
+        snapshot = {
+            "render_mode": "stock_video",
+            "pipeline": {"video_render": True, "render_mode": "stock_video"},
+        }
+        with (
+            patch.object(main, "_get_prompt_production_snapshot", return_value=snapshot),
+            patch.object(main, "_kick_production_queue") as kick_render,
+            patch.object(main, "_kick_flow_media_queue") as kick_flow,
+        ):
+            result = main.trigger_render_video(video_id)
+
+        self.assertEqual(result["job_type"], "video_render")
+        self.assertEqual(result["phase"], "render")
+        self.assertFalse(result["duplicate"])
+        kick_render.assert_called_once_with()
+        kick_flow.assert_not_called()
+
+    def test_flow_media_handoff_creates_exactly_one_render_job(self):
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-handoff",
+            "Flow Handoff Video",
+            "Transcript",
+            "Script",
+        )
+        snapshot = {"render_mode": "google_flow", "pipeline": {"video_render": True}}
+        job = database.create_system_job(
+            job_id="flow-media-handoff",
+            job_type="flow_media_generation",
+            title="Tạo media",
+            payload={"video_id": video_id, "snapshot": snapshot, "mode": "resume"},
+            video_id=video_id,
+        )
+        database.update_system_job(job["id"], status="running")
+        prepared_result = {
+            "manifest_artifact": {"id": 1},
+            "plan_hash": "plan-hash",
+            "scene_count": 3,
+        }
+
+        with (
+            patch.object(
+                video_production,
+                "prepare_google_flow_media",
+                return_value=prepared_result,
+            ),
+            patch.object(main, "_kick_production_queue") as kick_render,
+        ):
+            main._execute_flow_media_generation_job(database.get_system_job(job["id"]))
+            main._execute_flow_media_generation_job(database.get_system_job(job["id"]))
+
+        render_jobs = [
+            item
+            for item in database.list_system_jobs(video_id=video_id, limit=None)
+            if item["job_type"] == "video_render"
+        ]
+        self.assertEqual(len(render_jobs), 1)
+        self.assertTrue(render_jobs[0]["payload"]["media_prepared"])
+        self.assertEqual(
+            render_jobs[0]["payload"]["source_media_job_id"],
+            job["id"],
+        )
+        self.assertEqual(
+            database.get_system_job(job["id"])["status"],
+            "completed",
+        )
+        kick_render.assert_called_once_with()
+
+    def test_flow_media_manifest_rejects_tampering(self):
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-manifest-tamper",
+            "Flow Manifest Tamper",
+            "Transcript",
+            "Script",
+        )
+        media_path = Path(self.temporary_directory.name) / "scene_0.png"
+        media_path.write_bytes(b"stable-scene-media")
+
+        with patch.object(
+            video_production,
+            "VISUAL_PLANS_DIR",
+            Path(self.temporary_directory.name) / "visual-plans",
+        ):
+            saved = video_production.save_flow_media_manifest(
+                video_id,
+                plan_hash="plan-hash",
+                caption_hash="caption-hash",
+                scenes=[{"index": 0}],
+                visual_bible={"style": "documentary"},
+                media_paths=[media_path],
+            )
+            manifest_path = Path(saved["artifact"]["path"])
+            manifest_path.write_bytes(manifest_path.read_bytes() + b"\n")
+
+            with self.assertRaisesRegex(
+                video_production.VideoProductionError,
+                "đã bị thay đổi",
+            ):
+                video_production.load_flow_media_manifest(video_id)
 
     def test_produce_video_flow_without_comfyui(self):
         video_id = database.save_video(
@@ -725,7 +848,10 @@ class VideoProductionServiceTests(unittest.TestCase):
             voice_id="sample-voice",
             voice_name="Sample Voice",
         )
-        with patch.object(main, "_kick_production_queue"):
+        with (
+            patch.object(main, "_kick_production_queue"),
+            patch.object(main, "_kick_flow_media_queue"),
+        ):
             # 1. Resume mode (default)
             res_resume = main.trigger_render_video(video_id, mode="resume")
             self.assertTrue(res_resume["success"])

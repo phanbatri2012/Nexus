@@ -69,6 +69,8 @@ test('Dashboard and Job Center expose render and YouTube publish artifacts', () 
   assert.match(appSource, /final_artifact_id/);
   assert.match(appSource, /YouTube Studio/);
   assert.match(jobCenterSource, /video_render/);
+  assert.match(jobCenterSource, /flow_media_generation/);
+  assert.match(jobCenterSource, /Tạo media Google Flow/);
   assert.match(jobCenterSource, /youtube_publish/);
   assert.match(jobCenterSource, /artifact_download_url/);
   assert.match(jobCenterSource, /youtube_studio_url/);
@@ -80,6 +82,8 @@ test('App detail panel exposes MP4 render button, status, and download controls'
   assert.match(appSource, /\/download-mp4/);
   assert.match(appSource, /\/cancel-render/);
   assert.match(appSource, /Dựng video MP4/);
+  assert.match(appSource, /phase === 'media_generation'/);
+  assert.match(appSource, /Tạo media Google Flow/);
   assert.match(appSource, /Tải Video MP4/);
 });
 
