@@ -1,6 +1,7 @@
 import sqlite3
 import datetime
 import json
+import os
 import re
 import unicodedata
 import urllib.parse
@@ -12,7 +13,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 # Since main.py is run from the project root usually, we can resolve relative to this file
 _HERE = Path(__file__).resolve()
 PROJECT_ROOT = _HERE.parent.parent.parent.parent
-DB_PATH = PROJECT_ROOT / "data" / "database.db"
+DB_PATH = Path(os.environ.get("AUTO_YT_DB_PATH") or PROJECT_ROOT / "data" / "database.db")
 TTS_V2_BACKUP_SUFFIX = ".pre_tts_v2.bak"
 NULLABLE_PUBLICATION_CHANNEL_BACKUP_SUFFIX = ".pre_nullable_publication_channel.bak"
 TRUST_READINESS_V1_MIGRATION = "trust_readiness_v1"
@@ -2627,7 +2628,7 @@ def public_youtube_channel(channel: sqlite3.Row | dict | None) -> dict | None:
     """Return channel metadata without OAuth or proxy credentials."""
     if channel is None:
         return None
-    from auto_yt.services.proxy_utils import parse_proxy_url, proxy_display_value
+    from auto_yt.services.proxy_utils import parse_proxy_url
 
     public = dict(channel)
     proxy_info = str(public.pop("gpm_proxy_info", "") or "").strip()
@@ -2635,7 +2636,6 @@ def public_youtube_channel(channel: sqlite3.Row | dict | None) -> dict | None:
     public.pop("access_token_encrypted", None)
     public.pop("refresh_token_encrypted", None)
     public["gpm_proxy_configured"] = bool(parse_proxy_url(proxy_info))
-    public["gpm_proxy_display"] = proxy_display_value(proxy_info)
     return public
 
 
@@ -7124,8 +7124,8 @@ def update_channel_trust_plan(plan_id: int, **changes) -> dict | None:
         "daily_comment_target", "daily_subscribe_target", "min_watch_minutes",
         "branding_checklist", "status", "total_videos_watched", "total_searches",
         "total_likes", "total_comments", "total_subscriptions", "trust_score_estimated",
-        "error_message", "last_session_at", "last_attempt_at", "next_run_at"
-        , "legacy_trust_score_estimated", "mode", "requires_review",
+        "error_message", "last_session_at", "last_attempt_at", "next_run_at",
+        "legacy_trust_score_estimated", "mode", "requires_review",
         "profile_readiness", "channel_readiness", "profile_readiness_pct",
         "channel_readiness_pct", "readiness_state", "profile_baseline",
         "approved_sources", "reminder_enabled", "reminder_time_local",

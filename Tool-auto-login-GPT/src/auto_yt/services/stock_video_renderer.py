@@ -19,6 +19,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import sys
 import time
 import urllib.parse
 from pathlib import Path
@@ -837,10 +838,15 @@ def produce_stock_video(
     ffmpeg_log_path = scratch_dir / "ffmpeg_render.log"
     ffmpeg_log = open(ffmpeg_log_path, "w", encoding="utf-8", errors="replace")
 
+    ffmpeg_extra_kwargs = {}
+    if sys.platform == "win32" and hasattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS"):
+        ffmpeg_extra_kwargs["creationflags"] = subprocess.BELOW_NORMAL_PRIORITY_CLASS
+
     proc = subprocess.Popen(
         cmd,
         stdout=ffmpeg_log,
         stderr=subprocess.STDOUT,
+        **ffmpeg_extra_kwargs,
     )
     process_registry.register_process(f"video:{video_id}", proc)
 

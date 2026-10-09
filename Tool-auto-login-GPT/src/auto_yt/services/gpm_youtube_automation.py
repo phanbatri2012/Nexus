@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 import urllib.parse
@@ -31,8 +32,12 @@ class GpmAutomationError(RuntimeError):
     """Raised when an automation action fails inside a GPM browser session."""
 
 
-async def verify_youtube_login(profile_id: str, timeout_seconds: float = 20.0) -> dict[str, Any]:
-    """Check if the given GPM profile has an active YouTube Studio session."""
+async def verify_youtube_login(
+    profile_id: str,
+    timeout_seconds: float = 20.0,
+    expected_channel_id: str = "",
+) -> dict[str, Any]:
+    """Check the Studio session and, when supplied, verify its assigned channel."""
     logger.info("Kiểm tra đăng nhập YouTube trên GPM profile %s", profile_id)
     async with channel_browser_session(profile_id) as (context, _browser, _profile_meta):
         page = await context.new_page()
@@ -46,6 +51,7 @@ async def verify_youtube_login(profile_id: str, timeout_seconds: float = 20.0) -
             if "accounts.google.com" in current_url:
                 return {
                     "logged_in": False,
+                    "identity_verified": False,
                     "channel_title": "",
                     "channel_id": "",
                     "url": current_url,
@@ -56,6 +62,7 @@ async def verify_youtube_login(profile_id: str, timeout_seconds: float = 20.0) -
             if "studio.youtube.com" in current_url:
                 title = await page.title()
                 channel_name = ""
+                channel_id = ""
                 try:
                     name_elem = await page.query_selector("#entity-name, #channel-name, #header-channel-name")
                     if name_elem:
@@ -63,16 +70,39 @@ async def verify_youtube_login(profile_id: str, timeout_seconds: float = 20.0) -
                 except Exception:
                     pass
 
+                match = re.search(r"/channel/(UC[\w-]+)", current_url)
+                if match:
+                    channel_id = match.group(1)
+                if not channel_id:
+                    try:
+                        channel_link = await page.query_selector('a[href*="/channel/UC"]')
+                        href = await channel_link.get_attribute("href") if channel_link else ""
+                        match = re.search(r"/channel/(UC[\w-]+)", str(href or ""))
+                        channel_id = match.group(1) if match else ""
+                    except Exception:
+                        channel_id = ""
+
+                expected = str(expected_channel_id or "").strip()
+                identity_verified = bool(channel_id) and (not expected or channel_id == expected)
+                if expected and not channel_id:
+                    message = "Studio đã đăng nhập nhưng chưa đọc được Channel ID để đối chiếu."
+                elif expected and channel_id != expected:
+                    message = "Profile đang đăng nhập một kênh khác với kênh được gán."
+                else:
+                    message = "Đã đăng nhập và xác minh đúng YouTube Studio."
+
                 return {
                     "logged_in": True,
+                    "identity_verified": identity_verified,
                     "channel_title": channel_name or title,
-                    "channel_id": "",
+                    "channel_id": channel_id,
                     "url": current_url,
-                    "message": "Đã đăng nhập YouTube Studio thành công trên Profile GPM.",
+                    "message": message,
                 }
 
             return {
                 "logged_in": False,
+                "identity_verified": False,
                 "channel_title": "",
                 "channel_id": "",
                 "url": current_url,
@@ -82,6 +112,7 @@ async def verify_youtube_login(profile_id: str, timeout_seconds: float = 20.0) -
             logger.error("Lỗi khi kiểm tra đăng nhập YouTube trên GPM: %s", exc)
             return {
                 "logged_in": False,
+                "identity_verified": False,
                 "channel_title": "",
                 "channel_id": "",
                 "url": "",

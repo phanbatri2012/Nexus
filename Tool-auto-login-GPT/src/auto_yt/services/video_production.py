@@ -14,6 +14,7 @@ import secrets
 import shutil
 import statistics
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -2355,7 +2356,17 @@ def _render_segments(
             f"Đang dựng segment {index + 1}/{len(scenes)}" + (" (Video Intro)" if is_video_input else ""),
             "video_render_segment",
         )
-        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        ffmpeg_extra_kwargs = {}
+        if sys.platform == "win32" and hasattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS"):
+            ffmpeg_extra_kwargs["creationflags"] = subprocess.BELOW_NORMAL_PRIORITY_CLASS
+
+        proc = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            **ffmpeg_extra_kwargs,
+        )
         process_registry.register_process(f'video:{video_id}', proc)
         try:
             stdout, stderr = proc.communicate()

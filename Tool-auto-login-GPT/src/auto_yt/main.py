@@ -589,10 +589,23 @@ def get_health():
         if _production_coordinator is not None
         else {"running": False, "ready": False, "current_job_id": ""}
     )
+    publish_coord = (
+        _publish_coordinator.status()
+        if _publish_coordinator is not None
+        else {"running": False, "ready": False, "current_job_id": ""}
+    )
+    flow_coord = (
+        _flow_media_coordinator.status()
+        if _flow_media_coordinator is not None
+        else {"running": False, "ready": False, "current_job_id": ""}
+    )
+    is_ready = bool(coordinator.get("ready")) and bool(publish_coord.get("ready"))
     return {
         "status": "ok",
-        "ready": bool(coordinator.get("ready")),
+        "ready": is_ready,
         "production_coordinator": coordinator,
+        "publish_coordinator": publish_coord,
+        "flow_media_coordinator": flow_coord,
         "trust_builder_scheduler": (
             trust_builder_scheduler.get_trust_builder_scheduler_status()
         ),
@@ -1830,7 +1843,7 @@ async def publish_video_now_endpoint(video_id: int):
         production_progress="Đang chờ xuất bản công khai ngay",
         blocking_reason="",
     )
-    _kick_production_queue()
+    _kick_publish_queue()
     return {
         "success": True,
         "message": "Đã đưa video vào hàng đợi xuất bản công khai ngay!",
@@ -1897,7 +1910,7 @@ async def publish_video_schedule_endpoint(video_id: int):
         production_progress="Đang chờ tải lên và đặt lịch phát sóng",
         blocking_reason="",
     )
-    _kick_production_queue()
+    _kick_publish_queue()
     return {
         "success": True,
         "message": "Đã đưa video vào hàng đợi tải lên và đặt lịch YouTube!",
@@ -3528,23 +3541,29 @@ FLOW_MEDIA_JOB_LABELS = {
 PRODUCTION_JOB_TYPES = (
     "video_render",
     "visual_scene_plan",
-    "youtube_upload",
-    "youtube_publish",
-    "fb_crosspost",
-    "fb_crosspost_sync",
     "thumbnail_generation",
     "tiktok_publish",
 )
 PRODUCTION_JOB_LABELS = {
     "video_render": "Dựng video MP4",
     "visual_scene_plan": "Lập kế hoạch cảnh",
+    "thumbnail_generation": "Sinh ảnh Thumbnail",
+    "tiktok_publish": "Đăng video TikTok",
+}
+
+PUBLISHING_JOB_TYPES = (
+    "youtube_upload",
+    "youtube_publish",
+    "fb_crosspost",
+    "fb_crosspost_sync",
+)
+PUBLISHING_JOB_LABELS = {
     "youtube_upload": "Upload / đặt lịch YouTube",
     "youtube_publish": "Upload / đặt lịch YouTube",
     "fb_crosspost": "Đăng chéo Facebook",
     "fb_crosspost_sync": "Đồng bộ video Facebook",
-    "thumbnail_generation": "Sinh ảnh Thumbnail",
-    "tiktok_publish": "Đăng video TikTok",
 }
+
 TRUST_BUILDER_JOB_TYPES = ("trust_builder_session",)
 TRUST_BUILDER_JOB_LABELS = {
     "trust_builder_session": "Trust Builder",
@@ -3554,6 +3573,7 @@ ALL_JOB_LABELS = {
     **COMMENT_JOB_LABELS,
     **FLOW_MEDIA_JOB_LABELS,
     **PRODUCTION_JOB_LABELS,
+    **PUBLISHING_JOB_LABELS,
     **TRUST_BUILDER_JOB_LABELS,
 }
 
@@ -4817,6 +4837,7 @@ def resume_background_jobs() -> None:
     _kick_video_queue()
     _kick_flow_media_queue()
     _kick_production_queue()
+    _kick_publish_queue()
     _comment_sync_stop_event.clear()
     # Do not activate channel jobs during application startup. A due comment
     # publish can launch its assigned GPM profile, which must never be a side
@@ -4871,6 +4892,8 @@ def stop_video_queue_wakeup_timer() -> None:
         _flow_media_coordinator.stop()
     if _production_coordinator is not None:
         _production_coordinator.stop()
+    if _publish_coordinator is not None:
+        _publish_coordinator.stop()
     chatgpt_browser_service.stop_browser_service()
 
 
@@ -5437,7 +5460,7 @@ def _enqueue_youtube_publish_if_enabled(
         production_progress="Đang chờ kiểm tra cấu hình đăng YouTube",
         blocking_reason="",
     )
-    _kick_production_queue()
+    _kick_publish_queue()
     return job
 
 
@@ -6131,6 +6154,12 @@ _production_coordinator = production_coordinator_service.ProductionCoordinator(
     {
         "visual_scene_plan": _execute_visual_scene_plan_job,
         "video_render": _execute_video_render_job,
+    },
+    error_handler=_handle_production_job_error,
+)
+
+_publish_coordinator = production_coordinator_service.ProductionCoordinator(
+    {
         "youtube_publish": _execute_youtube_publish_job,
         "youtube_upload": _execute_youtube_publish_job,
         "fb_crosspost": _execute_fb_crosspost_job,
@@ -6148,6 +6177,10 @@ _flow_media_coordinator = production_coordinator_service.ProductionCoordinator(
 
 def _kick_production_queue() -> None:
     _production_coordinator.wake()
+
+
+def _kick_publish_queue() -> None:
+    _publish_coordinator.wake()
 
 
 def _kick_flow_media_queue() -> None:
@@ -7231,6 +7264,7 @@ JOB_CENTER_SYSTEM_JOB_TYPES = (
     *COMMENT_JOB_TYPES,
     *FLOW_MEDIA_JOB_TYPES,
     *PRODUCTION_JOB_TYPES,
+    *PUBLISHING_JOB_TYPES,
     *TRUST_BUILDER_JOB_TYPES,
 )
 
@@ -7459,6 +7493,8 @@ def _kick_job_queues(job_types: set[str]) -> None:
         _kick_flow_media_queue()
     if any(job_type in PRODUCTION_JOB_TYPES for job_type in job_types):
         _kick_production_queue()
+    if any(job_type in PUBLISHING_JOB_TYPES for job_type in job_types):
+        _kick_publish_queue()
     if any(job_type in TRUST_BUILDER_JOB_TYPES for job_type in job_types):
         trust_builder_scheduler.trigger_queue_drain()
 

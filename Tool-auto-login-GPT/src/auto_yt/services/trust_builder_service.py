@@ -17,9 +17,12 @@ from auto_yt.services import database as db, security_logging, trust_builder_saf
 from auto_yt.services.channel_scanner_service import (
     channel_browser_session,
     cleanup_owned_page,
+    inspect_profile_browser_readiness,
     is_profile_browser_busy,
     parse_profile_target,
 )
+from auto_yt.services.gpm_service import get_gpm_profile_detail
+from auto_yt.services.gpm_youtube_automation import verify_youtube_login
 from auto_yt.services.proxy_utils import parse_proxy_url
 from auto_yt.services.trust_builder_actions import (
     ACTION_PERFORMED,
@@ -140,7 +143,9 @@ def generate_contextual_comment(
 
 def validate_plan_browser_configuration(plan: dict[str, Any]) -> str:
     """Return the dedicated proxied GPM profile id or raise a safe validation error."""
-    profile_id = str(plan.get("gpm_profile_id") or "").strip()
+    channel_db_id = int(plan.get("channel_db_id") or 0)
+    channel = db.get_youtube_channel(channel_db_id) if channel_db_id else None
+    profile_id = str((channel or {}).get("gpm_profile_id") or plan.get("gpm_profile_id") or "").strip()
     if not profile_id:
         raise ValueError(
             "Kênh chưa được gán Profile GPM. Vui lòng cấu hình trong Channel Hub."
@@ -149,17 +154,263 @@ def validate_plan_browser_configuration(plan: dict[str, Any]) -> str:
     if parsed.get("type") != "gpm":
         raise ValueError("Trust Builder chỉ cho phép Profile GPM chuyên dụng.")
     proxy_info = str(
-        plan.get("gpm_proxy_info") or parsed.get("proxy_info") or ""
+        (channel or {}).get("gpm_proxy_info") or plan.get("gpm_proxy_info") or parsed.get("proxy_info") or ""
     ).strip()
     if not parse_proxy_url(proxy_info):
         raise ValueError("Profile GPM phải có proxy riêng; kết nối Direct bị từ chối.")
-    channel_db_id = int(plan.get("channel_db_id") or 0)
     for channel in db.list_youtube_channels():
         if int(channel.get("id") or 0) == channel_db_id:
             continue
         if str(channel.get("gpm_profile_id") or "").strip() == profile_id:
             raise ValueError("Profile GPM này đang được gán cho một kênh khác.")
     return profile_id
+
+
+def _readiness_check(
+    check_id: str,
+    label: str,
+    status: str,
+    detail: str,
+    *,
+    required: bool = False,
+    action: str = "",
+) -> dict[str, Any]:
+    return {
+        "id": check_id,
+        "label": label,
+        "status": status,
+        "detail": detail,
+        "required": required,
+        "action": action,
+    }
+
+
+def _readiness_summary(checks: list[dict[str, Any]]) -> tuple[int, list[str]]:
+    weights = {"pass": 1.0, "warn": 0.5, "unknown": 0.0, "fail": 0.0}
+    percentage = int(round(100 * sum(weights.get(str(item["status"]), 0.0) for item in checks) / max(1, len(checks))))
+    blockers = [
+        str(item["label"])
+        for item in checks
+        if item.get("required") and item.get("status") != "pass"
+    ]
+    return percentage, blockers
+
+
+def _profile_baseline(profile_id: str, detail: dict[str, Any]) -> dict[str, str]:
+    """Keep only stable, non-secret profile properties for drift detection."""
+    return {
+        "profile_id": profile_id,
+        "profile_name": str(detail.get("name") or detail.get("profile_name") or "").strip(),
+        "os": str(detail.get("os") or "").strip(),
+        "browser_type": str(detail.get("browser_type") or detail.get("browser") or "").strip(),
+        "browser_version": str(detail.get("browser_version") or "").strip(),
+    }
+
+
+def run_passive_readiness_check(
+    plan_id: int,
+    *,
+    identity_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Evaluate readiness without launching or navigating a browser profile."""
+    plan = db.get_channel_trust_plan(plan_id)
+    if not plan:
+        raise ValueError("Không tìm thấy kế hoạch readiness.")
+    channel = db.get_youtube_channel(int(plan.get("channel_db_id") or 0)) or {}
+    profile_id = str(channel.get("gpm_profile_id") or "").strip()
+    proxy_info = str(channel.get("gpm_proxy_info") or "").strip()
+    checks: list[dict[str, Any]] = []
+    checks.append(_readiness_check(
+        "profile_assigned", "Đã gán Profile GPM", "pass" if profile_id else "fail",
+        "Kênh đã có profile chuyên dụng." if profile_id else "Chưa gán Profile GPM cho kênh.",
+        required=True, action="Cấu hình profile trong Channel Hub",
+    ))
+
+    parsed: dict[str, Any] = {}
+    if profile_id:
+        try:
+            parsed = parse_profile_target(profile_id)
+        except Exception:
+            parsed = {}
+    checks.append(_readiness_check(
+        "gpm_only", "Profile chuyên dụng", "pass" if parsed.get("type") == "gpm" else "fail",
+        "Đang dùng GPM profile." if parsed.get("type") == "gpm" else "Chỉ chấp nhận GPM profile chuyên dụng.",
+        required=True,
+    ))
+    checks.append(_readiness_check(
+        "proxy_isolation", "Proxy riêng", "pass" if parse_proxy_url(proxy_info) else "fail",
+        "Proxy đã được cấu hình và giữ kín." if parse_proxy_url(proxy_info) else "Thiếu proxy hợp lệ; hệ thống sẽ fail closed.",
+        required=True, action="Cấu hình proxy riêng trong Channel Hub",
+    ))
+    duplicate = False
+    if profile_id:
+        duplicate = any(
+            int(item.get("id") or 0) != int(channel.get("id") or 0)
+            and str(item.get("gpm_profile_id") or "").strip() == profile_id
+            for item in db.list_youtube_channels()
+        )
+    checks.append(_readiness_check(
+        "exclusive_mapping", "Ánh xạ 1 kênh / 1 profile", "fail" if duplicate else ("pass" if profile_id else "unknown"),
+        "Profile không bị dùng chung." if profile_id and not duplicate else ("Profile đang được gán cho kênh khác." if duplicate else "Chưa thể kiểm tra khi thiếu profile."),
+        required=True,
+    ))
+
+    profile_detail: dict[str, Any] = {}
+    profile_error = ""
+    if profile_id and parsed.get("type") == "gpm":
+        try:
+            profile_detail = get_gpm_profile_detail(profile_id)
+        except Exception as exc:
+            profile_error = security_logging.redact_sensitive(exc)
+    checks.append(_readiness_check(
+        "profile_exists", "Profile tồn tại trong GPM", "pass" if profile_detail else "unknown",
+        "GPM API đã xác nhận profile." if profile_detail else (profile_error or "Chưa thể xác nhận profile qua GPM API."),
+        required=True, action="Mở GPM và kiểm tra dịch vụ",
+    ))
+
+    runtime = inspect_profile_browser_readiness(profile_id) if profile_id else {}
+    runtime_status = "warn" if runtime.get("busy") or runtime.get("requires_user_action") else ("pass" if profile_id else "unknown")
+    checks.append(_readiness_check(
+        "runtime_state", "Trạng thái browser", runtime_status,
+        "Profile đang bận hoặc cần người dùng xử lý." if runtime_status == "warn" else (f"Trạng thái: {runtime.get('state', 'closed')}." if profile_id else "Chưa có profile."),
+        action="Đóng tác vụ đang dùng profile rồi kiểm tra lại",
+    ))
+
+    current_baseline = _profile_baseline(profile_id, profile_detail) if profile_detail else {}
+    saved_baseline = plan.get("profile_baseline") or {}
+    comparable_keys = ("profile_id", "os", "browser_type", "browser_version")
+    drifted = bool(saved_baseline and current_baseline) and any(
+        str(saved_baseline.get(key) or "") != str(current_baseline.get(key) or "")
+        for key in comparable_keys
+        if saved_baseline.get(key) or current_baseline.get(key)
+    )
+    baseline_status = "fail" if drifted else ("pass" if current_baseline else "unknown")
+    checks.append(_readiness_check(
+        "profile_baseline", "Baseline profile", baseline_status,
+        "Phát hiện thay đổi thuộc tính profile." if drifted else ("Baseline ổn định hoặc vừa được ghi nhận." if baseline_status == "pass" else "Chưa thể ghi nhận baseline."),
+        required=True, action="Xác nhận thay đổi profile trước khi tiếp tục",
+    ))
+
+    profile_pct, profile_blockers = _readiness_summary(checks)
+    profile_snapshot = {
+        "checks": checks,
+        "percentage": profile_pct,
+        "blockers": profile_blockers,
+        "checked_at": db.utc_now(),
+        "passive": True,
+    }
+
+    channel_checks: list[dict[str, Any]] = []
+    channel_checks.append(_readiness_check(
+        "channel_record", "Kênh đã kết nối", "pass" if channel.get("channel_id") else "fail",
+        "Đã có bản ghi kênh YouTube." if channel.get("channel_id") else "Không tìm thấy Channel ID.",
+        required=True,
+    ))
+    branding = plan.get("branding_checklist") or {}
+    for field, label in (("avatar", "Ảnh đại diện"), ("banner", "Ảnh bìa"), ("about", "Mô tả kênh"), ("handle", "Handle")):
+        value = branding.get(field)
+        status = "pass" if value is True else ("warn" if value is False else "unknown")
+        channel_checks.append(_readiness_check(
+            f"branding_{field}", label, status,
+            "Đã xác minh." if status == "pass" else ("Chưa hoàn thiện." if status == "warn" else "Chưa kiểm tra tương tác."),
+            action="Chạy kiểm tra tương tác",
+        ))
+    feature_level = str(branding.get("feature_level") or "unknown").lower()
+    feature_status = "pass" if feature_level in {"intermediate", "advanced"} else ("warn" if feature_level == "standard" else "unknown")
+    channel_checks.append(_readiness_check(
+        "feature_eligibility", "Cấp tính năng", feature_status,
+        f"Mức đã xác minh: {feature_level}." if feature_level != "unknown" else "Chưa xác minh cấp tính năng.",
+        action="Chạy kiểm tra tương tác",
+    ))
+
+    previous_identity = next(
+        (item for item in (plan.get("channel_readiness") or {}).get("checks", []) if item.get("id") == "studio_identity"),
+        None,
+    )
+    if identity_result is not None:
+        verified = bool(identity_result.get("identity_verified"))
+        identity_check = _readiness_check(
+            "studio_identity", "Đúng tài khoản YouTube Studio", "pass" if verified else "fail",
+            str(identity_result.get("message") or ("Đã đối chiếu Channel ID." if verified else "Không thể đối chiếu Channel ID.")),
+            required=True, action="Đăng nhập đúng kênh trong GPM profile",
+        )
+    elif previous_identity:
+        identity_check = dict(previous_identity)
+    else:
+        identity_check = _readiness_check(
+            "studio_identity", "Đúng tài khoản YouTube Studio", "unknown",
+            "Cần kiểm tra tương tác để đối chiếu Channel ID.", required=True,
+            action="Chạy kiểm tra tương tác",
+        )
+    channel_checks.append(identity_check)
+    channel_pct, channel_blockers = _readiness_summary(channel_checks)
+    channel_snapshot = {
+        "checks": channel_checks,
+        "percentage": channel_pct,
+        "blockers": channel_blockers,
+        "checked_at": db.utc_now(),
+    }
+    all_blockers = profile_blockers + channel_blockers
+    state = "ready" if not all_blockers and profile_pct >= 70 and channel_pct >= 70 else "needs_attention"
+    baseline_to_store = saved_baseline or current_baseline
+    updated = db.update_channel_trust_plan(
+        plan_id,
+        mode="guided",
+        requires_review=False,
+        profile_readiness=profile_snapshot,
+        channel_readiness=channel_snapshot,
+        profile_readiness_pct=profile_pct,
+        channel_readiness_pct=channel_pct,
+        readiness_state=state,
+        profile_baseline=baseline_to_store,
+        last_readiness_check_at=db.utc_now(),
+        trust_score_estimated=0,
+    )
+    return {
+        "state": state,
+        "profile": profile_snapshot,
+        "channel": channel_snapshot,
+        "blockers": all_blockers,
+        "plan": updated,
+    }
+
+
+async def run_interactive_readiness_check(plan_id: int) -> dict[str, Any]:
+    """Run user-requested Studio checks inside the assigned GPM profile."""
+    plan = db.get_channel_trust_plan(plan_id)
+    if not plan:
+        raise ValueError("Không tìm thấy kế hoạch readiness.")
+    profile_id = validate_plan_browser_configuration(plan)
+    channel_id = str(plan.get("youtube_channel_ucid") or "").strip()
+    identity = await verify_youtube_login(
+        profile_id,
+        expected_channel_id=channel_id,
+    )
+    if identity.get("logged_in"):
+        await audit_channel_branding_for_plan(plan_id)
+        await audit_feature_eligibility_for_plan(plan_id)
+    return run_passive_readiness_check(plan_id, identity_result=identity)
+
+
+def create_guided_readiness_session(plan_id: int) -> dict[str, Any]:
+    """Create a human-operated research checklist; it performs no engagement."""
+    plan = db.get_channel_trust_plan(plan_id)
+    if not plan:
+        raise ValueError("Không tìm thấy kế hoạch readiness.")
+    topics = [str(item).strip() for item in (plan.get("niche_keywords") or []) if str(item).strip()]
+    sources = [str(item).strip() for item in (plan.get("approved_sources") or []) if str(item).strip()]
+    agenda = {
+        "notice": "Bạn tự thao tác trong browser; hệ thống không search, xem, cuộn hay tương tác thay bạn.",
+        "topics": topics[:5],
+        "approved_sources": sources[:10],
+        "steps": [
+            {"id": "google_search", "label": "Tự tìm kiếm chủ đề trên Google", "required": True},
+            {"id": "web_reading", "label": "Tự đọc nguồn đã duyệt", "required": True},
+            {"id": "youtube_research", "label": "Tự nghiên cứu YouTube, không ép tương tác", "required": True},
+            {"id": "notes", "label": "Ghi lại insight hữu ích", "required": False},
+        ],
+    }
+    return db.create_trust_guided_session(plan_id, agenda)
 
 
 def get_active_plan_job(plan_id: int) -> dict[str, Any] | None:
@@ -208,7 +459,15 @@ async def run_warmup_session(
     job_id: str = "",
     require_active: bool = False,
 ) -> dict[str, Any]:
-    """Execute one full, safe warmup session for a channel trust plan."""
+    """Legacy entry point retained only to reject automated engagement."""
+    return {
+        "success": False,
+        "disabled": True,
+        "message": "Automated warm-up đã bị vô hiệu hóa; hãy dùng Guided Readiness.",
+    }
+
+    # The legacy implementation remains below temporarily for history/reference,
+    # but is intentionally unreachable and cannot launch a browser.
     lock = await _get_plan_lock(plan_id)
     if lock.locked():
         logger.warning("Session cho Plan ID %d đang chạy, bỏ qua yêu cầu trùng lặp.", plan_id)
@@ -524,15 +783,10 @@ async def audit_channel_branding_for_plan(plan_id: int) -> dict[str, Any]:
             finally:
                 await cleanup_owned_page(context, page)
 
-        # Update checklist and recalculate score
-        stats = db.get_trust_activity_stats(plan_id)
-        plan["branding_checklist"] = checklist
-        new_score = calculate_trust_score(plan, stats)
-
         db.update_channel_trust_plan(
             plan_id=plan_id,
             branding_checklist=checklist,
-            trust_score_estimated=new_score,
+            trust_score_estimated=0,
         )
 
         db.create_trust_activity_log(
@@ -540,12 +794,12 @@ async def audit_channel_branding_for_plan(plan_id: int) -> dict[str, Any]:
             activity_type="branding_audit",
             detail_json=checklist,
             success=True,
+            activity_source="interactive_readiness",
         )
 
         return {
             "success": True,
             "checklist": checklist,
-            "trust_score": new_score,
         }
     except Exception as exc:
         safe_error = security_logging.redact_sensitive(exc)
@@ -576,25 +830,22 @@ async def audit_feature_eligibility_for_plan(plan_id: int) -> dict[str, Any]:
 
         checklist = dict(plan.get("branding_checklist") or {})
         checklist["feature_level"] = feature_result.get("feature_level", "unknown")
-        stats = db.get_trust_activity_stats(plan_id)
-        plan["branding_checklist"] = checklist
-        new_score = calculate_trust_score(plan, stats)
         updated = db.update_channel_trust_plan(
             plan_id,
             branding_checklist=checklist,
-            trust_score_estimated=new_score,
+            trust_score_estimated=0,
         )
         db.create_trust_activity_log(
             plan_id=plan_id,
             activity_type="feature_audit",
             detail_json=feature_result,
             success=bool(feature_result.get("verified")),
+            activity_source="interactive_readiness",
         )
         return {
             "success": True,
             "verified": bool(feature_result.get("verified")),
             "feature_level": checklist["feature_level"],
-            "trust_score": new_score,
             "plan": updated,
         }
     except Exception as exc:

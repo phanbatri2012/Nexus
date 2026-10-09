@@ -114,6 +114,7 @@ class SystemJobTests(unittest.TestCase):
             patch.object(main, "_kick_comment_queue") as kick_comment,
             patch.object(main, "_kick_flow_media_queue"),
             patch.object(main, "_kick_production_queue"),
+            patch.object(main, "_kick_publish_queue"),
             patch.object(main, "_enqueue_due_comment_syncs") as enqueue_comment_syncs,
             patch.object(main, "_cleanup_expired_tts_previews"),
             patch.object(main.threading, "Thread") as thread_class,
@@ -372,7 +373,7 @@ class SystemJobTests(unittest.TestCase):
 
         with (
             patch.object(main.threading, "Thread") as thread_class,
-            patch.object(main, "_kick_production_queue") as kick_production,
+            patch.object(main, "_kick_publish_queue") as kick_publish,
         ):
             result = main._run_system_job_center_action(
                 "fb-retry",
@@ -382,7 +383,7 @@ class SystemJobTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "queued")
         thread_class.assert_not_called()
-        kick_production.assert_called_once_with()
+        kick_publish.assert_called_once_with()
 
     def test_fb_retry_rejects_duplicate_active_item_job(self):
         item_id = self.create_fb_browser_item("page-fb-dedup", "yt-fb-dedup")

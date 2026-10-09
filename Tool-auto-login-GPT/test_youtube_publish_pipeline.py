@@ -1408,7 +1408,7 @@ class YouTubePublishPipelineTests(unittest.TestCase):
             content_hash="mp4-hash-test",
             status="ready",
         )
-        with patch.object(main, "_kick_production_queue") as kick_mock:
+        with patch.object(main, "_kick_publish_queue") as kick_mock:
             res = asyncio.run(main.publish_video_schedule_endpoint(video_id))
             self.assertTrue(res["success"])
             self.assertEqual(res["status"], "queued")
