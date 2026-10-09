@@ -15,6 +15,7 @@ PROJECT_ROOT = _HERE.parent.parent.parent.parent
 DB_PATH = PROJECT_ROOT / "data" / "database.db"
 TTS_V2_BACKUP_SUFFIX = ".pre_tts_v2.bak"
 NULLABLE_PUBLICATION_CHANNEL_BACKUP_SUFFIX = ".pre_nullable_publication_channel.bak"
+TRUST_READINESS_V1_MIGRATION = "trust_readiness_v1"
 
 VIDEO_STATUS_ACTIVE = "active"
 VIDEO_STATUS_ERROR = "error"
@@ -1286,6 +1287,7 @@ def init_db():
         "gpm_profile_id TEXT DEFAULT ''",
         "gpm_profile_name TEXT DEFAULT ''",
         "gpm_proxy_info TEXT DEFAULT ''",
+        "gpm_proxy_info_encrypted TEXT DEFAULT ''",
         "interaction_mode TEXT DEFAULT 'gpm_browser'",
         "auto_heart INTEGER DEFAULT 1",
     ):
@@ -1293,6 +1295,7 @@ def init_db():
             c.execute(f"ALTER TABLE youtube_channels ADD COLUMN {column_definition}")
         except sqlite3.OperationalError:
             pass
+    _migrate_youtube_channel_proxy_storage(conn)
 
     # Video publication columns
     for column_definition in (
@@ -1445,6 +1448,19 @@ def init_db():
             total_comments INTEGER DEFAULT 0,
             total_subscriptions INTEGER DEFAULT 0,
             trust_score_estimated INTEGER DEFAULT 0,
+            legacy_trust_score_estimated INTEGER DEFAULT 0,
+            mode TEXT NOT NULL DEFAULT 'guided',
+            requires_review INTEGER NOT NULL DEFAULT 0,
+            profile_readiness_json TEXT NOT NULL DEFAULT '{}',
+            channel_readiness_json TEXT NOT NULL DEFAULT '{}',
+            profile_readiness_pct INTEGER NOT NULL DEFAULT 0,
+            channel_readiness_pct INTEGER NOT NULL DEFAULT 0,
+            readiness_state TEXT NOT NULL DEFAULT 'needs_attention',
+            profile_baseline_json TEXT NOT NULL DEFAULT '{}',
+            approved_sources TEXT NOT NULL DEFAULT '[]',
+            reminder_enabled INTEGER NOT NULL DEFAULT 0,
+            reminder_time_local TEXT DEFAULT '',
+            last_readiness_check_at TEXT DEFAULT '',
             error_message TEXT DEFAULT '',
             last_session_at TEXT DEFAULT '',
             last_attempt_at TEXT DEFAULT '',
@@ -1459,6 +1475,19 @@ def init_db():
         "min_watch_minutes INTEGER DEFAULT 10",
         "last_attempt_at TEXT DEFAULT ''",
         "next_run_at TEXT DEFAULT ''",
+        "legacy_trust_score_estimated INTEGER DEFAULT 0",
+        "mode TEXT NOT NULL DEFAULT 'guided'",
+        "requires_review INTEGER NOT NULL DEFAULT 0",
+        "profile_readiness_json TEXT NOT NULL DEFAULT '{}'",
+        "channel_readiness_json TEXT NOT NULL DEFAULT '{}'",
+        "profile_readiness_pct INTEGER NOT NULL DEFAULT 0",
+        "channel_readiness_pct INTEGER NOT NULL DEFAULT 0",
+        "readiness_state TEXT NOT NULL DEFAULT 'needs_attention'",
+        "profile_baseline_json TEXT NOT NULL DEFAULT '{}'",
+        "approved_sources TEXT NOT NULL DEFAULT '[]'",
+        "reminder_enabled INTEGER NOT NULL DEFAULT 0",
+        "reminder_time_local TEXT DEFAULT ''",
+        "last_readiness_check_at TEXT DEFAULT ''",
     ):
         try:
             c.execute(f"ALTER TABLE channel_trust_plans ADD COLUMN {column_definition}")
@@ -1476,8 +1505,41 @@ def init_db():
             detail_json TEXT DEFAULT '{}',
             success INTEGER DEFAULT 1,
             error_message TEXT DEFAULT '',
+            activity_source TEXT NOT NULL DEFAULT 'system_verified',
             executed_at TEXT NOT NULL
         )
+    ''')
+
+    try:
+        c.execute(
+            "ALTER TABLE trust_activity_log ADD COLUMN "
+            "activity_source TEXT NOT NULL DEFAULT 'system_verified'"
+        )
+    except sqlite3.OperationalError:
+        pass
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS trust_guided_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_id INTEGER NOT NULL REFERENCES channel_trust_plans(id) ON DELETE CASCADE,
+            status TEXT NOT NULL DEFAULT 'ready',
+            agenda_json TEXT NOT NULL DEFAULT '{}',
+            checklist_json TEXT NOT NULL DEFAULT '{}',
+            notes TEXT DEFAULT '',
+            started_at TEXT DEFAULT '',
+            completed_at TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    ''')
+    c.execute('''
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_trust_guided_session_active
+        ON trust_guided_sessions(plan_id)
+        WHERE status IN ('ready', 'in_progress')
+    ''')
+    c.execute('''
+        CREATE INDEX IF NOT EXISTS idx_trust_guided_session_history
+        ON trust_guided_sessions(plan_id, created_at DESC)
     ''')
 
     c.execute('''
@@ -1495,6 +1557,7 @@ def init_db():
             WHERE channel_trust_plans.id = trust_activity_log.plan_id
         )
     ''')
+    _migrate_trust_builder_guided_mode(conn)
 
     c.execute('''
         CREATE TABLE IF NOT EXISTS trust_safety_blacklist (
@@ -1734,6 +1797,81 @@ def _migrate_fb_crossposter_token_storage(conn: sqlite3.Connection) -> None:
                 "WHERE id = ?",
                 (encrypted, row_id),
             )
+
+
+def _migrate_youtube_channel_proxy_storage(conn: sqlite3.Connection) -> None:
+    """Move legacy plaintext GPM proxy credentials into a DPAPI column."""
+    from auto_yt.services.secret_store import decrypt_secret, encrypt_secret
+
+    rows = conn.execute(
+        "SELECT id, gpm_proxy_info, gpm_proxy_info_encrypted FROM youtube_channels"
+    ).fetchall()
+    for row_id, plaintext_proxy, encrypted_proxy in rows:
+        plaintext = str(plaintext_proxy or "").strip()
+        encrypted = str(encrypted_proxy or "").strip()
+        if encrypted:
+            # Fail startup before workers run if an existing value cannot be recovered.
+            decrypt_secret(encrypted)
+        elif plaintext:
+            encrypted = encrypt_secret(plaintext)
+            if decrypt_secret(encrypted) != plaintext:
+                raise RuntimeError("Không thể xác minh proxy GPM sau khi mã hóa DPAPI.")
+        if plaintext or encrypted != str(encrypted_proxy or ""):
+            conn.execute(
+                "UPDATE youtube_channels "
+                "SET gpm_proxy_info = '', gpm_proxy_info_encrypted = ? WHERE id = ?",
+                (encrypted, row_id),
+            )
+
+
+def _migrate_trust_builder_guided_mode(conn: sqlite3.Connection) -> None:
+    """Preserve legacy history while disabling automated engagement plans."""
+    applied = conn.execute(
+        "SELECT 1 FROM schema_migrations WHERE name = ?",
+        (TRUST_READINESS_V1_MIGRATION,),
+    ).fetchone()
+    if applied:
+        return
+    now = utc_now()
+    conn.execute(
+        """
+        UPDATE channel_trust_plans
+        SET legacy_trust_score_estimated = trust_score_estimated,
+            trust_score_estimated = 0,
+            mode = 'guided',
+            requires_review = 1,
+            readiness_state = 'needs_attention',
+            status = CASE WHEN status = 'active' THEN 'paused' ELSE status END,
+            next_run_at = '',
+            updated_at = ?
+        """,
+        (now,),
+    )
+    conn.execute(
+        """
+        UPDATE trust_activity_log
+        SET activity_source = 'legacy_automation'
+        WHERE activity_source = 'system_verified'
+        """
+    )
+    conn.execute(
+        """
+        UPDATE system_jobs
+        SET status = 'canceled',
+            progress = 'Đã hủy khi chuyển sang Guided Readiness',
+            error = '',
+            cancel_requested = 0,
+            finished_at = ?,
+            updated_at = ?
+        WHERE job_type = 'trust_builder_session'
+          AND status IN ('queued', 'running', 'retry_wait', 'paused')
+        """,
+        (now, now),
+    )
+    conn.execute(
+        "INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)",
+        (TRUST_READINESS_V1_MIGRATION, now),
+    )
 
 
 def _migrate_channel_schedule_reservations_partial_unique(conn: sqlite3.Connection) -> None:
@@ -2386,7 +2524,10 @@ def save_youtube_channel(
     auto_heart: int = 1,
     **extra_fields,
 ) -> dict:
+    from auto_yt.services.secret_store import encrypt_secret
+
     now = utc_now()
+    encrypted_proxy = encrypt_secret(str(gpm_proxy_info or "").strip())
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute(
@@ -2394,9 +2535,10 @@ def save_youtube_channel(
         INSERT INTO youtube_channels (
             channel_id, title, thumbnail_url, access_token_encrypted,
             refresh_token_encrypted, token_expiry, scope, oauth_client_id, status,
-            gpm_profile_id, gpm_profile_name, gpm_proxy_info, interaction_mode, auto_heart,
+            gpm_profile_id, gpm_profile_name, gpm_proxy_info,
+            gpm_proxy_info_encrypted, interaction_mode, auto_heart,
             created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'connected', ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'connected', ?, ?, '', ?, ?, ?, ?, ?)
         ON CONFLICT(channel_id) DO UPDATE SET
             title = excluded.title,
             thumbnail_url = excluded.thumbnail_url,
@@ -2422,9 +2564,11 @@ def save_youtube_channel(
                 WHEN excluded.gpm_profile_name != '' THEN excluded.gpm_profile_name
                 ELSE youtube_channels.gpm_profile_name
             END,
-            gpm_proxy_info = CASE
-                WHEN excluded.gpm_proxy_info != '' THEN excluded.gpm_proxy_info
-                ELSE youtube_channels.gpm_proxy_info
+            gpm_proxy_info = '',
+            gpm_proxy_info_encrypted = CASE
+                WHEN excluded.gpm_proxy_info_encrypted != ''
+                THEN excluded.gpm_proxy_info_encrypted
+                ELSE youtube_channels.gpm_proxy_info_encrypted
             END,
             status = 'connected',
             updated_at = excluded.updated_at
@@ -2440,7 +2584,7 @@ def save_youtube_channel(
             str(oauth_client_id or "").strip(),
             gpm_profile_id,
             gpm_profile_name,
-            gpm_proxy_info,
+            encrypted_proxy,
             interaction_mode,
             auto_heart,
             now,
@@ -2461,7 +2605,12 @@ PUBLISH_PIPELINE_V1_MIGRATION = "publish_pipeline_v1"
 def _public_youtube_channel(row: sqlite3.Row | dict | None, *, include_tokens: bool = False) -> dict | None:
     if row is None:
         return None
+    from auto_yt.services.secret_store import decrypt_secret
+
     channel = dict(row)
+    encrypted_proxy = str(channel.pop("gpm_proxy_info_encrypted", "") or "").strip()
+    legacy_proxy = str(channel.get("gpm_proxy_info") or "").strip()
+    channel["gpm_proxy_info"] = decrypt_secret(encrypted_proxy) if encrypted_proxy else legacy_proxy
     channel["has_refresh_token"] = bool(channel.get("refresh_token_encrypted"))
     try:
         slots = json.loads(channel.get("publication_slots_json") or "[]")
@@ -2472,6 +2621,22 @@ def _public_youtube_channel(row: sqlite3.Row | dict | None, *, include_tokens: b
         channel.pop("access_token_encrypted", None)
         channel.pop("refresh_token_encrypted", None)
     return channel
+
+
+def public_youtube_channel(channel: sqlite3.Row | dict | None) -> dict | None:
+    """Return channel metadata without OAuth or proxy credentials."""
+    if channel is None:
+        return None
+    from auto_yt.services.proxy_utils import parse_proxy_url, proxy_display_value
+
+    public = dict(channel)
+    proxy_info = str(public.pop("gpm_proxy_info", "") or "").strip()
+    public.pop("gpm_proxy_info_encrypted", None)
+    public.pop("access_token_encrypted", None)
+    public.pop("refresh_token_encrypted", None)
+    public["gpm_proxy_configured"] = bool(parse_proxy_url(proxy_info))
+    public["gpm_proxy_display"] = proxy_display_value(proxy_info)
+    return public
 
 
 def get_youtube_channel(channel_db_id: int, *, include_tokens: bool = False) -> dict | None:
@@ -2554,6 +2719,13 @@ def update_youtube_channel(channel_db_id: int, **changes) -> dict | None:
         raise ValueError(f"Unsupported YouTube channel fields: {sorted(invalid)}")
     if not changes:
         return get_youtube_channel(channel_db_id)
+    if "gpm_proxy_info" in changes:
+        from auto_yt.services.secret_store import encrypt_secret
+
+        raw_proxy = str(changes.pop("gpm_proxy_info") or "").strip()
+        changes["gpm_proxy_info"] = ""
+        changes["gpm_proxy_info_encrypted"] = encrypt_secret(raw_proxy)
+        allowed.add("gpm_proxy_info_encrypted")
     changes["updated_at"] = utc_now()
     assignments = ", ".join(f"{field} = ?" for field in changes)
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
@@ -6626,7 +6798,10 @@ def upsert_youtube_channel(
     auto_heart: int = 1,
     **extra_fields,
 ) -> dict:
+    from auto_yt.services.secret_store import encrypt_secret
+
     now = utc_now()
+    encrypted_proxy = encrypt_secret(str(gpm_proxy_info or "").strip())
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
     existing = conn.execute(
@@ -6640,7 +6815,8 @@ def upsert_youtube_channel(
                 thumbnail_url = ?,
                 gpm_profile_id = ?,
                 gpm_profile_name = ?,
-                gpm_proxy_info = ?,
+                gpm_proxy_info = '',
+                gpm_proxy_info_encrypted = ?,
                 interaction_mode = ?,
                 auto_heart = ?,
                 updated_at = ?
@@ -6651,7 +6827,7 @@ def upsert_youtube_channel(
                 thumbnail_url,
                 gpm_profile_id,
                 gpm_profile_name,
-                gpm_proxy_info,
+                encrypted_proxy,
                 interaction_mode,
                 auto_heart,
                 now,
@@ -6665,8 +6841,9 @@ def upsert_youtube_channel(
                 channel_id, title, thumbnail_url, access_token_encrypted,
                 refresh_token_encrypted, token_expiry, scope, status,
                 gpm_profile_id, gpm_profile_name, gpm_proxy_info,
+                gpm_proxy_info_encrypted,
                 interaction_mode, auto_heart, created_at, updated_at
-            ) VALUES (?, ?, ?, '', '', '', '', 'connected', ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, '', '', '', '', 'connected', ?, ?, '', ?, ?, ?, ?, ?)
             """,
             (
                 channel_id,
@@ -6674,7 +6851,7 @@ def upsert_youtube_channel(
                 thumbnail_url,
                 gpm_profile_id,
                 gpm_profile_name,
-                gpm_proxy_info,
+                encrypted_proxy,
                 interaction_mode,
                 auto_heart,
                 now,
@@ -6800,12 +6977,21 @@ def _decode_trust_plan(row: sqlite3.Row | dict | None) -> dict | None:
     data["niche_keywords"] = _decode_json_field(data.get("niche_keywords"), [])
     data["target_channels"] = _decode_json_field(data.get("target_channels"), [])
     data["branding_checklist"] = _decode_json_field(data.get("branding_checklist"), {})
+    data["profile_readiness"] = _decode_json_field(data.pop("profile_readiness_json", None), {})
+    data["channel_readiness"] = _decode_json_field(data.pop("channel_readiness_json", None), {})
+    data["profile_baseline"] = _decode_json_field(data.pop("profile_baseline_json", None), {})
+    data["approved_sources"] = _decode_json_field(data.get("approved_sources"), [])
     data["total_videos_watched"] = int(data.get("total_videos_watched") or 0)
     data["total_searches"] = int(data.get("total_searches") or 0)
     data["total_likes"] = int(data.get("total_likes") or 0)
     data["total_comments"] = int(data.get("total_comments") or 0)
     data["total_subscriptions"] = int(data.get("total_subscriptions") or 0)
     data["trust_score_estimated"] = int(data.get("trust_score_estimated") or 0)
+    data["legacy_trust_score_estimated"] = int(data.get("legacy_trust_score_estimated") or 0)
+    data["profile_readiness_pct"] = int(data.get("profile_readiness_pct") or 0)
+    data["channel_readiness_pct"] = int(data.get("channel_readiness_pct") or 0)
+    data["requires_review"] = bool(data.get("requires_review"))
+    data["reminder_enabled"] = bool(data.get("reminder_enabled"))
     data["daily_watch_target"] = int(5 if data.get("daily_watch_target") is None else data["daily_watch_target"])
     data["daily_search_target"] = int(3 if data.get("daily_search_target") is None else data["daily_search_target"])
     data["daily_like_target"] = int(3 if data.get("daily_like_target") is None else data["daily_like_target"])
@@ -6836,6 +7022,7 @@ def create_channel_trust_plan(
     daily_subscribe_target: int = 0,
     min_watch_minutes: int = 10,
     branding_checklist: dict | None = None,
+    approved_sources: list[str] | None = None,
     status: str = "draft",
     warmup_phase: str = "idle",
 ) -> dict:
@@ -6843,6 +7030,7 @@ def create_channel_trust_plan(
     keywords_json = json.dumps(niche_keywords or [], ensure_ascii=False)
     channels_json = json.dumps(target_channels or [], ensure_ascii=False)
     branding_json = json.dumps(branding_checklist or {}, ensure_ascii=False)
+    approved_sources_json = json.dumps(approved_sources or [], ensure_ascii=False)
 
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
@@ -6852,15 +7040,15 @@ def create_channel_trust_plan(
             channel_db_id, niche_keywords, target_channels,
             daily_watch_target, daily_search_target, daily_like_target,
             daily_comment_target, daily_subscribe_target, min_watch_minutes,
-            branding_checklist, status, warmup_phase,
+            branding_checklist, approved_sources, status, warmup_phase,
             created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             channel_db_id, keywords_json, channels_json,
             daily_watch_target, daily_search_target, daily_like_target,
             daily_comment_target, daily_subscribe_target, min_watch_minutes,
-            branding_json, status, warmup_phase,
+            branding_json, approved_sources_json, status, warmup_phase,
             now, now
         )
     )
@@ -6937,6 +7125,11 @@ def update_channel_trust_plan(plan_id: int, **changes) -> dict | None:
         "branding_checklist", "status", "total_videos_watched", "total_searches",
         "total_likes", "total_comments", "total_subscriptions", "trust_score_estimated",
         "error_message", "last_session_at", "last_attempt_at", "next_run_at"
+        , "legacy_trust_score_estimated", "mode", "requires_review",
+        "profile_readiness", "channel_readiness", "profile_readiness_pct",
+        "channel_readiness_pct", "readiness_state", "profile_baseline",
+        "approved_sources", "reminder_enabled", "reminder_time_local",
+        "last_readiness_check_at"
     }
 
     set_clauses = []
@@ -6946,7 +7139,10 @@ def update_channel_trust_plan(plan_id: int, **changes) -> dict | None:
             continue
         if key in ("niche_keywords", "target_channels") and isinstance(value, list):
             value = json.dumps(value, ensure_ascii=False)
-        elif key == "branding_checklist" and isinstance(value, dict):
+        elif key in {"branding_checklist", "profile_readiness", "channel_readiness", "profile_baseline"} and isinstance(value, dict):
+            value = json.dumps(value, ensure_ascii=False)
+            key = f"{key}_json" if key in {"profile_readiness", "channel_readiness", "profile_baseline"} else key
+        elif key == "approved_sources" and isinstance(value, list):
             value = json.dumps(value, ensure_ascii=False)
         set_clauses.append(f"{key} = ?")
         params.append(value)
@@ -6984,6 +7180,7 @@ def delete_channel_trust_plan(plan_id: int) -> bool:
     conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
     try:
         conn.execute("BEGIN IMMEDIATE")
+        conn.execute("DELETE FROM trust_guided_sessions WHERE plan_id = ?", (plan_id,))
         conn.execute("DELETE FROM trust_activity_log WHERE plan_id = ?", (plan_id,))
         cursor = conn.execute(
             "DELETE FROM channel_trust_plans WHERE id = ?", (plan_id,)
@@ -7006,6 +7203,7 @@ def create_trust_activity_log(
     detail_json: dict | None = None,
     success: bool = True,
     error_message: str = "",
+    activity_source: str = "system_verified",
 ) -> dict:
     now = utc_now()
     detail_str = json.dumps(detail_json or {}, ensure_ascii=False)
@@ -7016,12 +7214,14 @@ def create_trust_activity_log(
         """
         INSERT INTO trust_activity_log (
             plan_id, activity_type, target_url, target_title,
-            duration_seconds, detail_json, success, error_message, executed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            duration_seconds, detail_json, success, error_message,
+            activity_source, executed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             plan_id, activity_type, target_url, target_title,
-            duration_seconds, detail_str, 1 if success else 0, error_message, now
+            duration_seconds, detail_str, 1 if success else 0, error_message,
+            activity_source, now
         )
     )
     log_id = cursor.lastrowid
@@ -7051,6 +7251,112 @@ def list_trust_activity_logs(
     ).fetchall()
     conn.close()
     return [_decode_trust_activity_log(row) for row in rows]
+
+
+GUIDED_SESSION_STATUSES = {"ready", "in_progress", "completed", "abandoned"}
+
+
+def _decode_guided_session(row: sqlite3.Row | dict | None) -> dict | None:
+    if row is None:
+        return None
+    data = dict(row)
+    data["agenda"] = _decode_json_field(data.pop("agenda_json", None), {})
+    data["checklist"] = _decode_json_field(data.pop("checklist_json", None), {})
+    return data
+
+
+def create_trust_guided_session(plan_id: int, agenda: dict) -> dict:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            """
+            SELECT * FROM trust_guided_sessions
+            WHERE plan_id = ? AND status IN ('ready', 'in_progress')
+            ORDER BY created_at ASC LIMIT 1
+            """,
+            (plan_id,),
+        ).fetchone()
+        if existing:
+            conn.execute("COMMIT")
+            return _decode_guided_session(existing)
+        cursor = conn.execute(
+            """
+            INSERT INTO trust_guided_sessions (
+                plan_id, status, agenda_json, checklist_json, notes,
+                started_at, completed_at, created_at, updated_at
+            ) VALUES (?, 'ready', ?, '{}', '', '', '', ?, ?)
+            """,
+            (plan_id, json.dumps(agenda, ensure_ascii=False), now, now),
+        )
+        session_id = int(cursor.lastrowid)
+        row = conn.execute(
+            "SELECT * FROM trust_guided_sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        conn.execute("COMMIT")
+        return _decode_guided_session(row)
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def get_trust_guided_session(session_id: int) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM trust_guided_sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    conn.close()
+    return _decode_guided_session(row)
+
+
+def list_trust_guided_sessions(
+    plan_id: int,
+    *,
+    limit: int = 30,
+    offset: int = 0,
+) -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT * FROM trust_guided_sessions
+        WHERE plan_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT ? OFFSET ?
+        """,
+        (plan_id, max(1, min(int(limit), 200)), max(0, int(offset))),
+    ).fetchall()
+    conn.close()
+    return [_decode_guided_session(row) for row in rows]
+
+
+def update_trust_guided_session(session_id: int, **changes) -> dict | None:
+    valid_fields = {"status", "checklist", "notes", "started_at", "completed_at"}
+    invalid = set(changes) - valid_fields
+    if invalid:
+        raise ValueError(f"Unsupported guided session fields: {sorted(invalid)}")
+    if "status" in changes and changes["status"] not in GUIDED_SESSION_STATUSES:
+        raise ValueError("Trạng thái guided session không hợp lệ.")
+    if "checklist" in changes:
+        changes["checklist_json"] = json.dumps(changes.pop("checklist") or {}, ensure_ascii=False)
+    if not changes:
+        return get_trust_guided_session(session_id)
+    changes["updated_at"] = utc_now()
+    assignments = ", ".join(f"{field} = ?" for field in changes)
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.execute(
+        f"UPDATE trust_guided_sessions SET {assignments} WHERE id = ?",
+        (*changes.values(), session_id),
+    )
+    conn.commit()
+    conn.close()
+    return get_trust_guided_session(session_id)
 
 
 def get_trust_activity_stats(

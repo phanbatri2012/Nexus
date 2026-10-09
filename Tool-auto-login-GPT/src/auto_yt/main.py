@@ -6,6 +6,7 @@ from fastapi import (
     HTTPException,
     Query,
     Request,
+    Response,
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
@@ -1050,14 +1051,21 @@ def finish_youtube_oauth(code: str = "", state: str = "", error: str = ""):
 
 
 @app.get("/api/youtube-comments/channels")
-def list_youtube_comment_channels():
-    return {"items": db.list_youtube_channels()}
+def list_youtube_comment_channels(response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    return {
+        "items": [
+            db.public_youtube_channel(channel)
+            for channel in db.list_youtube_channels()
+        ]
+    }
 
 
 @app.patch("/api/youtube-comments/channels/{channel_db_id}")
 def update_youtube_comment_channel(
-    channel_db_id: int, request: YouTubeChannelSettingsRequest
+    channel_db_id: int, request: YouTubeChannelSettingsRequest, response: Response
 ):
+    response.headers["Cache-Control"] = "no-store"
     existing_channel = db.get_youtube_channel(channel_db_id, include_tokens=True)
     if not existing_channel:
         raise HTTPException(status_code=404, detail="Không tìm thấy kênh YouTube.")
@@ -1145,7 +1153,7 @@ def update_youtube_comment_channel(
     channel = db.update_youtube_channel(channel_db_id, **update_data)
     if not request.reply_paused:
         _kick_comment_queue()
-    return channel
+    return db.public_youtube_channel(channel)
 
 
 @app.delete("/api/youtube-comments/channels/{channel_db_id}")
@@ -1366,9 +1374,10 @@ async def open_url_in_gpm_endpoint(profile_id: str, request: GpmOpenUrlRequest):
 
 @app.patch("/api/youtube-comments/channels/{channel_db_id}/gpm-mapping")
 def update_channel_gpm_mapping(
-    channel_db_id: int, request: GpmChannelMappingRequest
+    channel_db_id: int, request: GpmChannelMappingRequest, response: Response
 ):
     """Map or unmap a GPM profile to a YouTube channel."""
+    response.headers["Cache-Control"] = "no-store"
     channel = db.update_youtube_channel(
         channel_db_id,
         gpm_profile_id=request.gpm_profile_id.strip(),
@@ -1378,7 +1387,7 @@ def update_channel_gpm_mapping(
     )
     if not channel:
         raise HTTPException(status_code=404, detail="Không tìm thấy kênh YouTube.")
-    return channel
+    return db.public_youtube_channel(channel)
 
 
 @app.post("/api/youtube-comments/channels/{channel_db_id}/open-studio")

@@ -1802,19 +1802,23 @@ def launch_chatgpt_context(
             ) from last_error
         time.sleep(min(retry_interval, remaining_seconds))
 
-def get_active_prompts():
+def get_active_prompts(prompt_version: str = ""):
     try:
         if PROMPTS_PATH.exists():
             data = json.loads(PROMPTS_PATH.read_text(encoding="utf-8"))
-            # Allow env var override (for per-request version selection)
             import os
-            version_override = os.environ.get("PROMPT_VERSION", "").strip()
+            version_override = (
+                prompt_version.strip()
+                if prompt_version
+                else os.environ.get("PROMPT_VERSION", "").strip()
+            )
             active_version = version_override if version_override else data.get("active_version", "default")
-            if active_version in data["versions"]:
+            if active_version in data.get("versions", {}):
                 return data["versions"][active_version]["prompts"]
             # Fallback to configured active version
             active_version = data.get("active_version", "default")
-            return data["versions"][active_version]["prompts"]
+            if active_version in data.get("versions", {}):
+                return data["versions"][active_version]["prompts"]
     except Exception as e:
         print(f"Error loading prompts: {e}", file=sys.stderr)
     
@@ -4292,7 +4296,8 @@ def _run_complete(transcript: str, state: dict) -> dict:
         launch_chatgpt_context(p.chromium, profile_dir)
     ) as context:
         page = context.pages[0] if context.pages else context.new_page()
-        project_url = get_chatgpt_project_url()
+        prompt_version = state.get("prompt_version", "")
+        project_url = get_chatgpt_project_url(prompt_version)
         resume_url = state.get("chat_url", "")
         is_resuming = is_chatgpt_conversation_url(resume_url)
         if is_resuming:
@@ -4311,7 +4316,7 @@ def _run_complete(transcript: str, state: dict) -> dict:
         else:
             navigate_to_chatgpt_project(page, project_url)
 
-        prompts = get_active_prompts()
+        prompts = get_active_prompts(prompt_version)
         pipeline = normalize_prompt_pipeline(state.get("pipeline"))
         state["pipeline"] = pipeline
 
@@ -4793,6 +4798,7 @@ def run(transcript: str) -> dict:
     transcript_fingerprint = hashlib.sha256(
         transcript.encode("utf-8")
     ).hexdigest()
+    prompt_version = os.environ.get("PROMPT_VERSION", "").strip()
     state = {
         "chat_url": "",
         "current_step": "startup",
@@ -4809,6 +4815,7 @@ def run(transcript: str) -> dict:
         "thumb_notext": "",
         "pending_prompt": None,
         "pipeline": get_active_pipeline(),
+        "prompt_version": prompt_version,
         "transcript_fingerprint": transcript_fingerprint,
     }
     video_id = _checkpoint_video_id()
@@ -4816,6 +4823,10 @@ def run(transcript: str) -> dict:
         saved_state = load_checkpoint(video_id)
         if saved_state and saved_state.get("transcript_fingerprint") == transcript_fingerprint:
             state.update(saved_state)
+            if prompt_version:
+                state["prompt_version"] = prompt_version
+            elif not state.get("prompt_version") and saved_state.get("prompt_version"):
+                state["prompt_version"] = saved_state.get("prompt_version")
             if os.environ.get(PROMPT_PIPELINE_ENV, "").strip():
                 # The persistent queue snapshot is authoritative for automatic
                 # recovery, even if Settings changed while the job was waiting.
@@ -4926,7 +4937,7 @@ def generate_chapters_only(
             if prompt_version:
                 os.environ["PROMPT_VERSION"] = prompt_version
             try:
-                prompts = get_active_prompts()
+                prompts = get_active_prompts(prompt_version)
             finally:
                 if original_prompt_version is not None:
                     os.environ["PROMPT_VERSION"] = original_prompt_version
@@ -4976,7 +4987,7 @@ def generate_single_component_only(
             if prompt_version:
                 os.environ["PROMPT_VERSION"] = prompt_version
             try:
-                prompts = get_active_prompts()
+                prompts = get_active_prompts(prompt_version)
             finally:
                 if original_prompt_version is not None:
                     os.environ["PROMPT_VERSION"] = original_prompt_version
@@ -5047,7 +5058,7 @@ def generate_metadata_only(
             if prompt_version:
                 os.environ["PROMPT_VERSION"] = prompt_version
             try:
-                prompts = get_active_prompts()
+                prompts = get_active_prompts(prompt_version)
             finally:
                 if original_prompt_version is not None:
                     os.environ["PROMPT_VERSION"] = original_prompt_version
@@ -5213,7 +5224,7 @@ def generate_thumbnails_only(
             os.environ["PROMPT_VERSION"] = prompt_version
             
         try:
-            prompts = get_active_prompts()
+            prompts = get_active_prompts(prompt_version)
         finally:
             if original_env is not None:
                 os.environ["PROMPT_VERSION"] = original_env
@@ -5327,7 +5338,7 @@ def _generate_single_thumbnail(
         if prompt_version:
             os.environ["PROMPT_VERSION"] = prompt_version
         try:
-            prompts = get_active_prompts()
+            prompts = get_active_prompts(prompt_version)
         finally:
             if original_prompt_version is not None:
                 os.environ["PROMPT_VERSION"] = original_prompt_version
