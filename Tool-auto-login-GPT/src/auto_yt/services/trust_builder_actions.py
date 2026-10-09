@@ -655,8 +655,25 @@ async def action_like_video(page: Any) -> str:
             await btn.scroll_into_view_if_needed()
             await asyncio.sleep(random.uniform(0.3, 0.6))
             await btn.click()
-            await asyncio.sleep(random.uniform(1.2, 2.5))
-            logger.info("Đã Like video thành công!")
+            try:
+                await page.wait_for_function(
+                    """() => {
+                        const selectors = [
+                            '[data-trust-builder-action="like"]',
+                            'like-button-view-model button',
+                            'ytd-watch-metadata #segmented-like-button button'
+                        ];
+                        return selectors.some(selector => {
+                            const node = document.querySelector(selector);
+                            return node && node.getAttribute('aria-pressed') === 'true';
+                        });
+                    }""",
+                    timeout=5000,
+                )
+            except Exception:
+                logger.warning("YouTube chưa xác nhận trạng thái Like sau khi click.")
+                return ACTION_FAILED
+            logger.info("YouTube đã xác nhận video ở trạng thái Like.")
             return ACTION_PERFORMED
         return ACTION_NOT_FOUND
     except Exception as exc:
@@ -713,8 +730,35 @@ async def action_comment_video(page: Any, comment_text: str) -> str:
         submit_btn = await page.query_selector(submit_btn_sel)
         if submit_btn and await submit_btn.is_enabled():
             await submit_btn.click()
-            await asyncio.sleep(random.uniform(1.5, 3.0))
-            logger.info("Đã gửi bình luận thành công!")
+            try:
+                await page.wait_for_function(
+                    r"""commentText => {
+                        const normalize = value => (value || '').replace(/\s+/g, ' ').trim();
+                        const expected = normalize(commentText);
+                        const visibleComment = Array.from(document.querySelectorAll(
+                            'ytd-comment-thread-renderer #content-text, ytd-comment-renderer #content-text'
+                        )).some(node => normalize(node.textContent) === expected);
+                        const editor = document.querySelector(
+                            '#contenteditable-root, ytd-commentbox #contenteditable-root, div#contenteditable-textarea'
+                        );
+                        const submit = document.querySelector(
+                            '#submit-button button, ytd-commentbox #submit-button button'
+                        );
+                        const editorReset = Boolean(
+                            editor
+                            && normalize(editor.textContent) === ''
+                            && submit
+                            && (submit.disabled || submit.getAttribute('aria-disabled') === 'true')
+                        );
+                        return visibleComment || editorReset;
+                    }""",
+                    clean_text,
+                    timeout=8000,
+                )
+            except Exception:
+                logger.warning("YouTube chưa xác nhận bình luận sau khi gửi.")
+                return ACTION_FAILED
+            logger.info("YouTube đã xác nhận bình luận được gửi.")
             return ACTION_PERFORMED
 
         logger.warning("Nút Gửi bình luận không kích hoạt.")
@@ -772,8 +816,31 @@ async def action_subscribe_channel(page: Any) -> str:
             await btn.scroll_into_view_if_needed()
             await asyncio.sleep(random.uniform(0.3, 0.6))
             await btn.click()
-            await asyncio.sleep(random.uniform(1.5, 3.0))
-            logger.info("Đã bấm Subscribe kênh đối thủ thành công!")
+            try:
+                await page.wait_for_function(
+                    """() => {
+                        const selectors = [
+                            '[data-trust-builder-action="subscribe"]',
+                            'ytd-watch-metadata #subscribe-button button',
+                            'ytd-subscribe-button-renderer button',
+                            'subscribe-button-view-model button',
+                            '#subscribe-button-shape button'
+                        ];
+                        return selectors.some(selector => {
+                            const node = document.querySelector(selector);
+                            if (!node) return false;
+                            const text = (node.innerText || node.getAttribute('aria-label') || '').toLowerCase();
+                            return text.includes('subscribed')
+                                || text.includes('đã đăng ký')
+                                || node.getAttribute('aria-pressed') === 'true';
+                        });
+                    }""",
+                    timeout=6000,
+                )
+            except Exception:
+                logger.warning("YouTube chưa xác nhận trạng thái Subscribe sau khi click.")
+                return ACTION_FAILED
+            logger.info("YouTube đã xác nhận kênh ở trạng thái Subscribed.")
             return ACTION_PERFORMED
         return ACTION_NOT_FOUND
     except Exception as exc:

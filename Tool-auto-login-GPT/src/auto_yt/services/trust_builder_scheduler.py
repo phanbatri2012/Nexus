@@ -1,4 +1,4 @@
-"""Timezone-aware reminder scheduler for human-operated Guided Readiness."""
+"""Timezone-aware scheduler and system-job runner for Trust Builder."""
 
 from __future__ import annotations
 
@@ -13,8 +13,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from auto_yt.services import database as db, security_logging
 from auto_yt.services.trust_builder_service import (
     TRUST_JOB_TYPE,
-    create_guided_readiness_session,
+    get_active_plan_job,
     run_warmup_session,
+    validate_plan_browser_configuration,
 )
 
 logger = logging.getLogger(__name__)
@@ -79,7 +80,33 @@ def enqueue_trust_builder_session(
     source: str,
     run_immediately: bool,
 ) -> tuple[dict[str, Any], bool]:
-    raise ValueError("Automated warm-up đã bị vô hiệu hóa; hãy dùng Guided Readiness.")
+    plan = db.get_channel_trust_plan(plan_id)
+    if not plan:
+        raise ValueError("Không tìm thấy Trust Plan.")
+    if plan.get("status") == "completed":
+        raise ValueError("Plan đã hoàn tất; không thể chạy thêm session.")
+    validate_plan_browser_configuration(plan)
+    existing_job = get_active_plan_job(plan_id)
+    if existing_job:
+        return existing_job, False
+    if source == "scheduled" and plan.get("status") != "active":
+        raise ValueError("Plan không ở trạng thái active.")
+
+    job_id = f"trust_builder_{plan_id}_{uuid.uuid4().hex}"
+    job = db.create_system_job(
+        job_id=job_id,
+        job_type=TRUST_JOB_TYPE,
+        title=f"Trust Builder · {plan.get('channel_title') or f'Plan #{plan_id}'}",
+        payload={"plan_id": plan_id, "source": source},
+    )
+    db.update_channel_trust_plan(
+        plan_id,
+        last_attempt_at=db.utc_now(),
+        error_message="",
+    )
+    if run_immediately:
+        trigger_queue_drain()
+    return job, True
 
 
 async def _execute_claimed_job(job: dict[str, Any]) -> None:
@@ -158,8 +185,14 @@ async def _execute_claimed_job(job: dict[str, Any]) -> None:
 
 
 async def _drain_job_queue() -> None:
-    # Legacy jobs are never claimed. The migration cancels any pre-existing rows.
-    return
+    async with _drain_lock:
+        while True:
+            job = db.claim_next_system_job(TRUST_JOB_TYPE)
+            if not job:
+                return
+            task = asyncio.create_task(_execute_claimed_job(job))
+            _job_tasks.add(task)
+            task.add_done_callback(_job_tasks.discard)
 
 
 def trigger_queue_drain() -> None:
@@ -171,53 +204,73 @@ def trigger_queue_drain() -> None:
 
 
 def _is_plan_due(plan: dict[str, Any], now_utc: datetime.datetime) -> bool:
-    next_run_at = _parse_utc(str(plan.get("next_run_at") or ""))
-    if next_run_at is not None:
-        return next_run_at <= now_utc
-    local_now = now_utc.astimezone(_plan_timezone(plan))
-    try:
-        hour, minute = (int(part) for part in str(plan.get("reminder_time_local") or "09:00").split(":", 1))
-    except (TypeError, ValueError):
-        hour, minute = 9, 0
-    return (local_now.hour, local_now.minute) >= (
-        max(0, min(hour, 23)),
-        max(0, min(minute, 59)),
-    )
-
-
-def _next_guided_reminder(plan: dict[str, Any], now_utc: datetime.datetime) -> str:
     timezone = _plan_timezone(plan)
-    local_now = now_utc.astimezone(timezone)
-    try:
-        hour, minute = (int(part) for part in str(plan.get("reminder_time_local") or "09:00").split(":", 1))
-    except (TypeError, ValueError):
-        hour, minute = 9, 0
-    next_local = datetime.datetime.combine(
-        local_now.date() + datetime.timedelta(days=1),
-        datetime.time(hour=max(0, min(hour, 23)), minute=max(0, min(minute, 59))),
-        tzinfo=timezone,
-    )
-    return next_local.astimezone(datetime.timezone.utc).replace(microsecond=0).isoformat()
+    local_hour = now_utc.astimezone(timezone).hour
+    if local_hour < ACTIVE_START_HOUR or local_hour >= ACTIVE_END_HOUR:
+        return False
+    next_run_at = _parse_utc(str(plan.get("next_run_at") or ""))
+    return next_run_at is None or next_run_at <= now_utc
 
 
 async def _evaluate_active_plans() -> None:
     now_utc = _utc_now()
     for plan in db.list_channel_trust_plans():
-        if not plan.get("reminder_enabled") or not _is_plan_due(plan, now_utc):
+        if plan.get("status") != "active" or not _is_plan_due(plan, now_utc):
             continue
         plan_id = int(plan["id"])
-        try:
-            create_guided_readiness_session(plan_id)
+        daily_stats = db.get_trust_daily_activity_stats(
+            plan_id,
+            str(plan.get("publication_timezone") or "Asia/Ho_Chi_Minh"),
+            now_utc=now_utc,
+        )
+        if (
+            daily_stats.get("search_count", 0) >= int(plan.get("daily_search_target"))
+            or daily_stats.get("watch_count", 0) >= int(plan.get("daily_watch_target"))
+        ):
             db.update_channel_trust_plan(
                 plan_id,
-                next_run_at=_next_guided_reminder(plan, now_utc),
-                error_message="",
+                next_run_at=_next_active_start(plan, now_utc),
             )
-        except Exception as exc:
+            continue
+        try:
+            enqueue_trust_builder_session(
+                plan_id,
+                source="scheduled",
+                run_immediately=False,
+            )
+        except ValueError as exc:
             safe_error = security_logging.redact_sensitive(exc)
             db.update_channel_trust_plan(
                 plan_id,
+                status="error",
                 error_message=safe_error,
+            )
+    await _drain_job_queue()
+
+
+_last_safety_sync_check: datetime.datetime | None = None
+
+
+async def _check_periodic_safety_sync() -> None:
+    global _last_safety_sync_check
+    now = _utc_now()
+    if _last_safety_sync_check is not None and (now - _last_safety_sync_check).total_seconds() < 3600:
+        return
+    _last_safety_sync_check = now
+    config = db.get_safety_config()
+    if not config.get("shield_enabled", True):
+        return
+    last_synced_str = str(config.get("last_synced_at") or "")
+    interval_hours = int(config.get("auto_sync_interval_hours") or 24)
+    last_synced = _parse_utc(last_synced_str)
+    if last_synced is None or (now - last_synced).total_seconds() >= (interval_hours * 3600):
+        try:
+            from auto_yt.services import trust_builder_safety as safety
+            safety.sync_safety_blacklist_from_remote()
+        except Exception as exc:
+            logger.warning(
+                "Lỗi tự động đồng bộ Safety Blacklist định kỳ: %s",
+                security_logging.redact_sensitive(exc),
             )
 
 
@@ -229,6 +282,7 @@ async def _scheduler_loop() -> None:
     await asyncio.sleep(STARTUP_DELAY_SECONDS)
     while _scheduler_running:
         try:
+            await _check_periodic_safety_sync()
             await _evaluate_active_plans()
         except asyncio.CancelledError:
             raise
@@ -273,7 +327,6 @@ def get_trust_builder_scheduler_status() -> dict[str, Any]:
         "ready": bool(_scheduler_task and not _scheduler_task.done()),
         "startup_delay_seconds": STARTUP_DELAY_SECONDS,
         "active_jobs": sum(not task.done() for task in _job_tasks),
-        "mode": "guided_reminders_only",
     }
 
 

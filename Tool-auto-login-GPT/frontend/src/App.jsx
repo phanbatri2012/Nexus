@@ -1878,7 +1878,7 @@ function App() {
           <li className={`nav-item ${activeView === 'jobs' ? 'active' : ''}`} data-view="jobs" onClick={() => setActiveView('jobs')}>Trung tâm Job</li>
           <li className={`nav-item ${activeView === 'comments' ? 'active' : ''}`} data-view="comments" onClick={() => setActiveView('comments')}>Bình luận YouTube</li>
           <li className={`nav-item ${activeView === 'channels' ? 'active' : ''}`} data-view="channels" onClick={() => setActiveView('channels')}>Channel Hub</li>
-          <li className={`nav-item ${activeView === 'trustbuilder' ? 'active' : ''}`} data-view="trustbuilder" onClick={() => setActiveView('trustbuilder')}>Readiness</li>
+          <li className={`nav-item ${activeView === 'trustbuilder' ? 'active' : ''}`} data-view="trustbuilder" onClick={() => setActiveView('trustbuilder')}>Trust Builder</li>
           <li className={`nav-item ${activeView === 'crossposter' ? 'active' : ''}`} data-view="crossposter" onClick={() => setActiveView('crossposter')}>Cross-Poster</li>
           <li className={`nav-item ${activeView === 'fetcher' ? 'active' : ''}`} data-view="fetcher" onClick={() => setActiveView('fetcher')}>Video Fetcher</li>
           <li

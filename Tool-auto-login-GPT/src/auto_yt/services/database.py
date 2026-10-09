@@ -17,6 +17,7 @@ DB_PATH = Path(os.environ.get("AUTO_YT_DB_PATH") or PROJECT_ROOT / "data" / "dat
 TTS_V2_BACKUP_SUFFIX = ".pre_tts_v2.bak"
 NULLABLE_PUBLICATION_CHANNEL_BACKUP_SUFFIX = ".pre_nullable_publication_channel.bak"
 TRUST_READINESS_V1_MIGRATION = "trust_readiness_v1"
+TRUST_AUTOMATION_RESTORE_V1_MIGRATION = "trust_automation_restore_v1"
 
 VIDEO_STATUS_ACTIVE = "active"
 VIDEO_STATUS_ERROR = "error"
@@ -1450,7 +1451,7 @@ def init_db():
             total_subscriptions INTEGER DEFAULT 0,
             trust_score_estimated INTEGER DEFAULT 0,
             legacy_trust_score_estimated INTEGER DEFAULT 0,
-            mode TEXT NOT NULL DEFAULT 'guided',
+            mode TEXT NOT NULL DEFAULT 'automated',
             requires_review INTEGER NOT NULL DEFAULT 0,
             profile_readiness_json TEXT NOT NULL DEFAULT '{}',
             channel_readiness_json TEXT NOT NULL DEFAULT '{}',
@@ -1559,6 +1560,7 @@ def init_db():
         )
     ''')
     _migrate_trust_builder_guided_mode(conn)
+    _migrate_trust_builder_automation_restore(conn)
 
     c.execute('''
         CREATE TABLE IF NOT EXISTS trust_safety_blacklist (
@@ -1872,6 +1874,35 @@ def _migrate_trust_builder_guided_mode(conn: sqlite3.Connection) -> None:
     conn.execute(
         "INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)",
         (TRUST_READINESS_V1_MIGRATION, now),
+    )
+
+
+def _migrate_trust_builder_automation_restore(conn: sqlite3.Connection) -> None:
+    """Restore legacy automation plans without restarting them or reviving jobs."""
+    applied = conn.execute(
+        "SELECT 1 FROM schema_migrations WHERE name = ?",
+        (TRUST_AUTOMATION_RESTORE_V1_MIGRATION,),
+    ).fetchone()
+    if applied:
+        return
+    now = utc_now()
+    conn.execute(
+        """
+        UPDATE channel_trust_plans
+        SET trust_score_estimated = legacy_trust_score_estimated,
+            mode = 'automated',
+            requires_review = 0,
+            readiness_state = 'legacy_restored',
+            status = 'paused',
+            next_run_at = '',
+            updated_at = ?
+        WHERE legacy_trust_score_estimated > 0
+        """,
+        (now,),
+    )
+    conn.execute(
+        "INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)",
+        (TRUST_AUTOMATION_RESTORE_V1_MIGRATION, now),
     )
 
 
@@ -7040,9 +7071,9 @@ def create_channel_trust_plan(
             channel_db_id, niche_keywords, target_channels,
             daily_watch_target, daily_search_target, daily_like_target,
             daily_comment_target, daily_subscribe_target, min_watch_minutes,
-            branding_checklist, approved_sources, status, warmup_phase,
+            branding_checklist, approved_sources, status, warmup_phase, mode,
             created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'automated', ?, ?)
         """,
         (
             channel_db_id, keywords_json, channels_json,

@@ -459,15 +459,7 @@ async def run_warmup_session(
     job_id: str = "",
     require_active: bool = False,
 ) -> dict[str, Any]:
-    """Legacy entry point retained only to reject automated engagement."""
-    return {
-        "success": False,
-        "disabled": True,
-        "message": "Automated warm-up đã bị vô hiệu hóa; hãy dùng Guided Readiness.",
-    }
-
-    # The legacy implementation remains below temporarily for history/reference,
-    # but is intentionally unreachable and cannot launch a browser.
+    """Run one automated warm-up session inside the channel's GPM profile."""
     lock = await _get_plan_lock(plan_id)
     if lock.locked():
         logger.warning("Session cho Plan ID %d đang chạy, bỏ qua yêu cầu trùng lặp.", plan_id)
@@ -650,7 +642,7 @@ async def run_warmup_session(
                                 )
 
                     daily_stats = db.get_trust_daily_activity_stats(plan_id, timezone_name)
-                    if warmup_phase == "phase_2_engage" and not should_cancel():
+                    if warmup_phase == "phase_2_engage" and is_safe_engage and not should_cancel():
                         daily_comment_target = int(plan.get("daily_comment_target") or 0)
                         if (
                             daily_stats.get("comment_count", 0) < daily_comment_target
@@ -678,7 +670,7 @@ async def run_warmup_session(
                                 )
 
                     daily_stats = db.get_trust_daily_activity_stats(plan_id, timezone_name)
-                    if warmup_phase == "phase_2_engage" and not should_cancel():
+                    if warmup_phase == "phase_2_engage" and is_safe_engage and not should_cancel():
                         daily_sub_target = int(plan.get("daily_subscribe_target") or 0)
                         if (
                             daily_stats.get("subscribe_count", 0) < daily_sub_target
@@ -783,10 +775,13 @@ async def audit_channel_branding_for_plan(plan_id: int) -> dict[str, Any]:
             finally:
                 await cleanup_owned_page(context, page)
 
+        stats = db.get_trust_activity_stats(plan_id)
+        plan["branding_checklist"] = checklist
+        new_score = calculate_trust_score(plan, stats)
         db.update_channel_trust_plan(
             plan_id=plan_id,
             branding_checklist=checklist,
-            trust_score_estimated=0,
+            trust_score_estimated=new_score,
         )
 
         db.create_trust_activity_log(
@@ -794,12 +789,12 @@ async def audit_channel_branding_for_plan(plan_id: int) -> dict[str, Any]:
             activity_type="branding_audit",
             detail_json=checklist,
             success=True,
-            activity_source="interactive_readiness",
         )
 
         return {
             "success": True,
             "checklist": checklist,
+            "trust_score": new_score,
         }
     except Exception as exc:
         safe_error = security_logging.redact_sensitive(exc)
@@ -830,22 +825,25 @@ async def audit_feature_eligibility_for_plan(plan_id: int) -> dict[str, Any]:
 
         checklist = dict(plan.get("branding_checklist") or {})
         checklist["feature_level"] = feature_result.get("feature_level", "unknown")
+        stats = db.get_trust_activity_stats(plan_id)
+        plan["branding_checklist"] = checklist
+        new_score = calculate_trust_score(plan, stats)
         updated = db.update_channel_trust_plan(
             plan_id,
             branding_checklist=checklist,
-            trust_score_estimated=0,
+            trust_score_estimated=new_score,
         )
         db.create_trust_activity_log(
             plan_id=plan_id,
             activity_type="feature_audit",
             detail_json=feature_result,
             success=bool(feature_result.get("verified")),
-            activity_source="interactive_readiness",
         )
         return {
             "success": True,
             "verified": bool(feature_result.get("verified")),
             "feature_level": checklist["feature_level"],
+            "trust_score": new_score,
             "plan": updated,
         }
     except Exception as exc:
