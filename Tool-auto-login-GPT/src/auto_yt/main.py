@@ -425,7 +425,7 @@ class PromptPublishingData(BaseModel):
     premiere: bool = False
     checks_policy: str = "schedule_immediately"
     description_template: str = Field(
-        default="{description}\n\n{chapters}\n\n{tags}", max_length=5000
+        default="{description}\n\n{chapters}\n\n{hashtags}", max_length=5000
     )
 
     model_config = ConfigDict(extra="allow")
@@ -8292,7 +8292,7 @@ async def preview_youtube_description_endpoint(video_id: int):
         "success": True,
         "video_id": video_id,
         "actual_description": actual_description,
-        "template": publishing_settings.get("description_template", "{description}\n\n{chapters}\n\n{tags}")
+        "template": publishing_settings.get("description_template", "{description}\n\n{chapters}\n\n{hashtags}")
     }
 
 

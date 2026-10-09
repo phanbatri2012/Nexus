@@ -188,9 +188,9 @@ def build_upload_metadata(video: dict, publishing_settings: dict) -> dict:
     if not title:
         title = db.extract_generated_video_title(video.get("generated_script") or "")
 
-    description = str(video.get("description") or "").strip()
+    description = build_actual_youtube_description(video, publishing_settings)
     if not description:
-        description = build_actual_youtube_description(video, publishing_settings)
+        description = str(video.get("description") or "").strip()
 
     if not title:
         raise YouTubePublishError("Video chưa có tiêu đề YouTube hợp lệ.")

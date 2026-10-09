@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import html
 import json
 import logging
 import re
 import time
+import unicodedata
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -23,6 +25,19 @@ from auto_yt.services.channel_scanner_service import channel_browser_session, cl
 from auto_yt.services.browser_diagnostics import capture_browser_diagnostics_async
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_youtube_metadata_field(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return ""
+    val = html.unescape(text)
+    val = val.replace("\u00a0", " ").replace("\u200b", "").replace("\ufeff", "")
+    val = unicodedata.normalize("NFC", val)
+    val = re.sub(r":::[a-zA-Z0-9_\-]*(?:\{[^}]*\})?", "", val, flags=re.DOTALL)
+    val = re.sub(r"(?m)^\s*:::\s*$", "", val)
+    val = re.sub(r"\s*:::\s*$", "", val)
+    val = re.sub(r"\\([!:#\[\]\(\)\.\?\-\*_`|])", r"\1", val)
+    return val.strip()
 
 
 class BrowserUploadError(RuntimeError):
@@ -2976,7 +2991,9 @@ async def upload_video_via_browser(
         1800.0,
     )
 
-    tags_list = tags or []
+    title = _sanitize_youtube_metadata_field(title)
+    description = _sanitize_youtube_metadata_field(description)
+    tags_list = [_sanitize_youtube_metadata_field(t) for t in (tags or []) if _sanitize_youtube_metadata_field(t)]
     settings = dict(publishing_settings or {})
     monetization_mode = str(
         settings.get("monetization_mode") or MONETIZATION_MODE_AUTO

@@ -2,9 +2,11 @@ import sys
 import time
 import asyncio
 import base64
+import html
 import json
 import os
 import re
+import unicodedata
 import uuid
 import hashlib
 from collections.abc import Callable
@@ -128,13 +130,15 @@ CHATGPT_MESSAGE_CORRELATION_FIELDS = (
 )
 NARRATIVE_ONLY_INSTRUCTION = (
     "\n\nYÊU CẦU ĐẦU RA CHO PHẦN NỘI DUNG: Chỉ viết văn xuôi liền mạch trong tin nhắn chat thông thường. "
-    "TUYỆT ĐỐI KHÔNG mở Canvas, KHÔNG tạo document/tài liệu rời hay artifact riêng. "
+    "TUYỆT ĐỐI KHÔNG mở Canvas, KHÔNG tạo document/tài liệu rời hay artifact riêng, KHÔNG dùng thẻ directive như :::writing...:::. "
+    "TUYỆT ĐỐI KHÔNG dùng mã ký tự HTML (như &#124;, &amp;, &quot;, &#39;), luôn dùng ký tự thực tế (|, &, \", '). "
     "Không chèn tiêu đề, nhãn chuyển đoạn, dàn ý, ghi chú biên tập hoặc "
     "chỉ dẫn về cách viết."
 )
 STRICT_NO_FILLER = (
     "\n\nLƯU Ý QUAN TRỌNG: TRẢ LỜI TRỰC TIẾP VÀO NỘI DUNG BẰNG TIN NHẮN VĂN BẢN THƯỜNG TRONG KHUNG CHAT. "
-    "TUYỆT ĐỐI KHÔNG MỞ CANVAS, KHÔNG TẠO DOCUMENT/TÀI LIỆU RỜI. "
+    "TUYỆT ĐỐI KHÔNG MỞ CANVAS, KHÔNG TẠO DOCUMENT/TÀI LIỆU RỜI, KHÔNG DÙNG THẺ DIRECTIVE :::writing...:::. "
+    "TUYỆT ĐỐI KHÔNG DÙNG KÝ TỰ MÃ HÓA HTML (như &#124;, &amp;, &quot;, &#39;), LUÔN DÙNG KÝ TỰ THỰC TẾ (|, &, \", '). "
     "TUYỆT ĐỐI KHÔNG CHÀO HỎI, KHÔNG DẠ VÂNG, KHÔNG THÊM BẤT KỲ CÂU DẪN HAY GIẢI THÍCH NÀO "
     "(VD: 'Dưới đây là...', 'Trân trọng gửi bạn...'). CHỈ IN RA ĐÚNG NỘI DUNG CẦN VIẾT."
 )
@@ -1995,21 +1999,35 @@ TRAILING_ACTION_PILLS_PATTERN = re.compile(
 
 
 def clean_text(text: str) -> str:
-    """Removes 'Edit', citations, search badges, Canvas artifacts, LaTeX backslash escapes, and common AI conversational fillers from the output."""
+    """Removes 'Edit', citations, search badges, Canvas artifacts, LaTeX backslash escapes, HTML entities, and common AI conversational fillers from the output."""
     if not isinstance(text, str) or not text:
         return ""
+    
+    # 1. Decode HTML entities (e.g. &#124; -> |, &quot; -> ", &amp; -> &, &#39; -> ', etc.)
+    text = html.unescape(text)
+
+    # 2. Normalize special Unicode spaces and characters (\u00a0 -> space, remove zero-width chars)
+    text = text.replace("\u00a0", " ").replace("\u200b", "").replace("\u200c", "").replace("\u200d", "").replace("\ufeff", "")
+    text = unicodedata.normalize("NFC", text)
+
+    # 3. Strip Canvas / Document container directives (e.g. :::writing{variant="document" id="58341"}, :::document{...}, :::artifact, etc.)
+    text = re.sub(r":::[a-zA-Z0-9_\-]*(?:\{[^}]*\})?", "", text, flags=re.DOTALL)
+    text = re.sub(r"(?m)^\s*:::\s*$", "", text)
+    text = re.sub(r"\s*:::\s*$", "", text)
+
+    # 4. Remove citation artifacts
     text = remove_citation_artifacts(text)
     
-    # Strip unnecessary LaTeX/Markdown backslash escapes: \!, \:, \#, \[, \], \(, \), \., \?, \-, \*, \_, \`
-    text = re.sub(r"\\([!:#\[\]\(\)\.\?\-\*_`])", r"\1", text)
+    # 5. Strip unnecessary LaTeX/Markdown backslash escapes: \!, \:, \#, \[, \], \(, \), \., \?, \-, \*, \_, \`, \|
+    text = re.sub(r"\\([!:#\[\]\(\)\.\?\-\*_`|])", r"\1", text)
     
-    # Strip inline structural/canvas headers prepended to paragraphs (e.g. "Nội dung chính: ...", "Mở đầu video: ...", "Mở đầu:")
+    # 6. Strip inline structural/canvas headers prepended to paragraphs (e.g. "Nội dung chính: ...", "Mở đầu video: ...", "Mở đầu:")
     canvas_inline_header = re.compile(
         r"^(?:(?:mở\s+(?:đầu|bài)|kết\s+(?:thúc|bài|luận)|intro|body|outro|thân\s+bài)\s+(?:video|kịch\s+bản|bài\s+viết)\s*[:\-–—]?|(?:mở\s+(?:đầu|bài)|kết\s+(?:thúc|bài|luận)|intro|body|outro|thân\s+bài|nội\s+dung\s+chính|dàn\s+ý(?:\s+chi\s+tiết)?)\s*[:\-–—])\s*",
         flags=re.IGNORECASE,
     )
     
-    # Strip standalone section delimiters leaking into narrative lines
+    # 7. Strip standalone section delimiters leaking into narrative lines
     section_delimiter_line = re.compile(
         r"^(?:#{1,6}\s*)?(?:\*\*)?\\?\[\s*(?:phần|phan|part|section|intro|outro|body)\s*(?:\d+)?(?:\s*[:\-–—].*?)?\s*\\?\](?:\*\*)?$",
         flags=re.IGNORECASE,
@@ -2028,7 +2046,7 @@ def clean_text(text: str) -> str:
             cleaned.append("")
             continue
         lower_line = stripped.lower()
-        if lower_line == "edit":
+        if lower_line == "edit" or lower_line.startswith(":::") or lower_line == ":::":
             continue
         if section_delimiter_line.match(stripped):
             continue
@@ -2045,6 +2063,10 @@ def clean_text(text: str) -> str:
     result = '\n'.join(cleaned).strip()
     # Remove leading 'Edit' that might be left if it wasn't on its own line
     result = re.sub(r'^\s*Edit\s*\n*', '', result)
+    # Remove residual container colons if any
+    result = re.sub(r"(?m)^\s*:::\s*$", "", result)
+    result = re.sub(r"\s*:::\s*$", "", result)
+    result = re.sub(r"^\s*:::\s*", "", result)
     # Remove trailing Canvas Action Pills or suggestions attached to narrative ends
     result = TRAILING_ACTION_PILLS_PATTERN.sub(r'\1', result).strip()
     return result
@@ -2362,6 +2384,10 @@ def _extract_clean_markdown_text(node) -> str:
                 '[data-testid*="document-header"]',
                 '[class*="canvas-header"]',
                 '[class*="document-header"]',
+                '[data-testid*="writing-block"]',
+                '.writing-block-editor',
+                '[class*="writing-block"]',
+                '[class*="writing_block"]',
                 '[class*="suggestion"]',
                 '[class*="pill"]',
                 '[class*="chip"]',
@@ -4185,12 +4211,14 @@ def sanitize_and_repair_metadata(state: dict) -> None:
 
     # Case 3: Title cleanup
     if state.get("title"):
+        cleaned_title = clean_text(str(state["title"]))
         cleaned_title = re.sub(
             r"^(?:tiêu đề(?:\s*video)?\s*:\s*|\*\*\s*tiêu đề\s*:\s*\*\*|#+\s*)",
             "",
-            str(state["title"]),
+            cleaned_title,
             flags=re.IGNORECASE,
         ).strip().strip('"“”\'`#* ')
+        cleaned_title = re.sub(r"[ \t]*\|[ \t]*", " | ", cleaned_title)
         if len(cleaned_title) > 120 and looks_like_outro_or_cta(cleaned_title):
             pass
         else:
@@ -4198,11 +4226,23 @@ def sanitize_and_repair_metadata(state: dict) -> None:
 
     # Case 4: Slug cleanup
     if state.get("slug"):
-        cleaned_slug = str(state["slug"]).strip().strip("`*#\"' ")
+        cleaned_slug = clean_text(str(state["slug"])).strip("`*#\"' ")
         cleaned_slug = re.sub(r"^(?:url\s*slug|slug)\s*:\s*", "", cleaned_slug, flags=re.IGNORECASE).strip()
         if not is_likely_slug(cleaned_slug):
             cleaned_slug = re.sub(r"[^a-zA-Z0-9\-_]+", "-", cleaned_slug.lower()).strip("-")
         state["slug"] = cleaned_slug[:80]
+
+    # Description & other metadata cleanup
+    if state.get("description"):
+        state["description"] = clean_text(str(state["description"]))
+    if state.get("hashtags"):
+        state["hashtags"] = clean_text(str(state["hashtags"]))
+    if state.get("tags"):
+        state["tags"] = clean_text(str(state["tags"]))
+    if state.get("pinned_comment"):
+        state["pinned_comment"] = clean_text(str(state["pinned_comment"]))
+    if state.get("quiz"):
+        state["quiz"] = clean_text(str(state["quiz"]))
 
     # Case 5: Quiz is identical to Pinned comment
     if quiz and pinned and (quiz == pinned or quiz.strip() == pinned.strip()):

@@ -460,8 +460,53 @@ class TestBrowserYouTubeUploader(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(res)
         page.evaluate.assert_awaited()
 
+    def test_build_upload_metadata_uses_description_template_over_raw_source_description(self):
+        from auto_yt.services.youtube_publisher import build_upload_metadata
+
+        video = {
+            "title": "Old Source Title",
+            "description": "Old Raw Description from Source YouTube Channel",
+            "generated_title": "AI Title 2026",
+            "generated_script": (
+                "### [TIÊU ĐỀ]\nAI Title 2026\n\n"
+                "### [MÔ TẢ]\nĐây là mô tả AI tóm tắt câu chuyện.\n\n"
+                "### [HASHTAGS]\n#AiStory #VanSam\n\n"
+                "### [CHAPTERS]\n00:00 - Mở đầu\n05:00 - Diễn biến\n10:00 - Kết thúc"
+            ),
+        }
+        publishing_settings = {
+            "description_template": "{title}\n\n{description}\n\n{chapters}\n\nMIỄN TRỪ TRÁCH NHIỆM\n\n{hashtags}",
+            "category_id": "24",
+            "made_for_kids": False,
+        }
+
+        meta = build_upload_metadata(video, publishing_settings)
+        desc = meta["snippet"]["description"]
+
+        self.assertIn("AI Title 2026", desc)
+        self.assertIn("Đây là mô tả AI tóm tắt câu chuyện.", desc)
+        self.assertIn("00:00 - Mở đầu", desc)
+        self.assertIn("MIỄN TRỪ TRÁCH NHIỆM", desc)
+        self.assertIn("#AiStory #VanSam", desc)
+        self.assertNotIn("Old Raw Description from Source YouTube Channel", desc)
+
+    def test_build_upload_metadata_falls_back_to_raw_description_if_template_yields_empty(self):
+        from auto_yt.services.youtube_publisher import build_upload_metadata
+
+        video = {
+            "title": "Raw Title",
+            "description": "Raw Source Fallback Description",
+            "generated_script": "",
+        }
+        publishing_settings = {
+            "description_template": "",
+            "category_id": "24",
+            "made_for_kids": False,
+        }
+
+        meta = build_upload_metadata(video, publishing_settings)
+        self.assertEqual(meta["snippet"]["description"], "Raw Source Fallback Description")
+
 
 if __name__ == "__main__":
     unittest.main()
-
-

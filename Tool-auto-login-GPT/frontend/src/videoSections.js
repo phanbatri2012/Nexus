@@ -1,6 +1,36 @@
 const MAIN_SCRIPT_TAGS = new Set(['INTRO', 'BODY', 'OUTRO'])
 const IGNORED_TAGS = new Set(['IMAGE', 'AUDIO'])
 
+export function decodeAndSanitizeText(raw) {
+  if (!raw || typeof raw !== 'string') return ''
+  let text = raw
+  // Decode HTML entities
+  text = text
+    .replace(/&#124;/g, '|')
+    .replace(/&vert;/g, '|')
+    .replace(/&#x7C;/gi, '|')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\u00a0/g, ' ')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+  
+  // Strip :::writing... and other container directives
+  text = text.replace(/:::[a-zA-Z0-9_\-]*(?:\{[^}]*\})?/g, '')
+  text = text.replace(/^\s*:::\s*$/gm, '')
+  text = text.replace(/\s*:::\s*$/g, '')
+  text = text.replace(/^\s*:::\s*/g, '')
+
+  // Remove LaTeX backslash escapes (\!, \:, \|, etc.)
+  text = text.replace(/\\([!:#\[\]\(\)\.\?\-\*_`|])/g, '$1')
+
+  return text.trim()
+}
+
 function trimEmptyLines(lines) {
   let start = 0
   let end = lines.length
@@ -155,7 +185,7 @@ function parseMetadataContent(content) {
       if (key === 'slug') {
         text = text.replace(/^(?:url\s+)?slug:\s*/i, '').trim()
       }
-      return [key, text]
+      return [key, decodeAndSanitizeText(text)]
     })
   )
 }
@@ -197,28 +227,28 @@ export function parseVideoSections(text) {
     const content = parts[index + 1]?.trim() || ''
 
     if (MAIN_SCRIPT_TAGS.has(tag)) {
-      if (content) mainScriptParts.push(content)
+      if (content) mainScriptParts.push(decodeAndSanitizeText(content))
     } else if (tag === 'METADATA & QUIZ') {
       const parsed = parseMetadataContent(content)
       metadata = { ...metadata, ...parsed }
     } else if (tag === 'TIÊU ĐỀ' || tag === 'TIEU DE' || tag === 'TITLE') {
-      metadata.title = content.replace(/^[-*\s]+(?:tiêu\s+đề(?:\s+video)?|title):\s*/i, '').trim()
+      metadata.title = decodeAndSanitizeText(content.replace(/^[-*\s]+(?:tiêu\s+đề(?:\s+video)?|title):\s*/i, ''))
     } else if (tag === 'SLUG' || tag === 'URL SLUG') {
-      metadata.slug = content.replace(/^[-*\s]+(?:url\s+)?slug:\s*/i, '').trim()
+      metadata.slug = decodeAndSanitizeText(content.replace(/^[-*\s]+(?:url\s+)?slug:\s*/i, ''))
     } else if (tag === 'MÔ TẢ' || tag === 'MO TA' || tag === 'DESCRIPTION') {
-      metadata.description = content.replace(/^[-*\s]+(?:mô\s+tả(?:\s+video)?|description):\s*/i, '').trim()
+      metadata.description = decodeAndSanitizeText(content.replace(/^[-*\s]+(?:mô\s+tả(?:\s+video)?|description):\s*/i, ''))
     } else if (tag === 'HASHTAGS' || tag === 'HASHTAG') {
-      metadata.hashtags = content.replace(/^[-*\s]+(?:hashtags?):\s*/i, '').trim()
+      metadata.hashtags = decodeAndSanitizeText(content.replace(/^[-*\s]+(?:hashtags?):\s*/i, ''))
     } else if (tag === 'TAGS' || tag === 'TAG' || tag === 'THẺ TỪ KHÓA' || tag === 'THE TU KHOA') {
-      metadata.tags = content.replace(/^[-*\s]+(?:tags?|thẻ(?:\s+từ\s+khóa)?):\s*/i, '').trim()
+      metadata.tags = decodeAndSanitizeText(content.replace(/^[-*\s]+(?:tags?|thẻ(?:\s+từ\s+khóa)?):\s*/i, ''))
     } else if (tag === 'BÌNH LUẬN GHIM' || tag === 'BINH LUAN GHIM' || tag === 'PINNED COMMENT') {
-      metadata.pinnedComment = content.replace(/^[-*\s]+(?:bình\s+luận\s+ghim|pinned\s+comment):\s*/i, '').trim()
+      metadata.pinnedComment = decodeAndSanitizeText(content.replace(/^[-*\s]+(?:bình\s+luận\s+ghim|pinned\s+comment):\s*/i, ''))
     } else if (tag === 'QUIZ' || tag === 'QUIZ TƯƠNG TÁC' || tag === 'QUIZ TUONG TAC') {
-      metadata.quiz = content
+      metadata.quiz = decodeAndSanitizeText(content)
     } else if (tag === 'CHAPTERS' || tag === 'PHÂN ĐOẠN' || tag === 'PHAN DOAN') {
-      chaptersContent = content
+      chaptersContent = decodeAndSanitizeText(content)
     } else if (!IGNORED_TAGS.has(tag)) {
-      otherSections.push({ title: rawTag, content })
+      otherSections.push({ title: rawTag, content: decodeAndSanitizeText(content) })
     }
   }
 
