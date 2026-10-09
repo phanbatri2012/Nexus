@@ -742,6 +742,124 @@ def _parse_schedule_at(schedule_at: str, timezone_name: str) -> dt.datetime:
         raise BrowserUploadError(f"Timezone kênh không hợp lệ: {timezone_name}") from exc
 
 
+def _first_progress_percent(*texts: str) -> int | None:
+    for text in texts:
+        match = re.search(r"(\d+)\s*%", str(text or ""))
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _classify_file_upload_status(status: dict[str, Any]) -> dict[str, Any]:
+    """Keep upload progress separate from YouTube's non-blocking checks progress."""
+    dialog_found = bool(status.get("dialogFound"))
+    monitor_found = bool(status.get("monitorFound"))
+    upload_text = str(status.get("uploadText") or "").strip()
+    checks_text = str(status.get("checksText") or "").strip()
+    progress_text = str(status.get("progressText") or "").strip()
+    footer_text = str(status.get("footerText") or "").strip()
+    monitor_text = str(status.get("monitorText") or "").strip()
+    body_text = str(status.get("bodyText") or "").strip()
+
+    status_texts = (upload_text, progress_text, footer_text, monitor_text, checks_text, body_text)
+    combined = " ".join(text.lower() for text in status_texts if text)
+    interrupted = any(
+        marker in combined
+        for marker in (
+            "quá trình tải lên bị gián đoạn",
+            "upload process interrupted",
+            "upload interrupted",
+            "tạm dừng",
+            "upload paused",
+        )
+    )
+
+    checks_markers = (
+        "đang kiểm tra",
+        "quá trình kiểm tra sắp bắt đầu",
+        "kiểm tra đang diễn ra",
+        "kiểm tra hoàn tất",
+        "đã kiểm tra xong",
+        "checking",
+        "checks are running",
+        "checks in progress",
+        "checks will begin",
+        "checks complete",
+        "không tìm thấy vấn đề",
+        "không phát hiện vấn đề",
+        "no issues found",
+    )
+    processing_markers = (
+        "quá trình xử lý sắp bắt đầu",
+        "processing will begin shortly",
+        "đang xử lý phiên bản",
+        "đang xử lý",
+        "processing",
+        "đã xử lý xong",
+        "đã xử lý",
+    )
+    upload_done_markers = (
+        "đã hoàn tất quá trình tải lên",
+        "upload complete",
+        "đã tải lên 100%",
+        "100% uploaded",
+        "đã tải được 100%",
+        "đã lưu ở chế độ riêng tư",
+        "đã lưu ở chế độ riêng tư",
+        "saved as private",
+        "đã lưu ở chế độ không công khai",
+        "saved as unlisted",
+    )
+
+    def has_marker(text: str, markers: tuple[str, ...]) -> bool:
+        lowered = text.lower()
+        return any(marker in lowered for marker in markers)
+
+    checks_status_texts = tuple(
+        text for text in (checks_text, progress_text, monitor_text) if has_marker(text, checks_markers)
+    )
+    checks_active = bool(checks_status_texts)
+    checks_percent = _first_progress_percent(*checks_status_texts)
+
+    upload_percent = _first_progress_percent(upload_text)
+    if upload_percent is None:
+        upload_progress_texts = tuple(
+            text
+            for text in (progress_text, monitor_text)
+            if not has_marker(text, checks_markers)
+            and any(marker in text.lower() for marker in ("đang tải", "tải lên", "upload"))
+        )
+        upload_percent = _first_progress_percent(*upload_progress_texts)
+
+    if upload_percent is not None:
+        # An explicit upload percentage is authoritative even if checks have
+        # already started in parallel. Checks progress must never promote a
+        # partial file upload to complete.
+        upload_done = not interrupted and upload_percent >= 100
+    else:
+        upload_done = (
+            not interrupted
+            and (
+                any(marker in combined for marker in upload_done_markers)
+                or checks_active
+                or any(marker in combined for marker in processing_markers)
+                or (not dialog_found and not monitor_found)
+            )
+        )
+    if upload_done:
+        upload_percent = 100
+
+    clean_text = upload_text or progress_text or monitor_text or footer_text
+    return {
+        "isDone": upload_done,
+        "isInterrupted": interrupted,
+        "uploadPercent": upload_percent,
+        "checksPercent": checks_percent,
+        "cleanText": clean_text,
+        "checksText": " ".join(checks_status_texts).strip(),
+    }
+
+
 async def _wait_for_file_upload_complete(
     page,
     timeout_seconds: float = 1800.0,
@@ -761,71 +879,29 @@ async def _wait_for_file_upload_complete(
         () => {
             const dialog = document.querySelector('ytcp-uploads-dialog, ytcp-video-upload-dialog, ytcp-video-metadata-editor');
             const bottomMonitor = document.querySelector('ytcp-multi-progress-monitor, ytcp-upload-progress, ytcp-toast, .progress-label');
-
-            if (!dialog && !bottomMonitor) {
-                const bodyText = (document.body?.innerText || '').toLowerCase();
-                const hasInterrupted = bodyText.includes('quá trình tải lên bị gián đoạn')
-                    || bodyText.includes('upload process interrupted')
-                    || bodyText.includes('upload interrupted');
-                return { isDone: !hasInterrupted, isInterrupted: hasInterrupted, cleanText: 'no_dialog', pctVal: hasInterrupted ? null : 100 };
-            }
-
-            const progressEl = (dialog ? dialog.querySelector('ytcp-video-upload-progress, .progress-label, ytcp-badge, #dialog-title + *') : null)
-                || document.querySelector('ytcp-video-upload-progress, ytcp-multi-progress-monitor .progress-label, .progress-label');
+            const uploadEl = (dialog ? dialog.querySelector('ytcp-video-upload-progress') : null)
+                || document.querySelector('ytcp-video-upload-progress');
+            const checksEl = (dialog ? dialog.querySelector('ytcp-video-checks') : null)
+                || document.querySelector('ytcp-video-checks');
+            const progressEl = (dialog ? dialog.querySelector('.progress-label, ytcp-badge, #dialog-title + *') : null)
+                || document.querySelector('ytcp-multi-progress-monitor .progress-label, .progress-label');
             const footerEl = dialog ? dialog.querySelector('ytcp-video-metadata-editor-footer, #dialog-footer, .footer, ytcp-animatable') : null;
 
+            const uploadText = uploadEl ? (uploadEl.innerText || uploadEl.textContent || '').trim() : '';
+            const checksText = checksEl ? (checksEl.innerText || checksEl.textContent || '').trim() : '';
             const progressText = progressEl ? (progressEl.innerText || progressEl.textContent || '').trim() : '';
             const footerText = footerEl ? (footerEl.innerText || footerEl.textContent || '').trim() : '';
             const monitorText = bottomMonitor ? (bottomMonitor.innerText || bottomMonitor.textContent || '').trim() : '';
-
-            const combinedProgress = (progressText + ' ' + footerText + ' ' + monitorText).toLowerCase();
-
-            const isInterrupted = combinedProgress.includes('quá trình tải lên bị gián đoạn')
-                || combinedProgress.includes('upload process interrupted')
-                || combinedProgress.includes('upload interrupted')
-                || combinedProgress.includes('tạm dừng')
-                || combinedProgress.includes('upload paused');
-
-            let pctVal = null;
-            const m = (progressText + ' ' + footerText + ' ' + monitorText).match(/(\\d+)\\s*%/);
-            if (m) {
-                pctVal = parseInt(m[1], 10);
-            }
-
-            const doneKeywords = [
-                "đã hoàn tất quá trình tải lên",
-                "upload complete",
-                "đã tải lên 100%",
-                "100% uploaded",
-                "đã tải được 100%",
-                "quá trình xử lý sắp bắt đầu",
-                "processing will begin shortly",
-                "quá trình kiểm tra sắp bắt đầu",
-                "đang xử lý phiên bản",
-                "đang xử lý",
-                "processing",
-                "đã xử lý xong",
-                "đã xử lý",
-                "kiểm tra hoàn tất",
-                "đã kiểm tra xong",
-                "checks complete",
-                "không tìm thấy vấn đề",
-                "không phát hiện vấn đề",
-                "no issues found",
-            ];
-
-            let isDone = false;
-            if (pctVal !== null) {
-                isDone = (pctVal >= 100);
-            } else {
-                isDone = doneKeywords.some(k => combinedProgress.includes(k));
-            }
-
+            const bodyText = (!dialog && !bottomMonitor) ? (document.body?.innerText || '').trim() : '';
             return {
-                isDone: Boolean(isDone && !isInterrupted),
-                isInterrupted: Boolean(isInterrupted),
-                pctVal: pctVal,
-                cleanText: progressText || footerText || monitorText || (pctVal !== null ? `${pctVal}%` : (isDone ? 'Đã tải lên và xử lý xong' : ''))
+                dialogFound: Boolean(dialog),
+                monitorFound: Boolean(bottomMonitor),
+                uploadText,
+                checksText,
+                progressText,
+                footerText,
+                monitorText,
+                bodyText,
             };
         }
         """)
@@ -834,11 +910,15 @@ async def _wait_for_file_upload_complete(
         is_done = False
         is_interrupted = False
         pct_val = None
+        checks_pct = None
 
         if isinstance(status_info, dict):
+            if "dialogFound" in status_info or "monitorFound" in status_info:
+                status_info = _classify_file_upload_status(status_info)
             is_done = bool(status_info.get("isDone"))
             is_interrupted = bool(status_info.get("isInterrupted"))
-            pct_val = status_info.get("pctVal")
+            pct_val = status_info.get("uploadPercent", status_info.get("pctVal"))
+            checks_pct = status_info.get("checksPercent")
             clean_text = str(status_info.get("cleanText") or "").strip()
         elif isinstance(status_info, str):
             clean_text = status_info.strip()
@@ -878,6 +958,17 @@ async def _wait_for_file_upload_complete(
                 f"Quá trình tải lên YouTube bị gián đoạn ({clean_text or 'Upload process interrupted'})."
             )
 
+        if is_done or (pct_val is not None and pct_val >= 100) or last_pct >= 100:
+            logger.info(
+                "Quá trình upload file MP4 lên YouTube đã hoàn tất (upload=%s%%, checks=%s%%, status=%s)",
+                pct_val if pct_val is not None else "unknown",
+                checks_pct if checks_pct is not None else "not-reported",
+                clean_text,
+            )
+            if progress:
+                progress("Đã tải xong 100% file video lên YouTube.", "upload_complete", 65)
+            return
+
         if pct_val is not None:
             if pct_val > last_pct:
                 last_progress_time = time.monotonic()
@@ -886,12 +977,6 @@ async def _wait_for_file_upload_complete(
                 mapped_pct = int(20 + (pct_val * 0.45))
                 if progress:
                     progress(f"Đang tải video lên YouTube ({clean_text or f'{pct_val}%'})...", "uploading_file", mapped_pct)
-
-        if is_done or (pct_val is not None and pct_val >= 100) or last_pct >= 100:
-            logger.info("Quá trình upload file MP4 lên YouTube đã hoàn tất (%s)", clean_text)
-            if progress:
-                progress("Đã tải xong 100% file video lên YouTube.", "upload_complete", 65)
-            return
 
         # Check for stalled upload (no progress change for 15+ minutes)
         if (time.monotonic() - last_progress_time) > stall_timeout_seconds and last_pct < 100:

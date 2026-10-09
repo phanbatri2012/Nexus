@@ -163,6 +163,79 @@ class TestBrowserYouTubeUploader(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(len(progress_called) > 0)
         self.assertEqual(progress_called[-1][1], "upload_complete")
 
+    def test_classify_file_upload_status_separates_checks_percent(self):
+        from auto_yt.services.browser_youtube_uploader import _classify_file_upload_status
+
+        status = _classify_file_upload_status({
+            "dialogFound": True,
+            "monitorFound": True,
+            "uploadText": "Đã lưu ở chế độ riêng tư",
+            "checksText": "",
+            "progressText": "Đã lưu ở chế độ riêng tư",
+            "footerText": "",
+            "monitorText": "Đang kiểm tra 20% ... Còn 8 phút",
+        })
+
+        self.assertTrue(status["isDone"])
+        self.assertEqual(status["uploadPercent"], 100)
+        self.assertEqual(status["checksPercent"], 20)
+
+    def test_classify_file_upload_status_keeps_waiting_for_real_upload(self):
+        from auto_yt.services.browser_youtube_uploader import _classify_file_upload_status
+
+        status = _classify_file_upload_status({
+            "dialogFound": True,
+            "monitorFound": True,
+            "uploadText": "Đang tải lên 35% ... Còn 10 phút",
+            "checksText": "Đang kiểm tra 20% ... Còn 8 phút",
+            "progressText": "",
+            "footerText": "",
+            "monitorText": "Đang tải lên 35% ... Còn 10 phút",
+        })
+
+        self.assertFalse(status["isDone"])
+        self.assertEqual(status["uploadPercent"], 35)
+        self.assertEqual(status["checksPercent"], 20)
+
+    def test_classify_file_upload_status_preserves_interruption_without_dialog(self):
+        from auto_yt.services.browser_youtube_uploader import _classify_file_upload_status
+
+        status = _classify_file_upload_status({
+            "dialogFound": False,
+            "monitorFound": False,
+            "bodyText": "Quá trình tải lên bị gián đoạn",
+        })
+
+        self.assertFalse(status["isDone"])
+        self.assertTrue(status["isInterrupted"])
+        self.assertIsNone(status["uploadPercent"])
+
+    async def test_wait_for_file_upload_complete_does_not_wait_for_checks(self):
+        from auto_yt.services.browser_youtube_uploader import _wait_for_file_upload_complete
+
+        page = AsyncMock()
+        page.evaluate.return_value = {
+            "dialogFound": True,
+            "monitorFound": True,
+            "uploadText": "Đã lưu ở chế độ riêng tư",
+            "checksText": "",
+            "progressText": "Đã lưu ở chế độ riêng tư",
+            "footerText": "",
+            "monitorText": "Đang kiểm tra 20% ... Còn 8 phút",
+        }
+        progress_called = []
+
+        await _wait_for_file_upload_complete(
+            page,
+            timeout_seconds=0.1,
+            progress=lambda msg, stage, pct: progress_called.append((msg, stage, pct)),
+        )
+
+        page.evaluate.assert_awaited_once()
+        self.assertEqual(progress_called, [
+            ("Đã tải xong 100% file video lên YouTube.", "upload_complete", 65),
+        ])
+
     async def test_wait_for_file_upload_complete_dict_success(self):
         from auto_yt.services.browser_youtube_uploader import _wait_for_file_upload_complete
         page = AsyncMock()
