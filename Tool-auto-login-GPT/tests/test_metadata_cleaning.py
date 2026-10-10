@@ -77,3 +77,33 @@ def test_browser_youtube_uploader_sanitizer():
     raw_desc = ':::writing{variant="document" id="58341"}\nMô tả &amp; hashtag\n:::'
     sanitized_desc = _sanitize_youtube_metadata_field(raw_desc)
     assert sanitized_desc == "Mô tả & hashtag"
+
+
+def test_extract_generated_video_title_rejects_subsequent_section_headers():
+    from auto_yt.services.database import extract_generated_video_title
+
+    # When [TIÊU ĐỀ] has an invalid long description with CTA and next section is [SLUG],
+    # it should not parse [SLUG] as the title.
+    malformed_script = (
+        "[MC]: Chào quý vị.\n\n"
+        "### [TIÊU ĐỀ]\n"
+        "Một câu chuyện dài hơn hai trăm ký tự với lời kêu gọi hãy bấm like và đăng ký kênh Sâm Audio để đón xem nhiều câu chuyện hay tiếp theo trên kênh của chúng tôi.\n\n"
+        "### [SLUG]\n"
+        "cau-chuyen-hay\n\n"
+        "### [MÔ TẢ]\n"
+        "Mô tả video.\n"
+    )
+    title = extract_generated_video_title(malformed_script)
+    assert title != "[SLUG]"
+    assert title != "cau-chuyen-hay"
+
+    # When valid title is present under [TIÊU ĐỀ]
+    valid_script = (
+        "[MC]: Chào quý vị.\n\n"
+        "### [TIÊU ĐỀ]\n"
+        "Câu Chuyện Hay Về Lòng Người | Sâm Audio\n\n"
+        "### [SLUG]\n"
+        "cau-chuyen-hay\n"
+    )
+    assert extract_generated_video_title(valid_script) == "Câu Chuyện Hay Về Lòng Người | Sâm Audio"
+

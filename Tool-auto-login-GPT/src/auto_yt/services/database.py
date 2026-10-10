@@ -184,11 +184,26 @@ def extract_generated_video_title(generated_script: str) -> str:
             candidate = _clean_generated_title(following_line)
             if not candidate:
                 continue
+            if candidate.startswith("[") and candidate.endswith("]"):
+                break
             candidate_label = candidate.partition(":")[0]
             if _normalize_metadata_label(candidate_label) in {
                 "URL SLUG",
+                "SLUG",
+                "MO TA",
                 "MO TA VIDEO",
+                "DESCRIPTION",
                 "HASHTAG",
+                "HASHTAGS",
+                "TAGS",
+                "TAG",
+                "THE TU KHOA",
+                "BINH LUAN GHIM",
+                "PINNED COMMENT",
+                "QUIZ",
+                "CHAPTERS",
+                "PHAN DOAN",
+                "THUMBNAIL",
             }:
                 break
             if not _looks_like_outro_or_cta(candidate):
@@ -541,7 +556,7 @@ def _backup_database_before_video_production() -> None:
     backup_path = DB_PATH.with_name(DB_PATH.name + VIDEO_PRODUCTION_BACKUP_SUFFIX)
     if backup_path.exists():
         return
-    source = sqlite3.connect(str(DB_PATH))
+    source = sqlite3.connect(str(DB_PATH), timeout=30.0)
     try:
         existing = source.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
@@ -549,7 +564,7 @@ def _backup_database_before_video_production() -> None:
         ).fetchone()
         if existing:
             return
-        destination = sqlite3.connect(str(backup_path))
+        destination = sqlite3.connect(str(backup_path), timeout=30.0)
         try:
             source.backup(destination)
         finally:
@@ -744,6 +759,7 @@ def init_db():
     _backup_database_before_tts_v2()
     _backup_database_before_nullable_publication_channel()
     _migrate_nullable_publication_channel()
+    _backup_database_before_video_production()
     conn = sqlite3.connect(str(DB_PATH))
     c = conn.cursor()
     c.execute('''
@@ -1258,8 +1274,6 @@ def init_db():
         except sqlite3.OperationalError:
             pass
     _migrate_fb_crossposter_token_storage(conn)
-
-    _backup_database_before_video_production()
 
     # Video Production columns
     for column_definition in (
