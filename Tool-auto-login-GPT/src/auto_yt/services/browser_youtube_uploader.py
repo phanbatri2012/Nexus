@@ -185,6 +185,30 @@ async def _has_visible_element(page, selectors: list[str]) -> bool:
     return False
 
 
+async def _has_upload_dialog_input(page) -> bool:
+    """Check if YouTube Studio upload dialog or file input is present and attached."""
+    try:
+        for sel in (
+            "ytcp-uploads-dialog input[type='file']",
+            "ytcp-video-upload-dialog input[type='file']",
+            "input[type='file']",
+        ):
+            el = await page.query_selector(sel)
+            if el is not None:
+                return True
+        dialog = await page.query_selector("ytcp-uploads-dialog, ytcp-video-upload-dialog")
+        if dialog is not None:
+            has_content = await dialog.evaluate(
+                "d => d.children.length > 0 && !d.hasAttribute('hidden')"
+            )
+            if has_content:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+
 async def _ensure_altered_content_controls_visible(page, timeout_ms: int = 10000) -> None:
     if await _has_visible_element(page, UPLOAD_ALTERED_CONTENT_SELECTORS):
         return
@@ -3264,46 +3288,97 @@ async def upload_video_via_browser(
             if not resuming_existing_draft:
                 # 2. Click Create button (+) -> Upload videos
                 progress("Đang mở hộp thoại Tải video lên...", "opening_upload_dialog", 15)
-                create_clicked = await _safe_click(
-                    page,
-                    [
-                        "button#create-icon",
-                        "ytcp-button#create-icon",
-                        "#create-icon button",
-                        "ytcp-icon-button#create-icon",
-                        "[aria-label*='Tạo' i]",
-                        "[aria-label*='Create' i]",
-                    ],
-                    timeout_ms=10000,
-                )
-                if not create_clicked:
-                    logger.warning("Không click được nút Tạo; điều hướng trực tiếp đến trang upload...")
+
+                dialog_open = await _has_upload_dialog_input(page)
+
+                if not dialog_open:
+                    # 2a. Quick actions: direct upload icon on dashboard if visible
+                    quick_upload_clicked = await _safe_click(
+                        page,
+                        [
+                            "ytcp-icon-button#upload-icon",
+                            "#upload-icon",
+                            "ytcp-icon-button[aria-label='Tải video lên']",
+                            "ytcp-icon-button[aria-label='Upload videos']",
+                        ],
+                        timeout_ms=2000,
+                    )
+                    if quick_upload_clicked:
+                        await asyncio.sleep(2.0)
+                        dialog_open = await _has_upload_dialog_input(page)
+
+                if not dialog_open:
+                    # 2b. Header Create button (+) -> Dropdown "Upload videos"
+                    # Note: exact match [aria-label='Tạo' i] / [aria-label='Create' i] to avoid
+                    # falsely matching [aria-label="Trò chuyện với Bộ phận hỗ trợ nhà sáng tạo"]!
+                    create_clicked = await _safe_click(
+                        page,
+                        [
+                            "ytcp-button.ytcpAppHeaderCreateIcon button",
+                            "ytcp-button.ytcpAppHeaderCreateIcon",
+                            "button[aria-label='Tạo' i]",
+                            "button[aria-label='Create' i]",
+                            "button#create-icon",
+                            "ytcp-button#create-icon",
+                            "#create-icon button",
+                            "ytcp-icon-button#create-icon",
+                        ],
+                        timeout_ms=5000,
+                    )
+                    if create_clicked:
+                        await asyncio.sleep(1.0)
+                        menu_clicked = await _safe_click(
+                            page,
+                            [
+                                "tp-yt-paper-item:has-text('Tải video lên')",
+                                "tp-yt-paper-item:has-text('Upload videos')",
+                                "tp-yt-paper-item#text-item-0",
+                                "ytd-menu-service-item-renderer:has-text('Tải video lên')",
+                                "ytd-menu-service-item-renderer:has-text('Upload videos')",
+                                "ytcp-text-menu tp-yt-paper-item:has-text('Tải video')",
+                                "yt-formatted-string:has-text('Tải video lên')",
+                                "yt-formatted-string:has-text('Upload videos')",
+                            ],
+                            timeout_ms=4000,
+                        )
+                        if menu_clicked:
+                            await asyncio.sleep(2.0)
+                            dialog_open = await _has_upload_dialog_input(page)
+
+                # Wait for file input or upload dialog to be attached in the DOM
+                file_input_ready = False
+                for _ in range(15):
+                    cancel_check()
+                    if await _has_upload_dialog_input(page):
+                        file_input_ready = True
+                        break
+                    await asyncio.sleep(1.0)
+
+                if not file_input_ready:
+                    # Fallback only if clicking failed AND dialog is not present
+                    logger.warning("Chưa mở được upload dialog; thử điều hướng đến trang upload...")
                     await page.goto(
                         f"{studio_url.rstrip('/')}/videos/upload?d=pt",
                         wait_until="domcontentloaded",
                     )
-                    await asyncio.sleep(2.0)
-                else:
-                    await asyncio.sleep(1.0)
-                    await _require_click(
-                        page,
-                        [
-                            "tp-yt-paper-item#text-item-0",
-                            "tp-yt-paper-item:has-text('Tải video lên')",
-                            "tp-yt-paper-item:has-text('Upload videos')",
-                            "ytd-menu-service-item-renderer:has-text('Tải video lên')",
-                            "ytd-menu-service-item-renderer:has-text('Upload videos')",
-                        ],
-                        "Không thể mở upload dialog từ menu Tạo.",
-                        timeout_ms=5000,
-                    )
+                    await asyncio.sleep(3.0)
+                    for _ in range(10):
+                        cancel_check()
+                        if await _has_upload_dialog_input(page):
+                            file_input_ready = True
+                            break
+                        await asyncio.sleep(1.0)
+
+                if not file_input_ready:
+                    raise BrowserUploadError("Không thể mở upload dialog trên YouTube Studio.")
 
                 # 3. Inject Video MP4 File (via CDP to bypass Playwright 50MB limit)
                 progress("Đang nạp file video MP4...", "uploading_file", 20)
                 await _cdp_set_input_files(
                     page,
                     "ytcp-uploads-dialog input[type='file'], "
-                    "ytcp-video-upload-dialog input[type='file']",
+                    "ytcp-video-upload-dialog input[type='file'], "
+                    "input[type='file']",
                     video_path,
                     timeout_ms=15000,
                 )
@@ -3712,6 +3787,13 @@ async def upload_video_via_browser(
                 if not await _safe_click(
                     page,
                     [
+                        "ytcp-video-monetization .m10n-text",
+                        "ytcp-video-monetization .placeholder-text",
+                        "ytcp-video-monetization ytcp-icon-button.edit-button",
+                        "ytcp-video-monetization [aria-label*='kiếm tiền' i]",
+                        "ytcp-video-monetization [aria-label*='monetization' i]",
+                        "ytcp-video-monetization #container",
+                        "ytcp-video-monetization",
                         "ytcp-uploads-dialog ytcp-video-monetization ytcp-dropdown-trigger",
                         "ytcp-uploads-dialog #monetization-step ytcp-dropdown-trigger",
                         "ytcp-video-upload-dialog ytcp-video-monetization ytcp-dropdown-trigger",
@@ -3727,15 +3809,25 @@ async def upload_video_via_browser(
                     [
                         "tp-yt-paper-radio-button[name='ON']",
                         "tp-yt-paper-radio-button[name='MONETIZATION_ON']",
+                        "ytcp-video-monetization-edit-dialog tp-yt-paper-radio-button[name='ON']",
+                        "ytcp-video-monetization-edit-dialog tp-yt-paper-radio-button:has-text('Bật')",
+                        "ytcp-video-monetization-edit-dialog tp-yt-paper-radio-button:has-text('On')",
                         "ytcp-dialog tp-yt-paper-radio-button:has-text('Bật')",
                         "ytcp-dialog tp-yt-paper-radio-button:has-text('On')",
+                        "tp-yt-paper-radio-button:has-text('Bật')",
+                        "tp-yt-paper-radio-button:has-text('On')",
                     ]
                     if desired_on
                     else [
                         "tp-yt-paper-radio-button[name='OFF']",
                         "tp-yt-paper-radio-button[name='MONETIZATION_OFF']",
+                        "ytcp-video-monetization-edit-dialog tp-yt-paper-radio-button[name='OFF']",
+                        "ytcp-video-monetization-edit-dialog tp-yt-paper-radio-button:has-text('Tắt')",
+                        "ytcp-video-monetization-edit-dialog tp-yt-paper-radio-button:has-text('Off')",
                         "ytcp-dialog tp-yt-paper-radio-button:has-text('Tắt')",
                         "ytcp-dialog tp-yt-paper-radio-button:has-text('Off')",
+                        "tp-yt-paper-radio-button:has-text('Tắt')",
+                        "tp-yt-paper-radio-button:has-text('Off')",
                     ]
                 )
                 if not await _safe_click(
@@ -3757,11 +3849,16 @@ async def upload_video_via_browser(
                 await _require_click(
                     page,
                     [
+                        "ytcp-video-monetization-edit-dialog #save-button",
+                        "ytcp-video-monetization-edit-dialog ytcp-button#save-button",
+                        "ytcp-video-monetization-edit-dialog ytcp-button:has-text('Xong')",
+                        "ytcp-video-monetization-edit-dialog ytcp-button:has-text('Done')",
                         "ytcp-video-monetization ytcp-button#save-button",
                         "ytcp-video-monetization ytcp-button:has-text('Xong')",
                         "ytcp-video-monetization ytcp-button:has-text('Done')",
                         "ytcp-dialog ytcp-button:has-text('Xong')",
                         "ytcp-dialog ytcp-button:has-text('Done')",
+                        "ytcp-button#save-button",
                     ],
                     "Không thể lưu trạng thái kiếm tiền.",
                     timeout_ms=5000,

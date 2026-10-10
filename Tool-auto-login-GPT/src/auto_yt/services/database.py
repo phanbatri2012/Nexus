@@ -2914,13 +2914,20 @@ def save_video_publication(
         conn.execute(
             """
             UPDATE videos
-            SET is_published = CASE WHEN EXISTS (
-                SELECT 1 FROM video_publications
-                WHERE video_id = ? AND privacy_status = 'public'
-            ) THEN 1 ELSE 0 END
+            SET is_published = CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM video_publications
+                    WHERE video_id = ?
+                      AND (privacy_status IN ('public', 'unlisted') OR (scheduled_at IS NOT NULL AND scheduled_at != ''))
+                ) THEN 1
+                WHEN is_published = 1 AND EXISTS (
+                    SELECT 1 FROM video_publications WHERE video_id = ?
+                ) THEN 1
+                ELSE 0
+            END
             WHERE id = ?
             """,
-            (video_id, video_id),
+            (video_id, video_id, video_id),
         )
         row = conn.execute(
             "SELECT * FROM video_publications WHERE youtube_video_id = ?",
@@ -6658,6 +6665,15 @@ def complete_youtube_schedule(
             """,
             (scheduled_at, now, workflow_id),
         )
+        publication_video = conn.execute(
+            "SELECT video_id FROM video_publications WHERE id = ?",
+            (publication_id,),
+        ).fetchone()
+        if publication_video is not None:
+            conn.execute(
+                "UPDATE videos SET is_published = 1 WHERE id = ?",
+                (int(publication_video[0]),),
+            )
         row = conn.execute(
             "SELECT * FROM youtube_publish_workflows WHERE id = ?",
             (workflow_id,),
@@ -6802,13 +6818,20 @@ def update_video_publication(publication_id: int, **changes) -> dict | None:
         conn.execute(
             """
             UPDATE videos
-            SET is_published = CASE WHEN EXISTS (
-                SELECT 1 FROM video_publications
-                WHERE video_id = ? AND privacy_status = 'public'
-            ) THEN 1 ELSE 0 END
+            SET is_published = CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM video_publications
+                    WHERE video_id = ?
+                      AND (privacy_status IN ('public', 'unlisted') OR (scheduled_at IS NOT NULL AND scheduled_at != ''))
+                ) THEN 1
+                WHEN is_published = 1 AND EXISTS (
+                    SELECT 1 FROM video_publications WHERE video_id = ?
+                ) THEN 1
+                ELSE 0
+            END
             WHERE id = ?
             """,
-            (video_id, video_id),
+            (video_id, video_id, video_id),
         )
     conn.commit()
     row = conn.execute(

@@ -827,7 +827,11 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                             </div>
                           </>
                         ) : (
+                          job.attention_required === 'youtube_browser_retry' ? (
+                          <div>Quá trình upload gặp sự cố trên trình duyệt. Hãy bấm “Tiếp tục” để tự động thử lại.</div>
+                        ) : (
                           <div>Video đã được tải lên YouTube. Hãy bấm “Tiếp tục” để tự động hoàn tất lưu và đặt lịch phát sóng.</div>
+                        )
                         )}
                       </div>
                     )}

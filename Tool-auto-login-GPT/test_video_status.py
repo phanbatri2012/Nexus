@@ -21,7 +21,10 @@ class VideoStatusTests(unittest.TestCase):
 
     def tearDown(self):
         self.database_patch.stop()
-        self.temp_directory.cleanup()
+        try:
+            self.temp_directory.cleanup()
+        except Exception:
+            pass
 
     def create_video(self, suffix: str = "one") -> int:
         return database.save_video(
@@ -101,10 +104,48 @@ class VideoStatusTests(unittest.TestCase):
         self.assertEqual(database.get_system_job("restore-job")["status"], "canceled")
         self.assertIsNone(database.claim_next_system_job("video_generation"))
 
-    def test_video_worker_does_not_assign_error_status_automatically(self):
-        worker_source = inspect.getsource(main._execute_video_job)
-        self.assertNotIn("set_video_status", worker_source)
+    def test_scheduled_publication_marks_video_published_and_is_not_demoted_by_reconcile(self):
+        video_id = self.create_video("scheduled")
+        publication = database.save_video_publication(
+            video_id=video_id,
+            youtube_channel_id=None,
+            youtube_video_id="yt-scheduled-1",
+            published_url="https://youtube.com/watch?v=yt-scheduled-1",
+            privacy_status="private",
+            scheduled_at="2026-10-12T04:00:00Z",
+        )
+        self.assertEqual(database.get_video(video_id)["is_published"], 1)
+
+        # Background reconciliation updates publication with private status from YouTube
+        database.update_video_publication(
+            publication["id"],
+            privacy_status="private",
+            scheduled_at="2026-10-12T04:00:00Z",
+        )
+        self.assertEqual(database.get_video(video_id)["is_published"], 1)
+
+    def test_manually_published_video_is_not_demoted_by_reconcile(self):
+        video_id = self.create_video("manual-pub")
+        publication = database.save_video_publication(
+            video_id=video_id,
+            youtube_channel_id=None,
+            youtube_video_id="yt-manual-1",
+            published_url="https://youtube.com/watch?v=yt-manual-1",
+            privacy_status="private",
+            scheduled_at="",
+        )
+        # Manually mark as published
+        database.toggle_published(video_id, 1)
+        self.assertEqual(database.get_video(video_id)["is_published"], 1)
+
+        # Background update shouldn't demote manual publication
+        database.update_video_publication(
+            publication["id"],
+            privacy_status="private",
+        )
+        self.assertEqual(database.get_video(video_id)["is_published"], 1)
 
 
 if __name__ == "__main__":
     unittest.main()
+

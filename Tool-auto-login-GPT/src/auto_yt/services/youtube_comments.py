@@ -13,12 +13,15 @@ import ctypes.wintypes
 import datetime as dt
 import hashlib
 import json
+import logging
 import re
 import secrets
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from auto_yt.paths import DATA_DIR
 from auto_yt.services.proxy_utils import create_proxy_opener
