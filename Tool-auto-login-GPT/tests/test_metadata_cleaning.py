@@ -107,3 +107,53 @@ def test_extract_generated_video_title_rejects_subsequent_section_headers():
     )
     assert extract_generated_video_title(valid_script) == "Câu Chuyện Hay Về Lòng Người | Sâm Audio"
 
+
+def test_auto_repair_metadata_helpers():
+    from auto_yt.services.chatgpt_worker import (
+        auto_repair_hashtags,
+        auto_repair_tags,
+        auto_repair_pinned_comment,
+        auto_repair_quiz,
+        sanitize_and_repair_metadata,
+    )
+
+    # 1. Hashtags without '#'
+    raw_sentence = "Trên cung đường đèo vắng, sĩ quan Trần Hoàng Nam gặp tai nạn"
+    repaired_hashtags = auto_repair_hashtags(raw_sentence, "Sĩ Quan Bị Vợ Hãm Hại")
+    assert "#" in repaired_hashtags
+    assert "#TrênCungĐườngĐèoVắng" in repaired_hashtags or "#SamAudio" in repaired_hashtags
+
+    # 2. Empty hashtags fallback
+    empty_hashtags = auto_repair_hashtags("", "Sĩ Quan Bị Vợ Hãm Hại")
+    assert "#SamAudio" in empty_hashtags
+
+    # 3. Tags containing hashes
+    hash_tags = "#MCVanSam, #TamSuGiaDinh, #TruyenNhanQua"
+    repaired_tags = auto_repair_tags(hash_tags)
+    assert "#" not in repaired_tags
+    assert "MCVanSam" in repaired_tags
+
+    # 4. Empty tags fallback
+    empty_tags = auto_repair_tags("", "Sĩ Quan Bị Hãm Hại")
+    assert "MC Văn Sâm" in empty_tags
+    assert "Sĩ Quan Bị Hãm Hại" in empty_tags
+
+    # 5. Pinned comment & Quiz
+    assert "Văn Sâm" in auto_repair_pinned_comment("")
+    assert "Đáp án đúng:" in auto_repair_quiz("")
+
+    # 6. sanitize_and_repair_metadata state repair
+    state = {
+        "title": "Sĩ Quan Bị Vợ Hãm Hại | MC Văn Sâm",
+        "hashtags": "tâm sự gia đình, chuyện hôn nhân, ngoại tình",
+        "tags": "#MCVanSam, #TamSu, #HonNhan",
+        "pinned_comment": "Bình luận ngắn",
+        "quiz": "Quiz ngắn",
+    }
+    sanitize_and_repair_metadata(state)
+    assert "#" in state["hashtags"]
+    assert "#" not in state["tags"]
+    assert len(state["pinned_comment"]) > 10
+    assert "Đáp án đúng:" in state["quiz"]
+
+

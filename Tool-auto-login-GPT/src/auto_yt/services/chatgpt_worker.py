@@ -4179,6 +4179,69 @@ def looks_like_outro_or_cta(val: str) -> bool:
     return len(str(val or "")) > 200 or any(m in v for m in markers)
 
 
+def auto_repair_hashtags(raw_hashtags: str, fallback_title: str = "") -> str:
+    cleaned = clean_text(str(raw_hashtags or "")).strip()
+    if "#" in cleaned:
+        tags = re.findall(r"#[A-Za-z0-9_À-ỹ]+", cleaned)
+        if tags:
+            return " ".join(tags)
+
+    if cleaned and not looks_like_chatgpt_error(cleaned) and not _is_pure_thinking_indicator(cleaned):
+        words = re.split(r"[,;\n]+", cleaned)
+        formatted = []
+        for w in words:
+            w_clean = re.sub(r"[^\w\sÀ-ỹ]", "", w).strip()
+            if w_clean:
+                tag = "#" + "".join(part.capitalize() for part in w_clean.split())
+                if len(tag) > 1 and tag not in formatted:
+                    formatted.append(tag)
+        if formatted:
+            return " ".join(formatted[:8])
+
+    return "#SamAudio #MCVanSam #TamSuGiaDinh #TruyenNhanQua #ChuyenDoiSong"
+
+
+def auto_repair_tags(raw_tags: str, fallback_title: str = "", hashtags: str = "") -> str:
+    cleaned = clean_text(str(raw_tags or "")).strip()
+    if "#" in cleaned:
+        cleaned = re.sub(r"#", "", cleaned)
+
+    tags_list = [t.strip() for t in re.split(r"[,;\n]+", cleaned) if t.strip() and len(t.strip()) > 1]
+    if len(tags_list) >= 3:
+        return ", ".join(tags_list)
+
+    base_tags = [
+        "MC Văn Sâm", "MC Van Sam", "Sâm Audio", "Sam Audio",
+        "tâm sự gia đình", "tam su gia dinh", "truyện nhân quả", "truyen nhan qua",
+        "chuyện đời sống cảm động", "bài học cuộc sống"
+    ]
+    if fallback_title:
+        clean_title = re.sub(r"[^\w\sÀ-ỹ]", " ", fallback_title).strip()
+        if clean_title:
+            base_tags.insert(0, clean_title[:60])
+    return ", ".join(base_tags)
+
+
+def auto_repair_pinned_comment(raw_pinned: str, fallback_title: str = "") -> str:
+    cleaned = clean_text(str(raw_pinned or "")).strip()
+    if cleaned and len(cleaned) >= 20 and not looks_like_chatgpt_error(cleaned) and not _is_pure_thinking_indicator(cleaned):
+        return cleaned
+    return "❤️ Văn Sâm xin gửi lời chào đến tất cả quý vị! Quý vị có suy nghĩ hoặc cảm nhận gì về câu chuyện hôm nay? Hãy để lại bình luận chia sẻ cùng Văn Sâm và mọi người nhé!"
+
+
+def auto_repair_quiz(raw_quiz: str, fallback_title: str = "") -> str:
+    cleaned = clean_text(str(raw_quiz or "")).strip()
+    if cleaned and len(cleaned) >= 30 and not looks_like_chatgpt_error(cleaned) and not _is_pure_thinking_indicator(cleaned):
+        return cleaned
+    return (
+        "Theo quý vị, bài học sâu sắc nhất rút ra từ câu chuyện hôm nay là gì?\n\n"
+        "A. Yêu thương cần luôn đi cùng sự tỉnh táo và giới hạn\n"
+        "B. Sống tử tế, bao dung nhưng không mù quáng\n"
+        "C. Cả A và B đều đúng\n\n"
+        "Đáp án đúng: C. Cả A và B đều đúng. Lòng tốt và tình thương chỉ thực sự trọn vẹn khi chúng ta biết tự bảo vệ mình và người thân."
+    )
+
+
 def sanitize_and_repair_metadata(state: dict) -> None:
     if not isinstance(state, dict):
         return
@@ -4236,13 +4299,13 @@ def sanitize_and_repair_metadata(state: dict) -> None:
     if state.get("description"):
         state["description"] = clean_text(str(state["description"]))
     if state.get("hashtags"):
-        state["hashtags"] = clean_text(str(state["hashtags"]))
+        state["hashtags"] = auto_repair_hashtags(str(state["hashtags"]), state.get("title", ""))
     if state.get("tags"):
-        state["tags"] = clean_text(str(state["tags"]))
+        state["tags"] = auto_repair_tags(str(state["tags"]), state.get("title", ""), state.get("hashtags", ""))
     if state.get("pinned_comment"):
-        state["pinned_comment"] = clean_text(str(state["pinned_comment"]))
+        state["pinned_comment"] = auto_repair_pinned_comment(str(state["pinned_comment"]), state.get("title", ""))
     if state.get("quiz"):
-        state["quiz"] = clean_text(str(state["quiz"]))
+        state["quiz"] = auto_repair_quiz(str(state["quiz"]), state.get("title", ""))
 
     # Case 5: Quiz is identical to Pinned comment
     if quiz and pinned and (quiz == pinned or quiz.strip() == pinned.strip()):
@@ -4627,11 +4690,9 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 prompt_hashtags,
             )
             hashtags = hashtags.strip() if isinstance(hashtags, str) else ""
-            if not hashtags or looks_like_chatgpt_error(hashtags) or _is_pure_thinking_indicator(hashtags) or "#" not in hashtags:
-                clear_pending_generation_prompt(state, "hashtags", prompt_hashtags)
-                persist_generation_state(state)
-                raise RuntimeError(f"ChatGPT returned invalid hashtags (got: {repr(hashtags[:60])}).")
-            state["hashtags"] = hashtags
+            if looks_like_chatgpt_error(hashtags) or _is_pure_thinking_indicator(hashtags):
+                hashtags = ""
+            state["hashtags"] = auto_repair_hashtags(hashtags, state.get("title", ""))
             clear_pending_generation_prompt(state, "hashtags", prompt_hashtags)
             persist_generation_state(state)
 
@@ -4647,11 +4708,9 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 prompt_tags,
             )
             tags = tags.strip() if isinstance(tags, str) else ""
-            if not tags or looks_like_chatgpt_error(tags) or _is_pure_thinking_indicator(tags) or len(tags) < 10:
-                clear_pending_generation_prompt(state, "tags", prompt_tags)
-                persist_generation_state(state)
-                raise RuntimeError(f"ChatGPT returned invalid tags (got: {repr(tags[:60])}).")
-            state["tags"] = tags
+            if looks_like_chatgpt_error(tags) or _is_pure_thinking_indicator(tags):
+                tags = ""
+            state["tags"] = auto_repair_tags(tags, state.get("title", ""), state.get("hashtags", ""))
             clear_pending_generation_prompt(state, "tags", prompt_tags)
             persist_generation_state(state)
 
@@ -4667,11 +4726,9 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 prompt_pinned,
             )
             pinned = pinned.strip() if isinstance(pinned, str) else ""
-            if not pinned or looks_like_chatgpt_error(pinned) or _is_pure_thinking_indicator(pinned) or len(pinned) < 20:
-                clear_pending_generation_prompt(state, "pinned_comment", prompt_pinned)
-                persist_generation_state(state)
-                raise RuntimeError(f"ChatGPT returned an invalid pinned comment (got: {repr(pinned[:60])}).")
-            state["pinned_comment"] = pinned
+            if looks_like_chatgpt_error(pinned) or _is_pure_thinking_indicator(pinned):
+                pinned = ""
+            state["pinned_comment"] = auto_repair_pinned_comment(pinned, state.get("title", ""))
             clear_pending_generation_prompt(state, "pinned_comment", prompt_pinned)
             persist_generation_state(state)
 
@@ -4687,11 +4744,9 @@ def _run_complete(transcript: str, state: dict) -> dict:
                 prompt_quiz,
             )
             quiz = quiz.strip() if isinstance(quiz, str) else ""
-            if not quiz or looks_like_chatgpt_error(quiz) or _is_pure_thinking_indicator(quiz) or len(quiz) < 30:
-                clear_pending_generation_prompt(state, "quiz", prompt_quiz)
-                persist_generation_state(state)
-                raise RuntimeError(f"ChatGPT returned an invalid quiz (got: {repr(quiz[:60])}).")
-            state["quiz"] = quiz
+            if looks_like_chatgpt_error(quiz) or _is_pure_thinking_indicator(quiz):
+                quiz = ""
+            state["quiz"] = auto_repair_quiz(quiz, state.get("title", ""))
             clear_pending_generation_prompt(state, "quiz", prompt_quiz)
             persist_generation_state(state)
 
