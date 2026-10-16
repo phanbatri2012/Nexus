@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from PIL import Image
+from PIL import Image, ImageColor
 
 from auto_yt.services import database as db
 from auto_yt.services import stock_video_renderer
@@ -311,6 +311,9 @@ class StockVideoRendererTests(unittest.TestCase):
             self.assertIn("settb=AVTB,setpts=PTS-STARTPTS", cmd_str)
             self.assertIn("between(t,0,3)", cmd_str)
             self.assertIn("s=15x260:mode=cline", cmd_str)
+            # FFmpeg defaults to draw=scale, which can turn an intended bright
+            # waveform nearly black after pixel scaling and overlay.
+            self.assertIn("draw=full", cmd_str)
             self.assertIn("scale=480:260:flags=neighbor", cmd_str)
             self.assertIn("geq=", cmd_str)
             self.assertIn("enable='gte(t,3)'", cmd_str)
@@ -383,6 +386,7 @@ class StockVideoRendererTests(unittest.TestCase):
             self.assertNotIn("subtitles=", render_cmds[0])
             self.assertIn("between(t,0,3)", render_cmds[0])
             self.assertIn("s=15x260:mode=cline", render_cmds[0])
+            self.assertIn("draw=full", render_cmds[0])
             self.assertIn("scale=480:260:flags=neighbor", render_cmds[0])
             self.assertIn("geq=", render_cmds[0])
             # Audio must be delayed by 3s
@@ -391,6 +395,21 @@ class StockVideoRendererTests(unittest.TestCase):
             # Wave color must never be black
             self.assertNotIn("black", str(res.get("wave_color")).lower())
             self.assertIn(res.get("wave_color"), stock_video_renderer.WAVE_COLORS_PALETTE)
+
+    def test_waveform_palette_excludes_black_and_near_black_colors(self):
+        self.assertTrue(stock_video_renderer.WAVE_COLORS_PALETTE)
+        for color in stock_video_renderer.WAVE_COLORS_PALETTE:
+            base_color = color.split("@", 1)[0].strip().lower()
+            self.assertNotIn("black", base_color)
+            try:
+                red, green, blue = ImageColor.getrgb(base_color)
+            except ValueError as exc:
+                self.fail(f"Invalid waveform palette color {color}: {exc}")
+            self.assertGreater(
+                max(red, green, blue),
+                127,
+                f"Waveform palette color is too dark: {color}",
+            )
 
     def test_random_waveform_placement_strictly_avoids_collisions(self):
         corners = ["bottom_left", "bottom_right", "top_left", "top_right"]
@@ -425,4 +444,3 @@ class StockVideoRendererTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
