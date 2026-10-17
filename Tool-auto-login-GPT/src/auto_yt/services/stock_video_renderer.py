@@ -495,6 +495,7 @@ WAVE_BAR_GAP: int = 18
 WAVE_BAR_PITCH: int = WAVE_BAR_WIDTH + WAVE_BAR_GAP  # 32
 WAVE_DEFAULT_WIDTH: int = WAVE_BARS_COUNT * WAVE_BAR_PITCH  # 480
 WAVE_DEFAULT_HEIGHT: int = 260
+AVAILABLE_CORNERS: tuple[str, ...] = ("bottom_right", "bottom_left", "top_right", "top_left")
 
 
 def _boxes_intersect(b1: tuple[int, int, int, int], b2: tuple[int, int, int, int]) -> bool:
@@ -894,11 +895,13 @@ def produce_stock_video(
 
     playlist, video_durations = build_background_playlist(available_videos, total_duration)
 
-    # 5. Corner layout (Default: bottom-left for thumbnail PiP, bottom-right for title)
-    corner = str((snapshot.get("stock_video_settings") or {}).get("thumbnail_corner_mode") or "bottom_left").strip().lower()
-    if corner not in {"bottom_right", "bottom_left", "top_right", "top_left"}:
-        corner = "bottom_left"
-    logger.info("Stock Video: Selected corner '%s' for Video ID %s", corner, video_id)
+    # 5. Corner layout (Random 1 of 4 corners when set to 'random', or specific corner)
+    raw_corner = str((snapshot.get("stock_video_settings") or {}).get("thumbnail_corner_mode") or "random").strip().lower()
+    if raw_corner in AVAILABLE_CORNERS:
+        corner = raw_corner
+    else:
+        corner = secrets.choice(AVAILABLE_CORNERS)
+    logger.info("Stock Video: Selected corner '%s' (mode: %s) for Video ID %s", corner, raw_corner, video_id)
 
     # 6. Generate Pre-rendered Overlays (Full 3s Intro, PiP Thumbnail & Direct Title Overlay)
     scratch_dir = RENDERS_DIR / "temp" / f"video_{video_id}_{int(time.time())}"

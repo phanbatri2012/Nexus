@@ -443,6 +443,79 @@ class StockVideoRendererTests(unittest.TestCase):
                     f"Waveform collided with Title in {corner} layout: wave={w_box}, card={c_box}",
                 )
 
+    def test_thumbnail_corner_mode_explicit_and_random(self):
+        video_id = db.save_video(
+            url="https://youtube.com/watch?v=corner_test",
+            title="Corner Test",
+            transcript="Transcript",
+            generated_script="Script",
+            prompt_version="default",
+        )
+        db.upsert_audio_task(video_id=video_id, task_id="dummy_task", status="completed", audio_url="/audio.mp3", request_hash="dummy_hash")
+
+        bg_video = self.temp_path / "bg_corner.mp4"
+        bg_video.touch()
+        thumb_file = self.temp_path / "thumb_corner.png"
+        Image.new("RGB", (640, 360), (10, 20, 30)).save(thumb_file)
+
+        class MockProc:
+            returncode = 0
+            def poll(self):
+                return 0
+            def kill(self):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+
+        def mock_popen(cmd, *args, **kwargs):
+            out_file = Path(cmd[-1])
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            out_file.write_bytes(b"dummy_video_mp4_bytes")
+            return MockProc()
+
+        with patch.object(stock_video_renderer, "probe_media_duration", return_value=60.0), \
+             patch.object(stock_video_renderer.imageio_ffmpeg, "get_ffmpeg_exe", return_value="ffmpeg"), \
+             patch.object(stock_video_renderer, "get_available_background_videos", return_value=[bg_video]), \
+             patch.object(stock_video_renderer, "AUDIO_DIR", self.temp_path), \
+             patch.object(stock_video_renderer, "THUMBNAILS_DIR", self.temp_path), \
+             patch.object(stock_video_renderer, "RENDERS_DIR", self.temp_path), \
+             patch.object(stock_video_renderer.subprocess, "Popen", side_effect=mock_popen):
+
+            (self.temp_path / f"video_{video_id}.mp3").write_bytes(b"ID3" + b"\x00" * 1024)
+            (self.temp_path / f"thumb_{video_id}.png").write_bytes(thumb_file.read_bytes())
+
+            # 1. Test explicit selection for each corner
+            for expected_corner in stock_video_renderer.AVAILABLE_CORNERS:
+                res = stock_video_renderer.produce_stock_video(
+                    video_id=video_id,
+                    snapshot={
+                        "render_mode": "stock_video",
+                        "stock_video_settings": {"thumbnail_corner_mode": expected_corner},
+                    },
+                    progress=lambda m, s="": None,
+                    cancel_check=lambda: None,
+                )
+                self.assertEqual(res["corner"], expected_corner)
+
+            # 2. Test 'random' mode produces valid corners and samples across corners
+            chosen_corners = set()
+            for _ in range(20):
+                res = stock_video_renderer.produce_stock_video(
+                    video_id=video_id,
+                    snapshot={
+                        "render_mode": "stock_video",
+                        "stock_video_settings": {"thumbnail_corner_mode": "random"},
+                    },
+                    progress=lambda m, s="": None,
+                    cancel_check=lambda: None,
+                )
+                self.assertIn(res["corner"], stock_video_renderer.AVAILABLE_CORNERS)
+                chosen_corners.add(res["corner"])
+            self.assertGreater(len(chosen_corners), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
+
