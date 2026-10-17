@@ -310,6 +310,7 @@ class StockVideoRendererTests(unittest.TestCase):
             self.assertIn("format=yuv420p[bg]", cmd_str)
             self.assertIn("settb=AVTB,setpts=PTS-STARTPTS", cmd_str)
             self.assertIn("between(t,0,3)", cmd_str)
+            self.assertIn("fade=t=out:st=2.5:d=0.5:alpha=1", cmd_str)
             self.assertIn("s=15x260:mode=cline", cmd_str)
             # FFmpeg defaults to draw=scale, which can turn an intended bright
             # waveform nearly black after pixel scaling and overlay.
@@ -385,6 +386,7 @@ class StockVideoRendererTests(unittest.TestCase):
             self.assertTrue(len(render_cmds) >= 1)
             self.assertNotIn("subtitles=", render_cmds[0])
             self.assertIn("between(t,0,3)", render_cmds[0])
+            self.assertIn("fade=t=out:st=2.5:d=0.5:alpha=1", render_cmds[0])
             self.assertIn("s=15x260:mode=cline", render_cmds[0])
             self.assertIn("draw=full", render_cmds[0])
             self.assertIn("scale=480:260:flags=neighbor", render_cmds[0])
