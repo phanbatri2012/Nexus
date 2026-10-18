@@ -5413,7 +5413,10 @@ def _schedule_automatic_video_recovery(
     result: dict | None,
     *,
     resume_from_step: str = "",
+    retryable: bool = True,
 ) -> bool:
+    if not retryable:
+        return False
     if video_id is not None:
         video = db.get_video(video_id)
         if not video or video.get("video_status") == db.VIDEO_STATUS_ERROR:
@@ -5625,6 +5628,11 @@ def _execute_video_job(job: dict) -> None:
             if isinstance(worker_result, dict)
             else True
         )
+        generation_retryable = (
+            worker_result.get("retryable", True) is not False
+            if isinstance(worker_result, dict)
+            else True
+        )
 
         update("Đang lưu vào database")
         if not db.update_video_generation(video_id, summary_text, chat_url):
@@ -5679,6 +5687,7 @@ def _execute_video_job(job: dict) -> None:
                 else None
             ),
             "generation_warning": generation_warning,
+            "generation_retryable": generation_retryable,
             "complete_for_audio": complete_for_audio,
             "failed_step": failed_step,
         }
@@ -5687,6 +5696,7 @@ def _execute_video_job(job: dict) -> None:
             video_id,
             generation_warning,
             result,
+            retryable=generation_retryable,
         ):
             return
         job_status = "done"
@@ -5695,7 +5705,11 @@ def _execute_video_job(job: dict) -> None:
         if generation_warning:
             job_status = "error"
             job_error = generation_warning
-            job_progress = "Đã giữ phần hoàn tất nhưng tự phục hồi đã hết số lần thử"
+            job_progress = (
+                "Đã giữ phần hoàn tất; lỗi xác định không được tự động thử lại"
+                if not generation_retryable
+                else "Đã giữ phần hoàn tất nhưng tự phục hồi đã hết số lần thử"
+            )
         elif audio_error:
             job_status = "error"
             job_error = f"Lỗi TTS Audio: {audio_error}"

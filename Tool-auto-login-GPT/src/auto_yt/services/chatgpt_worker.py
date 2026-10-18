@@ -12,6 +12,7 @@ import uuid
 import hashlib
 from collections.abc import Callable
 from contextlib import closing
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright, Page
@@ -63,7 +64,7 @@ if sys.platform == "win32":
     if sys.stderr is not None:
         sys.stderr.reconfigure(encoding='utf-8')
 
-_HERE = __import__('pathlib').Path(__file__).resolve()
+_HERE = Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parent.parent.parent))
 
 DEFAULT_GPT_PROFILE = "PROFILE_GPT_1"
@@ -394,6 +395,26 @@ class ChatGPTGenerationTimeoutError(RuntimeError):
         self.response_text = response_text
         self.previous_assistant_turn = previous_assistant_turn
         self.previous_assistant_count = previous_assistant_count
+
+
+class ReferenceImageValidationError(ValueError):
+    pass
+
+
+NON_RETRYABLE_GENERATION_EXCEPTIONS = (
+    AssertionError,
+    AttributeError,
+    ImportError,
+    NameError,
+    ReferenceImageValidationError,
+    SyntaxError,
+    TypeError,
+    UnboundLocalError,
+)
+
+
+def is_generation_error_retryable(error: BaseException) -> bool:
+    return not isinstance(error, NON_RETRYABLE_GENERATION_EXCEPTIONS)
 
 
 def is_valid_chapter_response(response_text: str) -> bool:
@@ -4064,6 +4085,27 @@ def wait_for_conversation_history(
         f"{message} No new prompt was sent during recovery."
     ) from last_error
 
+
+def _resolve_reference_files(reference_files: list[str] | None) -> list[str]:
+    resolved_files: list[str] = []
+    for raw_path in reference_files or []:
+        try:
+            reference_path = Path(raw_path).resolve()
+        except (OSError, TypeError, ValueError) as exc:
+            raise ReferenceImageValidationError(
+                "Invalid reference image path. No prompt was sent."
+            ) from exc
+        if reference_path.is_file():
+            resolved_files.append(str(reference_path))
+        else:
+            print(
+                ">>> Skipped missing reference image before composing the prompt: "
+                f"{reference_path.name}",
+                file=sys.stderr,
+            )
+    return resolved_files
+
+
 def send_prompt(
     page: Page,
     prompt_text: str,
@@ -4073,6 +4115,7 @@ def send_prompt(
     reference_files: list[str] | None = None,
 ) -> str:
     validate_prompt_text(prompt_text)
+    valid_reference_files = _resolve_reference_files(reference_files)
 
     # Recover a transient ChatGPT full-page load failure before touching the
     # composer. This is shared by every prompt-driven workflow.
@@ -4129,18 +4172,24 @@ def send_prompt(
 
     # Attach images if provided (prefer native input[type="file"], fallback to clipboard paste)
     attached_via_file_input = False
-    if reference_files:
-        valid_files = [str(Path(f).resolve()) for f in reference_files if Path(f).is_file()]
-        if valid_files:
-            try:
-                file_input = page.locator('input[type="file"]').first
-                if file_input.count() > 0:
-                    file_input.set_input_files(valid_files)
-                    attached_via_file_input = True
-                    page.wait_for_timeout(2500)
-                    logger.info("Attached %d reference images via input[type='file']", len(valid_files))
-            except Exception as f_err:
-                logger.warning("Failed to attach reference files via input[type='file']: %s", f_err)
+    if valid_reference_files:
+        try:
+            file_input = page.locator('input[type="file"]').first
+            if file_input.count() > 0:
+                file_input.set_input_files(valid_reference_files)
+                attached_via_file_input = True
+                page.wait_for_timeout(2500)
+                print(
+                    f">>> Attached {len(valid_reference_files)} reference image(s) "
+                    "via the native file input.",
+                    file=sys.stderr,
+                )
+        except Exception as file_error:
+            print(
+                ">>> Native reference image attachment failed; using the "
+                f"available fallback ({type(file_error).__name__}).",
+                file=sys.stderr,
+            )
 
     if not attached_via_file_input and reference_image_base64:
         js = """
@@ -5987,6 +6036,7 @@ def run(transcript: str) -> dict:
             "metadata_errors": metadata_errors,
             "publish_ready": complete_for_audio and metadata_ready,
             "pipeline": pipeline,
+            "retryable": is_generation_error_retryable(exc),
         }
 
 
@@ -6545,6 +6595,11 @@ if __name__ == "__main__":
                 result.get("pipeline", normalize_prompt_pipeline(None))
                 if isinstance(result, dict)
                 else normalize_prompt_pipeline(None)
+            ),
+            "retryable": (
+                result.get("retryable", True)
+                if isinstance(result, dict)
+                else True
             ),
         }
         # Print script then marker then chat_url for the service to parse

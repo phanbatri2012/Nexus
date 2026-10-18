@@ -586,6 +586,25 @@ class VideoProcessingRecoveryTests(unittest.TestCase):
         save_video.assert_not_called()
         schedule_wakeup.assert_any_call(main.YOUTUBE_RECOVERY_DELAYS_SECONDS[0])
 
+    def test_non_retryable_generation_error_keeps_checkpoint_without_scheduling(self):
+        with (
+            patch.object(main.db, "get_video") as get_video,
+            patch.object(main.db, "schedule_system_job_recovery") as schedule_recovery,
+            patch.object(main, "_schedule_video_queue_wakeup") as schedule_wakeup,
+        ):
+            scheduled = main._schedule_automatic_video_recovery(
+                "job-id",
+                329,
+                "thumbnail with text: name 'Path' is not defined",
+                {"failed_step": "thumbnail with text"},
+                retryable=False,
+            )
+
+        self.assertFalse(scheduled)
+        get_video.assert_not_called()
+        schedule_recovery.assert_not_called()
+        schedule_wakeup.assert_not_called()
+
     def test_chapter_timeout_still_starts_audio_when_core_script_is_complete(self):
         recovered_script = (
             "### [INTRO]\nIntro\n\n"

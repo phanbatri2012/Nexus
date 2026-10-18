@@ -79,6 +79,129 @@ class ThumbnailGenerationTests(unittest.TestCase):
 
         page.locator.assert_not_called()
 
+    def test_reference_file_is_attached_before_single_prompt_submission(self):
+        page = MagicMock()
+        page.url = "https://chatgpt.com/c/test-conversation"
+        prompt_textarea = MagicMock()
+        send_button = MagicMock()
+        file_input = MagicMock()
+        file_input.count.return_value = 1
+        page.locator.return_value.first = file_input
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            reference_path = Path(temporary_directory) / "reference.png"
+            reference_path.write_bytes(b"reference-image")
+            with (
+                patch(
+                    "auto_yt.services.chatgpt_worker.wait_for_chatgpt_composer",
+                    return_value=prompt_textarea,
+                ),
+                patch("auto_yt.services.chatgpt_worker.wait_for_conversation_history"),
+                patch(
+                    "auto_yt.services.chatgpt_worker.get_latest_conversation_turn",
+                    return_value=10,
+                ),
+                patch(
+                    "auto_yt.services.chatgpt_worker.get_assistant_message_count",
+                    return_value=2,
+                ),
+                patch(
+                    "auto_yt.services.chatgpt_worker.get_user_message_count",
+                    return_value=3,
+                ),
+                patch("auto_yt.services.chatgpt_worker.ensure_prompt_editor_integrity"),
+                patch(
+                    "auto_yt.services.chatgpt_worker.get_chatgpt_send_button",
+                    return_value=send_button,
+                ),
+                patch(
+                    "auto_yt.services.chatgpt_worker.wait_for_assistant_response",
+                    return_value="Generated response",
+                ),
+                patch("auto_yt.services.chatgpt_worker.time.sleep"),
+            ):
+                response = send_prompt(
+                    page,
+                    "Thumbnail prompt",
+                    reference_files=[str(reference_path)],
+                )
+
+        self.assertEqual(response, "Generated response")
+        file_input.set_input_files.assert_called_once_with(
+            [str(reference_path.resolve())]
+        )
+        send_button.click.assert_called_once_with()
+
+    def test_native_reference_failure_uses_base64_fallback_and_sends_once(self):
+        page = MagicMock()
+        page.url = "https://chatgpt.com/c/test-conversation"
+        prompt_textarea = MagicMock()
+        send_button = MagicMock()
+        file_input = MagicMock()
+        file_input.count.return_value = 1
+        file_input.set_input_files.side_effect = RuntimeError("native upload failed")
+        page.locator.return_value.first = file_input
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            reference_path = Path(temporary_directory) / "reference.png"
+            reference_path.write_bytes(b"reference-image")
+            with (
+                patch(
+                    "auto_yt.services.chatgpt_worker.wait_for_chatgpt_composer",
+                    return_value=prompt_textarea,
+                ),
+                patch("auto_yt.services.chatgpt_worker.wait_for_conversation_history"),
+                patch(
+                    "auto_yt.services.chatgpt_worker.get_latest_conversation_turn",
+                    return_value=10,
+                ),
+                patch(
+                    "auto_yt.services.chatgpt_worker.get_assistant_message_count",
+                    return_value=2,
+                ),
+                patch(
+                    "auto_yt.services.chatgpt_worker.get_user_message_count",
+                    return_value=3,
+                ),
+                patch("auto_yt.services.chatgpt_worker.ensure_prompt_editor_integrity"),
+                patch(
+                    "auto_yt.services.chatgpt_worker.get_chatgpt_send_button",
+                    return_value=send_button,
+                ),
+                patch(
+                    "auto_yt.services.chatgpt_worker.wait_for_assistant_response",
+                    return_value="Generated response",
+                ),
+                patch("auto_yt.services.chatgpt_worker.time.sleep"),
+            ):
+                response = send_prompt(
+                    page,
+                    "Thumbnail prompt",
+                    reference_image_base64="ZmFrZQ==",
+                    reference_files=[str(reference_path)],
+                )
+
+        self.assertEqual(response, "Generated response")
+        self.assertEqual(prompt_textarea.evaluate.call_args.args[1], "ZmFrZQ==")
+        send_button.click.assert_called_once_with()
+
+    def test_invalid_reference_file_is_rejected_before_composer_changes(self):
+        page = MagicMock()
+        with (
+            patch(
+                "auto_yt.services.chatgpt_worker.wait_for_chatgpt_composer"
+            ) as wait_for_composer,
+            self.assertRaisesRegex(ValueError, "No prompt was sent"),
+        ):
+            send_prompt(
+                page,
+                "Thumbnail prompt",
+                reference_files=[object()],
+            )
+
+        wait_for_composer.assert_not_called()
+        page.keyboard.insert_text.assert_not_called()
+
     def test_corrupted_editor_text_is_reinserted_before_send(self):
         prompt_textarea = MagicMock()
         prompt_textarea.inner_text.side_effect = (

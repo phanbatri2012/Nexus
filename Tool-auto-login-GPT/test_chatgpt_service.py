@@ -1815,7 +1815,8 @@ class ChatGptServiceTests(unittest.TestCase):
                 b'"complete_for_audio":true,'
                 b'"metadata_ready":false,'
                 b'"metadata_errors":["title: missing title"],'
-                b'"publish_ready":false}'
+                b'"publish_ready":false,'
+                b'"retryable":false}'
             ),
             b"",
         )
@@ -1834,7 +1835,30 @@ class ChatGptServiceTests(unittest.TestCase):
         self.assertFalse(result["metadata_ready"])
         self.assertEqual(result["metadata_errors"], ["title: missing title"])
         self.assertFalse(result["publish_ready"])
+        self.assertFalse(result["retryable"])
         self.assertIn("timed out", result["warning"])
+
+    def test_programming_error_with_checkpoint_is_not_retryable(self):
+        def fail_with_programming_error(_transcript, state):
+            state.update(
+                {
+                    "chat_url": "https://chatgpt.com/c/test",
+                    "current_step": "thumbnail with text",
+                    "intro": "Saved intro",
+                }
+            )
+            raise NameError("name 'Path' is not defined")
+
+        with patch.object(
+            chatgpt_worker,
+            "_run_complete",
+            side_effect=fail_with_programming_error,
+        ):
+            result = chatgpt_worker.run("transcript")
+
+        self.assertEqual(result["failed_step"], "thumbnail with text")
+        self.assertFalse(result["retryable"])
+        self.assertIn("Path", result["warning"])
 
     def test_chapter_timeout_preserves_complete_core_script(self):
         intro_section = " ".join(f"intro content {index}" for index in range(8))
