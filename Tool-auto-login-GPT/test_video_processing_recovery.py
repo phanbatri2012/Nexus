@@ -135,6 +135,11 @@ class VideoProcessingRecoveryTests(unittest.TestCase):
         with (
             patch.object(
                 main,
+                "_get_prompt_production_snapshot",
+                return_value={"pipeline": {}},
+            ),
+            patch.object(
+                main,
                 "_get_prompt_default_voice_id",
                 return_value=prompt_voice_id,
             ),
@@ -584,7 +589,7 @@ class VideoProcessingRecoveryTests(unittest.TestCase):
         get_title.assert_not_called()
         process_chatgpt.assert_not_called()
         save_video.assert_not_called()
-        schedule_wakeup.assert_any_call(main.YOUTUBE_RECOVERY_DELAYS_SECONDS[0])
+        schedule_wakeup.assert_any_call(main.TRANSCRIPT_RECOVERY_DELAYS_SECONDS[0])
 
     def test_non_retryable_generation_error_keeps_checkpoint_without_scheduling(self):
         with (

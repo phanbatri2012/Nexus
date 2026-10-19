@@ -8520,6 +8520,53 @@ def get_competitor_dispatch_for_job(system_job_id: str) -> dict | None:
     return dict(row) if row else None
 
 
+def reconcile_competitor_dispatches_from_jobs() -> int:
+    """Repair stale active dispatches without reviving terminal work."""
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    repaired = 0
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            """
+            SELECT d.id, j.status AS job_status, j.error AS job_error
+            FROM competitor_dispatches d
+            JOIN system_jobs j ON j.id = d.system_job_id
+            WHERE d.status IN ('reserved', 'queued', 'processing')
+              AND j.status IN ('error', 'failed', 'canceled', 'paused')
+            """
+        ).fetchall()
+        for row in rows:
+            dispatch_status = (
+                "error"
+                if str(row["job_status"] or "") in {"error", "failed"}
+                else "needs_attention"
+            )
+            conn.execute(
+                """
+                UPDATE competitor_dispatches
+                SET status = ?, error = ?, updated_at = ?
+                WHERE id = ? AND status IN ('reserved', 'queued', 'processing')
+                """,
+                (
+                    dispatch_status,
+                    str(row["job_error"] or ""),
+                    now,
+                    int(row["id"]),
+                ),
+            )
+            repaired += 1
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+    return repaired
+
+
 def list_competitor_dispatches(*, rule_id: int | None = None, limit: int = 100) -> list[dict]:
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row

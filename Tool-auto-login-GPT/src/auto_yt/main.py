@@ -56,7 +56,11 @@ if sys.platform == "win32":
 # Add src to sys.path so we can import auto_yt paths correctly if run directly
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from auto_yt.services.youtube_service import get_video_transcript, get_video_title
+from auto_yt.services.youtube_service import (
+    TranscriptRetrievalError,
+    get_video_title,
+    get_video_transcript,
+)
 from auto_yt.services.chatgpt_service import process_prompt_via_chatgpt
 from auto_yt.services.chatgpt_runtime import (
     ChatGPTAttentionRequiredError,
@@ -182,6 +186,7 @@ TTS_PREVIEW_CLEANUP_INTERVAL_SECONDS = 60 * 60
 SYSTEM_CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
 VIDEO_RECOVERY_DELAYS_SECONDS = (30, 120, 300)
 YOUTUBE_RECOVERY_DELAYS_SECONDS = (120, 300, 900)
+TRANSCRIPT_RECOVERY_DELAYS_SECONDS = (60, 300)
 TRANSIENT_YOUTUBE_ERROR_MARKERS = (
     "http error 429",
     "status code 429",
@@ -5252,6 +5257,18 @@ def resume_background_jobs() -> None:
     for task in db.get_active_audio_tasks():
         _start_audio_watcher(task["video_id"])
     db.recover_interrupted_system_jobs("video_generation")
+    finalized_transcript_jobs = _finalize_exhausted_transcript_recoveries()
+    if finalized_transcript_jobs:
+        logger.info(
+            "Đã dừng %d job transcript hết ngân sách retry sau restart.",
+            finalized_transcript_jobs,
+        )
+    repaired_dispatches = db.reconcile_competitor_dispatches_from_jobs()
+    if repaired_dispatches:
+        logger.info(
+            "Đã đồng bộ %d dispatch Radar với job terminal liên kết.",
+            repaired_dispatches,
+        )
     for job_type in COMMENT_JOB_TYPES:
         db.recover_interrupted_system_jobs(job_type)
     for prod_job in (
@@ -5378,9 +5395,38 @@ def _sync_legacy_job(job: dict | None) -> None:
         }
 
 
+def _sync_competitor_dispatch_from_video_job(job: dict | None) -> None:
+    if not job or str(job.get("job_type") or "") != "video_generation":
+        return
+    payload = job.get("payload") or {}
+    automation = payload.get("automation") or {}
+    dispatch_id = int(automation.get("competitor_dispatch_id") or 0)
+    if not dispatch_id:
+        return
+    dispatch_status = {
+        "queued": "queued",
+        "running": "processing",
+        "retry_wait": "queued",
+        "paused": "needs_attention",
+        "error": "error",
+        "failed": "error",
+        "canceled": "needs_attention",
+        "done": "generation_complete",
+    }.get(str(job.get("status") or ""))
+    if not dispatch_status:
+        return
+    db.update_competitor_dispatch(
+        dispatch_id,
+        video_id=job.get("video_id"),
+        status=dispatch_status,
+        error=security_logging.redact_sensitive(str(job.get("error") or "")),
+    )
+
+
 def _update_video_job(job_id: str, **changes) -> dict | None:
     job = db.update_system_job(job_id, **changes)
     _sync_legacy_job(job)
+    _sync_competitor_dispatch_from_video_job(job)
     return job
 
 
@@ -5391,6 +5437,8 @@ def _raise_if_video_job_canceled(job_id: str) -> None:
 
 
 def _is_transient_youtube_error(error: BaseException | str) -> bool:
+    if isinstance(error, TranscriptRetrievalError):
+        return error.retryable
     normalized_error = str(error).casefold()
     return any(
         marker in normalized_error
@@ -5433,7 +5481,7 @@ def _schedule_automatic_video_recovery(
     job = db.get_system_job(job_id)
     recovery_count = int((job or {}).get("recovery_count") or 0)
     recovery_delays = (
-        YOUTUBE_RECOVERY_DELAYS_SECONDS
+        TRANSCRIPT_RECOVERY_DELAYS_SECONDS
         if resume_from_step == "youtube_transcript"
         else VIDEO_RECOVERY_DELAYS_SECONDS
     )
@@ -5472,8 +5520,55 @@ def _schedule_automatic_video_recovery(
         progress=progress,
     )
     _sync_legacy_job(recovered_job)
+    _sync_competitor_dispatch_from_video_job(recovered_job)
     _schedule_video_queue_wakeup(delay_seconds)
     return True
+
+
+def _video_job_youtube_network_context(payload: dict) -> tuple[str | None, bool]:
+    automation = payload.get("automation") or {}
+    if str(automation.get("source") or "") != "competitor_radar":
+        return None, False
+
+    target_channel_id = int(automation.get("target_youtube_channel_id") or 0)
+    if not target_channel_id:
+        rule_id = int(automation.get("competitor_rule_id") or 0)
+        rule = db.get_competitor_watch_rule(rule_id) if rule_id else None
+        target_channel_id = int((rule or {}).get("target_youtube_channel_id") or 0)
+    target_channel = db.get_youtube_channel(target_channel_id) if target_channel_id else None
+    raw_proxy = str((target_channel or {}).get("gpm_proxy_info") or "").strip()
+    if not parse_proxy_url(raw_proxy):
+        raise ProxyConfigurationError(
+            "Kênh đích chưa có proxy GPM hợp lệ; tải transcript trực tiếp đã bị chặn."
+        )
+    return raw_proxy, True
+
+
+def _finalize_exhausted_transcript_recoveries() -> int:
+    finalized = 0
+    for job in db.list_system_jobs(limit=None, job_type="video_generation"):
+        if (
+            str(job.get("status") or "") not in {"queued", "retry_wait"}
+            or str(job.get("resume_from_step") or "") != "youtube_transcript"
+            or int(job.get("recovery_count") or 0)
+            < len(TRANSCRIPT_RECOVERY_DELAYS_SECONDS)
+        ):
+            continue
+        updated = _update_video_job(
+            job["id"],
+            status="error",
+            progress="Đã dừng sau khi hết số lần tự thử lại transcript",
+            error=(
+                str(job.get("error") or "").strip()
+                or "Không thể tải transcript sau số lần thử cho phép."
+            ),
+            next_retry_at="",
+            cancel_requested=0,
+            finished_at=db.utc_now(),
+        )
+        if updated:
+            finalized += 1
+    return finalized
 
 
 def _execute_video_job(job: dict) -> None:
@@ -5542,9 +5637,20 @@ def _execute_video_job(job: dict) -> None:
             update("Đang tiếp tục bản nháp đã lưu")
         else:
             update("Đang tải phụ đề YouTube")
-            full_transcript = get_video_transcript(request_url)
+            youtube_proxy, require_youtube_proxy = _video_job_youtube_network_context(
+                payload
+            )
+            full_transcript = get_video_transcript(
+                request_url,
+                proxy=youtube_proxy,
+                require_proxy=require_youtube_proxy,
+            )
             _raise_if_video_job_canceled(job_id)
-            title = get_video_title(request_url)
+            title = get_video_title(
+                request_url,
+                proxy=youtube_proxy,
+                require_proxy=require_youtube_proxy,
+            )
             update("Đang lưu bản nháp an toàn")
             video_id = db.save_video(
                 url=request_url,
@@ -5814,22 +5920,25 @@ def _execute_video_job(job: dict) -> None:
             )
             return
         error_message = security_logging.redact_sensitive(exc) or "Tạo video thất bại."
+        transcript_error = exc if isinstance(exc, TranscriptRetrievalError) else None
+        transcript_result = (
+            {
+                "transcript_error_code": transcript_error.code,
+                "transcript_retryable": transcript_error.retryable,
+            }
+            if transcript_error
+            else None
+        )
         if video_id is None and _is_transient_youtube_error(exc):
             if _schedule_automatic_video_recovery(
                 job_id,
                 None,
                 error_message,
-                None,
+                transcript_result,
                 resume_from_step="youtube_transcript",
+                retryable=bool(transcript_error.retryable) if transcript_error else True,
             ):
                 return
-        if (
-            "Could not retrieve a transcript" in error_message
-            or "Subtitles are disabled" in error_message
-        ):
-            error_message = (
-                "Video này không có phụ đề (Transcript). Vui lòng chọn video khác."
-            )
 
         recovered_result = None
         checkpoint = {}
@@ -5896,11 +6005,21 @@ def _execute_video_job(job: dict) -> None:
                 if recovered_result
                 else "Tạo video thất bại"
             ),
-            result_json=recovered_result or {},
+            result_json=recovered_result or transcript_result or {},
             error=error_message,
             cancel_requested=0,
             finished_at=db.utc_now(),
         )
+        if transcript_error:
+            automation = payload.get("automation") or {}
+            dispatch_id = int(automation.get("competitor_dispatch_id") or 0)
+            if dispatch_id:
+                db.update_competitor_dispatch(
+                    dispatch_id,
+                    video_id=video_id,
+                    status="needs_attention",
+                    error=error_message,
+                )
     finally:
         _finish_chatgpt_operation()
 
@@ -7425,10 +7544,7 @@ def _execute_competitor_scan_job(job: dict) -> None:
         existing_dispatch = db.get_competitor_dispatch(
             int(source_row["id"]), str(rule["prompt_version"])
         )
-        retry_failed_dispatch = bool(
-            existing_dispatch and existing_dispatch.get("status") == "error"
-        )
-        if existing_dispatch and not retry_failed_dispatch:
+        if existing_dispatch:
             duplicates += 1
             continue
         dispatch, reserved = db.reserve_competitor_dispatch(
@@ -7436,7 +7552,7 @@ def _execute_competitor_scan_job(job: dict) -> None:
             watch_rule_id=rule_id,
             prompt_version=str(rule["prompt_version"]),
         )
-        if not reserved and dispatch.get("status") != "error":
+        if not reserved:
             duplicates += 1
             continue
         automation = {
@@ -7444,6 +7560,7 @@ def _execute_competitor_scan_job(job: dict) -> None:
             "competitor_rule_id": rule_id,
             "competitor_dispatch_id": int(dispatch["id"]),
             "competitor_source_video_id": int(source_row["id"]),
+            "target_youtube_channel_id": int(rule["target_youtube_channel_id"]),
             "requires_video_qc": True,
             "voice_policy": {
                 "guest_voice_pool": str(rule.get("guest_voice_pool") or ""),
@@ -8016,6 +8133,7 @@ def _drain_video_queue() -> None:
             if not job:
                 return
             _sync_legacy_job(job)
+            _sync_competitor_dispatch_from_video_job(job)
             if not _try_start_chatgpt_operation(
                 "video",
                 job.get("prompt_version", ""),
@@ -9410,6 +9528,7 @@ def _run_system_job_center_action(
                         blocking_reason="",
                     )
     _sync_legacy_job(updated_job)
+    _sync_competitor_dispatch_from_video_job(updated_job)
     if kick_queues:
         _kick_job_queues({str(job["job_type"])})
     return _system_job_center_item(

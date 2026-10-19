@@ -202,7 +202,7 @@ class TestCompetitorRadarPersistence(unittest.TestCase):
         self.assertFalse(second_created)
         self.assertEqual(first["id"], second["id"])
 
-    def test_failed_dispatch_is_retried_after_last_success_boundary(self):
+    def test_failed_dispatch_is_not_revived_by_later_scans(self):
         rule = self._rule("prompt-retry")
         db.update_competitor_watch_rule(
             rule["id"],
@@ -273,10 +273,10 @@ class TestCompetitorRadarPersistence(unittest.TestCase):
         ) as enqueue:
             main._execute_competitor_scan_job(job)
 
-        enqueue.assert_called_once()
-        retried = db.get_competitor_dispatch(source["id"], "prompt-retry")
-        self.assertEqual(retried["status"], "queued")
-        self.assertEqual(retried["system_job_id"], "video-retry")
+        enqueue.assert_not_called()
+        terminal = db.get_competitor_dispatch(source["id"], "prompt-retry")
+        self.assertEqual(terminal["status"], "error")
+        self.assertEqual(terminal["system_job_id"], "")
 
     def test_baseline_counts_only_eligible_long_form_and_never_dispatches(self):
         rule = self._rule("prompt-baseline-long-form")
