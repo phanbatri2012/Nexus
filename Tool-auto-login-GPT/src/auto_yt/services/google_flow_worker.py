@@ -255,7 +255,7 @@ class GoogleFlowWorker:
     _session_uploaded_image_urls: set[str] = set()
     _session_video_frame_assets: dict[str, dict[str, dict[str, str]]] = {}
     _session_configured_agent_projects: set[str] = set()
-    _session_configured_agent_image_projects: set[str] = set()
+    _session_configured_agent_image_projects: dict[str, tuple[str, str, int]] = {}
 
     def __init__(self, page: Page):
         self.page = page
@@ -1045,7 +1045,11 @@ class GoogleFlowWorker:
             )
 
         project_id = self._project_id()
-        if project_id in self._session_configured_agent_image_projects:
+        settings_signature = (model_id, aspect_ratio, output_count)
+        if (
+            self._session_configured_agent_image_projects.get(project_id)
+            == settings_signature
+        ):
             return
 
         try:
@@ -1125,7 +1129,7 @@ class GoogleFlowWorker:
             await self._save_debug_screenshot("agent_image_settings_failed")
             raise FlowAgentSettingsError("Không thể lưu cài đặt Google Flow Agent (Hình ảnh).") from exc
 
-        self._session_configured_agent_image_projects.add(project_id)
+        self._session_configured_agent_image_projects[project_id] = settings_signature
         logger.info(
             "flow_generation media=image state=agent_settings_saved project=%s "
             "aspect=%s outputs=%d model=%s",
@@ -5726,4 +5730,3 @@ class GoogleFlowWorker:
         except Exception as e:
             logger.warning("Failed to save debug diagnostics: %s", e)
             return {}
-

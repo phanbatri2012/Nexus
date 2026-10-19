@@ -40,6 +40,16 @@ test('wires Competitor Radar navigation and automatic rule management', async ()
 })
 
 
+test('Competitor Radar displays prompt names instead of stored version IDs', async () => {
+  const radarSource = await readFile(new URL('./CompetitorRadar.jsx', import.meta.url), 'utf8')
+
+  assert.match(radarSource, /promptVersions\?\.\[promptVersion\]\?\.name \|\| promptVersion/)
+  assert.match(radarSource, /promptLabel\(prompts\.versions, rule\.prompt_version\)/)
+  assert.match(radarSource, /promptLabel\(prompts\.versions, item\.prompt_version\)/)
+  assert.doesNotMatch(radarSource, /<td>\{item\.prompt_version\}<\/td>/)
+})
+
+
 test('TTS catalog exposes usage permissions and safe guest pools', async () => {
   const source = await readFile(new URL('./TTSSettings.jsx', import.meta.url), 'utf8')
 

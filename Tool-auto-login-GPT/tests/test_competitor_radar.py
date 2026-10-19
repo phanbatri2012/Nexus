@@ -735,5 +735,54 @@ class TestCompetitorRadarStartupContract(unittest.TestCase):
         self.assertIn("_competitor_radar_thread.join(timeout=5)", shutdown)
 
 
+
+    def test_resolve_competitor_channel_prioritizes_canonical_over_featured(self):
+        from unittest.mock import AsyncMock, MagicMock
+        featured_html = '''
+        <html>
+          <head>
+            <title>Radio Văn Sâm - YouTube</title>
+            <link rel="canonical" href="https://www.youtube.com/channel/UCb1ubfu9A8I7bAw9VleSR5g">
+            <meta property="og:image" content="https://example.com/thumb.jpg">
+          </head>
+          <body>
+            <script>
+              var data = {"items": [{"gridChannelRenderer": {"channelId": "UC4JP20XnIBVlAI5GQM58edg"}}]};
+            </script>
+          </body>
+        </html>
+        '''
+        mock_page = AsyncMock()
+        mock_page.title.return_value = "Radio Văn Sâm - YouTube"
+        mock_page.content.return_value = featured_html
+        mock_page.url = "https://www.youtube.com/@radio-vansam78"
+        mock_locator = MagicMock()
+        def get_attr(attr):
+            if attr == "href":
+                return "https://www.youtube.com/channel/UCb1ubfu9A8I7bAw9VleSR5g"
+            if attr == "content":
+                return "https://example.com/thumb.jpg"
+            return ""
+        mock_locator.get_attribute = AsyncMock(side_effect=get_attr)
+        mock_page.locator = MagicMock(return_value=mock_locator)
+
+        mock_context = AsyncMock()
+        mock_context.pages = [mock_page]
+        mock_session = AsyncMock()
+        mock_session.__aenter__.return_value = (mock_context, None, None)
+        mock_session.__aexit__.return_value = None
+
+        with patch("auto_yt.services.channel_scanner_service.channel_browser_session", return_value=mock_session):
+            import asyncio
+            result = asyncio.run(
+                competitor_radar.resolve_competitor_channel(
+                    "https://www.youtube.com/@radio-vansam78",
+                    "dummy_profile",
+                )
+            )
+            self.assertEqual(result["channel_id"], "UCb1ubfu9A8I7bAw9VleSR5g")
+            self.assertEqual(result["canonical_url"], "https://www.youtube.com/channel/UCb1ubfu9A8I7bAw9VleSR5g")
+
+
 if __name__ == "__main__":
     unittest.main()

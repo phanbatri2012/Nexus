@@ -50,6 +50,10 @@ function usageModes(voice) {
     (voice.casting_profile?.auto_cast ? ['multi_guest'] : ['single_narrator'])
 }
 
+function promptLabel(promptVersions, promptVersion) {
+  return promptVersions?.[promptVersion]?.name || promptVersion || '—'
+}
+
 export default function CompetitorRadar({ onOpenJobCenter }) {
   const [rules, setRules] = useState([])
   const [history, setHistory] = useState([])
@@ -254,7 +258,7 @@ export default function CompetitorRadar({ onOpenJobCenter }) {
         {!rules.length ? <p className="radar-empty">Chưa có đối thủ nào được theo dõi.</p> : <div className="radar-rule-grid">
           {rules.map(rule => <article className="radar-rule" key={rule.id}>
             <div className="radar-rule-head">
-              <div><h3>{rule.competitor_title || rule.competitor_handle || rule.competitor_youtube_channel_id}</h3><small>{rule.prompt_version} → {rule.target_channel_title}</small></div>
+              <div><h3>{rule.competitor_title || rule.competitor_handle || rule.competitor_youtube_channel_id}</h3><small>{promptLabel(prompts.versions, rule.prompt_version)} → {rule.target_channel_title}</small></div>
               <span className={`radar-status ${rule.status}`}>{statusLabel(rule.status)}</span>
             </div>
             <dl>
@@ -290,7 +294,7 @@ export default function CompetitorRadar({ onOpenJobCenter }) {
         <div className="radar-table-wrap"><table className="radar-table"><thead><tr><th>Video nguồn</th><th>Đối thủ</th><th>Prompt</th><th>Phát hiện</th><th>Trạng thái</th><th>Báo cáo</th></tr></thead>
           <tbody>{history.map(item => <tr key={item.id}>
             <td><a href={item.source_url} target="_blank" rel="noreferrer">{item.source_title || item.youtube_video_id}</a></td>
-            <td>{item.competitor_title}</td><td>{item.prompt_version}</td><td>{formatDate(item.created_at)}</td>
+            <td>{item.competitor_title}</td><td>{promptLabel(prompts.versions, item.prompt_version)}</td><td>{formatDate(item.created_at)}</td>
             <td><span className={`radar-status ${item.status}`}>{statusLabel(item.status)}</span>{item.error && <small className="radar-row-error">{item.error}</small>}</td>
             <td><button disabled={!item.video_id || busy === `report-${item.id}`} onClick={() => openReport(item)}>Casting &amp; QC</button></td>
           </tr>)}</tbody>

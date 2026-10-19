@@ -41,6 +41,7 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
         GoogleFlowWorker._session_uploaded_image_urls.clear()
         GoogleFlowWorker._session_video_frame_assets.clear()
         GoogleFlowWorker._session_configured_agent_projects.clear()
+        GoogleFlowWorker._session_configured_agent_image_projects.clear()
 
     async def test_wait_for_editor_finds_prosemirror(self):
         page = MagicMock()
@@ -2429,7 +2430,7 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
         settings_locator.first = settings_button
 
         panel = MagicMock()
-        panel.is_visible = AsyncMock(side_effect=[True, False])
+        panel.is_visible = AsyncMock(side_effect=[True, False, True, False])
         choices = {}
         for text in ("Không bao giờ", "16:9", "x1"):
             choice_locator = MagicMock()
@@ -2502,15 +2503,25 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
             }
             await worker.ensure_agent_image_settings(settings)
             await worker.ensure_agent_image_settings(settings)
+            await worker.ensure_agent_image_settings(
+                {
+                    **settings,
+                    "model": "nano_banana_pro",
+                }
+            )
 
-        settings_button.click.assert_awaited_once()
-        choices["Không bao giờ"].click.assert_awaited_once()
-        choices["16:9"].click.assert_awaited_once()
-        choices["x1"].click.assert_awaited_once()
-        save_button.click.assert_awaited_once()
-        model_select.click.assert_awaited_once()
-        model_option.click.assert_awaited_once()
+        self.assertEqual(settings_button.click.await_count, 2)
+        self.assertEqual(choices["Không bao giờ"].click.await_count, 2)
+        self.assertEqual(choices["16:9"].click.await_count, 2)
+        self.assertEqual(choices["x1"].click.await_count, 2)
+        self.assertEqual(save_button.click.await_count, 2)
+        self.assertEqual(model_select.click.await_count, 2)
+        self.assertEqual(model_option.click.await_count, 2)
         self.assertIn("project-one", GoogleFlowWorker._session_configured_agent_image_projects)
+        self.assertEqual(
+            GoogleFlowWorker._session_configured_agent_image_projects["project-one"],
+            ("nano_banana_pro", "16:9", 1),
+        )
 
     async def test_wait_for_editor_rejects_asset_edit_route(self):
         page = MagicMock()

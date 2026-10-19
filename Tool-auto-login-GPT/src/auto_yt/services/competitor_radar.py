@@ -111,18 +111,31 @@ async def resolve_competitor_channel(reference: str, gpm_profile_id: str) -> dic
             handle = "@" + urllib.parse.unquote(handle_match.group(1))
 
     channel_id = ""
-    for pattern in (
-        r'"channelId"\s*:\s*"(UC[A-Za-z0-9_-]{20,30})"',
-        r'"externalId"\s*:\s*"(UC[A-Za-z0-9_-]{20,30})"',
-        r'/channel/(UC[A-Za-z0-9_-]{20,30})',
-    ):
-        match = re.search(pattern, html)
-        if match:
-            channel_id = match.group(1)
-            break
+    if canonical:
+        canonical_match = CHANNEL_ID_PATTERN.search(canonical)
+        if canonical_match:
+            channel_id = canonical_match.group(0)
+
     if not channel_id:
-        match = CHANNEL_ID_PATTERN.search(target_url)
-        channel_id = match.group(0) if match else ""
+        url_match = CHANNEL_ID_PATTERN.search(current_url) or CHANNEL_ID_PATTERN.search(target_url)
+        if url_match:
+            channel_id = url_match.group(0)
+
+    if not channel_id:
+        ext_match = re.search(r'"externalId"\s*:\s*"(UC[A-Za-z0-9_-]{20,30})"', html)
+        if ext_match:
+            channel_id = ext_match.group(1)
+
+    if not channel_id:
+        for pattern in (
+            r'/channel/(UC[A-Za-z0-9_-]{20,30})',
+            r'<meta itemprop="channelId" content="(UC[A-Za-z0-9_-]{20,30})"',
+            r'"channelId"\s*:\s*"(UC[A-Za-z0-9_-]{20,30})"',
+        ):
+            match = re.search(pattern, html)
+            if match:
+                channel_id = match.group(1)
+                break
     if not channel_id:
         raise CompetitorResolutionError(
             "Không tìm thấy Channel ID trong trang YouTube qua GPM."
