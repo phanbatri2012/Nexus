@@ -281,7 +281,7 @@ class TestGoogleFlowWorkerUpload(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.worker._resolve_new_media_source.await_count, 3)
 
 
-    async def test_find_video_for_prompt_resolves_from_canvas_when_chat_is_queued(self):
+    async def test_find_video_for_prompt_does_not_reuse_unscoped_canvas_video(self):
         self.worker.page.evaluate = AsyncMock(
             return_value={
                 "promptFound": True,
@@ -299,8 +299,28 @@ class TestGoogleFlowWorkerUpload(unittest.IsolatedAsyncioTestCase):
             return_value="https://flow.google.com/video/canvas_video_1.mp4"
         )
         result = await self.worker._find_video_for_prompt("Generate cinematic video")
-        self.assertEqual(result.get("state"), "completed")
-        self.assertEqual(result.get("source"), "https://flow.google.com/video/canvas_video_1.mp4")
+        self.assertEqual(result.get("state"), "queued")
+        self.assertEqual(result.get("source"), "")
+        self.worker._inspect_video_candidate_detail.assert_not_awaited()
+
+    async def test_generation_receipt_contains_identity_without_media_url(self):
+        self.worker.page.url = "https://flow.google.com/project/project-123"
+        receipt = self.worker._remember_generation_receipt(
+            request_key="request-abc",
+            media_type="video",
+            scene_index=3,
+            full_prompt="Generate a cinematic clip",
+            submitted_at="2026-10-20T00:00:00+00:00",
+            deadline_seconds=900,
+            attempt=2,
+        )
+
+        self.assertEqual(receipt["request_key"], "request-abc")
+        self.assertEqual(receipt["project_id"], "project-123")
+        self.assertEqual(receipt["scene_index"], 3)
+        self.assertEqual(receipt["attempt"], 2)
+        self.assertEqual(len(receipt["prompt_hash"]), 64)
+        self.assertNotIn("url", " ".join(receipt))
 
     async def test_ensure_agent_video_frame_falls_back_to_upload_on_picker_error(self):
         import tempfile

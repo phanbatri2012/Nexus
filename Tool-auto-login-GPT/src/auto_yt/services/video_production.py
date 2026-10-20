@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -55,8 +56,11 @@ PERCEPTUAL_DUPLICATE_DISTANCE = 6
 LOW_VARIANCE_IMAGE_THRESHOLD = 2.0
 LOW_VARIANCE_COLOR_DISTANCE = 8.0
 MAX_PERCEPTUAL_DUPLICATE_RETRIES = 2
-FLOW_VIDEO_RECONCILIATION_TTL_SECONDS = 3600.0
-FLOW_VIDEO_RECONCILIATION_POLL_SECONDS = 60.0
+FLOW_IMAGE_RECONCILIATION_TTL_SECONDS = 600.0
+FLOW_VIDEO_RECONCILIATION_TTL_SECONDS = 900.0
+FLOW_MEDIA_RECONCILIATION_POLL_SECONDS = 30.0
+FLOW_IMAGE_TRANSIENT_RETRY_DELAYS_SECONDS = (30.0, 60.0, 120.0)
+FLOW_REMOTE_MAX_IN_FLIGHT = 4
 PERCEPTUAL_RETRY_DIRECTIONS = (
     "Use a substantially different camera distance, viewpoint, and subject arrangement",
     "Change the foreground, background, direction of movement, and visual hierarchy completely",
@@ -76,6 +80,65 @@ class SceneVisualDuplicateError(VideoProductionError):
     pass
 
 
+class SceneVideoDuplicateError(VideoProductionError):
+    pass
+
+
+def _parse_utc_timestamp(value: object) -> dt.datetime | None:
+    try:
+        parsed = dt.datetime.fromisoformat(str(value or ""))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+def _seconds_until(value: object) -> float:
+    parsed = _parse_utc_timestamp(value)
+    if parsed is None:
+        return 0.0
+    return max(0.0, (parsed - dt.datetime.now(dt.timezone.utc)).total_seconds())
+
+
+async def _best_effort_cancel_flow_request(worker, request_key: str) -> bool:
+    cancel = getattr(worker, "cancel_generation_for_prompt", None)
+    if not callable(cancel) or not request_key:
+        return False
+    result = cancel(f"AYT-{request_key}")
+    if inspect.isawaitable(result):
+        result = await result
+    return bool(result) if isinstance(result, bool) else False
+
+
+def _fallback_flow_receipt(
+    *,
+    request_key: str,
+    media_type: str,
+    scene_index: int,
+    project_id: str,
+    prompt_hash: str,
+    frame_hashes: list[str],
+    attempt: int,
+    deadline_seconds: float,
+) -> dict[str, object]:
+    submitted_at = dt.datetime.now(dt.timezone.utc)
+    return {
+        "request_key": request_key,
+        "media_type": media_type,
+        "scene_index": int(scene_index),
+        "project_id": project_id,
+        "prompt_hash": prompt_hash,
+        "frame_hashes": list(frame_hashes),
+        "submitted_at": submitted_at.isoformat(),
+        "deadline_at": (
+            submitted_at + dt.timedelta(seconds=max(0.0, deadline_seconds))
+        ).isoformat(),
+        "identity_keys": [f"request:{request_key}", f"prompt:{prompt_hash}"],
+        "attempt": max(1, int(attempt or 1)),
+    }
+
+
 VIDEO_FAILURE_STAGE_BY_ERROR = {
     "FlowAgentInteractionError": "agent_interaction",
     "FlowAgentSettingsError": "agent_settings",
@@ -89,6 +152,7 @@ VIDEO_FAILURE_STAGE_BY_ERROR = {
     "FlowVideoPending": "reconciliation",
     "FlowResultMissingError": "result_missing",
     "FlowUiStateError": "ui_state",
+    "SceneVideoDuplicateError": "output_validation",
 }
 
 
@@ -962,7 +1026,12 @@ def _flow_mock_enabled() -> bool:
 
 
 @asynccontextmanager
-async def _flow_worker_session(video_id: int, *, force_new_project: bool = False):
+async def _flow_worker_session(
+    video_id: int,
+    *,
+    force_new_project: bool = False,
+    force_new_flow_project: bool = False,
+):
     """Open one Playwright/CDP connection for a complete scene generation batch."""
     if _flow_mock_enabled():
         yield None
@@ -998,10 +1067,29 @@ async def _flow_worker_session(video_id: int, *, force_new_project: bool = False
 
         worker = GoogleFlowWorker(page)
         worker.video_id = video_id
-        await worker.ensure_project(
+        project_record = db.get_flow_project(video_id) or {}
+        reset_requested = bool(project_record.get("reset_requested"))
+        mapped_url = str(project_record.get("project_url") or "").strip()
+        if (
+            mapped_url
+            and not force_new_project
+            and not force_new_flow_project
+            and not reset_requested
+            and re.match(r"^https://(?:flow\.google\.com|labs\.google)/project/", mapped_url)
+        ):
+            try:
+                await page.goto(mapped_url, wait_until="domcontentloaded", timeout=30000)
+            except Exception as exc:
+                logger.warning(
+                    "Could not open mapped Flow project for video %s: %s",
+                    video_id,
+                    security_logging.redact_sensitive(exc),
+                )
+        project_url = await worker.ensure_project(
             f"auto_yt_{video_id}",
-            force_new=force_new_project,
+            force_new=bool(force_new_project or force_new_flow_project or reset_requested),
         )
+        db.upsert_flow_project(video_id, worker._project_id(), str(project_url or page.url or ""))
         yield worker
 
 
@@ -1042,7 +1130,15 @@ async def _generate_scene_image_async(
     existing_hashes: set[str] | None = None,
     existing_perceptual_hashes: list[ImagePerceptualFingerprint] | None = None,
     force_new_project: bool = False,
+    submit_only: bool = False,
 ) -> Path:
+    from auto_yt.services.google_flow_worker import (
+        FlowGenerationError,
+        FlowGenerationTimeout,
+        FlowImageNeedsAttention,
+        FlowImagePending,
+    )
+
     negative_prompt = str(settings.get("avoid_prompt") or settings.get("negative_prompt") or "")
     fixed_seed = int(_sha256_bytes(str(video_id).encode("utf-8"))[:15], 16)
     cancel_check()
@@ -1052,6 +1148,7 @@ async def _generate_scene_image_async(
     )
     artifact_type = f"scene:{scene['index']}"
     existing = db.get_latest_video_artifact(video_id, artifact_type)
+    existing_metadata = existing.get("metadata", {}) if existing else {}
 
     cache_matches_plan = bool(
         existing and existing.get("content_hash") == content_hash
@@ -1103,7 +1200,51 @@ async def _generate_scene_image_async(
 
     target = SCENES_DIR / f"{video_id}_{scene['index']}_{content_hash[:8]}.png"
     target.parent.mkdir(parents=True, exist_ok=True)
-    generation_attempt = existing.get("metadata", {}).get("generation_attempt", 0) + 1 if existing else 1
+    receipt = existing_metadata.get("flow_receipt")
+    receipt = receipt if isinstance(receipt, dict) else {}
+    is_reconciliation_checkpoint = bool(
+        not force_new_project
+        and existing
+        and existing.get("content_hash") == content_hash
+        and existing.get("status") == "queued"
+        and receipt.get("request_key")
+    )
+    retry_wait_remaining = 0.0
+    if (
+        not force_new_project
+        and existing
+        and existing.get("content_hash") == content_hash
+        and existing.get("status") == "retry_wait"
+    ):
+        retry_wait_remaining = _seconds_until(existing_metadata.get("next_retry_at"))
+        if retry_wait_remaining > 0:
+            raise FlowImagePending(
+                "Ảnh đang chờ lượt tự thử lại theo backoff.",
+                reason_code="flow_image_retry_wait",
+                retry_delay_seconds=retry_wait_remaining,
+                pending_image_scene_indices=[int(scene.get("index", 0))],
+            )
+    generation_attempt = int(existing_metadata.get("generation_attempt") or 0)
+    if not is_reconciliation_checkpoint:
+        generation_attempt += 1
+    generation_attempt = max(1, generation_attempt)
+    request_key = (
+        str(receipt.get("request_key") or "")
+        if is_reconciliation_checkpoint
+        else secrets.token_hex(10)
+    )
+    pending_expired = bool(
+        is_reconciliation_checkpoint
+        and _seconds_until(receipt.get("deadline_at")) <= 0
+    )
+    checkpoint_metadata = {
+        **existing_metadata,
+        **scene,
+        "seed": fixed_seed,
+        "generation_attempt": generation_attempt,
+        "reference_id": reference_id,
+        "reference_hash": reference_hash,
+    }
     
     started_at = time.monotonic()
     progress(
@@ -1118,17 +1259,12 @@ async def _generate_scene_image_async(
         content_hash=content_hash,
         status="processing",
         mime_type="image/png",
-        metadata={
-            **scene,
-            "seed": fixed_seed,
-            "generation_attempt": generation_attempt,
-            "reference_id": reference_id,
-            "reference_hash": reference_hash,
-        },
+        metadata=checkpoint_metadata,
     )
 
     flow_frame_metadata: dict[str, str] = {}
     perceptual_duplicate_retries = 0
+    safe_prompt_used = bool(existing_metadata.get("safe_prompt_used"))
     try:
         if _flow_mock_enabled():
             from PIL import Image
@@ -1140,8 +1276,6 @@ async def _generate_scene_image_async(
         else:
             if worker is None:
                 raise VideoProductionError("Google Flow worker chưa được khởi tạo.")
-
-            from auto_yt.services.google_flow_worker import FlowGenerationError
 
             video_rec = db.get_video(video_id) or {}
             video_title = str(video_rec.get("title") or video_rec.get("generated_title") or "")
@@ -1179,12 +1313,18 @@ async def _generate_scene_image_async(
                 "aspect_ratio": str(settings.get("aspect_ratio") or "16:9"),
                 "output_count": int(settings.get("output_count") or 1),
             }
+            if pending_expired:
+                await _best_effort_cancel_flow_request(worker, request_key)
+                raise FlowGenerationTimeout(
+                    "Google Flow không trả về ảnh gắn đúng request trước thời hạn 10 phút."
+                )
             while True:
+                base_generation_prompt = safe_prompt if safe_prompt_used else clean_prompt
                 generation_prompt = (
-                    clean_prompt
+                    base_generation_prompt
                     if perceptual_duplicate_retries == 0
                     else _build_perceptual_retry_prompt(
-                        clean_prompt,
+                        base_generation_prompt,
                         scene,
                         perceptual_duplicate_retries,
                     )
@@ -1210,8 +1350,15 @@ async def _generate_scene_image_async(
                         scene_index=int(scene.get("index", 0)),
                         scene_count=scene_count,
                         image_settings=image_settings,
+                        request_key=request_key,
+                        reconcile_only=is_reconciliation_checkpoint,
+                        submit_only=submit_only,
+                        request_attempt=generation_attempt,
+                        deadline_seconds=FLOW_IMAGE_RECONCILIATION_TTL_SECONDS,
                     )
                 except FlowGenerationError as first_error:
+                    if safe_prompt_used:
+                        raise
                     logger.warning(
                         "Flow explicitly rejected scene %d (%s). Retrying once with a safe prompt.",
                         scene.get("index", 0),
@@ -1226,6 +1373,9 @@ async def _generate_scene_image_async(
                             perceptual_duplicate_retries,
                         )
                     )
+                    safe_prompt_used = True
+                    checkpoint_metadata["safe_prompt_used"] = True
+                    request_key = secrets.token_hex(10)
                     _log_scene_generation(
                         video_id=video_id,
                         scene_index=int(scene.get("index", 0)),
@@ -1243,6 +1393,10 @@ async def _generate_scene_image_async(
                         scene_index=int(scene.get("index", 0)),
                         scene_count=scene_count,
                         image_settings=image_settings,
+                        request_key=request_key,
+                        submit_only=submit_only,
+                        request_attempt=generation_attempt,
+                        deadline_seconds=FLOW_IMAGE_RECONCILIATION_TTL_SECONDS,
                     )
 
                 await worker.download_image(asset_url, str(target))
@@ -1317,7 +1471,110 @@ async def _generate_scene_image_async(
             raise SceneVisualDuplicateError(
                 "Tạo ảnh quá giống cảnh trước; dừng để tránh video lặp ảnh."
             )
+    except FlowImagePending as exc:
+        pending_receipt = dict(exc.receipt or {})
+        if not pending_receipt and hasattr(worker, "get_last_generation_receipt"):
+            worker_receipt = worker.get_last_generation_receipt()
+            if isinstance(worker_receipt, dict):
+                pending_receipt = dict(worker_receipt)
+        if not pending_receipt:
+            pending_receipt = _fallback_flow_receipt(
+                request_key=request_key,
+                media_type="image",
+                scene_index=int(scene.get("index", 0)),
+                project_id="",
+                prompt_hash=content_hash,
+                frame_hashes=[],
+                attempt=generation_attempt,
+                deadline_seconds=FLOW_IMAGE_RECONCILIATION_TTL_SECONDS,
+            )
+        queued_since = str(
+            pending_receipt.get("submitted_at")
+            or existing_metadata.get("queued_since")
+            or db.utc_now()
+        )
+        next_retry_at = (
+            dt.datetime.now(dt.timezone.utc)
+            + dt.timedelta(seconds=FLOW_MEDIA_RECONCILIATION_POLL_SECONDS)
+        ).isoformat()
+        db.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type=artifact_type,
+            path=str(target),
+            content_hash=content_hash,
+            status="queued",
+            mime_type="image/png",
+            metadata={
+                **checkpoint_metadata,
+                "flow_receipt": pending_receipt or receipt,
+                "queued_since": queued_since,
+                "next_retry_at": next_retry_at,
+                "reason_code": str(exc.reason_code or "flow_image_pending"),
+                "terminal": False,
+            },
+        )
+        exc.queued_since = queued_since
+        exc.next_retry_at = next_retry_at
+        exc.retry_delay_seconds = FLOW_MEDIA_RECONCILIATION_POLL_SECONDS
+        exc.pending_image_scene_indices = [int(scene.get("index", 0))]
+        raise
     except Exception as exc:
+        transient_error_names = {
+            "FlowAgentStalledError",
+            "FlowGenerationStartError",
+            "FlowGenerationTimeout",
+            "FlowResultMissingError",
+            "FlowSubmissionError",
+            "FlowUiStateError",
+        }
+        terminal_exc: Exception = exc
+        if type(exc).__name__ in transient_error_names:
+            transient_retry_count = int(
+                existing_metadata.get("transient_retry_count") or 0
+            )
+            if transient_retry_count < len(FLOW_IMAGE_TRANSIENT_RETRY_DELAYS_SECONDS):
+                retry_delay = FLOW_IMAGE_TRANSIENT_RETRY_DELAYS_SECONDS[
+                    transient_retry_count
+                ]
+                next_retry_at = (
+                    dt.datetime.now(dt.timezone.utc)
+                    + dt.timedelta(seconds=retry_delay)
+                ).isoformat()
+                db.upsert_video_artifact(
+                    video_id=video_id,
+                    artifact_type=artifact_type,
+                    path=str(target),
+                    content_hash=content_hash,
+                    status="retry_wait",
+                    mime_type="image/png",
+                    metadata={
+                        **checkpoint_metadata,
+                        "error": security_logging.redact_sensitive(exc),
+                        "failure_stage": {
+                            "FlowGenerationStartError": "generation_start",
+                            "FlowGenerationTimeout": "generation_timeout",
+                            "FlowAgentStalledError": "generation_timeout",
+                            "FlowResultMissingError": "result_missing",
+                            "FlowSubmissionError": "submit",
+                            "FlowUiStateError": "ui_state",
+                        }.get(type(exc).__name__, "image_generation"),
+                        "reason_code": _safe_reason_code(exc),
+                        "transient_retry_count": transient_retry_count + 1,
+                        "next_retry_at": next_retry_at,
+                        "terminal": False,
+                    },
+                )
+                raise FlowImagePending(
+                    "Lỗi Flow tạm thời; ảnh sẽ tự thử lại theo backoff.",
+                    reason_code="flow_image_retry_wait",
+                    next_retry_at=next_retry_at,
+                    retry_delay_seconds=retry_delay,
+                    pending_image_scene_indices=[int(scene.get("index", 0))],
+                ) from exc
+            terminal_exc = FlowImageNeedsAttention(
+                f"Ảnh cảnh {int(scene.get('index', 0)) + 1} đã hết 3 lượt tự thử lại: "
+                f"{security_logging.redact_sensitive(exc)}"
+            )
         failure_stage_by_error = {
             "FlowAgentInteractionError": "agent_interaction",
             "FlowSubmissionError": "submit",
@@ -1331,7 +1588,7 @@ async def _generate_scene_image_async(
             "SceneVisualDuplicateError": "visual_duplicate",
         }
         failure_stage = failure_stage_by_error.get(
-            type(exc).__name__,
+            type(terminal_exc).__name__,
             "image_generation",
         )
         try:
@@ -1347,10 +1604,11 @@ async def _generate_scene_image_async(
             mime_type="image/png",
             metadata={
                 **scene,
-                "error": str(exc),
+                "error": security_logging.redact_sensitive(terminal_exc),
                 "failure_stage": failure_stage,
                 "generation_attempt": generation_attempt,
                 "perceptual_duplicate_retries": perceptual_duplicate_retries,
+                "safe_prompt_used": safe_prompt_used,
                 "reference_id": reference_id,
                 "reference_hash": reference_hash,
             },
@@ -1362,9 +1620,9 @@ async def _generate_scene_image_async(
             state="failed",
             attempt=generation_attempt,
             started_at=started_at,
-            detail=str(exc),
+            detail=security_logging.redact_sensitive(terminal_exc),
         )
-        raise
+        raise terminal_exc
 
     progress(f"Đã tải ảnh {scene['index'] + 1}/{scene_count}", "downloading_flow_image")
     db.upsert_video_artifact(
@@ -1378,6 +1636,7 @@ async def _generate_scene_image_async(
             **scene,
             "generation_attempt": generation_attempt,
             "perceptual_duplicate_retries": perceptual_duplicate_retries,
+            "safe_prompt_used": safe_prompt_used,
             "reference_id": reference_id,
             **flow_frame_metadata,
         },
@@ -1543,6 +1802,10 @@ async def _generate_scene_video_async(
     cancel_check,
     worker,
     force_new_project: bool = False,
+    submit_only: bool = False,
+    existing_video_hashes: set[str] | None = None,
+    video_number: int | None = None,
+    video_count: int | None = None,
 ) -> Path:
     from auto_yt.services.google_flow_worker import (
         FlowFrameAttachmentError,
@@ -1565,6 +1828,8 @@ async def _generate_scene_video_async(
     artifact_type = f"scene_video:{scene['index']}"
     existing = db.get_latest_video_artifact(video_id, artifact_type)
     existing_metadata = existing.get("metadata", {}) if existing else {}
+    receipt = existing_metadata.get("flow_receipt")
+    receipt = receipt if isinstance(receipt, dict) else {}
     recoverable_reason_codes = {
         "flow_generation_timeout",
         "flow_generation_start_error",
@@ -1620,7 +1885,15 @@ async def _generate_scene_video_async(
             )
         except (TypeError, ValueError):
             pending_age = 0.0
-        pending_expired = pending_age >= max_wait_seconds
+        receipt_deadline = _parse_utc_timestamp(receipt.get("deadline_at"))
+        pending_expired = (
+            not receipt.get("request_key")
+            or (
+                receipt_deadline is not None
+                and receipt_deadline <= now_utc
+            )
+            or pending_age >= max_wait_seconds
+        )
 
     if (
         not force_new_project
@@ -1630,7 +1903,16 @@ async def _generate_scene_video_async(
     ):
         artifact_path = Path(existing["path"])
         if artifact_path.exists() and artifact_path.stat().st_size > 1000:
-            return artifact_path
+            cached_hash = _sha256_file(artifact_path)
+            if existing_video_hashes is None or cached_hash not in existing_video_hashes:
+                return artifact_path
+            logger.warning(
+                "Cached scene video %s duplicates another intro clip; regenerating.",
+                scene.get("index"),
+            )
+            if existing.get("id"):
+                db.delete_video_artifact(existing["id"])
+            artifact_path.unlink(missing_ok=True)
     elif existing and existing.get("content_hash") != content_hash:
         logger.info(
             "Ignoring stale scene video cache for video=%s scene=%s: expected=%s actual=%s",
@@ -1667,6 +1949,11 @@ async def _generate_scene_video_async(
         previous_attempt if is_reconciliation_checkpoint else previous_attempt + 1
     )
     generation_attempt = max(1, generation_attempt)
+    request_key = (
+        str(receipt.get("request_key") or "")
+        if is_reconciliation_checkpoint
+        else secrets.token_hex(10)
+    )
     checkpoint_metadata = {
         **existing_metadata,
         **scene,
@@ -1679,9 +1966,11 @@ async def _generate_scene_video_async(
     }
     
     started_at = time.monotonic()
+    display_video_number = int(video_number or (int(scene.get("index", 0)) + 1))
+    display_video_count = int(video_count or scene_count)
     progress(
-        f"Đang tạo video intro {scene['index'] + 1}/{scene_count} bằng Google Flow Veo",
-        f"generating_flow_video {scene['index'] + 1}/{scene_count}",
+        f"Đang tạo video intro {display_video_number}/{display_video_count} bằng Google Flow Veo",
+        f"generating_flow_video {display_video_number}/{display_video_count}",
     )
     
     db.upsert_video_artifact(
@@ -1776,6 +2065,12 @@ async def _generate_scene_video_async(
                 )
             except (TypeError, ValueError):
                 baseline_tile_count = None
+            if pending_expired:
+                await _best_effort_cancel_flow_request(worker, request_key)
+                raise FlowVideoWaitExpired(
+                    f"Google Flow không cung cấp video tải xuống cho scene {scene.get('index')} "
+                    f"trước khi hết thời hạn đối soát {max_wait_seconds:.0f} giây."
+                )
             video_url = await worker.generate_scene_video(
                 prompt=video_prompt,
                 avoid_prompt=negative_prompt,
@@ -1791,6 +2086,10 @@ async def _generate_scene_video_async(
                 reconcile_only=is_reconciliation_checkpoint,
                 video_error_count_before_submit=baseline_error_count,
                 video_tile_count_before_submit=baseline_tile_count,
+                request_key=request_key,
+                submit_only=submit_only,
+                request_attempt=generation_attempt,
+                deadline_seconds=max_wait_seconds,
             )
             await worker.download_video(video_url, str(target))
             timing_snapshot = worker.get_last_video_timing()
@@ -1802,6 +2101,11 @@ async def _generate_scene_video_async(
         if not target.exists() or target.stat().st_size < 1000:
             raise RuntimeError(f"Video tạo từ Google Flow Veo không hợp lệ hoặc quá nhỏ: {target}")
         clip_probe = probe_scene_video(target)
+        clip_hash = _sha256_file(target)
+        if existing_video_hashes is not None and clip_hash in existing_video_hashes:
+            raise SceneVideoDuplicateError(
+                f"Clip scene {scene.get('index')} trùng SHA-256 với clip intro đã nhận trước đó."
+            )
     except FlowVideoPending as exc:
         if pending_expired:
             logger.info(
@@ -1820,8 +2124,30 @@ async def _generate_scene_video_async(
                 **(previous_timing if isinstance(previous_timing, dict) else {}),
                 **(timing_snapshot if isinstance(timing_snapshot, dict) else {}),
             }
+        pending_receipt = dict(exc.receipt or {})
+        if not pending_receipt and worker is not None and hasattr(
+            worker, "get_last_generation_receipt"
+        ):
+            worker_receipt = worker.get_last_generation_receipt()
+            if isinstance(worker_receipt, dict):
+                pending_receipt = dict(worker_receipt)
+        if not pending_receipt:
+            pending_receipt = _fallback_flow_receipt(
+                request_key=request_key,
+                media_type="video",
+                scene_index=int(scene.get("index", 0)),
+                project_id="",
+                prompt_hash=content_hash,
+                frame_hashes=[start_hash, end_hash],
+                attempt=generation_attempt,
+                deadline_seconds=max_wait_seconds,
+            )
         safe_error = security_logging.redact_sensitive(exc)
-        queued_since = str(existing_metadata.get("queued_since") or db.utc_now())
+        queued_since = str(
+            pending_receipt.get("submitted_at")
+            or existing_metadata.get("queued_since")
+            or db.utc_now()
+        )
         previous_poll_count = int(
             existing_metadata.get("reconciliation_poll_count") or 0
         )
@@ -1830,12 +2156,13 @@ async def _generate_scene_video_async(
         )
         next_retry_at = (
             dt.datetime.now(dt.timezone.utc)
-            + dt.timedelta(seconds=FLOW_VIDEO_RECONCILIATION_POLL_SECONDS)
+            + dt.timedelta(seconds=FLOW_MEDIA_RECONCILIATION_POLL_SECONDS)
         ).isoformat()
         exc.queued_since = queued_since
         exc.next_retry_at = next_retry_at
         exc.reconciliation_poll_count = reconciliation_poll_count
-        exc.retry_delay_seconds = FLOW_VIDEO_RECONCILIATION_POLL_SECONDS
+        exc.retry_delay_seconds = FLOW_MEDIA_RECONCILIATION_POLL_SECONDS
+        exc.pending_video_scene_indices = [int(scene.get("index", 0))]
         db.upsert_video_artifact(
             video_id=video_id,
             artifact_type=artifact_type,
@@ -1845,6 +2172,7 @@ async def _generate_scene_video_async(
             mime_type="video/mp4",
             metadata={
                 **checkpoint_metadata,
+                "flow_receipt": pending_receipt or receipt,
                 "queued_since": queued_since,
                 "error": safe_error,
                 "failure_stage": "reconciliation",
@@ -1856,7 +2184,7 @@ async def _generate_scene_video_async(
             },
         )
         progress(
-            f"Google Flow vẫn đang xử lý video intro {scene['index'] + 1}/{scene_count}; sẽ tự đối soát lại",
+            f"Google Flow vẫn đang xử lý video intro {display_video_number}/{display_video_count}; sẽ tự đối soát lại",
             "waiting_flow_video",
         )
         _log_scene_generation(
@@ -1909,7 +2237,10 @@ async def _generate_scene_video_async(
         )
         raise
 
-    progress(f"Đã tải video {scene['index'] + 1}/{scene_count}", "downloading_flow_video")
+    progress(
+        f"Đã tải video {display_video_number}/{display_video_count}",
+        "downloading_flow_video",
+    )
     completed_metadata = {
         **checkpoint_metadata,
         "flow_timing": flow_timing,
@@ -1995,22 +2326,11 @@ def generate_scene_media(
     progress,
     cancel_check,
     force_new_project: bool = False,
+    force_new_flow_project: bool = False,
 ) -> dict:
-    """Generate media assets for all scenes.
-    
-    1. Phase 1: Generates base images for all scenes (Image 0..N).
-    2. Phase 2: For intro scenes (is_video=True), animates Image[i] -> Image[i+1] into video clips.
-       Video failures fall back to the corresponding base image and remain visible in the summary.
-    """
+    """Advance one bounded Flow scheduling pass and return once all media is ready."""
     settings = settings or {}
     enable_intro_video = bool(settings.get("enable_intro_video", True))
-    has_video_scenes = enable_intro_video and any(
-        bool(scene.get("is_video") or scene.get("media_type") == "video")
-        for scene in scenes
-    )
-
-    # Keep the public image-only facade intact while using one shared session for
-    # jobs that include both image and Veo phases.
     existing_final = db.get_latest_video_artifact(video_id, "final_mp4", status="ready")
     if existing_final and Path(existing_final.get("path") or "").is_file():
         logger.info("Video %s đã có final_mp4 hoàn tất; bỏ qua generate_scene_media.", video_id)
@@ -2019,53 +2339,187 @@ def generate_scene_media(
             "intro_video_summary": _empty_intro_video_summary(enabled=enable_intro_video),
         }
 
-    if not has_video_scenes:
-        return {
-            "media_paths": generate_scene_images(
-                video_id=video_id,
-                scenes=scenes,
-                profile=profile,
-                reference_profile=reference_profile,
-                settings=settings,
-                progress=progress,
-                cancel_check=cancel_check,
-                force_new_project=force_new_project,
-            ),
-            "intro_video_summary": _empty_intro_video_summary(
-                enabled=enable_intro_video
-            ),
-        }
-
     if force_new_project:
         purge_all_scene_artifacts(video_id)
     cleanup_duplicate_scene_artifacts(video_id)
 
     async def _run_batch() -> dict:
-        async with _flow_worker_session(
-            video_id,
-            force_new_project=force_new_project,
-        ) as worker:
-            base_image_paths = await _generate_scene_images_with_worker(
-                video_id=video_id,
-                scenes=scenes,
-                profile=profile,
-                reference_profile=reference_profile,
-                settings=settings,
-                progress=progress,
-                cancel_check=cancel_check,
-                worker=worker,
-                force_new_project=force_new_project,
+        from auto_yt.services.google_flow_worker import (
+            FlowAgentSettingsError,
+            FlowImagePending,
+            FlowMediaPending,
+            FlowModeError,
+            FlowVideoPending,
+        )
+
+        def bounded_setting(name: str, default: int, minimum: int, maximum: int) -> int:
+            try:
+                value = int(settings.get(name, default))
+            except (TypeError, ValueError):
+                value = default
+            return max(minimum, min(maximum, value))
+
+        image_limit = bounded_setting("flow_image_max_in_flight", 2, 1, 4)
+        video_limit = bounded_setting("intro_video_max_in_flight", 4, 1, 12)
+        requested_positions = [
+            index
+            for index, scene in enumerate(scenes)
+            if enable_intro_video
+            and bool(scene.get("is_video") or scene.get("media_type") == "video")
+        ]
+        video_ordinal = {
+            position: ordinal
+            for ordinal, position in enumerate(requested_positions, start=1)
+        }
+
+        def remote_counts() -> tuple[int, int]:
+            image_pending = 0
+            video_pending = 0
+            for item in scenes:
+                scene_index = int(item.get("index", 0))
+                image_artifact = db.get_latest_video_artifact(
+                    video_id, f"scene:{scene_index}"
+                )
+                video_artifact = db.get_latest_video_artifact(
+                    video_id, f"scene_video:{scene_index}"
+                )
+                image_pending += int(
+                    bool(image_artifact and image_artifact.get("status") == "queued")
+                )
+                video_pending += int(
+                    bool(video_artifact and video_artifact.get("status") == "queued")
+                )
+            return image_pending, video_pending
+
+        def append_pending(target: list[dict[str, object]], exc, scene_index: int) -> None:
+            target.append(
+                {
+                    "scene_index": scene_index,
+                    "queued_since": str(getattr(exc, "queued_since", "") or ""),
+                    "next_retry_at": str(getattr(exc, "next_retry_at", "") or ""),
+                    "reconciliation_poll_count": int(
+                        getattr(exc, "reconciliation_poll_count", 0) or 0
+                    ),
+                    "retry_delay_seconds": max(
+                        1.0,
+                        float(
+                            getattr(
+                                exc,
+                                "retry_delay_seconds",
+                                FLOW_MEDIA_RECONCILIATION_POLL_SECONDS,
+                            )
+                            or FLOW_MEDIA_RECONCILIATION_POLL_SECONDS
+                        ),
+                    ),
+                }
             )
 
-            media_paths: list[Path] = []
-            pending_scenes: list[dict[str, object]] = []
+        def emit_progress(
+            image_paths: list[Path | None],
+            video_paths: dict[int, Path],
+            image_pending: list[dict[str, object]],
+            video_pending: list[dict[str, object]],
+            fallback_count: int,
+        ) -> None:
+            payload = {
+                "images_total": len(scenes),
+                "images_completed": sum(path is not None for path in image_paths),
+                "images_pending": len({int(item["scene_index"]) for item in image_pending}),
+                "videos_total": len(requested_positions),
+                "videos_completed": len(video_paths),
+                "videos_pending": len({int(item["scene_index"]) for item in video_pending}),
+                "videos_fallback": fallback_count,
+            }
+            message = (
+                f"Flow: ảnh {payload['images_completed']}/{payload['images_total']}; "
+                f"video intro {payload['videos_completed']}/{payload['videos_total']}; "
+                f"đang chờ {payload['images_pending']} ảnh, {payload['videos_pending']} video"
+            )
+            try:
+                progress(message, "flow_media_generation", media_progress=payload)
+            except TypeError:
+                progress(message, "flow_media_generation")
+
+        session_kwargs = {"force_new_project": force_new_project}
+        if force_new_flow_project:
+            session_kwargs["force_new_flow_project"] = True
+        async with _flow_worker_session(video_id, **session_kwargs) as worker:
+            base_image_paths: list[Path | None] = [None] * len(scenes)
+            video_paths: dict[int, Path] = {}
+            pending_images: list[dict[str, object]] = []
+            pending_videos: list[dict[str, object]] = []
+            references: dict[str, Path] = {}
+            first_reference_position: dict[str, int] = {}
+            image_hashes: set[str] = set()
+            image_perceptual_hashes: list[ImagePerceptualFingerprint] = []
+            video_hashes: set[str] = set()
             flow_video_unsupported = False
             summary = _empty_intro_video_summary(enabled=enable_intro_video)
-            summary["requested_count"] = sum(
-                1
-                for scene in scenes
-                if scene.get("is_video") or scene.get("media_type") == "video"
-            )
+            summary["requested_count"] = len(requested_positions)
+
+            for position, scene in enumerate(scenes):
+                reference_id = str(scene.get("primary_reference_id") or "").strip()
+                if reference_id and reference_id not in first_reference_position:
+                    first_reference_position[reference_id] = position
+
+            for position, scene in enumerate(scenes):
+                cancel_check()
+                scene_index = int(scene.get("index", position))
+                reference_id = str(scene.get("primary_reference_id") or "").strip()
+                explicit_reference = scene.get("reference_path")
+                reference_path = (
+                    Path(explicit_reference)
+                    if explicit_reference and Path(explicit_reference).is_file()
+                    else references.get(reference_id)
+                )
+                if (
+                    reference_id
+                    and reference_path is None
+                    and first_reference_position.get(reference_id) != position
+                ):
+                    pending_images.append({"scene_index": scene_index})
+                    continue
+
+                current_artifact = db.get_latest_video_artifact(
+                    video_id, f"scene:{scene_index}"
+                )
+                current_status = str((current_artifact or {}).get("status") or "")
+                image_remote, video_remote = remote_counts()
+                can_advance = current_status in {"completed", "queued", "retry_wait"}
+                if not can_advance and (
+                    image_remote >= image_limit
+                    or image_remote + video_remote >= FLOW_REMOTE_MAX_IN_FLIGHT
+                ):
+                    pending_images.append({"scene_index": scene_index})
+                    continue
+                try:
+                    image_path = await _generate_scene_image_async(
+                        video_id=video_id,
+                        scene=scene,
+                        scene_count=len(scenes),
+                        profile=profile or {},
+                        settings=settings,
+                        reference_path=reference_path,
+                        reference_id=reference_id,
+                        progress=progress,
+                        cancel_check=cancel_check,
+                        worker=worker,
+                        existing_hashes=image_hashes,
+                        existing_perceptual_hashes=image_perceptual_hashes,
+                        force_new_project=False,
+                        submit_only=True,
+                    )
+                except FlowImagePending as exc:
+                    append_pending(pending_images, exc, scene_index)
+                    continue
+                image_hash = _sha256_file(image_path)
+                image_fingerprint = _image_perceptual_fingerprint(image_path)
+                image_hashes.add(image_hash)
+                image_perceptual_hashes.append(image_fingerprint)
+                base_image_paths[position] = image_path
+                if reference_id and reference_id not in references:
+                    references[reference_id] = image_path
+
             for index, scene in enumerate(scenes):
                 cancel_check()
                 is_video_requested = bool(
@@ -2073,10 +2527,8 @@ def generate_scene_media(
                     and (scene.get("is_video") or scene.get("media_type") == "video")
                 )
                 if not is_video_requested:
-                    media_paths.append(base_image_paths[index])
                     continue
                 if flow_video_unsupported:
-                    media_paths.append(base_image_paths[index])
                     summary["fallback_scenes"].append(
                         {
                             "scene_index": int(scene.get("index", index)),
@@ -2092,6 +2544,24 @@ def generate_scene_media(
                     if index + 1 < len(base_image_paths)
                     else None
                 )
+                scene_index = int(scene.get("index", index))
+                if start_frame is None or (
+                    index + 1 < len(base_image_paths) and end_frame is None
+                ):
+                    pending_videos.append({"scene_index": scene_index})
+                    continue
+                current_artifact = db.get_latest_video_artifact(
+                    video_id, f"scene_video:{scene_index}"
+                )
+                current_status = str((current_artifact or {}).get("status") or "")
+                image_remote, video_remote = remote_counts()
+                can_advance = current_status in {"completed", "queued", "failed"}
+                if not can_advance and (
+                    video_remote >= video_limit
+                    or image_remote + video_remote >= FLOW_REMOTE_MAX_IN_FLIGHT
+                ):
+                    pending_videos.append({"scene_index": scene_index})
+                    continue
                 try:
                     video_path = await _generate_scene_video_async(
                         video_id=video_id,
@@ -2105,37 +2575,17 @@ def generate_scene_media(
                         cancel_check=cancel_check,
                         worker=worker,
                         force_new_project=False,
+                        submit_only=True,
+                        existing_video_hashes=video_hashes,
+                        video_number=video_ordinal[index],
+                        video_count=len(requested_positions),
                     )
-                    media_paths.append(video_path)
+                    video_paths[index] = video_path
+                    video_hashes.add(_sha256_file(video_path))
                     summary["generated_count"] += 1
                 except Exception as exc:
-                    from auto_yt.services.google_flow_worker import (
-                        FlowModeError,
-                        FlowAgentSettingsError,
-                        FlowVideoPending,
-                    )
                     if isinstance(exc, FlowVideoPending):
-                        scene_index = int(scene.get("index", index))
-                        pending_scenes.append(
-                            {
-                                "scene_index": scene_index,
-                                "queued_since": str(
-                                    getattr(exc, "queued_since", "") or ""
-                                ),
-                                "next_retry_at": str(
-                                    getattr(exc, "next_retry_at", "") or ""
-                                ),
-                                "reconciliation_poll_count": int(
-                                    getattr(
-                                        exc,
-                                        "reconciliation_poll_count",
-                                        0,
-                                    )
-                                    or 0
-                                ),
-                            }
-                        )
-                        media_paths.append(base_image_paths[index])
+                        append_pending(pending_videos, exc, scene_index)
                         continue
                     is_system_unsupported = isinstance(
                         exc, (FlowModeError, FlowAgentSettingsError)
@@ -2160,35 +2610,71 @@ def generate_scene_media(
                             **failure_details,
                         }
                     )
-                    media_paths.append(base_image_paths[index])
-            if pending_scenes:
+            summary["fallback_count"] = len(summary["fallback_scenes"])
+            emit_progress(
+                base_image_paths,
+                video_paths,
+                pending_images,
+                pending_videos,
+                summary["fallback_count"],
+            )
+            if pending_images or pending_videos:
+                pending_records = pending_images + pending_videos
                 queued_values = [
                     str(item["queued_since"])
-                    for item in pending_scenes
+                    for item in pending_records
                     if item.get("queued_since")
                 ]
                 retry_values = [
                     str(item["next_retry_at"])
-                    for item in pending_scenes
+                    for item in pending_records
                     if item.get("next_retry_at")
                 ]
-                raise FlowVideoPending(
-                    "Google Flow vẫn đang xử lý "
-                    f"{len(pending_scenes)} cảnh video; sẽ đối soát lại cả batch "
-                    "mà không gửi trùng prompt.",
-                    reason_code="flow_video_batch_pending",
+                retry_delays = [
+                    float(item["retry_delay_seconds"])
+                    for item in pending_records
+                    if item.get("retry_delay_seconds") is not None
+                ]
+                pending_image_indices = sorted(
+                    {int(item["scene_index"]) for item in pending_images}
+                )
+                pending_video_indices = sorted(
+                    {int(item["scene_index"]) for item in pending_videos}
+                )
+                pending_error_type = (
+                    FlowVideoPending
+                    if pending_video_indices and not pending_image_indices
+                    else FlowImagePending
+                    if pending_image_indices and not pending_video_indices
+                    else FlowMediaPending
+                )
+                raise pending_error_type(
+                    "Google Flow còn "
+                    f"{len(pending_image_indices)} ảnh và {len(pending_video_indices)} video "
+                    "đang chờ; sẽ đối soát lại mà không gửi trùng prompt.",
+                    reason_code="flow_media_batch_pending",
                     queued_since=min(queued_values) if queued_values else "",
-                    pending_scene_indices=[
-                        int(item["scene_index"]) for item in pending_scenes
-                    ],
+                    pending_scene_indices=pending_video_indices,
+                    pending_image_scene_indices=pending_image_indices,
+                    pending_video_scene_indices=pending_video_indices,
                     next_retry_at=min(retry_values) if retry_values else "",
                     reconciliation_poll_count=max(
-                        int(item["reconciliation_poll_count"])
-                        for item in pending_scenes
+                        [
+                            int(item.get("reconciliation_poll_count") or 0)
+                            for item in pending_records
+                        ]
+                        or [0]
                     ),
-                    retry_delay_seconds=FLOW_VIDEO_RECONCILIATION_POLL_SECONDS,
+                    retry_delay_seconds=min(retry_delays)
+                    if retry_delays
+                    else FLOW_MEDIA_RECONCILIATION_POLL_SECONDS,
                 )
-            summary["fallback_count"] = len(summary["fallback_scenes"])
+            media_paths = [
+                video_paths.get(index) or base_image_paths[index]
+                for index in range(len(scenes))
+            ]
+            if any(path is None for path in media_paths):
+                raise VideoProductionError("Flow media scheduler completed with missing scene media.")
             return {
                 "media_paths": media_paths,
                 "intro_video_summary": summary,
@@ -3557,6 +4043,7 @@ def prepare_google_flow_media(
     progress,
     cancel_check,
     force_new_project: bool = False,
+    force_new_flow_project: bool = False,
     flow_video_pending_since: str = "",
 ) -> dict:
     existing_final = db.get_latest_video_artifact(video_id, "final_mp4", status="ready")
@@ -3596,6 +4083,7 @@ def prepare_google_flow_media(
         progress=progress,
         cancel_check=cancel_check,
         force_new_project=force_new_project,
+        force_new_flow_project=force_new_flow_project,
     )
     media_paths = media_result["media_paths"]
     intro_video_summary = _normalize_intro_video_summary(

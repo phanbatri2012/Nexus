@@ -6,6 +6,7 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -121,8 +122,27 @@ class FlowGenerationTimeout(RuntimeError):
     """Raised when Flow remains active beyond the hard generation deadline."""
 
 
-class FlowVideoPending(RuntimeError):
-    """Raised after Flow accepts a video request that may still complete later."""
+@dataclass(frozen=True)
+class FlowGenerationReceipt:
+    """Stable request identity persisted without expiring media URLs."""
+
+    request_key: str
+    media_type: str
+    scene_index: int
+    project_id: str
+    prompt_hash: str
+    frame_hashes: list[str]
+    submitted_at: str
+    deadline_at: str
+    identity_keys: list[str] = field(default_factory=list)
+    attempt: int = 1
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+class FlowMediaPending(RuntimeError):
+    """Raised after Flow accepts work that may still complete later."""
 
     def __init__(
         self,
@@ -134,6 +154,9 @@ class FlowVideoPending(RuntimeError):
         next_retry_at: str = "",
         reconciliation_poll_count: int = 0,
         retry_delay_seconds: float = 60.0,
+        pending_image_scene_indices: list[int] | None = None,
+        pending_video_scene_indices: list[int] | None = None,
+        receipt: dict[str, object] | None = None,
     ):
         super().__init__(message)
         self.reason_code = reason_code
@@ -142,6 +165,25 @@ class FlowVideoPending(RuntimeError):
         self.next_retry_at = next_retry_at
         self.reconciliation_poll_count = max(0, int(reconciliation_poll_count or 0))
         self.retry_delay_seconds = max(1.0, float(retry_delay_seconds or 60.0))
+        self.pending_image_scene_indices = list(pending_image_scene_indices or [])
+        self.pending_video_scene_indices = list(pending_video_scene_indices or [])
+        self.receipt = dict(receipt or {})
+
+
+class FlowImagePending(FlowMediaPending):
+    """Raised after Flow accepts an image request that is not complete yet."""
+
+    def __init__(self, message: str, **kwargs):
+        kwargs.setdefault("reason_code", "flow_image_pending")
+        super().__init__(message, **kwargs)
+
+
+class FlowVideoPending(FlowMediaPending):
+    """Raised after Flow accepts a video request that is not complete yet."""
+
+
+class FlowImageNeedsAttention(RuntimeError):
+    """Raised after bounded transient image retries have been exhausted."""
 
 
 class FlowVideoWaitExpired(FlowGenerationTimeout):
@@ -275,6 +317,7 @@ class GoogleFlowWorker:
         self._video_completed_candidate_seen_at: dict[str, float] = {}
         self._inspected_video_detail_keys: set[str] = set()
         self._last_video_timing: dict[str, object] = {}
+        self._last_generation_receipt: dict[str, object] = {}
         self._active_video_submitted_at: float | None = None
         self._frame_failure_diagnostic_saved = False
 
@@ -300,6 +343,56 @@ class GoogleFlowWorker:
 
     def get_last_video_timing(self) -> dict[str, object]:
         return dict(self._last_video_timing)
+
+    def get_last_generation_receipt(self) -> dict[str, object]:
+        return dict(self._last_generation_receipt)
+
+    @staticmethod
+    def _request_marker(request_key: str) -> str:
+        key = re.sub(r"[^A-Za-z0-9_-]", "", str(request_key or ""))[:80]
+        return f" Internal tracking token: AYT-{key}; do not render this token." if key else ""
+
+    def _remember_generation_receipt(
+        self,
+        *,
+        request_key: str,
+        media_type: str,
+        scene_index: int | None,
+        full_prompt: str,
+        submitted_at: str,
+        deadline_seconds: float,
+        frame_paths: list[Path] | None = None,
+        attempt: int = 1,
+    ) -> dict[str, object]:
+        try:
+            submitted = dt.datetime.fromisoformat(submitted_at)
+        except (TypeError, ValueError):
+            submitted = dt.datetime.now(dt.timezone.utc)
+            submitted_at = submitted.isoformat()
+        if submitted.tzinfo is None:
+            submitted = submitted.replace(tzinfo=dt.timezone.utc)
+        prompt_hash = hashlib.sha256(full_prompt.encode("utf-8")).hexdigest()
+        frame_hashes = [
+            self._file_sha256(Path(path))
+            for path in (frame_paths or [])
+            if Path(path).is_file()
+        ]
+        receipt = FlowGenerationReceipt(
+            request_key=str(request_key or ""),
+            media_type=media_type,
+            scene_index=int(scene_index if scene_index is not None else -1),
+            project_id=self._project_id(),
+            prompt_hash=prompt_hash,
+            frame_hashes=frame_hashes,
+            submitted_at=submitted_at,
+            deadline_at=(
+                submitted + dt.timedelta(seconds=max(0.0, float(deadline_seconds)))
+            ).isoformat(),
+            identity_keys=[f"request:{request_key}", f"prompt:{prompt_hash}"],
+            attempt=max(1, int(attempt or 1)),
+        ).to_dict()
+        self._last_generation_receipt = receipt
+        return receipt
 
     @staticmethod
     def _project_root_from_url(url: str) -> str:
@@ -2440,49 +2533,83 @@ class GoogleFlowWorker:
                 )
                 return {"state": "completed", "source": source}
 
-        # Scan full workspace Canvas for completed video tiles if chat bubble did not contain a playable video
-        try:
-            canvas_candidates = await self._collect_video_candidates()
-            canvas_source = self._find_new_video_source(canvas_candidates, set())
-            if canvas_source:
-                logger.info(
-                    "flow_generation media=video state=canvas_output_reused project=%s",
-                    self._project_id(),
-                )
-                return {"state": "completed", "source": canvas_source}
-            for candidate in reversed(canvas_candidates):
-                if not candidate.get("completed"):
-                    continue
-                try:
-                    canvas_source = await self._inspect_video_candidate_detail(
-                        candidate,
-                        detail_baseline,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "flow_generation media=video state=canvas_output_detail_failed project=%s detail=%s",
-                        self._project_id(),
-                        exc,
-                    )
-                    canvas_source = ""
-                if canvas_source:
-                    logger.info(
-                        "flow_generation media=video state=canvas_output_reused project=%s",
-                        self._project_id(),
-                    )
-                    return {"state": "completed", "source": canvas_source}
-        except Exception as exc:
-            logger.warning(
-                "flow_generation media=video state=canvas_reconciliation_scan_failed project=%s detail=%s",
-                self._project_id(),
-                exc,
-            )
-
         return {
             "state": "queued" if result.get("queued") else "pending",
             "source": "",
             "is_latest_prompt": bool(result.get("isLatestPrompt")),
         }
+
+    async def cancel_generation_for_prompt(self, *prompts: str) -> bool:
+        """Best-effort cancellation limited to the response following a matching prompt."""
+        expected_prompts = [
+            self._normalize_prompt_text(prompt).casefold()
+            for prompt in prompts
+            if self._normalize_prompt_text(prompt)
+        ]
+        if not expected_prompts:
+            return False
+        try:
+            canceled = await self.page.evaluate(
+                r'''(expectedPrompts) => {
+                    const normalize = (value) => String(value || '')
+                        .replace(/\s+/g, ' ').trim().toLowerCase();
+                    let turns = Array.from(document.querySelectorAll('flow-chat-bubble'));
+                    if (!turns.length) {
+                        turns = Array.from(document.querySelectorAll(
+                            'flow-chat-message, .message-row, [data-message-role], [data-role]'
+                        ));
+                    }
+                    let promptIndex = -1;
+                    for (let index = turns.length - 1; index >= 0; index -= 1) {
+                        const turn = turns[index];
+                        const user = turn.matches(
+                            '.message-row.user-row, [data-message-role="user"], [data-role="user"]'
+                        ) ? turn : turn.querySelector(
+                            '.user-bubble, [data-message-role="user"], [data-role="user"]'
+                        );
+                        if (!user) continue;
+                        const text = normalize((user.querySelector('.prompt-text') || user).textContent);
+                        if (expectedPrompts.some((expected) => text === expected || text.includes(expected))) {
+                            promptIndex = index;
+                            break;
+                        }
+                    }
+                    if (promptIndex < 0) return false;
+                    for (let index = promptIndex + 1; index < turns.length; index += 1) {
+                        const turn = turns[index];
+                        if (turn.matches('.message-row.user-row, [data-message-role="user"], [data-role="user"]') ||
+                            turn.querySelector('.user-bubble, [data-message-role="user"], [data-role="user"]')) {
+                            break;
+                        }
+                        const buttons = Array.from(turn.querySelectorAll('button, [role="button"]'));
+                        const cancel = buttons.find((button) => {
+                            const label = normalize(
+                                `${button.textContent || ''} ${button.getAttribute('aria-label') || ''}`
+                            );
+                            return /(^|\s)(cancel|stop|hủy|dừng)(\s|$)/i.test(label);
+                        });
+                        if (cancel && !cancel.disabled) {
+                            cancel.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }''',
+                expected_prompts,
+            )
+        except Exception as exc:
+            logger.warning(
+                "flow_generation state=cancel_failed project=%s detail=%s",
+                self._project_id(),
+                security_logging.redact_sensitive(exc),
+            )
+            return False
+        logger.info(
+            "flow_generation state=cancel_%s project=%s",
+            "requested" if canceled else "unavailable",
+            self._project_id(),
+        )
+        return bool(canceled)
 
     async def _raise_latest_video_error(
         self,
@@ -2572,11 +2699,17 @@ class GoogleFlowWorker:
                     if (promptIndex < 0) return [];
 
                     const found = [];
+                    let error = '';
                     const seen = new Set();
                     for (let index = promptIndex + 1; index < bubbles.length; index += 1) {
                         const bubble = bubbles[index];
                         if (bubble.querySelector('.user-bubble')) break;
-                        if (!bubble.querySelector('.agent-bubble')) continue;
+                        const agent = bubble.querySelector('.agent-bubble');
+                        if (!agent) continue;
+                        const agentText = normalize(agent.textContent);
+                        if (/(không thành công|vi phạm chính sách|unsuccessful|violates our policy|policy violation|failed to generate|generation failed)/i.test(agentText)) {
+                            error = (agent.textContent || '').trim();
+                        }
                         const nodes = bubble.querySelectorAll(
                             'img[src], img[srcset], [data-image-url], [data-media-url], ' +
                             '[data-download-url], a[download][href]'
@@ -2620,7 +2753,7 @@ class GoogleFlowWorker:
                             });
                         }
                     }
-                    return found;
+                    return {candidates: found, error};
                 }''',
                 expected_prompts,
             )
@@ -2631,6 +2764,13 @@ class GoogleFlowWorker:
                 exc,
             )
             return ""
+        if isinstance(candidates, dict):
+            error_text = str(candidates.get("error") or "").strip()
+            if error_text and _is_valid_flow_error_text(error_text):
+                raise FlowGenerationError(
+                    f"Google Flow báo lỗi khi tạo image: {error_text}"
+                )
+            candidates = candidates.get("candidates") or []
         if not isinstance(candidates, list):
             return ""
         for candidate in reversed(candidates):
@@ -5100,6 +5240,11 @@ class GoogleFlowWorker:
         scene_index: int | None = None,
         scene_count: int | None = None,
         image_settings: dict | None = None,
+        request_key: str = "",
+        reconcile_only: bool = False,
+        submit_only: bool = False,
+        request_attempt: int = 1,
+        deadline_seconds: float = AGENT_IMAGE_GENERATION_TIMEOUT_SECONDS,
     ) -> str:
         self._set_active_reference_filenames(reference_ids, reference_paths)
         self._reset_image_candidate_state()
@@ -5113,6 +5258,11 @@ class GoogleFlowWorker:
                 scene_index=scene_index,
                 scene_count=scene_count,
                 image_settings=image_settings,
+                request_key=request_key,
+                reconcile_only=reconcile_only,
+                submit_only=submit_only,
+                request_attempt=request_attempt,
+                deadline_seconds=deadline_seconds,
             )
         finally:
             if self._is_asset_edit_url(str(self.page.url or "")):
@@ -5128,6 +5278,11 @@ class GoogleFlowWorker:
         scene_index: int | None = None,
         scene_count: int | None = None,
         image_settings: dict | None = None,
+        request_key: str = "",
+        reconcile_only: bool = False,
+        submit_only: bool = False,
+        request_attempt: int = 1,
+        deadline_seconds: float = AGENT_IMAGE_GENERATION_TIMEOUT_SECONDS,
     ) -> str:
         # Clean any URL / bracket tags from prompt
         clean_prompt = re.sub(r"\[IMAGE_URL:[^\]]*\]", "", prompt)
@@ -5150,7 +5305,9 @@ class GoogleFlowWorker:
                 "choices, do not organize assets, do not write a script, and do not animate. "
                 "Return only the requested image. "
             )
-        full_prompt = f"{scene_instruction}{legacy_full_prompt}"
+        full_prompt = (
+            f"{scene_instruction}{legacy_full_prompt}{self._request_marker(request_key)}"
+        )
 
         late_source = await self._find_completed_image_for_prompt(
             full_prompt,
@@ -5158,6 +5315,11 @@ class GoogleFlowWorker:
         )
         if late_source:
             return late_source
+        if reconcile_only:
+            raise FlowImagePending(
+                "Google Flow đã nhận yêu cầu ảnh và chưa có kết quả gắn đúng request; "
+                "sẽ tiếp tục đối soát mà không gửi lại prompt."
+            )
 
         await self._ensure_agent_session_ready()
         if await self._is_agent_interface_active():
@@ -5227,9 +5389,23 @@ class GoogleFlowWorker:
             baseline_keys=baseline_keys,
             on_agent_session_reset=restore_references_after_session_reset,
         )
+        receipt = self._remember_generation_receipt(
+            request_key=request_key,
+            media_type="image",
+            scene_index=scene_index,
+            full_prompt=full_prompt,
+            submitted_at=self._utc_timestamp(),
+            deadline_seconds=deadline_seconds,
+            attempt=request_attempt,
+        )
         if immediate_source:
             self._log_generation_event("image", "completed", submitted_at)
             return immediate_source
+        if submit_only:
+            raise FlowImagePending(
+                "Google Flow đã nhận yêu cầu ảnh; sẽ đối soát kết quả theo request.",
+                receipt=receipt,
+            )
 
         return await self._wait_for_new_media(
             media_type="image",
@@ -5496,6 +5672,10 @@ class GoogleFlowWorker:
         reconcile_only: bool = False,
         video_error_count_before_submit: int | None = None,
         video_tile_count_before_submit: int | None = None,
+        request_key: str = "",
+        submit_only: bool = False,
+        request_attempt: int = 1,
+        deadline_seconds: float = 900.0,
     ) -> str:
         await self._ensure_project_canvas()
         try:
@@ -5510,6 +5690,10 @@ class GoogleFlowWorker:
                 reconcile_only=reconcile_only,
                 video_error_count_before_submit=video_error_count_before_submit,
                 video_tile_count_before_submit=video_tile_count_before_submit,
+                request_key=request_key,
+                submit_only=submit_only,
+                request_attempt=request_attempt,
+                deadline_seconds=deadline_seconds,
             )
         finally:
             if self._is_asset_edit_url(str(self.page.url or "")):
@@ -5527,6 +5711,10 @@ class GoogleFlowWorker:
         reconcile_only: bool = False,
         video_error_count_before_submit: int | None = None,
         video_tile_count_before_submit: int | None = None,
+        request_key: str = "",
+        submit_only: bool = False,
+        request_attempt: int = 1,
+        deadline_seconds: float = 900.0,
     ) -> str:
         """Generate a video clip from start (and optional end) frame using Veo on Google Flow."""
         if not start_frame_path or not Path(start_frame_path).is_file():
@@ -5541,7 +5729,10 @@ class GoogleFlowWorker:
         self._inspected_video_detail_keys.clear()
         self._record_video_timing("prepare_started")
 
-        full_prompt = self._build_video_prompt(prompt, avoid_prompt)
+        full_prompt = (
+            self._build_video_prompt(prompt, avoid_prompt)
+            + self._request_marker(request_key)
+        )
         if reconcile_only:
             if video_error_count_before_submit is not None:
                 self._last_video_timing["video_error_count_before_submit"] = max(
@@ -5641,6 +5832,16 @@ class GoogleFlowWorker:
             on_agent_session_reset=restore_agent_video_frames,
         )
         self._active_video_submitted_at = submitted_at
+        receipt = self._remember_generation_receipt(
+            request_key=request_key,
+            media_type="video",
+            scene_index=scene_index,
+            full_prompt=full_prompt,
+            submitted_at=self._utc_timestamp(),
+            deadline_seconds=deadline_seconds,
+            frame_paths=[Path(start_frame_path), Path(end_frame_path)],
+            attempt=request_attempt,
+        )
         self._record_video_timing("submitted")
         logger.info(
             "flow_generation media=video state=video_submitted project=%s scene=%s",
@@ -5651,6 +5852,11 @@ class GoogleFlowWorker:
             self._record_video_timing("playable_url_seen")
             self._log_generation_event("video", "video_completed", submitted_at)
             return immediate_source
+        if submit_only:
+            raise FlowVideoPending(
+                "Google Flow đã nhận yêu cầu video; sẽ đối soát kết quả theo request.",
+                receipt=receipt,
+            )
 
         result = await self._wait_for_new_media(
             media_type="video",

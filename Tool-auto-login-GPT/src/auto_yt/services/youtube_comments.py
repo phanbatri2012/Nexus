@@ -415,6 +415,8 @@ def exchange_authorization_code(
     except urllib.error.HTTPError as exc:
         exc.read(64 * 1024)
         raise YouTubeCommentsError("Không thể xác thực YouTube với Google.") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise YouTubeCommentsError(f"Không thể kết nối máy chủ Google qua proxy ({exc}).") from exc
 
 
 def refresh_access_token(

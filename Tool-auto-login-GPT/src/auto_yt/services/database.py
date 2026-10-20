@@ -1381,6 +1381,12 @@ def init_db():
             FOREIGN KEY (video_id) REFERENCES videos (id) ON DELETE CASCADE
         )
     """)
+    try:
+        c.execute(
+            "ALTER TABLE flow_projects ADD COLUMN reset_requested INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError:
+        pass
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS youtube_publish_workflows (
@@ -6261,6 +6267,65 @@ def delete_video_artifact(artifact_id: int) -> bool:
     conn.commit()
     conn.close()
     return cursor.rowcount > 0
+
+
+# ==============================================================================
+# Google Flow projects
+# ==============================================================================
+
+def get_flow_project(video_id: int) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM flow_projects WHERE video_id = ?",
+        (int(video_id),),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row is not None else None
+
+
+def upsert_flow_project(video_id: int, project_id: str, project_url: str) -> dict:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        INSERT INTO flow_projects (video_id, project_id, project_url, reset_requested)
+        VALUES (?, ?, ?, 0)
+        ON CONFLICT(video_id) DO UPDATE SET
+            project_id = excluded.project_id,
+            project_url = excluded.project_url,
+            reset_requested = 0
+        """,
+        (int(video_id), str(project_id or ""), str(project_url or "")),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM flow_projects WHERE video_id = ?",
+        (int(video_id),),
+    ).fetchone()
+    conn.close()
+    return dict(row)
+
+
+def request_new_flow_project(video_id: int) -> dict:
+    """Persist a reset request until a new Flow project is created successfully."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        INSERT INTO flow_projects (video_id, project_id, project_url, reset_requested)
+        VALUES (?, '__reset__', '', 1)
+        ON CONFLICT(video_id) DO UPDATE SET reset_requested = 1
+        """,
+        (int(video_id),),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM flow_projects WHERE video_id = ?",
+        (int(video_id),),
+    ).fetchone()
+    conn.close()
+    return dict(row)
 
 
 def list_video_artifact_paths() -> list[str]:

@@ -30,13 +30,16 @@ def validate_publication_slots(slots: object) -> list[dict]:
             parsed_time = dt.time.fromisoformat(time_text)
         except ValueError as exc:
             raise ValueError("Giờ đăng phải có định dạng HH:MM.") from exc
-        if day < 0 or day > 6 or parsed_time.second or parsed_time.microsecond:
+        if day < -1 or day > 6 or parsed_time.second or parsed_time.microsecond:
             raise ValueError("Khung giờ đăng không hợp lệ.")
-        key = (day, parsed_time.strftime("%H:%M"))
-        if key in seen:
-            raise ValueError("Lịch đăng không được chứa khung giờ trùng nhau.")
-        seen.add(key)
-        normalized.append({"day": day, "time": key[1]})
+        time_formatted = parsed_time.strftime("%H:%M")
+        covered_days = list(range(7)) if day == -1 else [day]
+        for d in covered_days:
+            key = (d, time_formatted)
+            if key in seen:
+                raise ValueError("Lịch đăng không được chứa khung giờ trùng nhau.")
+            seen.add(key)
+        normalized.append({"day": day, "time": time_formatted})
     normalized.sort(key=lambda item: (item["day"], item["time"]))
     return normalized
 
@@ -94,7 +97,7 @@ def find_next_publication_slot(
         if local_counts.get(local_day, 0) >= max(1, int(daily_limit)):
             continue
         for slot in normalized_slots:
-            if slot["day"] != local_day.weekday():
+            if slot["day"] not in (-1, local_day.weekday()):
                 continue
             hour, minute = (int(value) for value in slot["time"].split(":"))
             local_candidate = dt.datetime.combine(

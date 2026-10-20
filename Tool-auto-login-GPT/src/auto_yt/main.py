@@ -402,6 +402,9 @@ class PromptImageGenerationData(BaseModel):
     enable_intro_video: bool = True
     intro_scene_target_seconds: float = 8.0
     intro_crop_watermark: bool = True
+    intro_video_max_wait_seconds: int = Field(default=900, ge=60, le=3600)
+    intro_video_max_in_flight: int = Field(default=4, ge=1, le=12)
+    flow_image_max_in_flight: int = Field(default=2, ge=1, le=4)
     video_style_prompt: str = Field(default="", max_length=8000)
     video_negative_prompt: str = Field(default="", max_length=8000)
     video_prompt_template: str = Field(default="", max_length=8000)
@@ -1013,16 +1016,26 @@ def start_youtube_oauth(
         gpm_profile_name = str(expected_channel.get("gpm_profile_name") or "").strip()
         if gpm_profile_id == str(expected_channel.get("gpm_profile_id") or "").strip():
             gpm_proxy_info = str(expected_channel.get("gpm_proxy_info") or "").strip()
-    if gpm_profile_id and not parse_proxy_url(gpm_proxy_info):
+    if gpm_profile_id:
         try:
             profile_detail = gpm_service.get_gpm_profile_detail(gpm_profile_id)
-            gpm_profile_name = str(profile_detail.get("name") or "")
-            gpm_proxy_info = str(profile_detail.get("raw_proxy") or profile_detail.get("proxy") or "")
+            gpm_profile_name = str(profile_detail.get("name") or gpm_profile_name)
+            live_proxy = str(profile_detail.get("raw_proxy") or profile_detail.get("proxy") or "").strip()
+            if live_proxy:
+                gpm_proxy_info = live_proxy
+                if expected_channel and expected_channel.get("id"):
+                    db.update_youtube_channel(
+                        int(expected_channel["id"]),
+                        gpm_profile_id=gpm_profile_id,
+                        gpm_profile_name=gpm_profile_name,
+                        gpm_proxy_info=gpm_proxy_info,
+                    )
         except Exception as exc:
-            raise HTTPException(
-                status_code=503,
-                detail="Không đọc được proxy của GPM Profile đã chọn.",
-            ) from exc
+            if not parse_proxy_url(gpm_proxy_info):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Không đọc được proxy của GPM Profile đã chọn.",
+                ) from exc
     if not gpm_profile_id or not parse_proxy_url(gpm_proxy_info):
         raise HTTPException(
             status_code=422,
@@ -1134,6 +1147,14 @@ def finish_youtube_oauth(code: str = "", state: str = "", error: str = ""):
                 gpm_profile_name=str(oauth_state.get("gpm_profile_name") or ""),
                 gpm_proxy_info=str(oauth_state.get("gpm_proxy_info") or ""),
             )
+    except youtube_comments.YouTubeCommentsError as exc:
+        error_id = security_logging.report_exception("youtube_oauth_callback", exc)
+        return HTMLResponse(
+            "<h2>Kết nối YouTube thất bại</h2>"
+            f"<p>{html.escape(str(exc))}</p>"
+            f"<p style='color: #64748b; font-size: 13px;'>Mã lỗi tham chiếu: {html.escape(error_id)}</p>",
+            status_code=400,
+        )
     except Exception as exc:
         error_id = security_logging.report_exception("youtube_oauth_callback", exc)
         return HTMLResponse(
@@ -1224,20 +1245,22 @@ def update_youtube_comment_channel(
                     else ""
                 )
             )
-            if profile_id != current_profile_id or not parse_proxy_url(proxy_info):
-                try:
-                    profile_detail = gpm_service.get_gpm_profile_detail(profile_id)
-                except Exception as exc:
-                    raise HTTPException(
-                        status_code=503,
-                        detail="Không đọc được cấu hình GPM Profile đã chọn.",
-                    ) from exc
+            try:
+                profile_detail = gpm_service.get_gpm_profile_detail(profile_id)
                 profile_name = str(profile_detail.get("name") or profile_name)
-                proxy_info = str(
+                live_proxy = str(
                     profile_detail.get("raw_proxy")
                     or profile_detail.get("proxy")
                     or ""
                 ).strip()
+                if live_proxy:
+                    proxy_info = live_proxy
+            except Exception as exc:
+                if profile_id != current_profile_id or not parse_proxy_url(proxy_info):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Không đọc được cấu hình GPM Profile đã chọn.",
+                    ) from exc
             update_data.update(
                 gpm_profile_id=profile_id,
                 gpm_profile_name=profile_name,
@@ -6144,8 +6167,15 @@ def _execute_flow_media_generation_job(job: dict) -> None:
     )
 
     def update(message: str, stage: str = "", *args, **kwargs) -> None:
-        del args, kwargs
-        db.update_system_job(job["id"], progress=message)
+        del args
+        job_updates = {"progress": message}
+        media_progress = kwargs.get("media_progress")
+        if isinstance(media_progress, dict):
+            current_job = db.get_system_job(job["id"]) or job
+            current_result = dict(current_job.get("result") or {})
+            current_result["flow_media_progress"] = media_progress
+            job_updates["result_json"] = current_result
+        db.update_system_job(job["id"], **job_updates)
         db.update_video_production_state(
             video_id,
             render_status="media_generation",
@@ -6160,6 +6190,12 @@ def _execute_flow_media_generation_job(job: dict) -> None:
         update,
         lambda: _raise_if_video_job_canceled(job["id"]),
         force_new_project=bool(payload.get("force_new_project", False)),
+        force_new_flow_project=bool(payload.get("force_new_flow_project", False)),
+        flow_video_pending_since=str(
+            ((job.get("result") or {}).get("flow_video_pending_since"))
+            or ((job.get("result") or {}).get("flow_media_pending_since"))
+            or ""
+        ),
     )
     _raise_if_video_job_canceled(job["id"])
     render_job, _ = _enqueue_video_render_job(
@@ -6850,32 +6886,82 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
         )
         db.update_video_production_state(video_id, render_status="error")
         return
-    from auto_yt.services.google_flow_worker import FlowVideoPending
+    from auto_yt.services.google_flow_worker import (
+        FlowImageNeedsAttention,
+        FlowMediaPending,
+    )
 
     if (
-        isinstance(exc, FlowVideoPending)
+        isinstance(exc, FlowImageNeedsAttention)
+        and str(job.get("job_type") or "") == "flow_media_generation"
+    ):
+        current_job = db.get_system_job(job["id"]) or job
+        attention_result = dict(current_job.get("result") or {})
+        attention_result["attention_required"] = "flow_image_generation"
+        db.update_system_job(
+            job["id"],
+            status="paused",
+            progress="Tạo ảnh Google Flow cần kiểm tra thủ công",
+            error=safe_error,
+            result_json=attention_result,
+            next_retry_at="",
+            cancel_requested=0,
+            finished_at="",
+        )
+        if job.get("video_id"):
+            db.update_video_production_state(
+                int(job["video_id"]),
+                render_status="paused",
+                current_stage="flow_image_needs_attention",
+                production_progress="Tạo ảnh Google Flow cần kiểm tra thủ công",
+                blocking_reason=safe_error,
+            )
+        return
+
+    if (
+        isinstance(exc, FlowMediaPending)
         and str(job.get("job_type") or "") == "flow_media_generation"
     ):
         current_job = db.get_system_job(job["id"]) or job
         recovery_result = dict(current_job.get("result") or {})
+        pending_image_scene_indices = [
+            int(index)
+            for index in (getattr(exc, "pending_image_scene_indices", None) or [])
+        ]
+        pending_video_scene_indices = [
+            int(index)
+            for index in (
+                getattr(exc, "pending_video_scene_indices", None)
+                or getattr(exc, "pending_scene_indices", None)
+                or []
+            )
+        ]
         pending_scene_indices = [
             int(index)
             for index in (getattr(exc, "pending_scene_indices", None) or [])
         ]
-        pending_count = len(pending_scene_indices) or 1
+        pending_count = (
+            len(pending_image_scene_indices) + len(pending_video_scene_indices) or 1
+        )
         reconciliation_poll_count = max(
             0, int(getattr(exc, "reconciliation_poll_count", 0) or 0)
         )
         retry_delay_seconds = max(
             1.0, float(getattr(exc, "retry_delay_seconds", 60.0) or 60.0)
         )
-        if not recovery_result.get("flow_video_pending_since"):
-            recovery_result["flow_video_pending_since"] = str(
+        if not recovery_result.get("flow_media_pending_since"):
+            recovery_result["flow_media_pending_since"] = str(
                 getattr(exc, "queued_since", "") or db.utc_now()
             )
+        if not recovery_result.get("flow_video_pending_since"):
+            recovery_result["flow_video_pending_since"] = recovery_result[
+                "flow_media_pending_since"
+            ]
         recovery_result.update(
             {
                 "pending_scene_indices": pending_scene_indices,
+                "pending_image_scene_indices": pending_image_scene_indices,
+                "pending_video_scene_indices": pending_video_scene_indices,
                 "reconcile_pending_count": pending_count,
                 "reconcile_poll_count": reconciliation_poll_count,
                 "flow_video_next_retry_at": str(
@@ -6883,6 +6969,13 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
                 ),
             }
         )
+        current_payload = dict(current_job.get("payload") or {})
+        if current_payload.get("force_new_project") or current_payload.get(
+            "force_new_flow_project"
+        ):
+            current_payload["force_new_project"] = False
+            current_payload["force_new_flow_project"] = False
+            db.update_system_job(job["id"], payload_json=current_payload)
         db.schedule_system_job_recovery(
             job["id"],
             resume_from_step="flow_video_reconcile",
@@ -6896,7 +6989,8 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
                 render_status="processing",
                 current_stage="flow_video_reconcile",
                 production_progress=(
-                    f"Google Flow còn {pending_count} cảnh video đang xử lý; "
+                    f"Google Flow còn {len(pending_image_scene_indices)} ảnh và "
+                    f"{len(pending_video_scene_indices)} video đang xử lý; "
                     "hệ thống sẽ tự đối soát lại"
                 ),
                 blocking_reason="",
@@ -8007,6 +8101,7 @@ def _enqueue_flow_media_job(
     snapshot: dict,
     mode: str = "resume",
     force_new_project: bool = False,
+    force_new_flow_project: bool = False,
 ) -> tuple[dict, bool]:
     prompt_version = str(
         snapshot.get("prompt_version")
@@ -8026,6 +8121,7 @@ def _enqueue_flow_media_job(
             "snapshot": snapshot,
             "mode": mode,
             "force_new_project": bool(force_new_project),
+            "force_new_flow_project": bool(force_new_flow_project),
         },
         video_id=video_id,
         prompt_version=prompt_version,
@@ -8799,6 +8895,21 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
             for index in (result.get("pending_scene_indices") or [])
             if str(index).lstrip("-").isdigit()
         ],
+        "pending_image_scene_indices": [
+            int(index)
+            for index in (result.get("pending_image_scene_indices") or [])
+            if str(index).lstrip("-").isdigit()
+        ],
+        "pending_video_scene_indices": [
+            int(index)
+            for index in (result.get("pending_video_scene_indices") or [])
+            if str(index).lstrip("-").isdigit()
+        ],
+        "flow_media_progress": (
+            result.get("flow_media_progress")
+            if isinstance(result.get("flow_media_progress"), dict)
+            else {}
+        ),
         "recovery_limit": (
             len(YOUTUBE_RECOVERY_DELAYS_SECONDS)
             if job_type in {"youtube_upload", "youtube_publish"}

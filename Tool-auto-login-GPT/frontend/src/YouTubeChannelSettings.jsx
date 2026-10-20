@@ -374,10 +374,10 @@ export default function YouTubeChannelSettings({
     changeChannel(channelId, 'gpm_proxy_configured', Boolean(selected?.proxy_configured))
   }
 
-  const addPublicationSlot = channel => {
+  const addPublicationSlot = (channel, day = -1) => {
     changeChannel(channel.id, 'publication_slots', [
       ...(Array.isArray(channel.publication_slots) ? channel.publication_slots : []),
-      { day: 0, time: '09:00' }
+      { day, time: '09:00' }
     ])
   }
 
@@ -1051,9 +1051,10 @@ export default function YouTubeChannelSettings({
                 <div key={`${index}-${slot.day}-${slot.time}`} style={{ display: 'grid', gridTemplateColumns: '1fr 140px auto', gap: 8 }}>
                   <select
                     className="version-select"
-                    value={slot.day}
+                    value={slot.day !== undefined && slot.day !== null ? Number(slot.day) : -1}
                     onChange={event => changePublicationSlot(channel, index, 'day', event.target.value)}
                   >
+                    <option value={-1}>Mỗi ngày</option>
                     {WEEKDAYS.map((label, day) => <option key={label} value={day}>{label}</option>)}
                   </select>
                   <input

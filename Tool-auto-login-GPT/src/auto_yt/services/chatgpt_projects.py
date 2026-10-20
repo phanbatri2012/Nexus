@@ -163,6 +163,9 @@ DEFAULT_IMAGE_GENERATION_SETTINGS = {
     "enable_intro_video": True,
     "intro_scene_target_seconds": 8.0,
     "intro_crop_watermark": True,
+    "intro_video_max_wait_seconds": 900,
+    "intro_video_max_in_flight": 4,
+    "flow_image_max_in_flight": 2,
     "video_style_prompt": "Cinematic documentary film, 35mm motion picture composition, natural atmospheric lighting, realistic textures, balanced color grading, 4k cinematic video footage.",
     "video_negative_prompt": "still image, static photo, cartoon, anime, 3D CGI render, illustration, deformed hands, distorted anatomy, text, watermark, signature, logo, blurry, low resolution.",
     "video_prompt_template": "{frame_directive} Scene action: {action}. Visual style: {style}. {motion} Clean video without any text, letters, watermark, or subtitles.",
@@ -420,6 +423,18 @@ def normalize_image_generation_settings(value: object) -> dict:
     except (TypeError, ValueError):
         normalized["intro_scene_target_seconds"] = 8.0
     normalized["intro_crop_watermark"] = bool(settings.get("intro_crop_watermark", True))
+    for key, default, minimum, maximum in (
+        ("intro_video_max_wait_seconds", 900, 60, 3600),
+        ("intro_video_max_in_flight", 4, 1, 12),
+        ("flow_image_max_in_flight", 2, 1, 4),
+    ):
+        try:
+            normalized[key] = max(
+                minimum,
+                min(maximum, int(settings.get(key, default) or default)),
+            )
+        except (TypeError, ValueError):
+            normalized[key] = default
     normalized["video_style_prompt"] = str(
         settings.get("video_style_prompt") if settings.get("video_style_prompt") is not None
         else DEFAULT_IMAGE_GENERATION_SETTINGS["video_style_prompt"]

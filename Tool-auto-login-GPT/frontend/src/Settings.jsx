@@ -147,6 +147,9 @@ const DEFAULT_IMAGE_GENERATION_SETTINGS = {
   enable_intro_video: true,
   intro_scene_target_seconds: 8.0,
   intro_crop_watermark: true,
+  intro_video_max_wait_seconds: 900,
+  intro_video_max_in_flight: 4,
+  flow_image_max_in_flight: 2,
   video_style_prompt: 'Cinematic documentary film, 35mm motion picture composition, natural atmospheric lighting, realistic textures, balanced color grading, 4k cinematic video footage.',
   video_negative_prompt: 'still image, static photo, cartoon, anime, 3D CGI render, illustration, deformed hands, distorted anatomy, text, watermark, signature, logo, blurry, low resolution.',
   video_prompt_template: '{frame_directive} Scene action: {action}. Visual style: {style}. {motion} Clean video without any text, letters, watermark, or subtitles.',
@@ -2783,6 +2786,67 @@ export default function Settings({
                     </div>
                   );
                 })()}
+
+                <details
+                  style={{
+                    marginBottom: 12,
+                    padding: '8px 12px',
+                    border: '1px solid rgba(167, 139, 250, 0.2)',
+                    borderRadius: 8,
+                    background: 'rgba(167, 139, 250, 0.04)'
+                  }}
+                >
+                  <summary style={{ cursor: 'pointer', color: '#c4b5fd', fontWeight: 600 }}>
+                    Nâng cao — hàng đợi Google Flow
+                  </summary>
+                  <div className="production-settings-grid" style={{ marginTop: 10 }}>
+                    <label>
+                      Chờ tối đa mỗi video (giây)
+                      <input
+                        type="number"
+                        min="60"
+                        max="3600"
+                        step="30"
+                        value={currentImageGeneration.intro_video_max_wait_seconds ?? 900}
+                        onChange={event => handlePromptSettingChange(
+                          'image_generation_settings', 'intro_video_max_wait_seconds', Number(event.target.value)
+                        )}
+                        disabled={activeVersionLocked}
+                      />
+                    </label>
+                    <label>
+                      Video đang xử lý tối đa
+                      <input
+                        type="number"
+                        min="1"
+                        max="12"
+                        step="1"
+                        value={currentImageGeneration.intro_video_max_in_flight ?? 4}
+                        onChange={event => handlePromptSettingChange(
+                          'image_generation_settings', 'intro_video_max_in_flight', Number(event.target.value)
+                        )}
+                        disabled={activeVersionLocked}
+                      />
+                    </label>
+                    <label>
+                      Ảnh đang xử lý tối đa
+                      <input
+                        type="number"
+                        min="1"
+                        max="4"
+                        step="1"
+                        value={currentImageGeneration.flow_image_max_in_flight ?? 2}
+                        onChange={event => handlePromptSettingChange(
+                          'image_generation_settings', 'flow_image_max_in_flight', Number(event.target.value)
+                        )}
+                        disabled={activeVersionLocked}
+                      />
+                    </label>
+                  </div>
+                  <div className="help-text" style={{ marginTop: 6 }}>
+                    Trình duyệt thao tác tuần tự; Google Flow xử lý nền tối đa 4 yêu cầu tổng cộng.
+                  </div>
+                </details>
 
                 {/* Video Style Prompt */}
                 <div style={{ marginTop: 12 }}>

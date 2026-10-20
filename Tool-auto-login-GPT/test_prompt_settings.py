@@ -440,6 +440,31 @@ class PromptSettingsTests(unittest.TestCase):
         self.assertEqual(result["version"]["image_generation_settings"]["density"], 35)
         self.assertEqual(result["version"]["image_generation_settings"]["negative_prompt"], "cartoon, 3D")
 
+    def test_image_generation_flow_queue_settings_are_saved_and_bounded(self):
+        result = main.save_prompt_image_generation(
+            "default",
+            main.PromptImageGenerationData(
+                intro_video_max_wait_seconds=1200,
+                intro_video_max_in_flight=6,
+                flow_image_max_in_flight=3,
+            ),
+        )
+        settings = result["version"]["image_generation_settings"]
+        self.assertEqual(settings["intro_video_max_wait_seconds"], 1200)
+        self.assertEqual(settings["intro_video_max_in_flight"], 6)
+        self.assertEqual(settings["flow_image_max_in_flight"], 3)
+
+        normalized = chatgpt_projects.normalize_image_generation_settings(
+            {
+                "intro_video_max_wait_seconds": 99999,
+                "intro_video_max_in_flight": 99,
+                "flow_image_max_in_flight": 99,
+            }
+        )
+        self.assertEqual(normalized["intro_video_max_wait_seconds"], 3600)
+        self.assertEqual(normalized["intro_video_max_in_flight"], 12)
+        self.assertEqual(normalized["flow_image_max_in_flight"], 4)
+
     def test_image_generation_save_negative_prompt_from_frontend(self):
         result = main.save_prompt_image_generation(
             "default",
