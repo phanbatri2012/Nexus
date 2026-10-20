@@ -3,7 +3,8 @@ import './CompetitorRadar.css'
 import PublicationTimePicker from './PublicationTimePicker'
 import { formatDateTimeAMPM } from './publicationTime'
 
-const API = 'http://127.0.0.1:8080/api'
+const SERVICE = 'http://127.0.0.1:8080'
+const API = `${SERVICE}/api`
 
 function errorMessage(payload, fallback) {
   const detail = payload?.detail
@@ -19,6 +20,13 @@ function errorMessage(payload, fallback) {
 
 async function request(path, options = {}) {
   const response = await fetch(`${API}${path}`, options)
+  const payload = await response.json().catch(() => ({}))
+  if (!response.ok) throw new Error(errorMessage(payload, `HTTP ${response.status}`))
+  return payload
+}
+
+async function requestHealth() {
+  const response = await fetch(`${SERVICE}/health`)
   const payload = await response.json().catch(() => ({}))
   if (!response.ok) throw new Error(errorMessage(payload, `HTTP ${response.status}`))
   return payload
@@ -61,6 +69,7 @@ export default function CompetitorRadar({ onOpenJobCenter }) {
   const [prompts, setPrompts] = useState({ active_version: '', versions: {} })
   const [channels, setChannels] = useState([])
   const [voices, setVoices] = useState([])
+  const [radarHealth, setRadarHealth] = useState(null)
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -74,18 +83,20 @@ export default function CompetitorRadar({ onOpenJobCenter }) {
   })
 
   const load = useCallback(async () => {
-    const [ruleData, historyData, promptData, channelData, voiceData] = await Promise.all([
+    const [ruleData, historyData, promptData, channelData, voiceData, healthData] = await Promise.all([
       request('/competitors/rules'),
       request('/competitors/history?limit=100'),
       request('/prompts'),
       request('/youtube-comments/channels'),
       request('/tts/voices?status=active'),
+      requestHealth(),
     ])
     setRules(ruleData.rules || [])
     setHistory(historyData.dispatches || [])
     setPrompts(promptData || { active_version: '', versions: {} })
     setChannels(channelData.channels || channelData.items || channelData || [])
     setVoices(voiceData.items || [])
+    setRadarHealth(healthData.competitor_radar_health || null)
     const availablePools = [...new Set((voiceData.items || []).flatMap(voice =>
       usageModes(voice).includes('multi_guest') ? (voice.casting_profile?.voice_pools || []) : []
     ))].sort()
@@ -116,6 +127,7 @@ export default function CompetitorRadar({ onOpenJobCenter }) {
     })
     return [...pools.values()].sort((left, right) => left.id.localeCompare(right.id))
   }, [voices])
+  const sourceVoiceModel = radarHealth?.source_voice_model
 
   const run = async (key, action, message) => {
     setBusy(key)
@@ -260,6 +272,14 @@ export default function CompetitorRadar({ onOpenJobCenter }) {
         </div>
       </header>
 
+      {sourceVoiceModel && <div className={`radar-model-health ${sourceVoiceModel.status || 'missing'}`}>
+        <span className={`radar-status ${sourceVoiceModel.status || 'missing'}`}>Model âm sắc: {sourceVoiceModel.status || 'missing'}</span>
+        <span>Revision <code>{sourceVoiceModel.revision || '—'}</code></span>
+        <span>SHA256 <code>{sourceVoiceModel.checksum || '—'}</code></span>
+        {sourceVoiceModel.status === 'invalid' && sourceVoiceModel.actual_checksum && <span>Thực tế <code>{sourceVoiceModel.actual_checksum}</code></span>}
+        <span>Source fallback: {sourceVoiceModel.benchmark?.mode || 'advisory'}</span>
+      </div>}
+
       {error && <div className="radar-alert error">{error}</div>}
       {notice && <div className="radar-alert success">{notice}</div>}
 
@@ -377,7 +397,10 @@ export default function CompetitorRadar({ onOpenJobCenter }) {
               <small>{role.gender || 'any'} · {Math.round((role.confidence || 0) * 100)}%</small>
               <select value={castSelections[role.speaker_key] || ''} onChange={event => setCastSelections(current => ({ ...current, [role.speaker_key]: event.target.value }))}>
                 <option value="">Chọn giọng</option>
-                {(candidateGroup?.items || []).map(candidate => <option key={candidate.voice_id} value={candidate.voice_id}>{candidate.voice_name} · {candidate.casting_profile?.gender || 'any'} · {candidate.casting_profile?.age_group || 'any'}</option>)}
+                {(candidateGroup?.items || []).map(candidate => {
+                  const selectedByAnotherRole = Object.entries(castSelections).some(([speakerKey, voiceId]) => speakerKey !== role.speaker_key && voiceId === candidate.voice_id)
+                  return <option key={candidate.voice_id} value={candidate.voice_id} disabled={selectedByAnotherRole}>{candidate.voice_name} · {candidate.casting_profile?.gender || 'any'} · {candidate.casting_profile?.age_group || 'any'}</option>
+                })}
               </select>
             </label>
           })}

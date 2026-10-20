@@ -463,7 +463,8 @@ class VideoProductionServiceTests(unittest.TestCase):
             "https://www.youtube.com/watch?v=source-upload",
             "Source upload",
             "Transcript",
-            "### [METADATA & QUIZ]\nMÔ TẢ VIDEO: Description\n"
+            "### [METADATA & QUIZ]\nTIÊU ĐỀ: A complete generated upload title\n"
+            "MÔ TẢ VIDEO: This generated description is deliberately long enough to pass the metadata quality gate in publish tests.\n"
             f"### [THUMBNAIL KHÔNG CHỮ]\n{thumbnail_url}",
         )
         channel = database.save_youtube_channel(

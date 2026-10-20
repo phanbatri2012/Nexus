@@ -6,6 +6,11 @@
 .radar-alert { border-radius: 10px; padding: 12px 14px; }
 .radar-alert.error, .radar-inline-error, .radar-row-error { color: #ff9a9a; background: rgba(213, 64, 64, .12); }
 .radar-alert.success { color: #8fe1b0; background: rgba(45, 178, 101, .13); }
+.radar-model-health { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; padding: 10px 12px; border: 1px solid rgba(95, 179, 255, .2); border-radius: 10px; background: rgba(10, 20, 36, .72); color: #aebfd2; font-size: .82rem; }
+.radar-model-health code { overflow-wrap: anywhere; color: #d9e8f7; }
+.radar-model-health.missing, .radar-model-health.invalid { border-color: rgba(224, 78, 78, .4); }
+.radar-status.ready { background: rgba(55, 187, 112, .18); color: #8de5b2; }
+.radar-status.missing, .radar-status.invalid { background: rgba(224, 78, 78, .18); color: #ff9b9b; }
 .radar-form-grid { display: grid; grid-template-columns: repeat(3, minmax(180px, 1fr)); gap: 14px; margin: 18px 0; }
 .radar-form-grid label { display: grid; gap: 7px; color: #c9d7e7; font-size: .9rem; }
 .radar-form-grid .wide { grid-column: span 2; }

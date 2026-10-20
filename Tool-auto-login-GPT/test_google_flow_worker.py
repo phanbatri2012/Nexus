@@ -2016,7 +2016,7 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         upload.assert_awaited_once()
 
-    async def test_video_frame_picker_ui_error_never_uploads(self):
+    async def test_video_frame_picker_ui_error_falls_back_to_upload(self):
         page = MagicMock()
         page.url = "https://flow.google.com/project/project-one"
         worker = GoogleFlowWorker(page)
@@ -2029,17 +2029,25 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
                     "_attach_video_frame_from_picker",
                     AsyncMock(return_value=REFERENCE_RESULT_UI_ERROR),
                 ),
-                patch.object(worker, "_upload_video_frame_file", AsyncMock()) as upload,
+                patch.object(
+                    worker,
+                    "_prompt_attachment_identities",
+                    AsyncMock(return_value=[{"assetId": "uploaded-one", "urls": []}]),
+                ),
+                patch.object(
+                    worker,
+                    "_upload_video_frame_file",
+                    AsyncMock(return_value=True),
+                ) as upload,
             ):
-                with self.assertRaises(FlowFrameAttachmentError):
-                    await worker._ensure_agent_video_frame(
-                        frame,
-                        "start",
-                        1,
-                        scene_index=0,
-                    )
+                await worker._ensure_agent_video_frame(
+                    frame,
+                    "start",
+                    1,
+                    scene_index=0,
+                )
 
-        upload.assert_not_awaited()
+        upload.assert_awaited_once_with(frame, 1)
 
     async def test_cold_frame_cache_reuses_exact_flow_upload(self):
         page = MagicMock()
