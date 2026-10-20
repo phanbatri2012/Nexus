@@ -95,6 +95,7 @@ from auto_yt.services import (
     prompt_assets,
     publication_scheduler,
     production_coordinator as production_coordinator_service,
+    source_voice_analyzer,
     video_qc,
     video_production,
     youtube_comments,
@@ -659,6 +660,7 @@ def get_health():
         "degraded_rules": len(radar_degraded),
         "attention_rules": len(radar_attention),
         "long_form_min_seconds": competitor_radar.LONG_FORM_MIN_SECONDS,
+        "source_voice_model": source_voice_analyzer.model_status(),
     }
     is_ready = bool(coordinator.get("ready")) and bool(publish_coord.get("ready"))
     return {
@@ -754,6 +756,22 @@ class CompetitorWatchRuleUpdate(BaseModel):
 
 class CompetitorRuleStatusUpdate(BaseModel):
     action: Literal["pause", "resume"]
+
+
+class CastingApprovalAssignment(BaseModel):
+    speaker_key: str = Field(min_length=1, max_length=80)
+    voice_id: str = Field(min_length=1, max_length=200)
+
+
+class CastingApprovalRequest(BaseModel):
+    assignments: List[CastingApprovalAssignment] = Field(
+        min_length=1,
+        max_length=20,
+    )
+
+
+class RecastStaleRequest(BaseModel):
+    dry_run: bool = True
 
 
 class RetryAudioRequest(BaseModel):
@@ -3650,6 +3668,12 @@ def _resolve_radar_auto_cast(
     video_id = int(video["id"])
     voice_policy = automation.get("voice_policy") or {}
     guest_voice_pool = str(voice_policy.get("guest_voice_pool") or "").strip()
+    cast_settings = production_snapshot.get("cast_settings") or {}
+    manifest = auto_casting.build_speaker_manifest(
+        script,
+        provided_manifest=production_snapshot.get("casting_manifest"),
+        cast_settings=cast_settings,
+    )
     existing = db.list_video_cast_assignments(video_id)
     if existing:
         auto_casting.validate_cast_policy(
@@ -3657,6 +3681,7 @@ def _resolve_radar_auto_cast(
             available_voices,
             mc_voice_id=mc_voice_id,
             guest_voice_pool=guest_voice_pool,
+            manifest=manifest,
         )
         return {
             str(item.get("role_key") or item.get("speaker_key") or ""): {
@@ -3665,12 +3690,60 @@ def _resolve_radar_auto_cast(
             for item in existing
         }
 
-    cast_settings = production_snapshot.get("cast_settings") or {}
-    manifest = auto_casting.build_speaker_manifest(
-        script,
-        provided_manifest=production_snapshot.get("casting_manifest"),
-        cast_settings=cast_settings,
-    )
+    source_profile: dict = {}
+    unresolved_guests = [
+        entry
+        for entry in manifest
+        if entry.get("role") == "guest" and not entry.get("profile_resolved")
+    ]
+    if len(unresolved_guests) == 1:
+        source_id = int(automation.get("competitor_source_video_id") or 0)
+        source_row = db.get_competitor_source_video(source_id) if source_id else None
+        if not source_row:
+            raise auto_casting.AutoCastingAttentionRequired(
+                "Không tìm thấy video nguồn để phân tích âm sắc giọng."
+            )
+        cached_profile = source_row.get("voice_profile") or {}
+        if (
+            str(source_row.get("voice_profile_version") or "")
+            == source_voice_analyzer.MODEL_REVISION
+            and str(source_row.get("voice_profile_status") or "") != "error"
+            and isinstance(cached_profile, dict)
+            and cached_profile
+        ):
+            source_profile = cached_profile
+        else:
+            target_channel_id = int(automation.get("target_youtube_channel_id") or 0)
+            target_channel = (
+                db.get_youtube_channel(target_channel_id) if target_channel_id else None
+            )
+            raw_proxy = str((target_channel or {}).get("gpm_proxy_info") or "").strip()
+            try:
+                source_profile = source_voice_analyzer.analyze_source_voice(
+                    str(source_row.get("url") or ""),
+                    duration_seconds=float(source_row.get("duration_seconds") or 0),
+                    proxy=raw_proxy,
+                )
+            except Exception as exc:
+                db.update_competitor_source_voice_profile(
+                    source_id,
+                    status="error",
+                    profile={
+                        "gender": "any",
+                        "model_revision": source_voice_analyzer.MODEL_REVISION,
+                        "model_checksum": source_voice_analyzer.MODEL_SHA256,
+                    },
+                    version=source_voice_analyzer.MODEL_REVISION,
+                )
+                raise auto_casting.AutoCastingAttentionRequired(
+                    "Không thể xác minh âm sắc giọng nguồn; cần duyệt casting thủ công."
+                ) from exc
+            db.update_competitor_source_voice_profile(
+                source_id,
+                status=str(source_profile.get("status") or "uncertain"),
+                profile=source_profile,
+                version=source_voice_analyzer.MODEL_REVISION,
+            )
     registry = {
         entry["speaker_key"]: stored
         for entry in manifest
@@ -3687,6 +3760,9 @@ def _resolve_radar_auto_cast(
         registry=registry,
         guest_voice_pool=guest_voice_pool,
         enforce_usage_policy=True,
+        source_voice_profile=source_profile,
+        source_video_id=str(automation.get("competitor_source_video_id") or ""),
+        prompt_version=str(video.get("prompt_version") or ""),
     )
     cast: dict[str, dict] = {}
     generic_speaker_pattern = re.compile(r"^(?:MC|KHACH_?\d*|GUEST_?\d*)$")
@@ -3705,6 +3781,9 @@ def _resolve_radar_auto_cast(
             match_score=match_score,
             source=str(assignment.get("source") or "auto"),
             manifest=assignment,
+            casting_version=int(assignment.get("casting_version") or 2),
+            manifest_hash=str(assignment.get("manifest_hash") or ""),
+            approval_status=str(assignment.get("approval_status") or "auto"),
         )
         cast[role_key] = {"voice_id": str(assignment["voice_id"])}
         if not generic_speaker_pattern.fullmatch(speaker_key):
@@ -5735,6 +5814,10 @@ def _execute_video_job(job: dict) -> None:
                 video_id,
                 pipeline=pipeline,
                 job_id=job_id,
+                require_casting_manifest=(
+                    str((production_snapshot.get("automation") or {}).get("source") or "")
+                    == "competitor_radar"
+                ),
             )
         _raise_if_video_job_canceled(job_id)
         summary_text = (
@@ -5763,6 +5846,19 @@ def _execute_video_job(job: dict) -> None:
             if isinstance(worker_result, dict)
             else True
         )
+        casting_manifest = (
+            worker_result.get("casting_manifest")
+            if isinstance(worker_result, dict)
+            else None
+        )
+        if isinstance(casting_manifest, dict) and casting_manifest.get("speakers"):
+            casting_manifest = auto_casting.validate_casting_manifest(
+                summary_text,
+                casting_manifest,
+            )
+            production_snapshot["casting_manifest"] = casting_manifest
+            if not db.update_video_production_snapshot(video_id, production_snapshot):
+                raise RuntimeError("Không thể lưu casting manifest của video.")
         generation_retryable = (
             worker_result.get("retryable", True) is not False
             if isinstance(worker_result, dict)
@@ -7981,24 +8077,329 @@ def get_competitor_history(rule_id: Optional[int] = None, limit: int = Query(100
     return {"dispatches": db.list_competitor_dispatches(rule_id=rule_id, limit=limit)}
 
 
+def _radar_casting_context(video_id: int) -> dict:
+    video = db.get_video(video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Không tìm thấy video.")
+    dispatch = db.get_competitor_dispatch_for_video(video_id)
+    if not dispatch:
+        raise HTTPException(status_code=404, detail="Video không thuộc một dispatch Radar.")
+    try:
+        snapshot = json.loads(video.get("production_snapshot_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        snapshot = {}
+    automation = snapshot.get("automation") or {}
+    if str(automation.get("source") or "") != "competitor_radar":
+        raise HTTPException(status_code=409, detail="Video không có snapshot Radar hợp lệ.")
+    script = str(video.get("generated_script") or "")
+    manifest = auto_casting.build_speaker_manifest(
+        script,
+        provided_manifest=snapshot.get("casting_manifest"),
+        cast_settings=snapshot.get("cast_settings") or {},
+    )
+    voices = voice_config.load_voice_config().get("voices", [])
+    job = (
+        db.get_system_job(str(dispatch.get("system_job_id") or ""))
+        if dispatch.get("system_job_id")
+        else None
+    )
+    return {
+        "video": video,
+        "dispatch": dispatch,
+        "snapshot": snapshot,
+        "manifest": manifest,
+        "voices": voices,
+        "job": job,
+        "mc_voice_id": str(video.get("voice_id") or ""),
+        "guest_voice_pool": str(dispatch.get("guest_voice_pool") or ""),
+    }
+
+
 @app.get("/api/competitors/videos/{video_id}/casting")
 def get_competitor_casting_report(video_id: int):
-    if not db.get_video(video_id):
-        raise HTTPException(status_code=404, detail="Không tìm thấy video.")
+    context = _radar_casting_context(video_id)
+    stored_assignments = db.list_video_cast_assignments(video_id)
     voice_names = {
         str(voice.get("id") or ""): str(voice.get("name") or "").strip()
-        for voice in voice_config.load_voice_config().get("voices", [])
+        for voice in context["voices"]
         if voice.get("id")
     }
     assignments = []
-    for stored in db.list_video_cast_assignments(video_id):
+    for stored in stored_assignments:
         assignment = dict(stored)
         assignment["voice_name"] = (
             voice_names.get(str(assignment.get("voice_id") or ""))
             or "Giọng không còn trong danh mục"
         )
         assignments.append(assignment)
-    return {"video_id": video_id, "assignments": assignments}
+    assigned_keys = {
+        auto_casting.normalize_speaker_key(
+            item.get("speaker_key") or item.get("role_key") or ""
+        )
+        for item in stored_assignments
+    }
+    unresolved_roles = [
+        entry
+        for entry in context["manifest"]
+        if entry.get("role") == "guest"
+        and auto_casting.normalize_speaker_key(entry.get("speaker_key") or "")
+        not in assigned_keys
+    ]
+    candidates = []
+    for entry in context["manifest"]:
+        if entry.get("role") != "guest":
+            continue
+        candidates.append(
+            {
+                "speaker_key": entry["speaker_key"],
+                "items": auto_casting.list_candidates(
+                    entry,
+                    context["voices"],
+                    guest_voice_pool=context["guest_voice_pool"],
+                    used_voice_ids={context["mc_voice_id"]},
+                ),
+            }
+        )
+    job = context.get("job") or {}
+    attention = (job.get("result") or {}).get("attention_required")
+    can_approve = bool(
+        job.get("status") == "paused"
+        and attention == "auto_cast"
+        and unresolved_roles
+        and all(item["items"] for item in candidates)
+    )
+    return {
+        "video_id": video_id,
+        "assignments": assignments,
+        "casting_manifest": {"speakers": context["manifest"]},
+        "source_voice_profile": context["dispatch"].get("voice_profile") or {},
+        "unresolved_roles": unresolved_roles,
+        "candidates": candidates,
+        "casting_version": auto_casting.CASTING_VERSION,
+        "can_approve": can_approve,
+        "job_id": str(job.get("id") or ""),
+        "job_status": str(job.get("status") or ""),
+    }
+
+
+@app.post("/api/competitors/videos/{video_id}/casting/approve")
+def approve_competitor_casting(video_id: int, request: CastingApprovalRequest):
+    context = _radar_casting_context(video_id)
+    job = context.get("job") or {}
+    if (
+        job.get("status") != "paused"
+        or (job.get("result") or {}).get("attention_required") != "auto_cast"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Job Radar không đang tạm dừng vì casting.",
+        )
+    manifest_by_key = {
+        auto_casting.normalize_speaker_key(entry.get("speaker_key") or ""): entry
+        for entry in context["manifest"]
+    }
+    guest_keys = {
+        key for key, entry in manifest_by_key.items() if entry.get("role") == "guest"
+    }
+    if "MC" not in manifest_by_key or not guest_keys:
+        raise HTTPException(
+            status_code=422,
+            detail="Casting manifest phải có đúng vai MC và ít nhất một vai khách.",
+        )
+    requested: dict[str, str] = {}
+    for item in request.assignments:
+        key = auto_casting.normalize_speaker_key(item.speaker_key)
+        if key not in guest_keys:
+            raise HTTPException(status_code=422, detail=f"Role '{key}' không thuộc kịch bản.")
+        if key in requested:
+            raise HTTPException(status_code=422, detail=f"Role '{key}' bị lặp.")
+        requested[key] = item.voice_id.strip()
+
+    stored = {
+        auto_casting.normalize_speaker_key(
+            item.get("speaker_key") or item.get("role_key") or ""
+        ): item
+        for item in db.list_video_cast_assignments(video_id)
+    }
+    selected = {
+        key: requested.get(key) or str((stored.get(key) or {}).get("voice_id") or "")
+        for key in guest_keys
+    }
+    missing = sorted(key for key, voice_id in selected.items() if not voice_id)
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail="Chưa chọn voice cho: " + ", ".join(missing),
+        )
+    voice_by_id = {
+        str(voice.get("id") or ""): voice for voice in context["voices"]
+    }
+    mc_voice_id = context["mc_voice_id"]
+    mc_voice = voice_by_id.get(mc_voice_id)
+    if not mc_voice or not voice_config.voice_allows_usage(mc_voice, "multi_host"):
+        raise HTTPException(status_code=409, detail="Giọng MC cố định không còn hợp lệ.")
+    used = {mc_voice_id}
+    for key, voice_id in selected.items():
+        voice = voice_by_id.get(voice_id)
+        if not voice or not voice_config.voice_allows_usage(
+            voice,
+            "multi_guest",
+            voice_pool=context["guest_voice_pool"],
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Voice của {key} không hoạt động hoặc không thuộc đúng pool.",
+            )
+        if voice_id in used:
+            raise HTTPException(status_code=422, detail="Các role không được dùng trùng voice.")
+        used.add(voice_id)
+
+    current_hash = auto_casting.manifest_hash(context["manifest"])
+    assignments = [
+        {
+            **manifest_by_key["MC"],
+            "role_key": "MC",
+            "speaker_key": "MC",
+            "voice_id": mc_voice_id,
+            "match_score": 100.0,
+            "score_breakdown": {"fixed_mc": 100.0},
+            "source": "fixed_mc",
+            "casting_version": auto_casting.CASTING_VERSION,
+            "manifest_hash": current_hash,
+            "approval_status": "auto",
+        }
+    ]
+    for key in sorted(guest_keys):
+        entry = manifest_by_key[key]
+        assignments.append(
+            {
+                **entry,
+                "role_key": key,
+                "speaker_key": key,
+                "voice_id": selected[key],
+                "match_score": 100.0,
+                "score_breakdown": {"manual_override": 100.0},
+                "source": "manual_override",
+                "casting_version": auto_casting.CASTING_VERSION,
+                "manifest_hash": current_hash,
+                "approval_status": "approved",
+            }
+        )
+    context["snapshot"]["cast_voice_overrides"] = {
+        item["role_key"]: {"voice_id": item["voice_id"]} for item in assignments
+    }
+    try:
+        resumed_job = db.approve_radar_casting(
+            video_id=video_id,
+            system_job_id=str(job["id"]),
+            assignments=assignments,
+            production_snapshot=context["snapshot"],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    _kick_video_queue()
+    return {
+        "success": True,
+        "video_id": video_id,
+        "job_id": resumed_job["id"],
+        "job_status": resumed_job["status"],
+    }
+
+
+def _radar_recast_safety(video_id: int) -> tuple[bool, str]:
+    video = db.get_video(video_id) or {}
+    if bool(video.get("is_published")) or db.list_video_publications(video_id):
+        return False, "published"
+    audio_task = db.get_audio_task(video_id)
+    if not audio_task:
+        return True, ""
+    try:
+        segments = json.loads(audio_task.get("segments_json") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        segments = []
+    submitted = bool(audio_task.get("task_id") or audio_task.get("audio_url")) or any(
+        isinstance(segment, dict)
+        and bool(
+            segment.get("task_id")
+            or segment.get("audio_url")
+            or str(segment.get("status") or "")
+            not in {"", "not_submitted"}
+        )
+        for segment in segments
+    )
+    return (False, "tts_started") if submitted else (True, "")
+
+
+@app.post("/api/competitors/casting/recast-stale")
+def recast_stale_competitor_casting(request: RecastStaleRequest):
+    results = []
+    recast_count = 0
+    attention_count = 0
+    for dispatch in db.list_competitor_dispatches(limit=10000):
+        video_id = int(dispatch.get("video_id") or 0)
+        if not video_id:
+            continue
+        context = _radar_casting_context(video_id)
+        stored = db.list_video_cast_assignments(video_id)
+        current_hash = auto_casting.manifest_hash(context["manifest"])
+        stale = bool(stored) and any(
+            int(item.get("casting_version") or 1) < auto_casting.CASTING_VERSION
+            or str(item.get("approval_status") or "legacy") == "legacy"
+            or (
+                int(item.get("casting_version") or 1) >= auto_casting.CASTING_VERSION
+                and str(item.get("manifest_hash") or "") != current_hash
+            )
+            for item in stored
+        )
+        safe, blocked_reason = _radar_recast_safety(video_id)
+        item_result = {
+            "video_id": video_id,
+            "stale": stale,
+            "eligible": stale and safe,
+            "blocked_reason": blocked_reason,
+            "action": "none",
+        }
+        if not stale or not safe or request.dry_run:
+            results.append(item_result)
+            continue
+        db.delete_video_cast_assignments(video_id)
+        try:
+            _resolve_radar_auto_cast(
+                video=context["video"],
+                production_snapshot=context["snapshot"],
+                script=str(context["video"].get("generated_script") or ""),
+                mc_voice_id=context["mc_voice_id"],
+                available_voices=context["voices"],
+            )
+            item_result["action"] = "recast"
+            recast_count += 1
+        except auto_casting.AutoCastingAttentionRequired as exc:
+            safe_error = security_logging.redact_sensitive(exc)
+            job = context.get("job") or {}
+            if job.get("id"):
+                db.update_system_job(
+                    job["id"],
+                    status="paused",
+                    progress="Cần duyệt casting sau khi recast",
+                    result_json={"attention_required": "auto_cast", "video_id": video_id},
+                    error=safe_error,
+                    finished_at="",
+                )
+            db.update_competitor_dispatch(
+                int(context["dispatch"]["id"]),
+                status="needs_attention",
+                error=safe_error,
+            )
+            item_result["action"] = "needs_attention"
+            attention_count += 1
+        results.append(item_result)
+    return {
+        "dry_run": request.dry_run,
+        "items": results,
+        "eligible_count": sum(1 for item in results if item["eligible"]),
+        "recast_count": recast_count,
+        "attention_count": attention_count,
+    }
 
 
 @app.get("/api/competitors/videos/{video_id}/qc")

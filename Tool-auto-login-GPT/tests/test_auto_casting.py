@@ -81,15 +81,35 @@ class TestAutomaticCasting(unittest.TestCase):
         self.assertEqual(len({item["voice_id"] for item in assignments}), 3)
 
     def test_named_speaker_registry_wins_when_profile_still_matches(self):
+        lan_manifest = next(item for item in self.manifest if item["speaker_key"] == "LAN")
         assignments = auto_casting.assign_cast(
             self.manifest,
             self.voices,
             mc_voice_id="mc-fixed",
-            registry={"LAN": {"voice_id": "female-backup"}},
+            registry={
+                "LAN": {
+                    "voice_id": "female-backup",
+                    "profile_signature": auto_casting.profile_signature(lan_manifest),
+                }
+            },
         )
         lan = next(item for item in assignments if item["speaker_key"] == "LAN")
         self.assertEqual(lan["voice_id"], "female-backup")
         self.assertEqual(lan["source"], "registry")
+
+    def test_registry_is_ignored_when_profile_signature_is_stale(self):
+        assignments = auto_casting.assign_cast(
+            self.manifest,
+            self.voices,
+            mc_voice_id="mc-fixed",
+            registry={
+                "LAN": {"voice_id": "female-backup", "profile_signature": "stale"}
+            },
+            source_video_id="source-1",
+            prompt_version="prompt-1",
+        )
+        lan = next(item for item in assignments if item["speaker_key"] == "LAN")
+        self.assertNotEqual(lan["source"], "registry")
 
     def test_missing_distinct_guest_voice_requires_attention(self):
         with self.assertRaises(auto_casting.AutoCastingAttentionRequired):
@@ -199,6 +219,125 @@ class TestAutomaticCasting(unittest.TestCase):
                 mc_voice_id="mc-fixed",
                 guest_voice_pool="kenh-suc-khoe",
             )
+
+    def test_role_aliases_share_one_canonical_key(self):
+        self.assertEqual(auto_casting.normalize_speaker_key("guest_1"), "KHACH_1")
+        self.assertEqual(auto_casting.normalize_speaker_key("GUEST1"), "KHACH_1")
+        self.assertEqual(auto_casting.normalize_speaker_key("KHACH_1"), "KHACH_1")
+
+    def test_manifest_schema_rejects_unknown_role_and_invalid_enum(self):
+        script = "[MC]: Chào.\n[KHACH_1]: Xin chào."
+        invalid_role = {
+            "speakers": [
+                {"speaker_key": "MC", "name": "MC", "gender": "male", "age_group": "adult", "language": "vi", "styles": [], "confidence": 1},
+                {"speaker_key": "KHACH_2", "name": "Khách", "gender": "female", "age_group": "adult", "language": "vi", "styles": [], "confidence": .9},
+            ]
+        }
+        with self.assertRaises(auto_casting.CastingManifestValidationError):
+            auto_casting.validate_casting_manifest(script, invalid_role)
+        invalid_enum = {
+            "speakers": [
+                {"speaker_key": "MC", "name": "MC", "gender": "unknown", "age_group": "adult", "language": "vi", "styles": [], "confidence": 1},
+                {"speaker_key": "KHACH_1", "name": "Khách", "gender": "female", "age_group": "adult", "language": "vi", "styles": [], "confidence": .9},
+            ]
+        }
+        with self.assertRaises(auto_casting.CastingManifestValidationError):
+            auto_casting.validate_casting_manifest(script, invalid_enum)
+
+    def test_character_profile_beats_opposite_source_timbre(self):
+        assignments = auto_casting.assign_cast(
+            self.manifest[:2],
+            self.voices,
+            mc_voice_id="mc-fixed",
+            source_voice_profile={"gender": "male", "confidence": .99},
+        )
+        self.assertEqual(assignments[1]["voice_id"], "female-young")
+        self.assertEqual(assignments[1]["source"], "manifest_profile")
+
+    def test_one_generic_role_uses_high_confidence_source_timbre(self):
+        manifest = auto_casting.build_speaker_manifest(
+            "[MC]: Chào.\n[GUEST1]: Xin chào."
+        )
+        assignments = auto_casting.assign_cast(
+            manifest,
+            self.voices,
+            mc_voice_id="mc-fixed",
+            source_voice_profile={"gender": "male", "confidence": .91},
+            source_video_id="youtube-source",
+            prompt_version="prompt-v2",
+        )
+        guest = assignments[1]
+        self.assertEqual(guest["voice_id"], "male-senior")
+        self.assertEqual(guest["source"], "source_voice_fallback")
+
+    def test_generic_role_with_mixed_pool_requires_attention(self):
+        manifest = auto_casting.build_speaker_manifest(
+            "[MC]: Chào.\n[KHACH_1]: Xin chào."
+        )
+        with self.assertRaises(auto_casting.AutoCastingAttentionRequired):
+            auto_casting.assign_cast(
+                manifest,
+                self.voices,
+                mc_voice_id="mc-fixed",
+                source_voice_profile={"gender": "any", "confidence": .4},
+            )
+
+    def test_unknown_requirement_does_not_reward_gender_or_age_metadata(self):
+        manifest = auto_casting.build_speaker_manifest(
+            "[MC]: Chào.\n[KHACH_1]: Xin chào."
+        )[1]
+        homogeneous = [
+            _voice("female-specific", gender="female", age_group="young"),
+            _voice("female-any-age", gender="female", age_group="any"),
+        ]
+        candidates = auto_casting.list_candidates(
+            manifest,
+            homogeneous,
+            guest_voice_pool="",
+        )
+        self.assertTrue(candidates)
+        for candidate in candidates:
+            self.assertEqual(candidate["breakdown"]["gender"], 0)
+            self.assertEqual(candidate["breakdown"]["age_group"], 0)
+
+    def test_known_profile_rejects_voice_with_any_metadata(self):
+        voices = [self.voices[0], _voice("unknown", gender="any", age_group="any")]
+        with self.assertRaises(auto_casting.AutoCastingAttentionRequired):
+            auto_casting.assign_cast(
+                self.manifest[:2],
+                voices,
+                mc_voice_id="mc-fixed",
+            )
+
+    def test_rendezvous_selection_is_stable_and_not_lexical_uuid_order(self):
+        manifest = auto_casting.build_speaker_manifest(
+            "[MC]: Chào.\n[LAN]: Xin chào.",
+            provided_manifest={
+                "speakers": [
+                    {"speaker_key": "LAN", "name": "Lan", "gender": "female", "age_group": "young", "language": "vi", "styles": [], "confidence": .9}
+                ]
+            },
+        )
+        voices = [
+            self.voices[0],
+            _voice("0000-a", gender="female", age_group="young"),
+            _voice("zzzz-z", gender="female", age_group="young"),
+        ]
+        first = auto_casting.assign_cast(
+            manifest,
+            voices,
+            mc_voice_id="mc-fixed",
+            source_video_id="video-77",
+            prompt_version="prompt-9",
+        )
+        second = auto_casting.assign_cast(
+            manifest,
+            list(reversed(voices)),
+            mc_voice_id="mc-fixed",
+            source_video_id="video-77",
+            prompt_version="prompt-9",
+        )
+        self.assertEqual(first[1]["voice_id"], second[1]["voice_id"])
 
 
 if __name__ == "__main__":

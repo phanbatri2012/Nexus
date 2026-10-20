@@ -1507,6 +1507,10 @@ def init_db():
             published_at_confidence TEXT NOT NULL DEFAULT 'unknown',
             metadata_checked_at TEXT DEFAULT '',
             metadata_json TEXT NOT NULL DEFAULT '{}',
+            voice_profile_status TEXT NOT NULL DEFAULT 'not_analyzed',
+            voice_profile_json TEXT NOT NULL DEFAULT '{}',
+            voice_profile_version TEXT NOT NULL DEFAULT '',
+            voice_profile_updated_at TEXT NOT NULL DEFAULT '',
             FOREIGN KEY(competitor_channel_id) REFERENCES competitor_channels(id) ON DELETE CASCADE,
             UNIQUE(competitor_channel_id, youtube_video_id)
         )
@@ -1523,6 +1527,10 @@ def init_db():
         "discovery_source TEXT DEFAULT ''",
         "published_at_confidence TEXT NOT NULL DEFAULT 'unknown'",
         "metadata_checked_at TEXT DEFAULT ''",
+        "voice_profile_status TEXT NOT NULL DEFAULT 'not_analyzed'",
+        "voice_profile_json TEXT NOT NULL DEFAULT '{}'",
+        "voice_profile_version TEXT NOT NULL DEFAULT ''",
+        "voice_profile_updated_at TEXT NOT NULL DEFAULT ''",
     ):
         try:
             c.execute(f"ALTER TABLE competitor_source_videos ADD COLUMN {column_sql}")
@@ -1562,12 +1570,24 @@ def init_db():
             match_score REAL NOT NULL DEFAULT 0,
             source TEXT NOT NULL DEFAULT 'auto',
             manifest_json TEXT NOT NULL DEFAULT '{}',
+            casting_version INTEGER NOT NULL DEFAULT 1,
+            manifest_hash TEXT NOT NULL DEFAULT '',
+            approval_status TEXT NOT NULL DEFAULT 'legacy',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY(video_id) REFERENCES videos(id) ON DELETE CASCADE,
             UNIQUE(video_id, speaker_key)
         )
     """)
+    for column_sql in (
+        "casting_version INTEGER NOT NULL DEFAULT 1",
+        "manifest_hash TEXT NOT NULL DEFAULT ''",
+        "approval_status TEXT NOT NULL DEFAULT 'legacy'",
+    ):
+        try:
+            c.execute(f"ALTER TABLE video_cast_assignments ADD COLUMN {column_sql}")
+        except sqlite3.OperationalError:
+            pass
     c.execute("""
         CREATE TABLE IF NOT EXISTS speaker_voice_registry (
             prompt_version TEXT NOT NULL,
@@ -3658,6 +3678,17 @@ def update_video_generation(
     conn.commit()
     conn.close()
     return success
+
+
+def update_video_production_snapshot(video_id: int, snapshot: dict) -> bool:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    cursor = conn.execute(
+        "UPDATE videos SET production_snapshot_json = ? WHERE id = ?",
+        (json.dumps(snapshot or {}, ensure_ascii=False), video_id),
+    )
+    conn.commit()
+    conn.close()
+    return cursor.rowcount > 0
 
 
 def update_audio_duration(video_id: int, duration_seconds: float | None) -> bool:
@@ -8501,6 +8532,57 @@ def list_competitor_source_videos(
     return [dict(row) for row in rows]
 
 
+def get_competitor_source_video(source_video_id: int) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM competitor_source_videos WHERE id = ?",
+        (source_video_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    result = dict(row)
+    try:
+        result["voice_profile"] = json.loads(result.get("voice_profile_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        result["voice_profile"] = {}
+    return result
+
+
+def update_competitor_source_voice_profile(
+    source_video_id: int,
+    *,
+    status: str,
+    profile: dict,
+    version: str,
+) -> dict | None:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        UPDATE competitor_source_videos
+        SET voice_profile_status = ?, voice_profile_json = ?,
+            voice_profile_version = ?, voice_profile_updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            str(status or "not_analyzed"),
+            json.dumps(profile or {}, ensure_ascii=False),
+            str(version or ""),
+            now,
+            source_video_id,
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM competitor_source_videos WHERE id = ?", (source_video_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 def reserve_competitor_dispatch(
     *, source_video_id: int, watch_rule_id: int, prompt_version: str
 ) -> tuple[dict, bool]:
@@ -8585,6 +8667,35 @@ def get_competitor_dispatch_for_job(system_job_id: str) -> dict | None:
     return dict(row) if row else None
 
 
+def get_competitor_dispatch_for_video(video_id: int) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        """
+        SELECT d.*, s.youtube_video_id, s.url AS source_url,
+               s.title AS source_title, s.duration_seconds,
+               s.voice_profile_status, s.voice_profile_json,
+               s.voice_profile_version, s.voice_profile_updated_at,
+               r.guest_voice_pool, r.target_youtube_channel_id
+        FROM competitor_dispatches d
+        JOIN competitor_source_videos s ON s.id = d.source_video_id
+        JOIN competitor_watch_rules r ON r.id = d.watch_rule_id
+        WHERE d.video_id = ?
+        ORDER BY d.id DESC LIMIT 1
+        """,
+        (video_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    result = dict(row)
+    try:
+        result["voice_profile"] = json.loads(result.get("voice_profile_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        result["voice_profile"] = {}
+    return result
+
+
 def reconcile_competitor_dispatches_from_jobs() -> int:
     """Repair stale active dispatches without reviving terminal work."""
     now = utc_now()
@@ -8666,6 +8777,9 @@ def upsert_video_cast_assignment(
     match_score: float,
     source: str,
     manifest: dict,
+    casting_version: int = 2,
+    manifest_hash: str = "",
+    approval_status: str = "auto",
 ) -> dict:
     now = utc_now()
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
@@ -8674,8 +8788,9 @@ def upsert_video_cast_assignment(
         """
         INSERT INTO video_cast_assignments (
             video_id, role_key, speaker_key, speaker_name, voice_id,
-            confidence, match_score, source, manifest_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            confidence, match_score, source, manifest_json, casting_version,
+            manifest_hash, approval_status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(video_id, speaker_key) DO UPDATE SET
             role_key = excluded.role_key,
             speaker_name = excluded.speaker_name,
@@ -8684,6 +8799,9 @@ def upsert_video_cast_assignment(
             match_score = excluded.match_score,
             source = excluded.source,
             manifest_json = excluded.manifest_json,
+            casting_version = excluded.casting_version,
+            manifest_hash = excluded.manifest_hash,
+            approval_status = excluded.approval_status,
             updated_at = excluded.updated_at
         """,
         (
@@ -8696,6 +8814,9 @@ def upsert_video_cast_assignment(
             float(match_score),
             source,
             json.dumps(manifest or {}, ensure_ascii=False),
+            max(1, int(casting_version or 1)),
+            str(manifest_hash or ""),
+            str(approval_status or "auto"),
             now,
             now,
         ),
@@ -8707,6 +8828,96 @@ def upsert_video_cast_assignment(
     ).fetchone()
     conn.close()
     return dict(row)
+
+
+def approve_radar_casting(
+    *,
+    video_id: int,
+    system_job_id: str,
+    assignments: list[dict],
+    production_snapshot: dict,
+) -> dict:
+    """Atomically persist manual casting and resume the same paused Radar job."""
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        job = conn.execute(
+            "SELECT * FROM system_jobs WHERE id = ? AND video_id = ?",
+            (system_job_id, video_id),
+        ).fetchone()
+        if job is None or job["job_type"] != "video_generation":
+            raise ValueError("Không tìm thấy job Radar gốc của video.")
+        if job["status"] != "paused":
+            raise ValueError("Job Radar không còn ở trạng thái chờ duyệt casting.")
+        try:
+            job_result = json.loads(job["result_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            job_result = {}
+        if job_result.get("attention_required") != "auto_cast":
+            raise ValueError("Job không tạm dừng vì casting.")
+
+        conn.execute("DELETE FROM video_cast_assignments WHERE video_id = ?", (video_id,))
+        for assignment in assignments:
+            conn.execute(
+                """
+                INSERT INTO video_cast_assignments (
+                    video_id, role_key, speaker_key, speaker_name, voice_id,
+                    confidence, match_score, source, manifest_json,
+                    casting_version, manifest_hash, approval_status,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    video_id,
+                    assignment["role_key"],
+                    assignment["speaker_key"],
+                    assignment.get("speaker_name", ""),
+                    assignment["voice_id"],
+                    float(assignment.get("confidence") or 0),
+                    float(assignment.get("match_score") or 0),
+                    assignment.get("source", "manual_override"),
+                    json.dumps(assignment, ensure_ascii=False),
+                    max(1, int(assignment.get("casting_version") or 2)),
+                    str(assignment.get("manifest_hash") or ""),
+                    str(assignment.get("approval_status") or "approved"),
+                    now,
+                    now,
+                ),
+            )
+        conn.execute(
+            "UPDATE videos SET production_snapshot_json = ? WHERE id = ?",
+            (json.dumps(production_snapshot, ensure_ascii=False), video_id),
+        )
+        conn.execute(
+            """
+            UPDATE system_jobs
+            SET status = 'queued', progress = ?, result_json = '{}', error = '',
+                next_retry_at = '', started_at = '', finished_at = '', updated_at = ?
+            WHERE id = ?
+            """,
+            ("Casting đã duyệt; đang chờ tiếp tục", now, system_job_id),
+        )
+        conn.execute(
+            """
+            UPDATE competitor_dispatches
+            SET status = 'queued', error = '', updated_at = ?
+            WHERE system_job_id = ? AND video_id = ?
+            """,
+            (now, system_job_id, video_id),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+    resumed = get_system_job(system_job_id)
+    if not resumed:
+        raise RuntimeError("Không đọc được job Radar sau khi duyệt casting.")
+    return resumed
 
 
 def list_video_cast_assignments(video_id: int) -> list[dict]:

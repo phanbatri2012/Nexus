@@ -19,6 +19,7 @@ from playwright.sync_api import sync_playwright, Page
 from auto_yt.paths import gpt_profile_dir, PROMPTS_PATH, THUMBNAILS_DIR, REFERENCES_DIR
 from auto_yt.default_prompts import DEFAULT_PROMPTS_DATA
 from auto_yt.services import media_fetcher
+from auto_yt.services import auto_casting
 from auto_yt.services.chatgpt_projects import (
     CHATGPT_PROJECT_URL_ENV,
     DEFAULT_CHATGPT_BOOTSTRAP_URL,
@@ -4776,6 +4777,55 @@ def build_video_script(state: dict) -> str:
     return build_monologue_video_script(state)
 
 
+def generate_casting_manifest(
+    page: Page,
+    state: dict,
+    prompts: dict,
+    *,
+    required: bool,
+) -> dict:
+    """Generate and validate one dedicated manifest turn, retrying invalid JSON once."""
+    if isinstance(state.get("casting_manifest"), dict) and state["casting_manifest"].get("speakers"):
+        return state["casting_manifest"]
+    prompt_template = str(prompts.get("casting_manifest") or "").strip()
+    if not prompt_template:
+        if required:
+            raise RuntimeError(
+                "Radar requires the local 'casting_manifest' prompt in data/prompts.json."
+            )
+        return {}
+    script = build_dialogue_video_script(state)
+    manifest_prompt = prompt_template.replace("{script}", script)
+    last_error: Exception | None = None
+    for attempt in range(2):
+        step = "casting manifest" if attempt == 0 else "casting manifest retry"
+        state["current_step"] = step
+        response = send_or_recover_generation_prompt(
+            page,
+            state,
+            step,
+            manifest_prompt,
+        )
+        try:
+            manifest = auto_casting.validate_casting_manifest(script, response)
+        except auto_casting.CastingManifestValidationError as exc:
+            last_error = exc
+            clear_pending_generation_prompt(state, step, manifest_prompt)
+            persist_generation_state(state)
+            if attempt == 0:
+                print(
+                    "[DIALOGUE] Casting manifest JSON không hợp lệ; thử lại đúng một lần.",
+                    file=sys.stderr,
+                )
+                continue
+            break
+        state["casting_manifest"] = manifest
+        clear_pending_generation_prompt(state, step, manifest_prompt)
+        persist_generation_state(state)
+        return manifest
+    raise RuntimeError(f"ChatGPT returned an invalid casting manifest: {last_error}")
+
+
 def _checkpoint_video_id() -> int | None:
     raw_video_id = os.environ.get("VIDEO_ID", "").strip()
     if not raw_video_id:
@@ -5556,6 +5606,15 @@ def _run_dialogue_pre_audio_pipeline(
             "No metadata, thumbnail, or audio request was sent."
         )
 
+    if os.environ.get("CASTING_MANIFEST_REQUIRED", "").strip() == "1":
+        print("[DIALOGUE] >>> CASTING MANIFEST", file=sys.stderr)
+        generate_casting_manifest(
+            page,
+            state,
+            prompts,
+            required=True,
+        )
+
     # Step 6: Tiêu đề (Title)
     if pipeline.get("title", True) and not state.get("title"):
         print("[DIALOGUE] >>> BƯỚC 6: TẠO TIÊU ĐỀ", file=sys.stderr)
@@ -5885,6 +5944,7 @@ def _run_dialogue_pre_audio_pipeline(
         "publish_ready": publish_ready,
         "pipeline": pipeline,
         "content_mode": "dialogue",
+        "casting_manifest": state.get("casting_manifest") or {},
     }
 
 
@@ -5969,6 +6029,7 @@ def run(transcript: str) -> dict:
         "pipeline": get_active_pipeline(),
         "prompt_version": prompt_version,
         "transcript_fingerprint": transcript_fingerprint,
+        "casting_manifest": {},
     }
     video_id = _checkpoint_video_id()
     if video_id is not None:
@@ -6037,6 +6098,7 @@ def run(transcript: str) -> dict:
             "publish_ready": complete_for_audio and metadata_ready,
             "pipeline": pipeline,
             "retryable": is_generation_error_retryable(exc),
+            "casting_manifest": state.get("casting_manifest") or {},
         }
 
 
@@ -6600,6 +6662,11 @@ if __name__ == "__main__":
                 result.get("retryable", True)
                 if isinstance(result, dict)
                 else True
+            ),
+            "casting_manifest": (
+                result.get("casting_manifest", {})
+                if isinstance(result, dict)
+                else {}
             ),
         }
         # Print script then marker then chat_url for the service to parse

@@ -68,6 +68,10 @@ class TestCompetitorRadarPersistence(unittest.TestCase):
                 row[1]
                 for row in conn.execute("PRAGMA table_info(competitor_source_videos)").fetchall()
             }
+            assignment_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(video_cast_assignments)").fetchall()
+            }
         self.assertTrue(
             {
                 "competitor_channels",
@@ -99,7 +103,16 @@ class TestCompetitorRadarPersistence(unittest.TestCase):
                 "discovery_source",
                 "published_at_confidence",
                 "metadata_checked_at",
+                "voice_profile_status",
+                "voice_profile_json",
+                "voice_profile_version",
+                "voice_profile_updated_at",
             }.issubset(source_columns)
+        )
+        self.assertTrue(
+            {"casting_version", "manifest_hash", "approval_status"}.issubset(
+                assignment_columns
+            )
         )
 
     def test_rule_persists_guest_voice_pool(self):
@@ -109,6 +122,126 @@ class TestCompetitorRadarPersistence(unittest.TestCase):
             rule["id"], guest_voice_pool="kenh-tai-chinh"
         )
         self.assertEqual(updated["guest_voice_pool"], "kenh-tai-chinh")
+
+    def test_manual_casting_approval_persists_overrides_and_resumes_same_job(self):
+        rule = self._rule("prompt-casting-v2")
+        source, _created = db.upsert_competitor_source_video(
+            competitor_channel_id=self.competitor["id"],
+            youtube_video_id="castsource1",
+            url="https://www.youtube.com/watch?v=castsource1",
+            title="Source",
+            published_at="2026-10-20T00:00:00+00:00",
+            is_baseline=False,
+            content_type="long_form",
+            duration_seconds=600,
+            eligibility_status="eligible",
+        )
+        dispatch, _reserved = db.reserve_competitor_dispatch(
+            source_video_id=source["id"],
+            watch_rule_id=rule["id"],
+            prompt_version=rule["prompt_version"],
+        )
+        snapshot = {
+            "automation": {
+                "source": "competitor_radar",
+                "competitor_source_video_id": source["id"],
+            },
+            "casting_manifest": {
+                "speakers": [
+                    {"speaker_key": "MC", "name": "MC", "gender": "male", "age_group": "adult", "language": "vi", "styles": [], "confidence": 1},
+                    {"speaker_key": "KHACH_1", "name": "Khách", "gender": "any", "age_group": "any", "language": "vi", "styles": [], "confidence": .3},
+                ]
+            },
+        }
+        video_id = db.save_video(
+            url=source["url"],
+            title="Generated",
+            transcript="Transcript",
+            generated_script="[MC]: Chào.\n[KHACH_1]: Xin chào.",
+            prompt_version=rule["prompt_version"],
+            voice_id="mc-fixed",
+            production_snapshot_json=json.dumps(snapshot),
+        )
+        job = db.create_system_job(
+            job_id="video-casting-approval",
+            job_type="video_generation",
+            title="Casting",
+            payload={"automation": snapshot["automation"]},
+            prompt_version=rule["prompt_version"],
+            voice_id="mc-fixed",
+            status="paused",
+            video_id=video_id,
+        )
+        db.update_system_job(
+            job["id"],
+            result_json={"attention_required": "auto_cast", "video_id": video_id},
+            error="Cần duyệt",
+        )
+        db.update_competitor_dispatch(
+            dispatch["id"],
+            system_job_id=job["id"],
+            video_id=video_id,
+            status="needs_attention",
+        )
+        snapshot["cast_voice_overrides"] = {
+            "MC": {"voice_id": "mc-fixed"},
+            "KHACH_1": {"voice_id": "guest-manual"},
+        }
+        assignments = [
+            {"role_key": "MC", "speaker_key": "MC", "speaker_name": "MC", "voice_id": "mc-fixed", "source": "fixed_mc", "casting_version": 2, "manifest_hash": "hash", "approval_status": "auto"},
+            {"role_key": "KHACH_1", "speaker_key": "KHACH_1", "speaker_name": "Khách", "voice_id": "guest-manual", "source": "manual_override", "casting_version": 2, "manifest_hash": "hash", "approval_status": "approved"},
+        ]
+
+        resumed = db.approve_radar_casting(
+            video_id=video_id,
+            system_job_id=job["id"],
+            assignments=assignments,
+            production_snapshot=snapshot,
+        )
+
+        self.assertEqual(resumed["id"], job["id"])
+        self.assertEqual(resumed["status"], "queued")
+        stored = db.list_video_cast_assignments(video_id)
+        self.assertEqual(stored[1]["approval_status"], "approved")
+        saved_snapshot = json.loads(db.get_video(video_id)["production_snapshot_json"])
+        self.assertEqual(
+            saved_snapshot["cast_voice_overrides"]["KHACH_1"]["voice_id"],
+            "guest-manual",
+        )
+        self.assertEqual(
+            db.get_competitor_dispatch_for_video(video_id)["status"],
+            "queued",
+        )
+
+    def test_recast_safety_keeps_video_after_any_tts_submission(self):
+        video_id = db.save_video(
+            url="https://www.youtube.com/watch?v=ttssource01",
+            title="TTS started",
+            transcript="Transcript",
+            generated_script="[MC]: Chào.\n[KHACH_1]: Xin chào.",
+        )
+        now = db.utc_now()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO audio_tasks (
+                    video_id, request_hash, task_id, status, segments_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    video_id,
+                    "request-hash",
+                    "",
+                    "processing",
+                    json.dumps([{"task_id": "provider-task-1", "status": "processing"}]),
+                    now,
+                    now,
+                ),
+            )
+        safe, reason = main._radar_recast_safety(video_id)
+        self.assertFalse(safe)
+        self.assertEqual(reason, "tts_started")
 
     def test_shared_competitor_dispatches_once_for_each_prompt(self):
         first_rule = self._rule("prompt-alpha")
@@ -670,28 +803,90 @@ class TestCompetitorRadarScheduling(unittest.TestCase):
 
 
 class TestCompetitorRadarStartupContract(unittest.TestCase):
+    @staticmethod
+    def _casting_voice(voice_id, *, status="active", usage="multi_guest", pool="pool-a"):
+        return {
+            "id": voice_id,
+            "name": voice_id,
+            "status": status,
+            "casting_profile": {
+                "gender": "female",
+                "age_group": "adult",
+                "languages": ["vi"],
+                "roles": ["mc" if usage == "multi_host" else "guest"],
+                "styles": [],
+                "usage_modes": [usage],
+                "voice_pools": [] if usage == "multi_host" else [pool],
+            },
+        }
+
+    def test_casting_approval_rejects_wrong_pool_inactive_and_duplicate_voice(self):
+        manifest = [
+            {"speaker_key": "MC", "speaker_name": "MC", "role": "mc", "gender": "male", "age_group": "adult", "language": "vi", "styles": [], "confidence": 1},
+            {"speaker_key": "KHACH_1", "speaker_name": "Khách 1", "role": "guest", "gender": "any", "age_group": "any", "language": "vi", "styles": [], "confidence": .3},
+            {"speaker_key": "KHACH_2", "speaker_name": "Khách 2", "role": "guest", "gender": "any", "age_group": "any", "language": "vi", "styles": [], "confidence": .3},
+        ]
+        voices = [
+            self._casting_voice("mc", usage="multi_host"),
+            self._casting_voice("good-1"),
+            self._casting_voice("good-2"),
+            self._casting_voice("wrong-pool", pool="pool-b"),
+            self._casting_voice("inactive", status="archived"),
+        ]
+        context = {
+            "video": {"id": 42},
+            "dispatch": {"id": 9},
+            "snapshot": {"automation": {"source": "competitor_radar"}},
+            "manifest": manifest,
+            "voices": voices,
+            "job": {"id": "job-42", "status": "paused", "result": {"attention_required": "auto_cast"}},
+            "mc_voice_id": "mc",
+            "guest_voice_pool": "pool-a",
+        }
+        invalid_payloads = (
+            [{"speaker_key": "KHACH_1", "voice_id": "wrong-pool"}, {"speaker_key": "KHACH_2", "voice_id": "good-2"}],
+            [{"speaker_key": "KHACH_1", "voice_id": "inactive"}, {"speaker_key": "KHACH_2", "voice_id": "good-2"}],
+            [{"speaker_key": "KHACH_1", "voice_id": "good-1"}, {"speaker_key": "KHACH_2", "voice_id": "good-1"}],
+        )
+        for payload in invalid_payloads:
+            request = main.CastingApprovalRequest(assignments=payload)
+            with self.subTest(payload=payload), patch.object(
+                main, "_radar_casting_context", return_value=context
+            ), patch.object(
+                main.db, "list_video_cast_assignments", return_value=[]
+            ), patch.object(
+                main.db, "approve_radar_casting"
+            ) as approve, self.assertRaises(HTTPException) as error:
+                main.approve_competitor_casting(42, request)
+            self.assertEqual(error.exception.status_code, 422)
+            approve.assert_not_called()
+
     def test_casting_report_resolves_voice_names_from_full_catalog(self):
         assignments = [
             {"id": 1, "speaker_key": "MC", "voice_id": "voice-active"},
             {"id": 2, "speaker_key": "GUEST_1", "voice_id": "voice-archived"},
             {"id": 3, "speaker_key": "GUEST_2", "voice_id": "voice-removed"},
         ]
-        with patch.object(main.db, "get_video", return_value={"id": 42}), patch.object(
-            main.db, "list_video_cast_assignments", return_value=assignments
-        ), patch.object(
-            main.voice_config,
-            "load_voice_config",
-            return_value={
-                "voices": [
-                    {"id": "voice-active", "name": "MC Minh", "status": "active"},
-                    {
-                        "id": "voice-archived",
-                        "name": "Khách Lan",
-                        "status": "archived",
-                    },
-                ]
+        voices = [
+            {"id": "voice-active", "name": "MC Minh", "status": "active"},
+            {
+                "id": "voice-archived",
+                "name": "Khách Lan",
+                "status": "archived",
             },
-        ):
+        ]
+        with patch.object(
+            main,
+            "_radar_casting_context",
+            return_value={
+                "voices": voices,
+                "manifest": [],
+                "dispatch": {"voice_profile": {}},
+                "job": {},
+                "mc_voice_id": "voice-active",
+                "guest_voice_pool": "pool",
+            },
+        ), patch.object(main.db, "list_video_cast_assignments", return_value=assignments):
             report = main.get_competitor_casting_report(42)
 
         self.assertEqual(
@@ -705,6 +900,7 @@ class TestCompetitorRadarStartupContract(unittest.TestCase):
         health = source[source.index('@app.get("/health")') : source.index('@app.get("/api/system/maintenance-status")')]
         self.assertIn('"competitor_radar_health": radar_health', health)
         self.assertIn('"long_form_min_seconds": competitor_radar.LONG_FORM_MIN_SECONDS', health)
+        self.assertIn('"source_voice_model": source_voice_analyzer.model_status()', health)
         self.assertIn('"degraded" if radar_degraded else "ready"', health)
         self.assertNotIn('and bool(radar_health', health)
 

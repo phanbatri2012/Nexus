@@ -25,6 +25,7 @@ def process_prompt_via_chatgpt(
     video_id: int | None = None,
     pipeline: dict[str, bool] | None = None,
     job_id: str | None = None,
+    require_casting_manifest: bool = False,
 ) -> dict:
     """
     Spawns chatgpt_worker.py as a subprocess.
@@ -41,6 +42,8 @@ def process_prompt_via_chatgpt(
         env["VIDEO_ID"] = str(video_id)
     if pipeline is not None:
         env["PROMPT_PIPELINE_JSON"] = json.dumps(pipeline)
+    if require_casting_manifest:
+        env["CASTING_MANIFEST_REQUIRED"] = "1"
 
     proc = subprocess.Popen(
         [PYTHON_EXE, str(WORKER_SCRIPT)],

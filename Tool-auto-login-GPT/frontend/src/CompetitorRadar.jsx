@@ -65,6 +65,7 @@ export default function CompetitorRadar({ onOpenJobCenter }) {
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [report, setReport] = useState(null)
+  const [castSelections, setCastSelections] = useState({})
   const [form, setForm] = useState({
     competitor: '', prompt_version: '', target_youtube_channel_id: '',
     publication_mode: 'inherit', window_mode: 'learned', start: '08:00', end: '22:00',
@@ -183,7 +184,61 @@ export default function CompetitorRadar({ onOpenJobCenter }) {
         request(`/competitors/videos/${item.video_id}/casting`),
         request(`/competitors/videos/${item.video_id}/qc`),
       ])
-      setReport({ item, casting: casting.assignments || [], qc: qc.reviews || [] })
+      setReport({ item, casting, qc: qc.reviews || [] })
+      setCastSelections({})
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const approveCasting = async () => {
+    if (!report?.casting?.can_approve) return
+    const unresolved = report.casting.unresolved_roles || []
+    if (unresolved.some(role => !castSelections[role.speaker_key])) return
+    setBusy(`approve-${report.item.video_id}`)
+    setError('')
+    try {
+      await request(`/competitors/videos/${report.item.video_id}/casting/approve`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          assignments: unresolved.map(role => ({
+            speaker_key: role.speaker_key,
+            voice_id: castSelections[role.speaker_key],
+          })),
+        }),
+      })
+      setNotice('Đã lưu casting và tiếp tục đúng job Radar đang chờ.')
+      setReport(null)
+      setCastSelections({})
+      await load()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const recastStale = async () => {
+    setBusy('recast-stale')
+    setError('')
+    try {
+      const preview = await request('/competitors/casting/recast-stale', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dry_run: true }),
+      })
+      if (!preview.eligible_count) {
+        setNotice('Không có casting cũ đủ điều kiện recast; video đã có audio/đã đăng được giữ nguyên.')
+        return
+      }
+      if (!confirm(`Có ${preview.eligible_count} video chưa đăng và chưa submit TTS. Tiến hành recast?`)) return
+      const result = await request('/competitors/casting/recast-stale', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dry_run: false }),
+      })
+      setNotice(`Đã recast ${result.recast_count}; ${result.attention_count} video chuyển sang chờ duyệt.`)
+      await load()
     } catch (err) {
       setError(err.message)
     } finally {
@@ -199,6 +254,7 @@ export default function CompetitorRadar({ onOpenJobCenter }) {
           <p>Theo dõi video dài mới, tự động tạo nội dung và kiểm tra chất lượng trước khi phát hành.</p>
         </div>
         <div className="radar-heading-actions">
+          <button disabled={busy === 'recast-stale'} onClick={recastStale}>{busy === 'recast-stale' ? 'Đang kiểm tra…' : 'Recast casting cũ'}</button>
           <button onClick={() => load().catch(err => setError(err.message))}>↻ Làm mới</button>
           <button onClick={onOpenJobCenter}>Mở Job Center</button>
         </div>
@@ -304,10 +360,31 @@ export default function CompetitorRadar({ onOpenJobCenter }) {
 
       {report && <div className="radar-modal-backdrop" onClick={() => setReport(null)}><section className="radar-modal" onClick={event => event.stopPropagation()}>
         <div className="radar-card-title"><div><h2>Báo cáo video #{report.item.video_id}</h2><small>{report.item.source_title}</small></div><button onClick={() => setReport(null)}>Đóng</button></div>
-        <h3>Casting</h3>
-        {!report.casting.length ? <p className="radar-empty">Chưa có casting report.</p> : <table className="radar-table"><thead><tr><th>Nhân vật</th><th>Giọng</th><th>Confidence</th><th>Điểm</th><th>Nguồn</th></tr></thead><tbody>
-          {report.casting.map(item => <tr key={item.id}><td>{item.speaker_name || item.speaker_key}</td><td>{item.voice_name || voices.find(voice => voice.id === item.voice_id)?.name || 'Giọng không còn trong danh mục'}</td><td>{Math.round((item.confidence || 0) * 100)}%</td><td>{item.match_score}</td><td>{item.source}</td></tr>)}
+        <h3>Casting <small>v{report.casting.casting_version || 1}</small></h3>
+        {report.casting.source_voice_profile?.status && <div className="radar-casting-evidence">
+          <b>Âm sắc giọng nguồn:</b> {report.casting.source_voice_profile.gender !== 'any' ? report.casting.source_voice_profile.gender : (report.casting.source_voice_profile.predicted_timbre || 'chưa xác định')}
+          {' · '}confidence {Math.round((report.casting.source_voice_profile.confidence || 0) * 100)}%
+          {' · '}{report.casting.source_voice_profile.status}
+        </div>}
+        {!(report.casting.assignments || []).length ? <p className="radar-empty">Chưa có casting report.</p> : <table className="radar-table"><thead><tr><th>Nhân vật</th><th>Giọng</th><th>Confidence</th><th>Điểm</th><th>Nguồn</th></tr></thead><tbody>
+          {(report.casting.assignments || []).map(item => <tr key={item.id}><td>{item.speaker_name || item.speaker_key}</td><td>{item.voice_name || voices.find(voice => voice.id === item.voice_id)?.name || 'Giọng không còn trong danh mục'}</td><td>{Math.round((item.confidence || 0) * 100)}%</td><td>{item.match_score}</td><td>{item.source}</td></tr>)}
         </tbody></table>}
+        {(report.casting.unresolved_roles || []).length > 0 && <div className="radar-casting-review">
+          <p>Tool chưa có đủ bằng chứng để tự chọn. Hãy duyệt từng vai trước khi TTS bắt đầu.</p>
+          {(report.casting.unresolved_roles || []).map(role => {
+            const candidateGroup = (report.casting.candidates || []).find(group => group.speaker_key === role.speaker_key)
+            return <label key={role.speaker_key}>{role.speaker_name || role.speaker_key}
+              <small>{role.gender || 'any'} · {Math.round((role.confidence || 0) * 100)}%</small>
+              <select value={castSelections[role.speaker_key] || ''} onChange={event => setCastSelections(current => ({ ...current, [role.speaker_key]: event.target.value }))}>
+                <option value="">Chọn giọng</option>
+                {(candidateGroup?.items || []).map(candidate => <option key={candidate.voice_id} value={candidate.voice_id}>{candidate.voice_name} · {candidate.casting_profile?.gender || 'any'} · {candidate.casting_profile?.age_group || 'any'}</option>)}
+              </select>
+            </label>
+          })}
+          <button className="primary" disabled={!report.casting.can_approve || (report.casting.unresolved_roles || []).some(role => !castSelections[role.speaker_key]) || busy === `approve-${report.item.video_id}`} onClick={approveCasting}>
+            {busy === `approve-${report.item.video_id}` ? 'Đang lưu…' : 'Lưu & tiếp tục'}
+          </button>
+        </div>}
         <h3>Auto QC</h3>
         {!report.qc.length ? <p className="radar-empty">Chưa chạy Auto QC.</p> : report.qc.map(review => <article className="radar-review" key={review.id}>
           <div><b>Lần {review.attempt}: {statusLabel(review.status)}</b><span>{review.repair_stage ? `Repair: ${review.repair_stage}` : ''}</span></div>
