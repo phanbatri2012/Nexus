@@ -153,6 +153,28 @@ class GoogleFlowBrowserServiceTests(unittest.TestCase):
         self.assertIn("flow-chat-thinking-indicator", script)
         self.assertIn("flow-creative-agent-prompt-box", script)
 
+    def test_service_owner_retries_failed_chromium_with_bounded_backoff(self):
+        with (
+            patch.object(
+                google_flow_browser_service,
+                "run_browser_service",
+                side_effect=[1, 1, 0],
+            ) as run_once,
+            patch.object(
+                google_flow_browser_service,
+                "_wait_before_service_restart",
+                return_value=True,
+            ) as wait_before_restart,
+        ):
+            result = google_flow_browser_service.run_browser_service_with_recovery()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(run_once.call_count, 3)
+        self.assertEqual(
+            [call.args for call in wait_before_restart.call_args_list],
+            [(1.0, 1), (2.0, 2)],
+        )
+
 
 class GoogleFlowEndpointTests(unittest.IsolatedAsyncioTestCase):
     async def test_login_check_reuses_the_connected_browser(self):

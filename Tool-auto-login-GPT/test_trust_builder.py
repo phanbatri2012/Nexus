@@ -14,8 +14,12 @@ from fastapi.testclient import TestClient
 from auto_yt.services import database as db, api_security
 from auto_yt.services.trust_builder_actions import (
     ACTION_ALREADY_DONE,
+    ACTION_BLOCKED,
     ACTION_PERFORMED,
+    ACTION_UNCERTAIN,
     action_audit_channel_branding,
+    action_browse_and_pick_video,
+    action_browse_and_read_comments,
     action_search_and_pick_video,
     action_watch_video,
     action_like_video,
@@ -26,6 +30,7 @@ from auto_yt.services.trust_builder_actions import (
 )
 from auto_yt.services.trust_builder_service import (
     calculate_trust_score,
+    engagement_requirements_met,
     generate_contextual_comment,
     validate_plan_browser_configuration,
 )
@@ -73,6 +78,17 @@ def test_calculate_trust_score():
     }
     score = calculate_trust_score(plan, stats)
     assert 50 <= score <= 100
+
+
+def test_enabled_engagement_must_have_verified_success_before_completion():
+    plan = {"daily_comment_target": 3, "daily_subscribe_target": 1}
+    assert engagement_requirements_met(plan, {"comment_count": 0, "subscribe_count": 0}) is False
+    assert engagement_requirements_met(plan, {"comment_count": 1, "subscribe_count": 0}) is False
+    assert engagement_requirements_met(plan, {"comment_count": 1, "subscribe_count": 1}) is True
+    assert engagement_requirements_met(
+        {"daily_comment_target": 0, "daily_subscribe_target": 0},
+        {"comment_count": 0, "subscribe_count": 0},
+    ) is True
 
 
 def test_generate_contextual_comment():
@@ -167,8 +183,11 @@ def test_action_subscribe_channel():
         mock_page.query_selector.return_value = mock_btn
 
         subscribed = await action_subscribe_channel(mock_page)
-        assert subscribed == ACTION_PERFORMED
+        assert subscribed["status"] == ACTION_PERFORMED
+        assert subscribed["reason_code"] == "subscribe_confirmed"
         assert mock_btn.click.called
+        confirmation_script = mock_page.wait_for_function.await_args.args[0]
+        assert "signature !==" not in confirmation_script
 
     asyncio.run(_run())
 
@@ -190,8 +209,136 @@ def test_already_done_engagement_is_not_performed():
             "subscribed": True,
             "selector": "ytd-watch-metadata #subscribe-button button",
         }
-        assert await action_subscribe_channel(subscribe_page) == ACTION_ALREADY_DONE
+        subscribe_result = await action_subscribe_channel(subscribe_page)
+        assert subscribe_result["status"] == ACTION_ALREADY_DONE
         subscribe_page.query_selector.assert_not_called()
+
+    asyncio.run(_run())
+
+
+def test_action_comment_video_records_confirmed_result():
+    async def _run():
+        mock_page = AsyncMock()
+        mock_element = AsyncMock()
+        mock_page.query_selector.return_value = mock_element
+        mock_page.evaluate.side_effect = [
+            {"found": True, "blocked": False},
+            {"found": True},
+            {"found": True, "enabled": True, "text_ready": True},
+        ]
+        mock_page.wait_for_function = AsyncMock()
+
+        with patch("auto_yt.services.trust_builder_actions.asyncio.sleep", new=AsyncMock()):
+            result = await action_comment_video(mock_page, "Bình luận kiểm thử")
+
+        assert result["status"] == ACTION_PERFORMED
+        assert result["reason_code"] == "comment_confirmed"
+        assert mock_element.click.await_count >= 3
+
+    asyncio.run(_run())
+
+
+def test_action_comment_video_reports_disabled_comments():
+    async def _run():
+        mock_page = AsyncMock()
+        mock_page.evaluate.return_value = {"found": False, "blocked": True}
+        with patch("auto_yt.services.trust_builder_actions.asyncio.sleep", new=AsyncMock()):
+            result = await action_comment_video(mock_page, "Bình luận kiểm thử")
+        assert result["status"] == ACTION_BLOCKED
+        assert result["reason_code"] == "comments_disabled"
+
+    asyncio.run(_run())
+
+
+def test_action_subscribe_channel_does_not_repeat_uncertain_click():
+    async def _run():
+        mock_page = AsyncMock()
+        mock_page.evaluate.return_value = {
+            "found": True,
+            "subscribed": False,
+            "selector": '[data-trust-builder-action="subscribe"]',
+            "signature": "Subscribe|Subscribe|false",
+        }
+        mock_page.query_selector.return_value = AsyncMock()
+        mock_page.wait_for_function.side_effect = TimeoutError("not confirmed")
+
+        result = await action_subscribe_channel(mock_page)
+        assert result["status"] == ACTION_UNCERTAIN
+        assert result["reason_code"] == "subscribe_confirmation_timeout"
+        assert mock_page.query_selector.return_value.click.await_count == 1
+
+    asyncio.run(_run())
+
+
+def test_action_browse_and_pick_video_filters_seen_and_unsafe_candidates():
+    async def _run():
+        mock_page = AsyncMock()
+        mock_page.evaluate.return_value = [
+            {"url": "https://www.youtube.com/watch?v=seen1", "title": "Seen", "channel": "@safe"},
+            {"url": "https://www.youtube.com/watch?v=unsafe1", "title": "Unsafe", "channel": "@unsafe"},
+            {"url": "https://www.youtube.com/watch?v=fresh1", "title": "Fresh safe video", "channel": "@safe"},
+        ]
+
+        def safety_result(*, title, **_kwargs):
+            return (title != "Unsafe", "blocked" if title == "Unsafe" else "")
+
+        with patch("auto_yt.services.trust_builder_actions.asyncio.sleep", new=AsyncMock()), patch(
+            "auto_yt.services.trust_builder_actions.safety.is_safe_for_interaction",
+            side_effect=safety_result,
+        ):
+            result = await action_browse_and_pick_video(
+                mock_page,
+                target_channel="@safe",
+                excluded_video_ids={"seen1"},
+            )
+
+        assert result["url"].endswith("fresh1")
+        mock_page.goto.assert_awaited_once()
+
+    asyncio.run(_run())
+
+
+def test_action_browse_and_read_comments_dwell_and_extraction():
+    """Verify that action_browse_and_read_comments performs natural scrolls, dwells, and extracts comments."""
+    async def _run():
+        mock_page = AsyncMock()
+        mock_page.evaluate.return_value = ["Bình luận rất hay!", "Cảm ơn tác giả."]
+        with patch("auto_yt.services.trust_builder_actions.asyncio.sleep", new=AsyncMock()):
+            res = await action_browse_and_read_comments(
+                mock_page,
+                min_dwell_seconds=15.0,
+                max_dwell_seconds=20.0,
+            )
+        assert res["dwell_seconds"] >= 15.0
+        assert res["comments"] == ["Bình luận rất hay!", "Cảm ơn tác giả."]
+        assert mock_page.mouse.wheel.await_count >= 4
+
+    asyncio.run(_run())
+
+
+def test_action_browse_and_read_comments_early_cancel():
+    """Verify that action_browse_and_read_comments exits early when cancel_check is triggered."""
+    async def _run():
+        mock_page = AsyncMock()
+        cancel_flag = False
+
+        def _check():
+            nonlocal cancel_flag
+            return cancel_flag
+
+        async def _fake_sleep(duration):
+            nonlocal cancel_flag
+            cancel_flag = True
+
+        mock_page.evaluate.return_value = ["Comment 1"]
+        with patch("auto_yt.services.trust_builder_actions.asyncio.sleep", side_effect=_fake_sleep):
+            res = await action_browse_and_read_comments(
+                mock_page,
+                min_dwell_seconds=30.0,
+                max_dwell_seconds=40.0,
+                cancel_check=_check,
+            )
+        assert res["dwell_seconds"] < 30.0
 
     asyncio.run(_run())
 
@@ -359,6 +506,7 @@ def test_delete_trust_plan_removes_activity_logs_atomically(tmp_path, monkeypatc
         """
         CREATE TABLE channel_trust_plans (id INTEGER PRIMARY KEY);
         CREATE TABLE trust_activity_log (id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL);
+        CREATE TABLE trust_guided_sessions (id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL);
         INSERT INTO channel_trust_plans(id) VALUES (7);
         INSERT INTO trust_activity_log(id, plan_id) VALUES (1, 7), (2, 7);
         """

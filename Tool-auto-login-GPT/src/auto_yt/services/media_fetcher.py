@@ -67,6 +67,144 @@ def extract_queries_from_response(response_text: str) -> list[str]:
     return fallback_queries[:4]
 
 
+def clean_query_to_core_entity(query: str) -> list[str]:
+    """Extract clean entity candidate names from overly verbose query strings."""
+    if not query or not query.strip():
+        return []
+
+    text = query.strip()
+
+    # 1. Remove common filler phrases
+    fillers = [
+        r"chân\s+dung\s+ảnh\s+tư\s+liệu\s+lịch\s+sử",
+        r"ảnh\s+tư\s+liệu\s+lịch\s+sử",
+        r"chân\s+dung\s+tư\s+liệu",
+        r"tư\s+liệu\s+lịch\s+sử",
+        r"ảnh\s+lịch\s+sử",
+        r"ảnh\s+tư\s+liệu",
+        r"archival\s+photo(?:graph)?",
+        r"historical\s+photo(?:graph)?",
+        r"chân\s+dung",
+        r"chiến\s+dịch\s+[^,0-9]+(?:\s+\d{4})?",
+        r"năm\s+\d{4}",
+        r"\b\d{4}\b",
+    ]
+    cleaned = text
+    for f in fillers:
+        cleaned = re.sub(f, " ", cleaned, flags=re.IGNORECASE)
+
+    # 2. Remove military and political titles for core name isolation
+    titles = [
+        r"\bĐại\s+tướng\b",
+        r"\bTrung\s+tướng\b",
+        r"\bThiếu\s+tướng\b",
+        r"\bThượng\s+tướng\b",
+        r"\bĐại\s+tá\b",
+        r"\bTướng\b",
+        r"\bGeneral\b",
+        r"\bAdmiral\b",
+        r"\bChủ\s+tịch\b",
+        r"\bTổng\s+thống\b",
+        r"\bThủ\s+tướng\b",
+    ]
+    entity_only = cleaned
+    for t in titles:
+        entity_only = re.sub(t, " ", entity_only, flags=re.IGNORECASE)
+
+    entity_only = re.sub(r"\s+", " ", entity_only).strip(" ,.-'\"")
+    cleaned_with_title = re.sub(r"\s+", " ", cleaned).strip(" ,.-'\"")
+    raw_cleaned = re.sub(r"\s+", " ", text).strip(" ,.-'\"")
+
+    candidates: list[str] = []
+    if entity_only and len(entity_only) >= 2:
+        candidates.append(entity_only)
+    if cleaned_with_title and cleaned_with_title != entity_only and len(cleaned_with_title) >= 2:
+        candidates.append(cleaned_with_title)
+    if raw_cleaned and raw_cleaned not in candidates:
+        candidates.append(raw_cleaned)
+
+    return candidates
+
+
+def search_wikipedia_pageimages(query: str, limit: int = 2) -> list[dict[str, Any]]:
+    """Search Wikipedia (Vietnamese & English) pageimages API for official portraits/historical images."""
+    if not query or not query.strip():
+        return []
+
+    results: list[dict[str, Any]] = []
+    headers = {"User-Agent": USER_AGENT}
+
+    for lang in ("vi", "en"):
+        if len(results) >= limit:
+            break
+
+        # 1. Direct title query (handles exact person/topic matches with automatic redirects)
+        direct_url = f"https://{lang}.wikipedia.org/w/api.php"
+        direct_params = {
+            "action": "query",
+            "titles": query.strip(),
+            "redirects": "1",
+            "prop": "pageimages",
+            "pithumbsize": str(MAX_IMAGE_DIMENSION),
+            "format": "json",
+        }
+        try:
+            resp = requests.get(direct_url, params=direct_params, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+            if resp.status_code == 200:
+                data = resp.json()
+                pages = data.get("query", {}).get("pages", {})
+                for _, page in pages.items():
+                    thumb = page.get("thumbnail")
+                    if thumb and thumb.get("source"):
+                        source_url = thumb["source"]
+                        results.append({
+                            "title": page.get("title", ""),
+                            "url": source_url,
+                            "width": thumb.get("width", 0),
+                            "height": thumb.get("height", 0),
+                            "source": f"wikipedia_{lang}",
+                        })
+                        if len(results) >= limit:
+                            break
+        except Exception as exc:
+            logger.debug("Wikipedia %s direct lookup failed for '%s': %s", lang, query, exc)
+
+        # 2. Generator search if direct title produced no thumbnail
+        if len(results) < limit:
+            search_params = {
+                "action": "query",
+                "generator": "search",
+                "gsrsearch": query.strip(),
+                "gsrlimit": str(limit),
+                "prop": "pageimages",
+                "pithumbsize": str(MAX_IMAGE_DIMENSION),
+                "format": "json",
+            }
+            try:
+                resp = requests.get(direct_url, params=search_params, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    pages = data.get("query", {}).get("pages", {})
+                    for _, page in pages.items():
+                        thumb = page.get("thumbnail")
+                        if thumb and thumb.get("source"):
+                            source_url = thumb["source"]
+                            if not any(r["url"] == source_url for r in results):
+                                results.append({
+                                    "title": page.get("title", ""),
+                                    "url": source_url,
+                                    "width": thumb.get("width", 0),
+                                    "height": thumb.get("height", 0),
+                                    "source": f"wikipedia_{lang}_search",
+                                })
+                                if len(results) >= limit:
+                                    break
+            except Exception as exc:
+                logger.debug("Wikipedia %s search failed for '%s': %s", lang, query, exc)
+
+    return results
+
+
 def search_wikimedia_commons(query: str, limit: int = 2) -> list[dict[str, Any]]:
     """Search Wikimedia Commons API for historical/factual reference images."""
     if not query or not query.strip():
@@ -78,7 +216,7 @@ def search_wikimedia_commons(query: str, limit: int = 2) -> list[dict[str, Any]]
         "generator": "search",
         "gsrnamespace": "6",  # File namespace
         "gsrsearch": query.strip(),
-        "gsrlimit": str(max(1, limit * 2)),
+        "gsrlimit": str(max(2, limit * 2)),
         "prop": "imageinfo",
         "iiprop": "url|size|mime",
         "iiurlwidth": str(MAX_IMAGE_DIMENSION),
@@ -126,6 +264,51 @@ def search_wikimedia_commons(query: str, limit: int = 2) -> list[dict[str, Any]]
         return results
     except Exception as exc:
         logger.warning("Wikimedia search failed for query '%s': %s", query, exc)
+        return []
+
+
+def search_bing_images(query: str, limit: int = 2) -> list[dict[str, Any]]:
+    """Search Bing Images as a zero-key web fallback."""
+    if not query or not query.strip():
+        return []
+
+    try:
+        encoded_query = urllib.parse.quote(query.strip())
+        bing_url = f"https://www.bing.com/images/search?q={encoded_query}&form=HDRSC2&first=1"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        resp = requests.get(bing_url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+        if resp.status_code != 200:
+            return []
+
+        # Bing encodes direct source URLs in 'murl&quot;:&quot;URL&quot;' attributes
+        raw_urls = re.findall(r'murl&quot;:&quot;(https?://[^&]+)&quot;', resp.text)
+        results: list[dict[str, Any]] = []
+
+        for img_url in raw_urls:
+            # Skip unworkable formats or tracking URLs
+            clean_url = img_url.replace(r"\/", "/")
+            if not clean_url.startswith("http"):
+                continue
+            lower_url = clean_url.lower()
+            if any(lower_url.endswith(ext) for ext in (".svg", ".gif", ".ico")):
+                continue
+
+            results.append({
+                "title": query.strip(),
+                "url": clean_url,
+                "width": 800,
+                "height": 600,
+                "source": "bing",
+            })
+            if len(results) >= limit:
+                break
+
+        return results
+    except Exception as exc:
+        logger.warning("Bing image search failed for query '%s': %s", query, exc)
         return []
 
 
@@ -313,6 +496,9 @@ def fetch_reference_images_for_queries(
 ) -> list[str]:
     """Execute multi-source visual research and save sanitized reference images.
 
+    Applies query cleaning and searches sequentially across Local Vault,
+    Wikipedia Pageimages (vi/en), Wikimedia Commons, Bing Images, and DuckDuckGo.
+
     Returns a list of absolute paths to downloaded reference image files.
     """
     if not queries:
@@ -322,45 +508,68 @@ def fetch_reference_images_for_queries(
     downloaded_paths: list[str] = []
     seen_urls: set[str] = set()
 
-    for query_idx, query in enumerate(queries):
+    for query_idx, raw_query in enumerate(queries):
         if len(downloaded_paths) >= max_images:
             break
 
-        candidates: list[dict[str, Any]] = []
+        # Generate cleaned query variations (e.g. core entity first, then full query)
+        search_variations = clean_query_to_core_entity(raw_query)
+        if not search_variations:
+            search_variations = [raw_query]
 
-        # 1. Check local curated vault
-        vault_hits = search_local_vault(query, limit=1)
-        if vault_hits:
-            candidates.extend(vault_hits)
+        found_image = False
 
-        # 2. Search Wikimedia Commons
-        if len(candidates) < 2:
-            wiki_hits = search_wikimedia_commons(query, limit=2)
-            candidates.extend(wiki_hits)
-
-        # 3. Fallback: DuckDuckGo
-        if len(candidates) < 1:
-            ddg_hits = search_duckduckgo_images(query, limit=2)
-            candidates.extend(ddg_hits)
-
-        # Download best candidate
-        for candidate in candidates:
-            url = candidate.get("url", "")
-            if not url or url in seen_urls:
-                continue
-            seen_urls.add(url)
-
-            dest_file = output_dir / f"ref_{len(downloaded_paths) + 1}.jpg"
-            saved_path = download_and_sanitize_image(url, dest_file)
-            if saved_path:
-                downloaded_paths.append(saved_path)
-                logger.info(
-                    "Saved visual reference #%d for query '%s' from %s: %s",
-                    len(downloaded_paths),
-                    query,
-                    candidate.get("source", "unknown"),
-                    saved_path,
-                )
+        for q_var in search_variations:
+            if found_image or len(downloaded_paths) >= max_images:
                 break
+
+            candidates: list[dict[str, Any]] = []
+
+            # 1. Check local curated vault
+            vault_hits = search_local_vault(q_var, limit=1)
+            if vault_hits:
+                candidates.extend(vault_hits)
+
+            # 2. Search Wikipedia Pageimages (official historical portraits/equipment)
+            if len(candidates) < 2:
+                wiki_page_hits = search_wikipedia_pageimages(q_var, limit=2)
+                candidates.extend(wiki_page_hits)
+
+            # 3. Search Wikimedia Commons
+            if len(candidates) < 2:
+                wiki_hits = search_wikimedia_commons(q_var, limit=2)
+                candidates.extend(wiki_hits)
+
+            # 4. Search Bing Images as robust zero-key web fallback
+            if len(candidates) < 2:
+                bing_hits = search_bing_images(q_var, limit=2)
+                candidates.extend(bing_hits)
+
+            # 5. Fallback: DuckDuckGo
+            if len(candidates) < 1:
+                ddg_hits = search_duckduckgo_images(q_var, limit=2)
+                candidates.extend(ddg_hits)
+
+            # Attempt to download best candidate
+            for candidate in candidates:
+                url = candidate.get("url", "")
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+
+                dest_file = output_dir / f"ref_{len(downloaded_paths) + 1}.jpg"
+                saved_path = download_and_sanitize_image(url, dest_file)
+                if saved_path:
+                    downloaded_paths.append(saved_path)
+                    logger.info(
+                        "Saved visual reference #%d for query '%s' (via '%s') from %s: %s",
+                        len(downloaded_paths),
+                        raw_query,
+                        q_var,
+                        candidate.get("source", "unknown"),
+                        saved_path,
+                    )
+                    found_image = True
+                    break
 
     return downloaded_paths

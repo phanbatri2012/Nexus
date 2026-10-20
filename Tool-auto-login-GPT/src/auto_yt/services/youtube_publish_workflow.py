@@ -249,6 +249,19 @@ def _resolve_thumbnail_path(script: str, variant: str, thumbnails_dir: Path) -> 
     return None
 
 
+def resolve_thumbnail_path_for_qc(
+    generated_script: str,
+    snapshot: dict,
+    thumbnails_dir: Path,
+) -> Path | None:
+    """Resolve the exact local thumbnail variant that publishing will use."""
+    image_settings = snapshot.get("image_generation_settings")
+    if not isinstance(image_settings, dict):
+        image_settings = {}
+    variant = str(image_settings.get("thumbnail_variant") or "with_text")
+    return _resolve_thumbnail_path(generated_script, variant, thumbnails_dir)
+
+
 def _artifact_snapshot(artifact: dict | None) -> dict:
     if not isinstance(artifact, dict) or not artifact.get("id"):
         return {}
@@ -506,7 +519,19 @@ def _build_preflight_context(
             )
         except youtube_publisher.YouTubePublishError as exc:
             raise PublishConfigurationRequired(["metadata"], str(exc)) from exc
-        snapshot["youtube_metadata"] = metadata
+    try:
+        metadata, metadata_quality = (
+            youtube_publisher.enforce_upload_metadata_quality(metadata, video)
+        )
+    except youtube_publisher.YouTubePublishError as exc:
+        raise PublishConfigurationRequired(["metadata"], str(exc)) from exc
+    snapshot["youtube_metadata"] = metadata
+    snapshot["metadata_quality"] = {
+        "quality_gate_version": metadata_quality.get("quality_gate_version", 1),
+        "script_hash": metadata_quality.get("script_hash", ""),
+        "metadata_hash": metadata_quality.get("metadata_hash", ""),
+        "decision": metadata_quality.get("decision", "block"),
+    }
 
     image_settings = snapshot.get("image_generation_settings")
     if not isinstance(image_settings, dict):

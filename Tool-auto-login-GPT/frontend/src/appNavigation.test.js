@@ -67,6 +67,18 @@ test('wires the persistent Job Center and keeps video submission queueable', asy
 })
 
 
+test('requires an explicit choice before submitting a duplicate source video', async () => {
+  const appSource = await readFile(new URL('./App.jsx', import.meta.url), 'utf8')
+
+  assert.match(appSource, /duplicate_confirmation_required/)
+  assert.match(appSource, /confirm_duplicate:\s*true/)
+  assert.match(appSource, />\s*Hủy tạo\s*</)
+  assert.match(appSource, /'Vẫn tạo'/)
+  assert.match(appSource, /setDuplicateWarningDialog\(null\)/)
+  assert.doesNotMatch(appSource, /hệ thống không tạo job trùng/)
+})
+
+
 test('wires multi-channel YouTube comments and Channel Hub into navigation', async () => {
   const appSource = await readFile(new URL('./App.jsx', import.meta.url), 'utf8')
   const commentsSource = await readFile(new URL('./YouTubeComments.jsx', import.meta.url), 'utf8')

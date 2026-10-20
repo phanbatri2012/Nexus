@@ -38,6 +38,7 @@ SERVICE_START_TIMEOUT_SECONDS = 30.0
 SERVICE_STOP_TIMEOUT_SECONDS = 15.0
 SERVICE_POLL_SECONDS = 0.25
 SERVICE_HEALTH_CHECK_SECONDS = 5.0
+SERVICE_RESTART_BACKOFF_SECONDS = (1.0, 2.0, 5.0, 10.0, 30.0)
 SERVICE_HOME_URL = "https://chatgpt.com/"
 SERVICE_NAVIGATION_TIMEOUT_MS = 60_000
 CDP_HOST = "127.0.0.1"
@@ -601,13 +602,56 @@ def run_browser_service() -> int:
     return exit_code
 
 
+def _wait_before_service_restart(delay_seconds: float, attempt: int) -> bool:
+    """Keep the owner discoverable during backoff and return False when stopped."""
+    instance_id = uuid.uuid4().hex
+    state = {
+        "pid": os.getpid(),
+        "instance_id": instance_id,
+        "cdp_url": "",
+        "started_at": _utc_now(),
+        "ready": False,
+        "recovering": True,
+        "restart_attempt": attempt,
+    }
+    _write_json(SERVICE_STATE_PATH, state)
+    deadline = time.monotonic() + max(0.0, delay_seconds)
+    while time.monotonic() < deadline:
+        if _stop_requested(instance_id):
+            SERVICE_STATE_PATH.unlink(missing_ok=True)
+            SERVICE_STOP_PATH.unlink(missing_ok=True)
+            return False
+        time.sleep(min(SERVICE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+    return True
+
+
+def run_browser_service_with_recovery() -> int:
+    attempt = 0
+    while True:
+        exit_code = run_browser_service()
+        if exit_code == 0:
+            return 0
+        delay = SERVICE_RESTART_BACKOFF_SECONDS[
+            min(attempt, len(SERVICE_RESTART_BACKOFF_SECONDS) - 1)
+        ]
+        attempt += 1
+        print(
+            f"ChatGPT Browser Service restarting in {delay:g}s "
+            f"(attempt {attempt}).",
+            file=sys.stderr,
+            flush=True,
+        )
+        if not _wait_before_service_restart(delay, attempt):
+            return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--serve", action="store_true")
     arguments = parser.parse_args()
     if not arguments.serve:
         parser.error("--serve is required")
-    return run_browser_service()
+    return run_browser_service_with_recovery()
 
 
 if __name__ == "__main__":

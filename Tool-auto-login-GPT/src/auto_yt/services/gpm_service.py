@@ -17,6 +17,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any, AsyncGenerator
 
 from auto_yt.paths import DATA_DIR
@@ -24,6 +25,7 @@ from auto_yt.paths import DATA_DIR
 logger = logging.getLogger(__name__)
 
 _active_gpm_profiles: dict[str, dict[str, Any]] = {}
+_tool_automated_profiles: set[str] = set()
 def get_cdp_version_info(port: int | None, timeout: float = 1.5) -> dict[str, Any] | None:
     """Query Chromium /json/version endpoint and return JSON dictionary if responsive."""
     if not port or port <= 0:
@@ -634,6 +636,7 @@ def kill_gpm_profile_processes(profile_id: str, api_url: str | None = None) -> i
     if not clean_id or sys.platform != "win32":
         return 0
     _active_gpm_profiles.pop(clean_id, None)
+    _tool_automated_profiles.discard(clean_id)
     profile_path = ""
     try:
         detail = get_gpm_profile_detail(clean_id, api_url=api_url)
@@ -707,18 +710,23 @@ def start_gpm_profile(
     addition_args: str | None = None,
     require_cdp: bool = True,
     api_url: str | None = None,
+    market_timezone: str | None = None,
+    manual: bool = False,
 ) -> dict[str, Any]:
     """Start a GPM profile browser or reuse an existing running instance, returning CDP coordinates."""
     clean_id = str(profile_id).strip()
     if not clean_id:
         raise ValueError("Profile ID không được để trống.")
 
+    if manual:
+        _tool_automated_profiles.discard(clean_id)
+
     # Reuse an existing profile process. Operational code must never stop or
     # restart a browser in order to obtain a new CDP endpoint.
     running_info = find_running_gpm_profile_coordinates(clean_id, api_url=api_url)
     if running_info and (running_info.get("remote_debugging_port") or running_info.get("websocket_debugging_url")):
         logger.info("Phát hiện GPM Profile %s đang mở sẵn với port %s, tái sử dụng cửa sổ hiện tại", clean_id, running_info.get("remote_debugging_port"))
-        running_info["already_running"] = True
+        running_info["already_running"] = (clean_id not in _tool_automated_profiles)
         _active_gpm_profiles[clean_id] = running_info
         return running_info
     if running_info and running_info.get("already_running_no_cdp"):
@@ -727,6 +735,19 @@ def start_gpm_profile(
             clean_id,
         )
         return running_info
+
+    if market_timezone:
+        try:
+            patch_gpm_profile_language(clean_id, market_timezone, api_url=api_url)
+        except Exception as exc:
+            logger.debug("Lỗi khi patch Preferences language cho GPM %s: %s", clean_id, exc)
+
+    final_addition_args = addition_args or ""
+    if market_timezone:
+        lang_config = resolve_market_language_config(market_timezone)
+        primary_lang = lang_config.get("primary_lang")
+        if primary_lang and "--lang=" not in final_addition_args:
+            final_addition_args = f"{final_addition_args} --lang={primary_lang}".strip()
 
     params: dict[str, Any] = {}
     if remote_debugging_port is not None and remote_debugging_port > 0:
@@ -742,9 +763,9 @@ def start_gpm_profile(
         params["win_size"] = window_size
     if skip_proxy_check:
         params["skip_proxy_check"] = "true"
-    if addition_args:
-        params["addition_args"] = addition_args
-        params["add_args"] = addition_args
+    if final_addition_args:
+        params["addition_args"] = final_addition_args
+        params["add_args"] = final_addition_args
 
     logger.info("Khởi chạy GPM Profile %s (params=%s)", clean_id, params)
     resp = _request_gpm_api(f"/profiles/start/{clean_id}", api_url=api_url, params=params, timeout=45.0)
@@ -791,7 +812,7 @@ def start_gpm_profile(
         running_info = find_running_gpm_profile_coordinates(clean_id, api_url=api_url)
         if running_info and (running_info.get("remote_debugging_port") or running_info.get("websocket_debugging_url")):
             logger.info("Phát hiện GPM Profile %s đang mở sẵn với port %s", clean_id, running_info.get("remote_debugging_port"))
-            running_info["already_running"] = True
+            running_info["already_running"] = (clean_id not in _tool_automated_profiles)
             _active_gpm_profiles[clean_id] = running_info
             return running_info
 
@@ -814,23 +835,61 @@ def start_gpm_profile(
             }
         raise GpmProfileLaunchError(f"GPM không thể mở profile với cổng CDP: {msg}")
 
+    if not manual:
+        _tool_automated_profiles.add(clean_id)
+    else:
+        _tool_automated_profiles.discard(clean_id)
     _active_gpm_profiles[clean_id] = data
     return data
 
 
-def stop_gpm_profile(profile_id: str, api_url: str | None = None) -> bool:
-    """Stop/close a running GPM profile browser."""
+def stop_gpm_profile(
+    profile_id: str,
+    api_url: str | None = None,
+    *,
+    verify_process: bool = True,
+    verify_delay: float = 1.0,
+) -> bool:
+    """Stop/close a running GPM profile browser using GPM v3 /close/ with fallback and fail-safe process cleanup."""
     clean_id = str(profile_id).strip()
     if not clean_id:
         return False
     _active_gpm_profiles.pop(clean_id, None)
+    _tool_automated_profiles.discard(clean_id)
     logger.info("Đóng GPM Profile %s", clean_id)
+
+    closed_via_api = False
+    # Priority 1: GPM v3 uses /profiles/close/{id}
     try:
-        resp = _request_gpm_api(f"/profiles/stop/{clean_id}", api_url=api_url, timeout=15.0)
-        return bool(resp.get("success", True))
+        resp = _request_gpm_api(f"/profiles/close/{clean_id}", api_url=api_url, timeout=15.0)
+        closed_via_api = bool(resp.get("success", False))
     except Exception as exc:
-        logger.warning("Lỗi khi đóng GPM profile %s: %s", clean_id, exc)
-        return False
+        logger.debug("Gọi API close GPM profile %s không thành công (%s), thử fallback...", clean_id, exc)
+
+    # Priority 2: Fallback to /profiles/stop/{id} for older GPM versions
+    if not closed_via_api:
+        try:
+            resp = _request_gpm_api(f"/profiles/stop/{clean_id}", api_url=api_url, timeout=15.0)
+            closed_via_api = bool(resp.get("success", False))
+        except Exception as exc:
+            logger.warning("Lỗi khi đóng GPM profile %s qua API: %s", clean_id, exc)
+
+    # Fail-safe check: verify if the browser process actually terminated
+    if verify_process and sys.platform == "win32":
+        try:
+            if verify_delay > 0:
+                time.sleep(verify_delay)
+            running_info = find_running_gpm_profile_coordinates(clean_id, api_url=api_url)
+            if running_info and (running_info.get("remote_debugging_port") or running_info.get("process_id")):
+                logger.warning(
+                    "Tiến trình GPM Profile %s vẫn đang chạy sau lệnh đóng API, kích hoạt dọn dẹp cưỡng bức...",
+                    clean_id,
+                )
+                kill_gpm_profile_processes(clean_id, api_url=api_url)
+        except Exception as proc_err:
+            logger.debug("Lỗi khi kiểm tra tiến trình sau khi đóng profile %s: %s", clean_id, proc_err)
+
+    return closed_via_api or True
 
 
 @asynccontextmanager
@@ -841,6 +900,7 @@ async def gpm_browser_session(
     skip_proxy_check: bool = False,
     addition_args: str | None = None,
     api_url: str | None = None,
+    market_timezone: str | None = None,
 ) -> AsyncGenerator[Any, None]:
     """Async context manager that starts a GPM profile (or connects to an existing running one),
 
@@ -852,11 +912,6 @@ async def gpm_browser_session(
     clean_id = str(profile_id).strip()
     if not clean_id:
         raise ValueError("Profile ID không được để trống.")
-    if auto_stop:
-        logger.info(
-            "Bỏ qua auto_stop=True cho Profile GPM %s; browser luôn được giữ hoạt động.",
-            clean_id,
-        )
 
     launch_info = await asyncio.to_thread(
         start_gpm_profile,
@@ -865,6 +920,7 @@ async def gpm_browser_session(
         addition_args=addition_args,
         require_cdp=True,
         api_url=api_url,
+        market_timezone=market_timezone,
     )
 
     if launch_info.get("already_running_no_cdp"):
@@ -921,6 +977,8 @@ async def gpm_browser_session(
     playwright_cm = async_playwright()
     playwright = await playwright_cm.start()
     browser = None
+    context = None
+    has_error = False
     try:
         last_conn_err = None
         for attempt in range(1, 4):
@@ -943,9 +1001,205 @@ async def gpm_browser_session(
 
         contexts = browser.contexts
         context = contexts[0] if contexts else await browser.new_context()
-        yield context, browser
+        try:
+            yield context, browser
+        except Exception:
+            has_error = True
+            raise
+    except Exception:
+        has_error = True
+        raise
     finally:
         try:
             await playwright.stop()
         except Exception:
             pass
+
+        should_preserve = has_error or (context is not None and getattr(context, "_preserve_session", None) is True)
+        is_busy = False
+        busy_reason = ""
+        if not should_preserve and auto_stop is not False and not was_already_running:
+            try:
+                from auto_yt.services.channel_scanner_service import is_profile_busy_or_queued
+                is_busy, busy_reason = is_profile_busy_or_queued(clean_id)
+            except Exception as check_err:
+                logger.debug("Không thể kiểm tra trạng thái bận của profile %s: %s", clean_id, check_err)
+
+        if auto_stop is not False and not was_already_running and not should_preserve and not is_busy:
+            logger.info("Tác vụ thành công & Profile GPM %s được mở mới (không có job chờ) -> Tự động đóng profile", clean_id)
+            await asyncio.to_thread(stop_gpm_profile, clean_id, api_url=api_url)
+            _active_gpm_profiles.pop(clean_id, None)
+        else:
+            if should_preserve:
+                logger.warning(
+                    "Tác vụ gặp lỗi hoặc yêu cầu giữ phiên -> GIỮ NGUYÊN Profile GPM %s để người dùng đối soát",
+                    clean_id,
+                )
+            elif is_busy:
+                logger.info(
+                    "GIỮ NGUYÊN Profile GPM %s vì: %s",
+                    clean_id,
+                    busy_reason,
+                )
+            else:
+                logger.info(
+                    "Profile GPM %s đã mở sẵn từ trước -> Giữ nguyên profile",
+                    clean_id,
+                )
+
+
+TIMEZONE_LANGUAGE_CONFIG: dict[str, dict[str, str]] = {
+    # Vietnam
+    "Asia/Ho_Chi_Minh": {"primary_lang": "vi-VN", "accept_languages": "vi-VN,vi,en-US,en", "lang_code": "vi"},
+    # North America
+    "America/New_York": {"primary_lang": "en-US", "accept_languages": "en-US,en", "lang_code": "en"},
+    "America/Chicago": {"primary_lang": "en-US", "accept_languages": "en-US,en", "lang_code": "en"},
+    "America/Denver": {"primary_lang": "en-US", "accept_languages": "en-US,en", "lang_code": "en"},
+    "America/Los_Angeles": {"primary_lang": "en-US", "accept_languages": "en-US,en", "lang_code": "en"},
+    "America/Anchorage": {"primary_lang": "en-US", "accept_languages": "en-US,en", "lang_code": "en"},
+    "Pacific/Honolulu": {"primary_lang": "en-US", "accept_languages": "en-US,en", "lang_code": "en"},
+    "America/Toronto": {"primary_lang": "en-CA", "accept_languages": "en-CA,en,fr-CA,fr", "lang_code": "en"},
+    "America/Vancouver": {"primary_lang": "en-CA", "accept_languages": "en-CA,en", "lang_code": "en"},
+    "America/Mexico_City": {"primary_lang": "es-MX", "accept_languages": "es-MX,es,en-US,en", "lang_code": "es"},
+    # Europe
+    "Europe/London": {"primary_lang": "en-GB", "accept_languages": "en-GB,en,en-US", "lang_code": "en"},
+    "Europe/Madrid": {"primary_lang": "es-ES", "accept_languages": "es-ES,es,en-US,en", "lang_code": "es"},
+    "Europe/Berlin": {"primary_lang": "de-DE", "accept_languages": "de-DE,de,en-US,en", "lang_code": "de"},
+    "Europe/Paris": {"primary_lang": "fr-FR", "accept_languages": "fr-FR,fr,en-US,en", "lang_code": "fr"},
+    "Europe/Rome": {"primary_lang": "it-IT", "accept_languages": "it-IT,it,en-US,en", "lang_code": "it"},
+    "Europe/Amsterdam": {"primary_lang": "nl-NL", "accept_languages": "nl-NL,nl,en-US,en", "lang_code": "nl"},
+    "Europe/Warsaw": {"primary_lang": "pl-PL", "accept_languages": "pl-PL,pl,en-US,en", "lang_code": "pl"},
+    "Europe/Stockholm": {"primary_lang": "sv-SE", "accept_languages": "sv-SE,sv,en-US,en", "lang_code": "sv"},
+    "Europe/Zurich": {"primary_lang": "de-CH", "accept_languages": "de-CH,de,fr-CH,fr,en-US,en", "lang_code": "de"},
+    "Europe/Moscow": {"primary_lang": "ru-RU", "accept_languages": "ru-RU,ru,en-US,en", "lang_code": "ru"},
+    # Asia - Pacific
+    "Asia/Tokyo": {"primary_lang": "ja-JP", "accept_languages": "ja-JP,ja,en-US,en", "lang_code": "ja"},
+    "Asia/Seoul": {"primary_lang": "ko-KR", "accept_languages": "ko-KR,ko,en-US,en", "lang_code": "ko"},
+    "Asia/Taipei": {"primary_lang": "zh-TW", "accept_languages": "zh-TW,zh,en-US,en", "lang_code": "zh"},
+    "Asia/Singapore": {"primary_lang": "en-SG", "accept_languages": "en-SG,en,zh-SG,zh", "lang_code": "en"},
+    "Asia/Bangkok": {"primary_lang": "th-TH", "accept_languages": "th-TH,th,en-US,en", "lang_code": "th"},
+    "Asia/Jakarta": {"primary_lang": "id-ID", "accept_languages": "id-ID,id,en-US,en", "lang_code": "id"},
+    "Asia/Manila": {"primary_lang": "en-PH", "accept_languages": "en-PH,en,tl-PH,tl", "lang_code": "en"},
+    "Asia/Kolkata": {"primary_lang": "en-IN", "accept_languages": "en-IN,en,hi-IN,hi", "lang_code": "en"},
+    "Australia/Sydney": {"primary_lang": "en-AU", "accept_languages": "en-AU,en,en-US", "lang_code": "en"},
+    "Australia/Perth": {"primary_lang": "en-AU", "accept_languages": "en-AU,en,en-US", "lang_code": "en"},
+    "Pacific/Auckland": {"primary_lang": "en-NZ", "accept_languages": "en-NZ,en,en-US", "lang_code": "en"},
+    # Latin America & Middle East
+    "America/Sao_Paulo": {"primary_lang": "pt-BR", "accept_languages": "pt-BR,pt,en-US,en", "lang_code": "pt"},
+    "America/Argentina/Buenos_Aires": {"primary_lang": "es-AR", "accept_languages": "es-AR,es,en-US,en", "lang_code": "es"},
+    "Asia/Dubai": {"primary_lang": "ar-AE", "accept_languages": "ar-AE,ar,en-US,en", "lang_code": "ar"},
+    "Asia/Riyadh": {"primary_lang": "ar-SA", "accept_languages": "ar-SA,ar,en-US,en", "lang_code": "ar"},
+    "Africa/Johannesburg": {"primary_lang": "en-ZA", "accept_languages": "en-ZA,en", "lang_code": "en"},
+}
+
+
+def resolve_market_language_config(timezone_name: str | None) -> dict[str, str]:
+    """Resolve primary UI language, HTTP Accept-Language, and ISO lang code for a timezone."""
+    tz = str(timezone_name or "").strip()
+    if tz in TIMEZONE_LANGUAGE_CONFIG:
+        return TIMEZONE_LANGUAGE_CONFIG[tz]
+    if tz.startswith("Europe/"):
+        return {"primary_lang": "en-GB", "accept_languages": "en-GB,en,en-US", "lang_code": "en"}
+    if tz.startswith("America/"):
+        return {"primary_lang": "en-US", "accept_languages": "en-US,en", "lang_code": "en"}
+    if tz.startswith("Asia/"):
+        if "Ho_Chi_Minh" in tz:
+            return {"primary_lang": "vi-VN", "accept_languages": "vi-VN,vi,en-US,en", "lang_code": "vi"}
+        return {"primary_lang": "en-US", "accept_languages": "en-US,en", "lang_code": "en"}
+    return {"primary_lang": "en-US", "accept_languages": "en-US,en", "lang_code": "en"}
+
+
+def patch_gpm_profile_language(
+    profile_id: str,
+    timezone_name: str,
+    *,
+    api_url: str | None = None,
+    custom_profile_dir: Path | str | None = None,
+) -> bool:
+    """Permanently patch Chromium preferences for the given GPM profile to match market language.
+
+    Safely creates Preferences.bak before writing atomically.
+    """
+    clean_id = str(profile_id or "").strip()
+    if not clean_id or clean_id.startswith("local_"):
+        return False
+    lang_config = resolve_market_language_config(timezone_name)
+    accept_languages = lang_config["accept_languages"]
+
+    # 1. Resolve profile directory on disk
+    profile_dir: Path | None = None
+    if custom_profile_dir:
+        profile_dir = Path(custom_profile_dir)
+    else:
+        try:
+            detail = get_gpm_profile_detail(clean_id, api_url=api_url)
+            profile_path_name = str(detail.get("profile_path") or "").strip()
+            if profile_path_name:
+                candidates = [
+                    Path("D:/GPM/Profiles") / profile_path_name,
+                    Path.home() / "AppData/Roaming/gpm/Profiles" / profile_path_name,
+                    Path("C:/GPM/Profiles") / profile_path_name,
+                ]
+                for cand in candidates:
+                    if cand.is_dir():
+                        profile_dir = cand
+                        break
+        except Exception as exc:
+            logger.debug("Không thể lấy profile detail qua API để patch language: %s", exc)
+
+    if not profile_dir or not profile_dir.is_dir():
+        logger.debug("Không tìm thấy thư mục profile GPM trên đĩa cho ID %s", clean_id)
+        return False
+    prefs_path = profile_dir / "Default" / "Preferences"
+    if not prefs_path.is_file():
+        prefs_path = profile_dir / "Preferences"
+    if not prefs_path.is_file():
+        logger.debug("Không tìm thấy file Preferences trong profile GPM %s", clean_id)
+        return False
+
+    # 2. Read existing preferences
+    try:
+        raw_text = prefs_path.read_text(encoding="utf-8", errors="replace")
+        data = json.loads(raw_text)
+        if not isinstance(data, dict):
+            return False
+    except Exception as exc:
+        logger.warning("Lỗi đọc file Preferences profile GPM %s: %s", clean_id, exc)
+        return False
+
+    # 3. Create .bak backup safely
+    bak_path = prefs_path.with_suffix(".bak")
+    try:
+        bak_path.write_text(raw_text, encoding="utf-8")
+    except Exception:
+        pass
+
+    # 4. Modify intl settings
+    intl = data.setdefault("intl", {})
+    if not isinstance(intl, dict):
+        intl = {}
+        data["intl"] = intl
+
+    intl["selected_languages"] = accept_languages
+    intl["accept_languages"] = accept_languages
+
+    # 5. Write back atomically
+    temp_path = prefs_path.with_suffix(".tmp")
+    try:
+        temp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path.replace(prefs_path)
+        logger.info(
+            "Đã cập nhật vĩnh viễn ngôn ngữ profile GPM %s thành '%s' (Preferences patched)",
+            clean_id,
+            accept_languages,
+        )
+        return True
+    except Exception as exc:
+        logger.error("Lỗi ghi file Preferences profile GPM %s: %s", clean_id, exc)
+        if temp_path.is_file():
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
+        return False
+

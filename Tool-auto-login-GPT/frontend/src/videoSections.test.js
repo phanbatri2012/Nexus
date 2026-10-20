@@ -52,7 +52,6 @@ Giải thích: Nội dung giải thích.
   assert.doesNotMatch(result[4].content, /bài học lớn nhất/)
   assert.match(result[5].content, /bài học lớn nhất/)
 })
-
 test('supports explicitly labeled metadata fields and strips slug prefixes', () => {
   const result = parseVideoSections(`
 ### [METADATA & QUIZ]
@@ -74,7 +73,6 @@ B) Hai
   assert.match(result.find(section => section.title === 'QUIZ')?.content, /Câu hỏi kiểm tra/)
   assert.equal(result.find(section => section.title === 'BÌNH LUẬN GHIM')?.content, 'Nội dung bình luận')
 })
-
 test('shows chapters even when the metadata response has no description label', () => {
   const result = parseVideoSections(`
 ### [METADATA & QUIZ]
@@ -128,3 +126,29 @@ D. Messier 87
   assert.match(result.find(s => s.title === 'QUIZ')?.content, /Andromeda/)
   assert.equal(result.find(s => s.title === 'BÌNH LUẬN GHIM')?.content, 'Bạn thích bí ẩn nào nhất trong video này? Hãy bình luận nhé!')
 })
+
+test('cleans Canvas writing directives and decodes HTML entities in titles and descriptions', () => {
+  const result = parseVideoSections(`
+### [TIÊU ĐỀ]
+Cô Gái Người Dao Bắt Cua Cứu Tỷ Phú Bị Bắt Cóc, Sững Người: Anh Ruột! &#124; MC Văn Sâm
+### [SLUG]
+co-gai-nguoi-dao-bat-cua
+### [MÔ TẢ]
+:::writing{variant="document" id="58341"}
+Khi vợ mang thai năm tháng bất ngờ đòi ly hôn để cưới chính bố chồng &quot;Sâm Audio&quot; &#124; Kênh chính thức.
+:::
+### [HASHTAGS]
+#SamAudio #TamSu
+`)
+
+  const titleSec = result.find(s => s.title === 'TIÊU ĐỀ VIDEO')
+  assert.equal(titleSec?.content, 'Cô Gái Người Dao Bắt Cua Cứu Tỷ Phú Bị Bắt Cóc, Sững Người: Anh Ruột! | MC Văn Sâm')
+
+  const descSec = result.find(s => s.title === 'MÔ TẢ, TAG & CHAPTERS')
+  assert.ok(descSec)
+  assert.doesNotMatch(descSec.content, /:::writing/)
+  assert.doesNotMatch(descSec.content, /:::/)
+  assert.doesNotMatch(descSec.content, /&#124;/)
+  assert.match(descSec.content, /"Sâm Audio" \| Kênh chính thức/)
+})
+

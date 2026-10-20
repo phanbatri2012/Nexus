@@ -394,6 +394,7 @@ class PromptSettingsTests(unittest.TestCase):
             {
                 **pipeline,
                 "video_render": False,
+                "visual_research": False,
                 "youtube_upload": False,
                 "youtube_schedule": False,
             },
@@ -438,6 +439,31 @@ class PromptSettingsTests(unittest.TestCase):
         self.assertEqual(saved_img["thumbnail_variant"], "with_text")
         self.assertEqual(result["version"]["image_generation_settings"]["density"], 35)
         self.assertEqual(result["version"]["image_generation_settings"]["negative_prompt"], "cartoon, 3D")
+
+    def test_image_generation_flow_queue_settings_are_saved_and_bounded(self):
+        result = main.save_prompt_image_generation(
+            "default",
+            main.PromptImageGenerationData(
+                intro_video_max_wait_seconds=1200,
+                intro_video_max_in_flight=6,
+                flow_image_max_in_flight=3,
+            ),
+        )
+        settings = result["version"]["image_generation_settings"]
+        self.assertEqual(settings["intro_video_max_wait_seconds"], 1200)
+        self.assertEqual(settings["intro_video_max_in_flight"], 6)
+        self.assertEqual(settings["flow_image_max_in_flight"], 3)
+
+        normalized = chatgpt_projects.normalize_image_generation_settings(
+            {
+                "intro_video_max_wait_seconds": 99999,
+                "intro_video_max_in_flight": 99,
+                "flow_image_max_in_flight": 99,
+            }
+        )
+        self.assertEqual(normalized["intro_video_max_wait_seconds"], 3600)
+        self.assertEqual(normalized["intro_video_max_in_flight"], 12)
+        self.assertEqual(normalized["flow_image_max_in_flight"], 4)
 
     def test_image_generation_save_negative_prompt_from_frontend(self):
         result = main.save_prompt_image_generation(
@@ -582,7 +608,7 @@ class PromptSettingsTests(unittest.TestCase):
         snapshot = main._build_prompt_production_snapshot("default", version)
         img = snapshot.get("image_generation_settings") or {}
         self.assertEqual(img.get("provider"), "google_flow")
-        self.assertEqual(img.get("model"), "nano_banana_pro")
+        self.assertEqual(img.get("model"), "nano_banana_2_1")
         self.assertEqual(img.get("style_prompt"), "cinematic documentary")
         self.assertEqual(img.get("avoid_prompt"), "blurry text")
         self.assertEqual(img.get("density"), 30)
@@ -592,11 +618,11 @@ class PromptSettingsTests(unittest.TestCase):
 
     def test_save_and_normalize_google_flow_models(self):
         """Test that Google Flow image & video models can be saved, migrated and normalized correctly."""
-        # 1. Test saving Nano Banana 2 and Omni 1.1 Flash
+        # 1. Test saving Nano Banana 2.1 and Omni 1.1 Flash
         res = main.save_prompt_image_generation(
             "default",
             main.PromptImageGenerationData(
-                model="nano_banana_2",
+                model="nano_banana_2_1",
                 video_model="omni_1_1_flash",
                 aspect_ratio="16:9",
                 output_count=2,
@@ -605,40 +631,66 @@ class PromptSettingsTests(unittest.TestCase):
                 thumbnail_variant="without_text",
             ),
         )
-        self.assertEqual(res["version"]["image_generation_settings"]["model"], "nano_banana_2")
+        self.assertEqual(res["version"]["image_generation_settings"]["model"], "nano_banana_2_1")
         self.assertEqual(res["version"]["image_generation_settings"]["video_model"], "omni_1_1_flash")
         self.assertEqual(res["version"]["image_generation_settings"]["aspect_ratio"], "16:9")
         self.assertEqual(res["version"]["image_generation_settings"]["output_count"], 2)
 
-        # 2. Test saving Veo 3.1 Fast video model
+        # 2. Test saving Nano Banana 2 Lite and Veo 3.1 Fast video model
         res = main.save_prompt_image_generation(
             "default",
             main.PromptImageGenerationData(
-                model="nano_banana_2",
+                model="nano_banana_2_lite",
                 video_model="veo_3_1_fast",
                 style_prompt="cinematic intro hook",
                 density=30,
                 thumbnail_variant="without_text",
             ),
         )
+        self.assertEqual(res["version"]["image_generation_settings"]["model"], "nano_banana_2_lite")
         self.assertEqual(res["version"]["image_generation_settings"]["video_model"], "veo_3_1_fast")
 
-        # 3. Test legacy model migration (google_veo_intro -> omni_1_1_flash) and nano_banana_pro preservation
+        # 3. Test legacy model migration (nano_banana_2 -> nano_banana_2_1, imagen_3 -> nano_banana_2_1, google_veo_intro -> omni_1_1_flash)
         res = main.save_prompt_image_generation(
             "default",
             main.PromptImageGenerationData(
-                model="nano_banana_pro",
+                model="nano_banana_2",
                 video_model="google_veo_intro",
                 style_prompt="",
                 density=30,
                 thumbnail_variant="without_text",
             ),
         )
-        self.assertEqual(res["version"]["image_generation_settings"]["model"], "nano_banana_pro")
+        self.assertEqual(res["version"]["image_generation_settings"]["model"], "nano_banana_2_1")
         self.assertEqual(res["version"]["image_generation_settings"]["video_model"], "omni_1_1_flash")
 
-        # 4. Test unknown model fallback to nano_banana_pro and veo_3_1_lite
-        res = main.save_prompt_image_generation(
+        res_imagen = main.save_prompt_image_generation(
+            "default",
+            main.PromptImageGenerationData(
+                model="imagen_3_standard",
+                video_model="omni_1_1_flash",
+                style_prompt="",
+                density=30,
+                thumbnail_variant="without_text",
+            ),
+        )
+        self.assertEqual(res_imagen["version"]["image_generation_settings"]["model"], "nano_banana_2_1")
+
+        # 4. Test nano_banana_pro preservation
+        res_pro = main.save_prompt_image_generation(
+            "default",
+            main.PromptImageGenerationData(
+                model="nano_banana_pro",
+                video_model="veo_3_1_lite",
+                style_prompt="",
+                density=30,
+                thumbnail_variant="without_text",
+            ),
+        )
+        self.assertEqual(res_pro["version"]["image_generation_settings"]["model"], "nano_banana_pro")
+
+        # 5. Test unknown model fallback to DEFAULT_IMAGE_MODEL (nano_banana_2_1) and veo_3_1_lite
+        res_unknown = main.save_prompt_image_generation(
             "default",
             main.PromptImageGenerationData(
                 model="non_existent_model_xyz",
@@ -648,15 +700,15 @@ class PromptSettingsTests(unittest.TestCase):
                 thumbnail_variant="without_text",
             ),
         )
-        self.assertEqual(res["version"]["image_generation_settings"]["model"], "nano_banana_pro")
-        self.assertEqual(res["version"]["image_generation_settings"]["video_model"], "veo_3_1_lite")
+        self.assertEqual(res_unknown["version"]["image_generation_settings"]["model"], "nano_banana_2_1")
+        self.assertEqual(res_unknown["version"]["image_generation_settings"]["video_model"], "omni_1_1_flash")
 
-        # 5. Restore default models
+        # 6. Restore default models
         main.save_prompt_image_generation(
             "default",
             main.PromptImageGenerationData(
-                model="nano_banana_pro",
-                video_model="veo_3_1_lite",
+                model="nano_banana_2_1",
+                video_model="omni_1_1_flash",
                 style_prompt="",
                 density=30,
                 thumbnail_variant="without_text",
@@ -805,6 +857,43 @@ class PromptSettingsTests(unittest.TestCase):
             if res.get("job_id"):
                 main.db.update_system_job(res["job_id"], status="canceled")
                 main.db.delete_system_job(res["job_id"])
+
+
+    def test_delete_prompt_version_success(self):
+        res = main.delete_prompt_version("second")
+        self.assertTrue(res["success"])
+        self.assertEqual(res["deleted_version"], "second")
+        saved = self.read_saved_data()
+        self.assertNotIn("second", saved["versions"])
+        self.assertIn("default", saved["versions"])
+
+    def test_delete_active_prompt_version_updates_active_version(self):
+        res = main.delete_prompt_version("default")
+        self.assertTrue(res["success"])
+        self.assertEqual(res["deleted_version"], "default")
+        saved = self.read_saved_data()
+        self.assertNotIn("default", saved["versions"])
+        self.assertEqual(saved["active_version"], "second")
+
+    def test_delete_single_remaining_prompt_version_fails(self):
+        main.delete_prompt_version("second")
+        with self.assertRaises(HTTPException) as ctx:
+            main.delete_prompt_version("default")
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("Không thể xóa", ctx.exception.detail)
+
+    def test_delete_locked_prompt_version_fails(self):
+        with patch.object(main, "_get_locked_prompt_version", return_value="second"):
+            with self.assertRaises(HTTPException) as ctx:
+                main.delete_prompt_version("second")
+            self.assertEqual(ctx.exception.status_code, 409)
+        saved = self.read_saved_data()
+        self.assertIn("second", saved["versions"])
+
+    def test_delete_nonexistent_prompt_version_fails(self):
+        with self.assertRaises(HTTPException) as ctx:
+            main.delete_prompt_version("non_existent")
+        self.assertEqual(ctx.exception.status_code, 404)
 
 
 if __name__ == "__main__":

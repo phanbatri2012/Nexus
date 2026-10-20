@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from auto_yt.services import database as db, security_logging
 from auto_yt.services.trust_builder_service import (
     TRUST_JOB_TYPE,
+    get_daily_work_state,
     get_active_plan_job,
     run_warmup_session,
     validate_plan_browser_configuration,
@@ -131,6 +132,8 @@ async def _execute_claimed_job(job: dict[str, Any]) -> None:
             progress = (
                 "Đã đạt quota hôm nay"
                 if result.get("quota_reached")
+                else "Trust Builder session hoàn thành một phần"
+                if result.get("partial_success")
                 else "Trust Builder session hoàn thành"
             )
             error = ""
@@ -157,6 +160,8 @@ async def _execute_claimed_job(job: dict[str, Any]) -> None:
                     plan_id,
                     next_run_at=_next_active_start(plan, _utc_now()),
                 )
+            elif result.get("retryable_engagement"):
+                _defer_plan(plan_id, RETRY_DELAY_MINUTES)
             elif result.get("success") and not result.get("skipped"):
                 _defer_plan(plan_id, random.randint(*SESSION_INTERVAL_MINUTES))
             else:
@@ -223,10 +228,7 @@ async def _evaluate_active_plans() -> None:
             str(plan.get("publication_timezone") or "Asia/Ho_Chi_Minh"),
             now_utc=now_utc,
         )
-        if (
-            daily_stats.get("search_count", 0) >= int(plan.get("daily_search_target"))
-            or daily_stats.get("watch_count", 0) >= int(plan.get("daily_watch_target"))
-        ):
+        if get_daily_work_state(plan, daily_stats)["daily_complete"]:
             db.update_channel_trust_plan(
                 plan_id,
                 next_run_at=_next_active_start(plan, now_utc),
@@ -260,6 +262,8 @@ async def _check_periodic_safety_sync() -> None:
     config = db.get_safety_config()
     if not config.get("shield_enabled", True):
         return
+    if not str(config.get("remote_sync_url") or "").strip():
+        return
     last_synced_str = str(config.get("last_synced_at") or "")
     interval_hours = int(config.get("auto_sync_interval_hours") or 24)
     last_synced = _parse_utc(last_synced_str)
@@ -268,7 +272,10 @@ async def _check_periodic_safety_sync() -> None:
             from auto_yt.services import trust_builder_safety as safety
             safety.sync_safety_blacklist_from_remote()
         except Exception as exc:
-            logger.warning("Lỗi tự động đồng bộ Safety Blacklist định kỳ: %s", exc)
+            logger.warning(
+                "Lỗi tự động đồng bộ Safety Blacklist định kỳ: %s",
+                security_logging.redact_sensitive(exc),
+            )
 
 
 async def _scheduler_loop() -> None:

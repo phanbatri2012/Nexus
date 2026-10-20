@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import secrets
-import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -29,8 +28,22 @@ OMNIVOICE_ROOT = Path(
 ).resolve()
 MAX_JSON_BYTES = 5 * 1024 * 1024
 MAX_AUDIO_BYTES = 2 * 1024 * 1024 * 1024
-START_TIMEOUT_SECONDS = 45
-_worker_process: subprocess.Popen | None = None
+
+
+class OmniVoiceClientError(RuntimeError):
+    """Base class for failures returned by the local OmniVoice service."""
+
+
+class OmniVoiceConnectionError(OmniVoiceClientError):
+    """The canonical lifecycle-managed worker could not be reached."""
+
+
+class OmniVoiceAPIError(OmniVoiceClientError):
+    """The worker responded with an HTTP or runtime error."""
+
+
+class OmniVoiceInvalidResponseError(OmniVoiceClientError):
+    """The worker response could not be safely consumed."""
 
 
 def _get_token() -> str:
@@ -78,7 +91,9 @@ def _request(
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read(MAX_AUDIO_BYTES + 1)
             if len(raw) > MAX_AUDIO_BYTES:
-                raise RuntimeError("OmniVoice returned a response that is too large.")
+                raise OmniVoiceInvalidResponseError(
+                    "OmniVoice returned a response that is too large."
+                )
             return raw
     except urllib.error.HTTPError as exc:
         error_body = exc.read(64 * 1024).decode("utf-8", errors="replace")
@@ -86,85 +101,49 @@ def _request(
             detail = json.loads(error_body).get("detail") or error_body
         except json.JSONDecodeError:
             detail = error_body
-        raise RuntimeError(f"OmniVoice API error: {exc.code} - {detail}") from exc
+        raise OmniVoiceAPIError(
+            f"OmniVoice API error: {exc.code} - {detail}"
+        ) from exc
     except (urllib.error.URLError, TimeoutError) as exc:
-        raise RuntimeError(f"Không thể kết nối OmniVoice: {exc}") from exc
+        raise OmniVoiceConnectionError(
+            f"Không thể kết nối OmniVoice: {exc}"
+        ) from exc
 
 
 def _request_json(path: str, **kwargs) -> dict:
     raw = _request(path, **kwargs)
     if len(raw) > MAX_JSON_BYTES:
-        raise RuntimeError("OmniVoice returned JSON that is too large.")
+        raise OmniVoiceInvalidResponseError(
+            "OmniVoice returned JSON that is too large."
+        )
     try:
         return json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("OmniVoice returned an invalid response.") from exc
+        raise OmniVoiceInvalidResponseError(
+            "OmniVoice returned an invalid response."
+        ) from exc
 
 
 def health(*, start_if_needed: bool = False, base_url: str = DEFAULT_BASE_URL) -> dict:
-    try:
-        return _request_json("/health", timeout=5, base_url=base_url)
-    except RuntimeError:
-        if not start_if_needed:
-            raise
+    if start_if_needed:
         ensure_worker_running(base_url=base_url)
-        return _request_json("/health", timeout=5, base_url=base_url)
+    return _request_json("/health", timeout=5, base_url=base_url)
 
 
 def ensure_worker_running(*, base_url: str = DEFAULT_BASE_URL) -> None:
-    global _worker_process
     try:
-        _request_json("/health", timeout=2, base_url=base_url)
-        return
-    except RuntimeError:
-        pass
-    python_path = OMNIVOICE_ROOT / ".venv" / "Scripts" / "python.exe"
-    api_server_path = OMNIVOICE_ROOT / "api_server.py"
-    if not python_path.exists() or not api_server_path.exists():
-        raise RuntimeError(f"Không tìm thấy OmniVoice worker tại {OMNIVOICE_ROOT}.")
-    environment = os.environ.copy()
-    environment["AUTO_YT_OMNIVOICE_TOKEN"] = _get_token()
-    environment.setdefault("OMNIVOICE_IDLE_UNLOAD_SECONDS", "900")
-    creation_flags = 0
-    startup_info = None
-    if os.name == "nt":
-        creation_flags = (
-            subprocess.CREATE_NO_WINDOW
-            | getattr(subprocess, "DETACHED_PROCESS", 0)
-            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        status = _request_json("/health", timeout=5, base_url=base_url)
+    except OmniVoiceConnectionError as exc:
+        raise OmniVoiceConnectionError(
+            "OmniVoice chưa sẵn sàng. Hãy khởi động dịch vụ bằng "
+            "run_autoyt.bat hoặc run_autoyt_restart.bat."
+        ) from exc
+    if not status.get("ok", False):
+        state = str(status.get("state") or "error")
+        detail = str(status.get("error") or "OmniVoice runtime error")
+        raise OmniVoiceAPIError(
+            f"OmniVoice không sẵn sàng ({state}): {detail}"
         )
-        startup_info = subprocess.STARTUPINFO()
-        startup_info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startup_info.wShowWindow = subprocess.SW_HIDE
-    _worker_process = subprocess.Popen(
-        [
-            str(python_path),
-            "-m",
-            "uvicorn",
-            "api_server:app",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "8011",
-        ],
-        cwd=str(OMNIVOICE_ROOT),
-        env=environment,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=creation_flags,
-        startupinfo=startup_info,
-    )
-    deadline = time.monotonic() + START_TIMEOUT_SECONDS
-    while time.monotonic() < deadline:
-        if _worker_process.poll() is not None:
-            raise RuntimeError("OmniVoice worker dừng trong lúc khởi động.")
-        try:
-            _request_json("/health", timeout=2, base_url=base_url)
-            return
-        except RuntimeError:
-            time.sleep(0.5)
-    raise RuntimeError("Quá thời gian chờ OmniVoice worker khởi động.")
 
 
 def list_voices(*, base_url: str = DEFAULT_BASE_URL) -> dict:

@@ -7,7 +7,7 @@ triggering automated warmup sessions, and inspecting channel branding.
 from __future__ import annotations
 
 from typing import List, Literal, Optional
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Response
 from pydantic import BaseModel, Field, field_validator
 
 from auto_yt.services import database as db
@@ -16,6 +16,7 @@ from auto_yt.services.trust_builder_service import (
     audit_channel_branding_for_plan,
     audit_feature_eligibility_for_plan,
     calculate_trust_score,
+    engagement_requirements_met,
     get_active_plan_job,
     request_cancel_plan_jobs,
     validate_plan_browser_configuration,
@@ -30,8 +31,11 @@ def _public_plan(plan: dict | None) -> dict | None:
     if plan is None:
         return None
     public_plan = dict(plan)
-    proxy_info = str(public_plan.pop("gpm_proxy_info", "") or "").strip()
-    public_plan["gpm_proxy_configured"] = bool(parse_proxy_url(proxy_info))
+    raw_proxy = public_plan.pop("gpm_proxy_info", None)
+    public_plan.pop("gpm_proxy_info_encrypted", None)
+    channel = db.get_youtube_channel(int(public_plan.get("channel_db_id") or 0))
+    proxy_val = str((channel or {}).get("gpm_proxy_info") or raw_proxy or "")
+    public_plan["gpm_proxy_configured"] = bool(parse_proxy_url(proxy_val))
     return public_plan
 
 
@@ -89,15 +93,17 @@ class TrustPlanUpdateRequest(BaseModel):
 
 
 @router.get("/plans")
-def list_plans():
+def list_plans(response: Response):
     """List all channel trust plans with channel info and estimated trust score."""
+    response.headers["Cache-Control"] = "no-store"
     plans = [_public_plan(plan) for plan in db.list_channel_trust_plans()]
     return {"plans": plans, "total": len(plans)}
 
 
 @router.get("/plans/{plan_id}")
-def get_plan_detail(plan_id: int):
+def get_plan_detail(plan_id: int, response: Response):
     """Get single trust plan detail with latest stats."""
+    response.headers["Cache-Control"] = "no-store"
     plan = db.get_channel_trust_plan(plan_id)
     if not plan:
         raise HTTPException(status_code=404, detail="Không tìm thấy Trust Plan.")
@@ -172,7 +178,9 @@ def start_plan(plan_id: int):
     plan = db.get_channel_trust_plan(plan_id)
     if not plan:
         raise HTTPException(status_code=404, detail="Không tìm thấy Trust Plan.")
-    if plan.get("status") == "completed":
+    stats = db.get_trust_activity_stats(plan_id)
+    reopening_engagement = plan.get("status") == "completed" and not engagement_requirements_met(plan, stats)
+    if plan.get("status") == "completed" and not reopening_engagement:
         raise HTTPException(
             status_code=400,
             detail="Plan đã hoàn tất. Hãy tạo plan mới nếu cần warm-up lại.",
@@ -181,14 +189,16 @@ def start_plan(plan_id: int):
         validate_plan_browser_configuration(plan)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    
-    current_phase = plan.get("warmup_phase")
+
+    current_phase = "phase_2_engage" if reopening_engagement else plan.get("warmup_phase")
     if current_phase == "idle":
         current_phase = "phase_1_consumer"
 
     updated = db.update_channel_trust_plan(
         plan_id,
         status="active",
+        mode="automated",
+        requires_review=False,
         warmup_phase=current_phase,
         phase_started_at=plan.get("phase_started_at") or db.utc_now(),
         next_run_at="",
@@ -221,6 +231,8 @@ def resume_plan(plan_id: int):
     updated = db.update_channel_trust_plan(
         plan_id,
         status="active",
+        mode="automated",
+        requires_review=False,
         next_run_at="",
         error_message="",
     )
@@ -233,7 +245,7 @@ async def trigger_run_session(plan_id: int):
     plan = db.get_channel_trust_plan(plan_id)
     if not plan:
         raise HTTPException(status_code=404, detail="Không tìm thấy Trust Plan.")
-    
+
     try:
         job, created = trust_builder_scheduler.enqueue_trust_builder_session(
             plan_id,
@@ -346,6 +358,14 @@ def get_safety_config_endpoint():
 def update_safety_config_endpoint(req: SafetyConfigRequest):
     """Update Vietnam Safety Shield settings."""
     changes = req.model_dump(exclude_unset=True)
+    if changes.get("remote_sync_url"):
+        from auto_yt.services import trust_builder_safety as safety
+        try:
+            changes["remote_sync_url"] = safety.validate_remote_sync_url(
+                changes["remote_sync_url"]
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     updated = db.update_safety_config(**changes)
     return {"success": True, "config": updated}
 
@@ -385,9 +405,13 @@ def list_safety_blacklist_endpoint(
 def create_safety_blacklist_endpoint(req: SafetyBlacklistCreateRequest):
     """Add a new custom rule or block a channel in 1-click."""
     try:
+        entry_value = req.entry_value
+        if req.entry_type == "regex_pattern":
+            from auto_yt.services import trust_builder_safety as safety
+            entry_value = safety.validate_regex_pattern(entry_value)
         entry = db.create_safety_blacklist_entry(
             entry_type=req.entry_type,
-            entry_value=req.entry_value,
+            entry_value=entry_value,
             reason=req.reason or "Người dùng thêm thủ công",
             is_custom=req.is_custom,
             is_enabled=1 if req.is_enabled else 0,
@@ -405,4 +429,3 @@ def delete_safety_blacklist_endpoint(entry_id: int):
         raise HTTPException(status_code=404, detail="Không tìm thấy quy tắc chặn.")
     deleted = db.delete_safety_blacklist_entry(entry_id)
     return {"success": deleted}
-

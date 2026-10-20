@@ -150,18 +150,28 @@ class TestChannelScanner(unittest.TestCase):
         page.close.assert_awaited_once()
         other_page.close.assert_not_called()
 
-    def test_cleanup_owned_page_keeps_last_tab_alive(self):
+    def test_cleanup_owned_page_closes_task_tab_on_completion(self):
         page = MagicMock()
         page.is_closed.return_value = False
-        page.goto = AsyncMock()
         page.close = AsyncMock()
         context = MagicMock()
         context.pages = [page]
 
-        asyncio.run(cleanup_owned_page(context, page))
+        asyncio.run(cleanup_owned_page(context, page, preserve=False))
 
-        page.goto.assert_awaited_once_with("about:blank")
+        page.close.assert_awaited_once()
+
+    def test_cleanup_owned_page_preserves_tab_on_error(self):
+        page = MagicMock()
+        page.is_closed.return_value = False
+        page.close = AsyncMock()
+        context = MagicMock()
+        context.pages = [page]
+
+        asyncio.run(cleanup_owned_page(context, page, preserve=True))
+
         page.close.assert_not_called()
+        self.assertTrue(getattr(context, "_preserve_session", None) is True)
 
     @patch("auto_yt.services.channel_scanner_service.scan_youtube_channel")
     def test_api_scan_youtube_endpoint(self, mock_scan):

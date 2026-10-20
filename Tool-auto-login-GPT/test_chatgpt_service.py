@@ -9,7 +9,10 @@ from unittest.mock import Mock, patch
 from playwright.sync_api import sync_playwright
 
 from auto_yt.services import chatgpt_service, chatgpt_worker
-from auto_yt.services.chatgpt_runtime import ChatGPTAttentionRequiredError
+from auto_yt.services.chatgpt_runtime import (
+    ChatGPTAttentionRequiredError,
+    ChatGPTPreSendTransientError,
+)
 
 
 def make_dil_conversation_payload(
@@ -269,7 +272,17 @@ class ChatGptServiceTests(unittest.TestCase):
             patch.object(
                 chatgpt_worker,
                 "is_chatgpt_generation_active",
-                side_effect=[True, False, False],
+                side_effect=[True, False],
+            ),
+            patch.object(
+                chatgpt_worker,
+                "is_chatgpt_render_error_present",
+                return_value=False,
+            ),
+            patch.object(
+                chatgpt_worker,
+                "recover_assistant_response_from_backend",
+                return_value="",
             ),
             patch.object(
                 chatgpt_worker,
@@ -279,12 +292,20 @@ class ChatGptServiceTests(unittest.TestCase):
             patch.object(
                 chatgpt_worker,
                 "get_assistant_response_after_latest_user",
-                side_effect=["", "Metadata generated", "Metadata generated"],
+                side_effect=[
+                    "",
+                    "Người kể khép lại câu chuyện bằng bài học về lòng nhân ái.",
+                ],
             ) as fallback_response,
             patch.object(
                 chatgpt_worker.time,
                 "monotonic",
-                side_effect=[0, 0.5, 1, 2.1],
+                side_effect=[0, 0.5, 1],
+            ),
+            patch.object(
+                chatgpt_worker,
+                "ASSISTANT_RESPONSE_SETTLE_AFTER_BUSY_SECONDS",
+                0,
             ),
             patch.object(chatgpt_worker.time, "sleep"),
         ):
@@ -295,8 +316,11 @@ class ChatGptServiceTests(unittest.TestCase):
                 submitted_prompt_text="Prompt metadata",
             )
 
-        self.assertEqual(response, "Metadata generated")
-        self.assertEqual(fallback_response.call_count, 3)
+        self.assertEqual(
+            response,
+            "Người kể khép lại câu chuyện bằng bài học về lòng nhân ái.",
+        )
+        self.assertEqual(fallback_response.call_count, 2)
 
     def test_response_recovery_reloads_the_same_conversation_once(self):
         page = Mock(url="https://chatgpt.com/c/saved-chat")
@@ -462,6 +486,61 @@ class ChatGptServiceTests(unittest.TestCase):
         )
         self.assertEqual(resp, "Body response text")
 
+    def test_mapping_tree_payload_rejects_sibling_when_current_branch_is_incomplete(self):
+        payload = {
+            "current_node": "node-current-assistant",
+            "mapping": {
+                "node-current-assistant": {
+                    "id": "node-current-assistant",
+                    "message": {
+                        "id": "node-current-assistant",
+                        "author": {"role": "assistant"},
+                        "status": "in_progress",
+                        "end_turn": False,
+                        "content": {"content_type": "text", "parts": [""]},
+                        "create_time": 103.0,
+                    },
+                    "parent": "node-missing-user",
+                    "children": [],
+                },
+                "node-title-user": {
+                    "id": "node-title-user",
+                    "message": {
+                        "id": "node-title-user",
+                        "author": {"role": "user"},
+                        "status": "finished_successfully",
+                        "content": {"content_type": "text", "parts": ["Title prompt"]},
+                        "create_time": 100.0,
+                    },
+                    "parent": "node-root",
+                    "children": [],
+                },
+                "node-sibling-assistant": {
+                    "id": "node-sibling-assistant",
+                    "message": {
+                        "id": "node-sibling-assistant",
+                        "author": {"role": "assistant"},
+                        "status": "finished_successfully",
+                        "end_turn": True,
+                        "content": {
+                            "content_type": "text",
+                            "parts": ["Wrong description from another branch"],
+                        },
+                        "create_time": 101.0,
+                    },
+                    "parent": "node-other-user",
+                    "children": [],
+                },
+            },
+        }
+
+        response = chatgpt_worker.extract_assistant_response_from_conversation_payload(
+            payload,
+            "Title prompt",
+        )
+
+        self.assertEqual(response, "")
+
     def test_dil_payload_extraction_keeps_same_prompt_on_current_exchange(self):
         payload = make_paginated_dil_conversation_payload()
         payload["messages"][0:0] = [
@@ -604,7 +683,12 @@ class ChatGptServiceTests(unittest.TestCase):
             ),
             patch.object(
                 chatgpt_worker,
-                "recover_assistant_response_after_reload",
+                "is_chatgpt_render_error_present",
+                return_value=True,
+            ),
+            patch.object(
+                chatgpt_worker,
+                "recover_assistant_response_from_backend",
                 return_value="Metadata recovered from DIL",
             ) as recover_response,
             patch.object(chatgpt_worker, "ASSISTANT_RESPONSE_STABLE_SECONDS", 0),
@@ -617,7 +701,10 @@ class ChatGptServiceTests(unittest.TestCase):
             )
 
         self.assertEqual(response, "Metadata recovered from DIL")
-        recover_response.assert_called_once_with(page, "Prompt metadata")
+        recover_response.assert_called_once_with(
+            page,
+            expected_user_text="Prompt metadata",
+        )
         send_prompt.assert_not_called()
 
     def test_pending_prompt_render_error_recovers_without_resending(self):
@@ -827,13 +914,21 @@ class ChatGptServiceTests(unittest.TestCase):
             patch.object(
                 chatgpt_worker,
                 "get_new_assistant_response",
-                return_value="Generated response",
+                return_value="The completed answer contains useful narrative details.",
+            ),
+            patch.object(
+                chatgpt_worker,
+                "is_chatgpt_render_error_present",
+                return_value=False,
             ),
             patch.object(chatgpt_worker, "ASSISTANT_RESPONSE_STABLE_SECONDS", 0),
         ):
             result = chatgpt_worker.wait_for_assistant_response(page, -1)
 
-        self.assertEqual(result, "Generated response")
+        self.assertEqual(
+            result,
+            "The completed answer contains useful narrative details.",
+        )
         dismiss_dialog.assert_called_once_with(page)
 
     def test_prompt_validation_allows_query_strings_in_source_urls(self):
@@ -1140,6 +1235,175 @@ class ChatGptServiceTests(unittest.TestCase):
 
         page.reload.assert_not_called()
 
+    def test_history_wait_recovers_full_page_try_again_before_send(self):
+        page = Mock()
+        page.url = "https://chatgpt.com/c/conversation"
+        page.wait_for_function.side_effect = [TimeoutError(), None]
+
+        with (
+            patch.object(
+                chatgpt_worker,
+                "get_chatgpt_load_state",
+                return_value={
+                    "editor_present": False,
+                    "conversation_turn_count": 0,
+                    "full_page_retry": True,
+                    "login_required": False,
+                    "challenge_present": False,
+                },
+            ),
+            patch.object(
+                chatgpt_worker,
+                "click_chatgpt_full_page_retry",
+                return_value=True,
+            ) as click_retry,
+            patch.object(chatgpt_worker, "wait_for_chatgpt_composer"),
+            patch.object(
+                chatgpt_worker,
+                "capture_browser_diagnostics_sync",
+            ) as capture_diagnostics,
+        ):
+            chatgpt_worker.wait_for_conversation_history(
+                page,
+                composer_ready=True,
+                pre_send=True,
+            )
+
+        self.assertEqual(page.wait_for_function.call_count, 2)
+        click_retry.assert_called_once_with(page)
+        page.reload.assert_not_called()
+        capture_diagnostics.assert_not_called()
+
+    def test_history_wait_reloads_same_conversation_before_send(self):
+        page = Mock()
+        page.url = "https://chatgpt.com/c/conversation"
+        page.wait_for_function.side_effect = [TimeoutError(), None]
+
+        with (
+            patch.object(
+                chatgpt_worker,
+                "get_chatgpt_load_state",
+                return_value={
+                    "editor_present": True,
+                    "conversation_turn_count": 0,
+                    "full_page_retry": False,
+                    "login_required": False,
+                    "challenge_present": False,
+                },
+            ),
+            patch.object(chatgpt_worker, "wait_for_chatgpt_composer"),
+            patch.object(
+                chatgpt_worker,
+                "capture_browser_diagnostics_sync",
+            ) as capture_diagnostics,
+        ):
+            chatgpt_worker.wait_for_conversation_history(
+                page,
+                composer_ready=True,
+                pre_send=True,
+            )
+
+        page.reload.assert_called_once_with(
+            wait_until="domcontentloaded",
+            timeout=chatgpt_worker.CHATGPT_NAVIGATION_TIMEOUT_MS,
+        )
+        page.goto.assert_not_called()
+        capture_diagnostics.assert_not_called()
+
+    def test_history_wait_exhaustion_is_typed_and_captures_diagnostics(self):
+        page = Mock()
+        page.url = "https://chatgpt.com/c/conversation"
+        page.wait_for_function.side_effect = TimeoutError()
+
+        with (
+            patch.object(
+                chatgpt_worker,
+                "get_chatgpt_load_state",
+                return_value={
+                    "editor_present": True,
+                    "conversation_turn_count": 0,
+                    "full_page_retry": False,
+                    "login_required": False,
+                    "challenge_present": False,
+                },
+            ),
+            patch.object(
+                chatgpt_worker,
+                "capture_browser_diagnostics_sync",
+            ) as capture_diagnostics,
+        ):
+            with self.assertRaisesRegex(
+                ChatGPTPreSendTransientError,
+                "No prompt was sent",
+            ):
+                chatgpt_worker.wait_for_conversation_history(
+                    page,
+                    composer_ready=True,
+                    pre_send=True,
+                    attempts=1,
+                )
+
+        page.reload.assert_not_called()
+        capture_diagnostics.assert_called_once()
+        self.assertEqual(
+            capture_diagnostics.call_args.kwargs["action_name"],
+            "conversation_history_pre_send",
+        )
+
+    def test_history_wait_does_not_recover_a_different_conversation(self):
+        page = Mock()
+        page.url = "https://chatgpt.com/c/expected"
+
+        def redirect_while_waiting(*_args, **_kwargs):
+            page.url = "https://chatgpt.com/c/unexpected"
+            raise TimeoutError()
+
+        page.wait_for_function.side_effect = redirect_while_waiting
+
+        with (
+            patch.object(chatgpt_worker, "get_chatgpt_load_state") as get_state,
+            patch.object(
+                chatgpt_worker,
+                "capture_browser_diagnostics_sync",
+            ) as capture_diagnostics,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "did not stay on the video's conversation page",
+            ):
+                chatgpt_worker.wait_for_conversation_history(
+                    page,
+                    composer_ready=True,
+                    pre_send=True,
+                )
+
+        page.reload.assert_not_called()
+        get_state.assert_not_called()
+        capture_diagnostics.assert_not_called()
+
+    def test_send_prompt_does_not_touch_composer_when_history_is_unavailable(self):
+        page = Mock()
+        page.url = "https://chatgpt.com/c/conversation"
+        prompt_textarea = Mock()
+
+        with (
+            patch.object(
+                chatgpt_worker,
+                "wait_for_chatgpt_composer",
+                return_value=prompt_textarea,
+            ),
+            patch.object(
+                chatgpt_worker,
+                "wait_for_conversation_history",
+                side_effect=ChatGPTPreSendTransientError("history unavailable"),
+            ),
+        ):
+            with self.assertRaises(ChatGPTPreSendTransientError):
+                chatgpt_worker.send_prompt(page, "Test prompt")
+
+        prompt_textarea.click.assert_not_called()
+        page.keyboard.insert_text.assert_not_called()
+
     def test_narrative_sanitizer_removes_isolated_editorial_lines(self):
         first_paragraph = (
             "Lực lượng được tổ chức linh hoạt để thích nghi với chiến trường "
@@ -1279,59 +1543,53 @@ class ChatGptServiceTests(unittest.TestCase):
         self.assertIn("00:00 - Mở đầu", result)
 
     def test_video_id_is_forwarded_for_durable_worker_checkpoints(self):
-        completed_process = Mock(
-            returncode=0,
-            stdout=b"Generated script",
-            stderr=b"",
-        )
+        completed_process = Mock(returncode=0)
+        completed_process.communicate.return_value = (b"Generated script", b"")
         with patch.object(
             chatgpt_service.subprocess,
-            "run",
+            "Popen",
             return_value=completed_process,
-        ) as run_worker:
+        ) as start_worker:
             chatgpt_service.process_prompt_via_chatgpt(
                 "transcript",
                 "version-key",
                 video_id=122,
             )
 
-        worker_env = run_worker.call_args.kwargs["env"]
+        worker_env = start_worker.call_args.kwargs["env"]
         self.assertEqual(worker_env["PROMPT_VERSION"], "version-key")
         self.assertEqual(worker_env["VIDEO_ID"], "122")
         source_root = Path(chatgpt_service.__file__).resolve().parents[2]
         self.assertIn(str(source_root), worker_env["PYTHONPATH"].split(os.pathsep))
         self.assertEqual(
-            Path(run_worker.call_args.kwargs["cwd"]),
+            Path(start_worker.call_args.kwargs["cwd"]),
             source_root.parent,
         )
 
     def test_worker_environment_preserves_existing_python_path(self):
-        completed_process = Mock(
-            returncode=0,
-            stdout=b"Generated script",
-            stderr=b"",
-        )
+        completed_process = Mock(returncode=0)
+        completed_process.communicate.return_value = (b"Generated script", b"")
         existing_path = str(Path.cwd() / "existing-python-path")
         with (
             patch.dict(os.environ, {"PYTHONPATH": existing_path}),
             patch.object(
                 chatgpt_service.subprocess,
-                "run",
+                "Popen",
                 return_value=completed_process,
-            ) as run_worker,
+            ) as start_worker,
         ):
             chatgpt_service.process_prompt_via_chatgpt("transcript")
 
-        worker_paths = run_worker.call_args.kwargs["env"]["PYTHONPATH"].split(
+        worker_paths = start_worker.call_args.kwargs["env"]["PYTHONPATH"].split(
             os.pathsep
         )
         self.assertIn(existing_path, worker_paths)
 
     def test_subprocess_attention_marker_preserves_the_error_type(self):
-        completed_process = Mock(
-            returncode=1,
-            stdout=b"",
-            stderr=(
+        completed_process = Mock(returncode=1)
+        completed_process.communicate.return_value = (
+            b"",
+            (
                 b"diagnostic\n###CHATGPT_ATTENTION_REQUIRED###"
                 b"ChatGPT login expired"
             ),
@@ -1339,7 +1597,7 @@ class ChatGptServiceTests(unittest.TestCase):
 
         with patch.object(
             chatgpt_service.subprocess,
-            "run",
+            "Popen",
             return_value=completed_process,
         ):
             with self.assertRaisesRegex(
@@ -1356,16 +1614,13 @@ class ChatGptServiceTests(unittest.TestCase):
             "thumbnail_without_text": True,
             "audio": False,
         }
-        completed_process = Mock(
-            returncode=0,
-            stdout=b"Generated script",
-            stderr=b"",
-        )
+        completed_process = Mock(returncode=0)
+        completed_process.communicate.return_value = (b"Generated script", b"")
         with patch.object(
             chatgpt_service.subprocess,
-            "run",
+            "Popen",
             return_value=completed_process,
-        ) as run_worker:
+        ) as start_worker:
             chatgpt_service.process_prompt_via_chatgpt(
                 "transcript",
                 "version-key",
@@ -1373,7 +1628,7 @@ class ChatGptServiceTests(unittest.TestCase):
                 pipeline=pipeline,
             )
 
-        worker_env = run_worker.call_args.kwargs["env"]
+        worker_env = start_worker.call_args.kwargs["env"]
         self.assertEqual(
             json.loads(worker_env["PROMPT_PIPELINE_JSON"]),
             pipeline,
@@ -1384,14 +1639,17 @@ class ChatGptServiceTests(unittest.TestCase):
         page.url = "https://chatgpt.com/g/g-p-test/project"
         context = Mock()
         context.pages = [page]
+        intro_section = " ".join(f"intro content {index}" for index in range(8))
+        body_section = " ".join(f"body content {index}" for index in range(8))
+        outro_section = " ".join(f"outro content {index}" for index in range(8))
         state = {
             "chat_url": "",
             "current_step": "outro",
             "expected_body_parts": 1,
             "outline_parts": ["Part one"],
-            "intro": "Intro complete",
-            "body_parts": ["Body complete"],
-            "outro": "Outro complete",
+            "intro": intro_section,
+            "body_parts": [body_section],
+            "outro": outro_section,
             "metadata": "",
             "chapters": "",
             "thumb_text": "",
@@ -1443,14 +1701,17 @@ class ChatGptServiceTests(unittest.TestCase):
     def test_video_pipeline_recovers_pending_title_without_resending(self):
         page = Mock(url="https://chatgpt.com/c/saved-chat")
         context = Mock(pages=[page])
+        intro_section = " ".join(f"intro content {index}" for index in range(8))
+        body_section = " ".join(f"body content {index}" for index in range(8))
+        outro_section = " ".join(f"outro content {index}" for index in range(8))
         state = {
             "chat_url": page.url,
             "current_step": "title",
             "expected_body_parts": 1,
             "outline_parts": ["Part one"],
-            "intro": "Intro complete",
-            "body_parts": ["Body complete"],
-            "outro": "Outro complete",
+            "intro": intro_section,
+            "body_parts": [body_section],
+            "outro": outro_section,
             "title": "",
             "slug": "",
             "description": "",
@@ -1524,40 +1785,45 @@ class ChatGptServiceTests(unittest.TestCase):
         send_prompt.assert_not_called()
 
     def test_long_worker_is_not_limited_by_a_total_process_timeout(self):
-        completed_process = Mock(
-            returncode=0,
-            stdout=b"Generated script\n###CHAT_URL###\nhttps://chatgpt.com/c/test",
-            stderr=b"",
+        completed_process = Mock(returncode=0)
+        completed_process.communicate.return_value = (
+            b"Generated script\n###CHAT_URL###\nhttps://chatgpt.com/c/test",
+            b"",
         )
 
         with patch.object(
             chatgpt_service.subprocess,
-            "run",
+            "Popen",
             return_value=completed_process,
-        ) as run_worker:
+        ) as start_worker:
             result = chatgpt_service.process_prompt_via_chatgpt("transcript")
 
-        self.assertNotIn("timeout", run_worker.call_args.kwargs)
+        start_worker.assert_called_once()
+        completed_process.communicate.assert_called_once_with(input=b"transcript")
         self.assertEqual(result["script"], "Generated script")
         self.assertEqual(result["chat_url"], "https://chatgpt.com/c/test")
 
     def test_partial_worker_metadata_is_returned_to_the_backend(self):
-        completed_process = Mock(
-            returncode=0,
-            stdout=(
+        completed_process = Mock(returncode=0)
+        completed_process.communicate.return_value = (
+            (
                 b"Partial script\n"
                 b"###CHAT_URL###https://chatgpt.com/c/test\n"
                 b"###WORKER_META###"
                 b'{"warning":"chapters: timed out",'
                 b'"failed_step":"chapters",'
-                b'"complete_for_audio":true}'
+                b'"complete_for_audio":true,'
+                b'"metadata_ready":false,'
+                b'"metadata_errors":["title: missing title"],'
+                b'"publish_ready":false,'
+                b'"retryable":false}'
             ),
-            stderr=b"",
+            b"",
         )
 
         with patch.object(
             chatgpt_service.subprocess,
-            "run",
+            "Popen",
             return_value=completed_process,
         ):
             result = chatgpt_service.process_prompt_via_chatgpt("transcript")
@@ -1566,18 +1832,49 @@ class ChatGptServiceTests(unittest.TestCase):
         self.assertEqual(result["chat_url"], "https://chatgpt.com/c/test")
         self.assertEqual(result["failed_step"], "chapters")
         self.assertTrue(result["complete_for_audio"])
+        self.assertFalse(result["metadata_ready"])
+        self.assertEqual(result["metadata_errors"], ["title: missing title"])
+        self.assertFalse(result["publish_ready"])
+        self.assertFalse(result["retryable"])
         self.assertIn("timed out", result["warning"])
 
+    def test_programming_error_with_checkpoint_is_not_retryable(self):
+        def fail_with_programming_error(_transcript, state):
+            state.update(
+                {
+                    "chat_url": "https://chatgpt.com/c/test",
+                    "current_step": "thumbnail with text",
+                    "intro": "Saved intro",
+                }
+            )
+            raise NameError("name 'Path' is not defined")
+
+        with patch.object(
+            chatgpt_worker,
+            "_run_complete",
+            side_effect=fail_with_programming_error,
+        ):
+            result = chatgpt_worker.run("transcript")
+
+        self.assertEqual(result["failed_step"], "thumbnail with text")
+        self.assertFalse(result["retryable"])
+        self.assertIn("Path", result["warning"])
+
     def test_chapter_timeout_preserves_complete_core_script(self):
+        intro_section = " ".join(f"intro content {index}" for index in range(8))
+        body_one = " ".join(f"first body content {index}" for index in range(8))
+        body_two = " ".join(f"second body content {index}" for index in range(8))
+        outro_section = " ".join(f"outro content {index}" for index in range(8))
+
         def fail_at_chapters(_transcript, state):
             state.update(
                 {
                     "chat_url": "https://chatgpt.com/c/test",
                     "current_step": "chapters",
                     "expected_body_parts": 2,
-                    "intro": "Intro complete",
-                    "body_parts": ["Body one", "Body two"],
-                    "outro": "Outro complete",
+                    "intro": intro_section,
+                    "body_parts": [body_one, body_two],
+                    "outro": outro_section,
                     "title": "Title complete",
                     "slug": "slug-complete",
                     "description": "Description complete",
@@ -1597,7 +1894,7 @@ class ChatGptServiceTests(unittest.TestCase):
 
         self.assertTrue(result["complete_for_audio"])
         self.assertEqual(result["failed_step"], "chapters")
-        self.assertIn("Body one\n\nBody two", result["script"])
+        self.assertIn(f"{body_one}\n\n{body_two}", result["script"])
         self.assertIn("Title complete", result["script"])
         self.assertIn("Title complete", result["script"])
 
@@ -1700,6 +1997,7 @@ class ChatGptServiceTests(unittest.TestCase):
             "video_render": False,
             "youtube_upload": False,
             "youtube_schedule": False,
+            "visual_research": False,
         }
         checkpoint = {
             "chat_url": "https://chatgpt.com/c/saved",
@@ -1829,15 +2127,17 @@ class ChatGptServiceTests(unittest.TestCase):
         self.assertIn('not([aria-label*="Dictate"])', selector)
 
     def test_reusable_turn_parsing_selects_expected_turns(self):
+        first_part = " ".join(f"bối cảnh lịch sử {index}" for index in range(6))
+        second_part = " ".join(f"diễn biến chính {index}" for index in range(6))
         turns = [
             ("user", "Hãy tạo kịch bản với dàn ý chi tiết"),
-            ("assistant", "[PHAN]\nPhần 1: Bối cảnh lịch sử\n\n[PHAN]\nPhần 2: Diễn biến"),
+            ("assistant", f"PHAN 1:\n{first_part}\n\nPHAN 2:\n{second_part}"),
             ("user", "Hãy tạo các chapters cho video"),
             ("assistant", "00:00 - Mở đầu\n05:00 - Diễn biến chính\n10:00 - Kết thúc"),
         ]
         outline = chatgpt_worker.select_reusable_outline_response(turns)
-        self.assertIn("[PHAN]", outline)
-        self.assertIn("Phần 1", outline)
+        self.assertIn(first_part, outline)
+        self.assertIn("PHAN 1:", outline)
 
         chapter = chatgpt_worker.select_reusable_chapter_response(turns)
         self.assertIn("00:00 - Mở đầu", chapter)

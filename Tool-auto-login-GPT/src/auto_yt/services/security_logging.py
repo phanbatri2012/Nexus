@@ -9,8 +9,10 @@ import uuid
 
 LOGGER = logging.getLogger("auto_yt.security")
 _SECRET_PATTERNS = (
+    re.compile(r"(?i)\b((?:https?|socks5?)://)[^/\s:@]+:[^@\s/]+@"),
     re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+"),
     re.compile(r"(?i)((?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|client[_ -]?secret|password|cookie)\s*[:=]\s*)[^\s,;]+"),
+    re.compile(r"(?i)(\bproxy(?:_url|_info)?\s*[:=]\s*)[^\s,;]+"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
     re.compile(r"EAA[A-Za-z0-9_-]{16,}"),
 )

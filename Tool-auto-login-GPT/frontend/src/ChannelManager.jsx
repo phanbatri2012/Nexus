@@ -3,6 +3,8 @@ import './ChannelManager.css'
 import { useSubRoute } from './router.js'
 import './Settings.css'
 import OAuthGuideBox from './OAuthGuideBox'
+import MarketSelect from './MarketSelect'
+import PublicationTimePicker from './PublicationTimePicker'
 
 const API_BASE = 'http://127.0.0.1:8080'
 const WEEKDAYS = ['Thứ Hai', 'Thứ Ba', 'Thứ Tư', 'Thứ Năm', 'Thứ Sáu', 'Thứ Bảy', 'Chủ Nhật']
@@ -728,10 +730,10 @@ export default function ChannelManager({
     changeChannel(channelId, 'gpm_proxy_configured', Boolean(selected?.proxy_configured))
   }
 
-  const addPublicationSlot = channel => {
+  const addPublicationSlot = (channel, day = -1) => {
     changeChannel(channel.id, 'publication_slots', [
       ...(Array.isArray(channel.publication_slots) ? channel.publication_slots : []),
-      { day: 0, time: '09:00' }
+      { day, time: '09:00' }
     ])
   }
 
@@ -1724,22 +1726,18 @@ export default function ChannelManager({
                       onChange={event => changeChannel(channel.id, 'backlog_daily_reply_limit', event.target.value)}
                     />
                   </label>
-                  <label style={{ color: '#aaa' }}>
+                  <label style={{ color: '#aaa', display: 'flex', flexDirection: 'column', gap: 4 }}>
                     Bắt đầu đăng
-                    <input
-                      className="version-select"
-                      type="time"
+                    <PublicationTimePicker
                       value={channel.reply_window_start || '08:00'}
-                      onChange={event => changeChannel(channel.id, 'reply_window_start', event.target.value)}
+                      onChange={val => changeChannel(channel.id, 'reply_window_start', val)}
                     />
                   </label>
-                  <label style={{ color: '#aaa' }}>
+                  <label style={{ color: '#aaa', display: 'flex', flexDirection: 'column', gap: 4 }}>
                     Kết thúc đăng
-                    <input
-                      className="version-select"
-                      type="time"
+                    <PublicationTimePicker
                       value={channel.reply_window_end || '22:00'}
-                      onChange={event => changeChannel(channel.id, 'reply_window_end', event.target.value)}
+                      onChange={val => changeChannel(channel.id, 'reply_window_end', val)}
                     />
                   </label>
                 </div>
@@ -1787,15 +1785,13 @@ export default function ChannelManager({
                   Chỉ dùng khi bộ prompt bật “Đặt lịch đăng”. Slot được giữ cục bộ và đối chiếu lại với YouTube.
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))', gap: 10, marginTop: 12 }}>
-                  <label style={{ color: '#aaa' }}>
-                    Timezone IANA
-                    <input
-                      className="version-select"
+                  <div style={{ minWidth: 260 }}>
+                    <MarketSelect
+                      label="Thị trường mục tiêu (Timezone)"
                       value={channel.publication_timezone || 'Asia/Ho_Chi_Minh'}
-                      onChange={event => changeChannel(channel.id, 'publication_timezone', event.target.value)}
-                      placeholder="Asia/Ho_Chi_Minh"
+                      onChange={eventValue => changeChannel(channel.id, 'publication_timezone', eventValue)}
                     />
-                  </label>
+                  </div>
                   <label style={{ color: '#aaa' }}>
                     Tối đa video / ngày
                     <input
@@ -1821,19 +1817,19 @@ export default function ChannelManager({
                 </div>
                 <div style={{ display: 'grid', gap: 8, marginTop: 12 }}>
                   {(Array.isArray(channel.publication_slots) ? channel.publication_slots : []).map((slot, index) => (
-                    <div key={`${index}-${slot.day}-${slot.time}`} style={{ display: 'grid', gridTemplateColumns: '1fr 140px auto', gap: 8 }}>
+                    <div key={`${index}-${slot.day}-${slot.time}`} style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                       <select
                         className="version-select"
-                        value={slot.day}
+                        style={{ flex: '1 1 160px', minWidth: 140 }}
+                        value={slot.day !== undefined && slot.day !== null ? Number(slot.day) : -1}
                         onChange={event => changePublicationSlot(channel, index, 'day', event.target.value)}
                       >
+                        <option value={-1}>Mỗi ngày</option>
                         {WEEKDAYS.map((label, day) => <option key={label} value={day}>{label}</option>)}
                       </select>
-                      <input
-                        className="version-select"
-                        type="time"
+                      <PublicationTimePicker
                         value={slot.time || '09:00'}
-                        onChange={event => changePublicationSlot(channel, index, 'time', event.target.value)}
+                        onChange={newTime => changePublicationSlot(channel, index, 'time', newTime)}
                       />
                       <button className="btn-danger" type="button" onClick={() => removePublicationSlot(channel, index)}>Xóa</button>
                     </div>

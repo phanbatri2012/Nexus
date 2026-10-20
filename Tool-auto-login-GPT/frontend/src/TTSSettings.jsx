@@ -181,6 +181,32 @@ export default function TTSSettings() {
       body: JSON.stringify(changes),
     }), message)
 
+  const patchCasting = (voice, changes) => {
+    const profile = {
+      gender: 'any', age_group: 'any', languages: ['vi'], roles: ['guest'],
+      styles: [], usage_modes: ['single_narrator'], voice_pools: [],
+      ...(voice.casting_profile || {}), ...changes,
+    }
+    return patchVoice(voice, { casting_profile: profile }, 'Đã cập nhật chính sách sử dụng giọng.')
+  }
+
+  const toggleUsageMode = (voice, usageMode, enabled) => {
+    const current = voice.casting_profile?.usage_modes ||
+      (voice.casting_profile?.auto_cast ? ['multi_guest'] : ['single_narrator'])
+    const next = enabled
+      ? [...new Set([...current, usageMode])]
+      : current.filter(value => value !== usageMode)
+    return patchCasting(voice, { usage_modes: next })
+  }
+
+  const editCastingTags = (voice, key, label) => {
+    const current = (voice.casting_profile?.[key] || []).join(', ')
+    const raw = prompt(`${label} (phân tách bằng dấu phẩy):`, current)
+    if (raw === null) return
+    const values = raw.split(',').map(value => value.trim().toLowerCase()).filter(Boolean)
+    patchCasting(voice, { [key]: values })
+  }
+
   const testVoice = voice => {
     if (voice.provider_id === 'omnivoice') {
       setPreviewVoiceId(voice.id)
@@ -463,6 +489,34 @@ export default function TTSSettings() {
                   {voice.provider_voice_id} · revision {voice.revision} · {voice.status}
                   {voice.provider_id === 'omnivoice' && ` · ${voice.config?.target_words_per_minute || 145} từ/phút`}
                 </small>
+                <div className="tts-casting-profile">
+                  <span className="tts-casting-label">Được dùng cho</span>
+                  {[
+                    ['single_narrator', 'Đơn giọng'],
+                    ['multi_host', 'MC đa giọng'],
+                    ['multi_guest', 'Khách đa giọng'],
+                  ].map(([mode, label]) => <label className="tts-toggle" key={mode}>
+                    <input
+                      type="checkbox"
+                      checked={(voice.casting_profile?.usage_modes || []).includes(mode)}
+                      onChange={event => toggleUsageMode(voice, mode, event.target.checked)}
+                    /> {label}
+                  </label>)}
+                  <label>Giới tính
+                    <select value={voice.casting_profile?.gender || 'any'} onChange={event => patchCasting(voice, { gender: event.target.value })}>
+                      <option value="any">Linh hoạt</option><option value="male">Nam</option><option value="female">Nữ</option>
+                    </select>
+                  </label>
+                  <label>Nhóm tuổi
+                    <select value={voice.casting_profile?.age_group || 'any'} onChange={event => patchCasting(voice, { age_group: event.target.value })}>
+                      <option value="any">Linh hoạt</option><option value="young">Trẻ</option><option value="adult">Trưởng thành</option><option value="senior">Lớn tuổi</option>
+                    </select>
+                  </label>
+                  <button className="tts-button" onClick={() => editCastingTags(voice, 'languages', 'Ngôn ngữ')}>🌐 {(voice.casting_profile?.languages || ['vi']).join(', ')}</button>
+                  <button className="tts-button" onClick={() => editCastingTags(voice, 'roles', 'Vai trò')}>🎭 {(voice.casting_profile?.roles || ['guest']).join(', ')}</button>
+                  <button className="tts-button" onClick={() => editCastingTags(voice, 'styles', 'Phong cách')}>✨ {(voice.casting_profile?.styles || []).join(', ') || 'Thêm phong cách'}</button>
+                  <button className="tts-button" onClick={() => editCastingTags(voice, 'voice_pools', 'Nhóm giọng (mã không dấu)')}>🗂 {(voice.casting_profile?.voice_pools || []).join(', ') || 'Chưa có nhóm'}</button>
+                </div>
               </div>
               <div className="tts-actions">
                 {voice.status === 'active' && <button className="tts-button" onClick={() => testVoice(voice)}>Thử giọng</button>}

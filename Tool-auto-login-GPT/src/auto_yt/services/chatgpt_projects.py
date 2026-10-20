@@ -34,56 +34,45 @@ THUMBNAIL_VARIANTS = {"with_text", "without_text"}
 DEFAULT_THUMBNAIL_VARIANT = "with_text"
 SCENE_0_SOURCES = {"from_thumbnail_without_text", "from_thumbnail_with_text", "from_intro_transcript"}
 DEFAULT_SCENE_0_SOURCE = "from_thumbnail_without_text"
-DEFAULT_IMAGE_MODEL = "nano_banana_pro"
-DEFAULT_VIDEO_MODEL = "veo_3_1_lite"
+DEFAULT_IMAGE_MODEL = "nano_banana_2_1"
+DEFAULT_VIDEO_MODEL = "omni_1_1_flash"
 
 SUPPORTED_ASPECT_RATIOS = {"16:9", "4:3", "1:1", "3:4", "9:16"}
 SUPPORTED_VIDEO_ASPECT_RATIOS = {"16:9", "9:16"}
 SUPPORTED_OUTPUT_COUNTS = {1, 2, 3, 4}
 
 GOOGLE_FLOW_IMAGE_MODELS = {
-    "nano_banana_2": {
-        "id": "nano_banana_2",
-        "name": "🍌 Nano Banana 2",
+    "nano_banana_2_1": {
+        "id": "nano_banana_2_1",
+        "name": "🍌 Nano Banana 2.1",
         "provider": "google_flow",
         "badge": "🟢 Chuẩn Google Flow",
         "credit_tier": "low",
-        "credit_label": "🟢 Tiết kiệm (~1 credit/ảnh)",
+        "credit_label": "🟢 Tiêu chuẩn (~1 credit/ảnh)",
         "speed": "⚡ 3–5s",
-        "description": "⭐ Model tạo ảnh mặc định mới nhất trên Google Flow. Tốc độ sinh nhanh, màu sắc chân thực, chi tiết sắc nét, phù hợp tạo 30–50 cảnh visual cho video dài.",
+        "description": "⭐ Model tạo ảnh mặc định mới nhất trên Google Flow. Tốc độ sinh nhanh, màu sắc chân thực, chi tiết sắc nét, bám sát prompt phức tạp.",
+        "is_default": True,
+    },
+    "nano_banana_2_lite": {
+        "id": "nano_banana_2_lite",
+        "name": "🍌 Nano Banana 2 Lite",
+        "provider": "google_flow",
+        "badge": "⚡ Siêu tốc",
+        "credit_tier": "low",
+        "credit_label": "🟢 Tiết kiệm (~1 credit/ảnh)",
+        "speed": "⚡ 2–3s",
+        "description": "Phiên bản rút gọn tối ưu tốc độ sinh ảnh, thời gian chờ cực ngắn, phù hợp tạo số lượng lớn cảnh visual.",
         "is_default": False,
     },
     "nano_banana_pro": {
         "id": "nano_banana_pro",
-        "name": "Nano Banana Pro (Legacy)",
+        "name": "🍌 Nano Banana Pro",
         "provider": "google_flow",
-        "badge": "🟢 Tiết kiệm Credit",
+        "badge": "🔵 Ổn định",
         "credit_tier": "low",
         "credit_label": "🟢 Thấp nhất (~1 credit/ảnh)",
         "speed": "⚡ 3–5s",
-        "description": "Model thế hệ tiền nhiệm, tương thích hoàn toàn với các prompt version cũ.",
-        "is_default": True,
-    },
-    "imagen_3_standard": {
-        "id": "imagen_3_standard",
-        "name": "Google Imagen 3 (High-Fidelity)",
-        "provider": "google_flow",
-        "badge": "🟡 Chất lượng cao",
-        "credit_tier": "medium",
-        "credit_label": "🟡 Trung bình (~2–3 credit/ảnh)",
-        "speed": "⏳ 8–12s",
-        "description": "Chất lượng siêu thực cao cấp. Tái tạo biểu cảm nhân vật, bàn tay, ánh sáng và chi tiết da xuất sắc; bám sát prompt phức tạp.",
-        "is_default": False,
-    },
-    "imagen_3_photoreal": {
-        "id": "imagen_3_photoreal",
-        "name": "Google Imagen 3 (Photorealistic / 35mm)",
-        "provider": "google_flow",
-        "badge": "🟡 Tư liệu thực tế",
-        "credit_tier": "standard",
-        "credit_label": "🟡 Tiêu chuẩn (~2 credit/ảnh)",
-        "speed": "⏳ 6–10s",
-        "description": "Phong cách ảnh tư liệu / Điện ảnh thực tế. Tối ưu đặc biệt cho video kể chuyện, phim tài liệu, hạn chế cảm giác bóng bẩy 3D/CGI.",
+        "description": "Model Pro ổn định thế hệ trước, tương thích hoàn toàn với các phong cách prompt cũ.",
         "is_default": False,
     },
 }
@@ -93,12 +82,12 @@ GOOGLE_FLOW_VIDEO_MODELS = {
         "id": "omni_1_1_flash",
         "name": "Omni 1.1 Flash",
         "provider": "google_flow",
-        "badge": "⚡ Mặc định / Siêu tốc",
+        "badge": "⚡ Mặc định / Chuẩn Flow",
         "credit_tier": "medium",
         "credit_label": "🟡 Tiêu chuẩn (~10 credit/clip)",
         "speed": "⚡ 15–25s",
         "description": "⭐ Model tạo video AI mặc định mới nhất của Google Flow. Tốc độ sinh siêu nhanh, chuyển động mượt mà và phối cảnh nhất quán.",
-        "is_default": False,
+        "is_default": True,
     },
     "veo_3_1_lite": {
         "id": "veo_3_1_lite",
@@ -109,7 +98,7 @@ GOOGLE_FLOW_VIDEO_MODELS = {
         "credit_label": "🟢 Thấp (~8 credit/clip)",
         "speed": "⏳ 20–30s",
         "description": "Bản rút gọn của Veo 3.1, tối ưu chi phí credit cho các cảnh intro ngắn.",
-        "is_default": True,
+        "is_default": False,
     },
     "veo_3_1_fast": {
         "id": "veo_3_1_fast",
@@ -174,6 +163,9 @@ DEFAULT_IMAGE_GENERATION_SETTINGS = {
     "enable_intro_video": True,
     "intro_scene_target_seconds": 8.0,
     "intro_crop_watermark": True,
+    "intro_video_max_wait_seconds": 900,
+    "intro_video_max_in_flight": 4,
+    "flow_image_max_in_flight": 2,
     "video_style_prompt": "Cinematic documentary film, 35mm motion picture composition, natural atmospheric lighting, realistic textures, balanced color grading, 4k cinematic video footage.",
     "video_negative_prompt": "still image, static photo, cartoon, anime, 3D CGI render, illustration, deformed hands, distorted anatomy, text, watermark, signature, logo, blurry, low resolution.",
     "video_prompt_template": "{frame_directive} Scene action: {action}. Visual style: {style}. {motion} Clean video without any text, letters, watermark, or subtitles.",
@@ -349,6 +341,8 @@ def normalize_image_generation_settings(value: object) -> dict:
     model = str(settings.get("model") or "").strip()
     if model in GOOGLE_FLOW_IMAGE_MODELS:
         normalized["model"] = model
+    elif model in {"nano_banana_2", "imagen_3_standard", "imagen_3_photoreal"}:
+        normalized["model"] = "nano_banana_2_1"
     elif model == "google_veo_intro":
         normalized["model"] = DEFAULT_IMAGE_MODEL
         normalized["video_model"] = "omni_1_1_flash"
@@ -429,6 +423,18 @@ def normalize_image_generation_settings(value: object) -> dict:
     except (TypeError, ValueError):
         normalized["intro_scene_target_seconds"] = 8.0
     normalized["intro_crop_watermark"] = bool(settings.get("intro_crop_watermark", True))
+    for key, default, minimum, maximum in (
+        ("intro_video_max_wait_seconds", 900, 60, 3600),
+        ("intro_video_max_in_flight", 4, 1, 12),
+        ("flow_image_max_in_flight", 2, 1, 4),
+    ):
+        try:
+            normalized[key] = max(
+                minimum,
+                min(maximum, int(settings.get(key, default) or default)),
+            )
+        except (TypeError, ValueError):
+            normalized[key] = default
     normalized["video_style_prompt"] = str(
         settings.get("video_style_prompt") if settings.get("video_style_prompt") is not None
         else DEFAULT_IMAGE_GENERATION_SETTINGS["video_style_prompt"]

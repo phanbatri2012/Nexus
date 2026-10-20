@@ -42,49 +42,92 @@ THUMBNAIL_DEFAULT_PATTERN = re.compile(
 
 SILENCE_MEDIA_INIT_SCRIPT = """
 (() => {
-    const silenceElement = (el) => {
-        try {
-            if (el && (el.tagName === 'VIDEO' || el.tagName === 'AUDIO')) {
-                el.muted = true;
-                el.volume = 0.0;
-                if (!el.paused) {
-                    el.pause();
-                }
-            }
-        } catch (e) {}
-    };
+    try {
+        const mediaProto = HTMLMediaElement.prototype;
+        const origMutedDesc = Object.getOwnPropertyDescriptor(mediaProto, 'muted');
+        const origVolumeDesc = Object.getOwnPropertyDescriptor(mediaProto, 'volume');
 
-    const silenceAll = () => {
-        document.querySelectorAll('video, audio').forEach(silenceElement);
-    };
-
-    silenceAll();
-    window.addEventListener('play', (e) => silenceElement(e.target), true);
-    window.addEventListener('playing', (e) => silenceElement(e.target), true);
-    window.addEventListener('loadeddata', (e) => silenceElement(e.target), true);
-    window.addEventListener('loadedmetadata', (e) => silenceElement(e.target), true);
-
-    const observer = new MutationObserver((mutations) => {
-        for (const mutation of mutations) {
-            for (const node of mutation.addedNodes) {
-                if (node.nodeType === 1) {
-                    if (node.tagName === 'VIDEO' || node.tagName === 'AUDIO') {
-                        silenceElement(node);
-                    } else if (node.querySelectorAll) {
-                        node.querySelectorAll('video, audio').forEach(silenceElement);
+        const enforceSilence = (el) => {
+            try {
+                if (el && (el.tagName === 'VIDEO' || el.tagName === 'AUDIO')) {
+                    if (origMutedDesc && origMutedDesc.set) {
+                        origMutedDesc.set.call(el, true);
+                    } else {
+                        el.muted = true;
                     }
+                    if (origVolumeDesc && origVolumeDesc.set) {
+                        origVolumeDesc.set.call(el, 0.0);
+                    } else {
+                        el.volume = 0.0;
+                    }
+                }
+            } catch (e) {}
+        };
+
+        if (!mediaProto.__tabSilenceInstalled) {
+            mediaProto.__tabSilenceInstalled = true;
+
+            Object.defineProperty(mediaProto, 'muted', {
+                get: function() { return true; },
+                set: function() {
+                    enforceSilence(this);
+                    return true;
+                },
+                configurable: true,
+                enumerable: true
+            });
+
+            Object.defineProperty(mediaProto, 'volume', {
+                get: function() { return 0.0; },
+                set: function() {
+                    enforceSilence(this);
+                    return 0.0;
+                },
+                configurable: true,
+                enumerable: true
+            });
+
+            ['volumechange', 'play', 'playing', 'loadeddata', 'loadedmetadata'].forEach((evt) => {
+                window.addEventListener(evt, (e) => enforceSilence(e.target), true);
+            });
+
+            const observer = new MutationObserver((mutations) => {
+                for (const mutation of mutations) {
+                    for (const node of mutation.addedNodes) {
+                        if (node.nodeType === 1) {
+                            if (node.tagName === 'VIDEO' || node.tagName === 'AUDIO') {
+                                enforceSilence(node);
+                            } else if (node.querySelectorAll) {
+                                node.querySelectorAll('video, audio').forEach(enforceSilence);
+                            }
+                        }
+                    }
+                }
+            });
+
+            if (document.documentElement) {
+                observer.observe(document.documentElement, { childList: true, subtree: true });
+            } else {
+                document.addEventListener('DOMContentLoaded', () => {
+                    observer.observe(document.documentElement, { childList: true, subtree: true });
+                });
+            }
+
+            const AudioCtx = window.AudioContext || window.webkitAudioContext;
+            if (AudioCtx && !AudioCtx.prototype.__tabSilenceInstalled) {
+                AudioCtx.prototype.__tabSilenceInstalled = true;
+                const origResume = AudioCtx.prototype.resume;
+                if (origResume) {
+                    AudioCtx.prototype.resume = function() {
+                        try { this.suspend(); } catch (e) {}
+                        return Promise.resolve();
+                    };
                 }
             }
         }
-    });
 
-    if (document.documentElement) {
-        observer.observe(document.documentElement, { childList: true, subtree: true });
-    } else {
-        document.addEventListener('DOMContentLoaded', () => {
-            observer.observe(document.documentElement, { childList: true, subtree: true });
-        });
-    }
+        document.querySelectorAll('video, audio').forEach(enforceSilence);
+    } catch (err) {}
 })();
 """
 
@@ -298,7 +341,7 @@ def _schedule_values_match(
 
 
 async def _silence_composer_video(page: Any) -> None:
-    """Mute and pause preview video player in Meta Reels Composer to eliminate background noise."""
+    """Mute tab media in Meta Reels Composer at page/prototype level without UI button interference."""
     if page is None:
         return
     try:
@@ -307,39 +350,10 @@ async def _silence_composer_video(page: Any) -> None:
     except Exception:
         return
 
-    # 1. Direct DOM pause and mute on all media elements
     try:
-        await page.evaluate(
-            """() => {
-                document.querySelectorAll('video, audio').forEach(el => {
-                    try {
-                        el.muted = true;
-                        el.volume = 0.0;
-                        if (!el.paused) {
-                            el.pause();
-                        }
-                    } catch (e) {}
-                });
-            }"""
-        )
+        await page.evaluate(SILENCE_MEDIA_INIT_SCRIPT)
     except Exception as exc:
-        logger.debug("Lỗi khi pause/mute video qua DOM evaluate: %s", exc)
-
-    # 2. UI Click fallback if mute / pause icon exists in Meta preview player
-    try:
-        mute_or_pause_btn = page.locator(
-            'div[aria-label*="Tắt tiếng" i], button[aria-label*="Tắt tiếng" i], '
-            'div[aria-label*="Mute" i], button[aria-label*="Mute" i], '
-            'div[aria-label*="Tạm dừng" i], button[aria-label*="Tạm dừng" i], '
-            'div[aria-label*="Pause" i], button[aria-label*="Pause" i]'
-        ).first
-        if await mute_or_pause_btn.is_visible():
-            try:
-                await mute_or_pause_btn.click(timeout=800)
-            except Exception:
-                await mute_or_pause_btn.evaluate("el => el.click()")
-    except Exception as exc:
-        logger.debug("Lỗi khi click nút tắt tiếng / tạm dừng UI: %s", exc)
+        logger.debug("Lỗi khi áp dụng silence script cho tab: %s", exc)
 
 
 async def _dismiss_unwanted_modals(page: Any) -> bool:

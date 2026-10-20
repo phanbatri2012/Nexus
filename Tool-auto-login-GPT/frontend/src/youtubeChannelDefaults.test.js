@@ -83,6 +83,7 @@ test('channel settings expose timezone-aware video publication slots', () => {
   assert.match(channelSettingsSource, /publication_paused/)
   assert.match(channelSettingsSource, /public_upload_verified/)
   assert.match(channelSettingsSource, /Thêm khung giờ đăng/)
+  assert.match(channelSettingsSource, /Mỗi ngày/)
 })
 
 test('legacy video import supports channel-wide selection with exact dedupe states', () => {

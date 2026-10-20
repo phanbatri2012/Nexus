@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import html
 import json
 import logging
 import re
 import time
+import unicodedata
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -23,6 +25,19 @@ from auto_yt.services.channel_scanner_service import channel_browser_session, cl
 from auto_yt.services.browser_diagnostics import capture_browser_diagnostics_async
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_youtube_metadata_field(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return ""
+    val = html.unescape(text)
+    val = val.replace("\u00a0", " ").replace("\u200b", "").replace("\ufeff", "")
+    val = unicodedata.normalize("NFC", val)
+    val = re.sub(r":::[a-zA-Z0-9_\-]*(?:\{[^}]*\})?", "", val, flags=re.DOTALL)
+    val = re.sub(r"(?m)^\s*:::\s*$", "", val)
+    val = re.sub(r"\s*:::\s*$", "", val)
+    val = re.sub(r"\\([!:#\[\]\(\)\.\?\-\*_`|])", r"\1", val)
+    return val.strip()
 
 
 class BrowserUploadError(RuntimeError):
@@ -135,34 +150,6 @@ UPLOAD_MONETIZATION_TRIGGER_SELECTORS = [
     "ytcp-uploads-dialog #monetization-step ytcp-dropdown-trigger",
     "ytcp-video-upload-dialog ytcp-video-monetization ytcp-dropdown-trigger",
 ]
-AD_SUITABILITY_ROOT_SELECTORS = [
-    "ytpp-self-certification-questionnaire",
-    "ytcp-uploads-dialog ytpp-self-certification-questionnaire",
-    "ytcp-uploads-dialog ytcp-self-certification",
-    "ytcp-video-upload-dialog ytcp-self-certification",
-    "ytcp-uploads-dialog [test-id='self-certification']",
-    "ytcp-self-certification",
-]
-AD_SUITABILITY_NONE_SELECTORS = [
-    "ytcp-checkbox-lit.all-none-checkbox",
-    "ytpp-self-certification-questionnaire ytcp-checkbox-lit",
-    "ytcp-self-certification #none-of-the-above-checkbox",
-    "ytcp-self-certification tp-yt-paper-checkbox:has-text('Không chứa nội dung nào ở trên')",
-    "ytcp-self-certification tp-yt-paper-checkbox:has-text('None of the above')",
-    "tp-yt-paper-checkbox:has-text('Không chứa nội dung nào ở trên')",
-    "tp-yt-paper-checkbox:has-text('None of the above')",
-    "[aria-label*='Không chứa nội dung nào ở trên' i]",
-    "[aria-label*='None of the above' i]",
-]
-AD_SUITABILITY_SUBMIT_SELECTORS = [
-    "ytpp-self-certification-predictor ytcp-button",
-    "ytpp-self-certification-predictor #submit-questionnaire-button",
-    "ytcp-self-certification ytcp-button#submit-questionnaire-button",
-    "ytcp-button#submit-questionnaire-button",
-    "ytcp-button:has-text('Gửi thông tin đánh giá')",
-    "ytcp-button:has-text('Submit rating')",
-    "#submit-questionnaire-button button",
-]
 UPLOAD_THUMBNAIL_PREVIEW_SELECTOR = (
     "ytcp-uploads-dialog ytcp-video-custom-still-editor img[src], "
     "ytcp-uploads-dialog ytcp-video-thumbnail-editor img[src], "
@@ -190,6 +177,53 @@ MONETIZATION_MODES = {
     MONETIZATION_MODE_REQUIRE,
 }
 DEFAULT_STEP_TIMEOUT_SECONDS = 20.0
+
+AD_SUITABILITY_ROOT_SELECTORS = (
+    "ytcp-uploads-dialog[workflow-step='CONTENT_RATINGS'] ytcp-uploads-content-ratings",
+    "ytcp-uploads-dialog ytcp-uploads-content-ratings ytpp-self-certification-questionnaire",
+    "ytcp-uploads-dialog ytpp-self-certification-questionnaire",
+    "ytcp-video-upload-dialog ytpp-self-certification-questionnaire",
+    "ytcp-uploads-dialog ytcp-self-certification",
+    "ytcp-video-upload-dialog ytcp-self-certification",
+    "ytcp-uploads-dialog [test-id='self-certification']",
+    "ytpp-self-certification-questionnaire",
+    "ytcp-self-certification",
+)
+AD_SUITABILITY_STEP_SELECTORS = (
+    "ytcp-uploads-dialog [test-id='CONTENT_RATINGS'][aria-selected='true']",
+    "ytcp-video-upload-dialog [test-id='CONTENT_RATINGS'][aria-selected='true']",
+)
+AD_SUITABILITY_NONE_SELECTORS = [
+    "ytcp-checkbox-lit.all-none-checkbox",
+    "ytpp-self-certification-questionnaire ytcp-checkbox-lit.all-none-checkbox",
+    "ytpp-self-certification-questionnaire ytcp-checkbox-lit",
+    "ytpp-self-certification-questionnaire ytcp-checkbox-lit:has-text('Không chứa nội dung nào ở trên')",
+    "ytpp-self-certification-questionnaire [role='checkbox'][aria-label*='Không chứa nội dung nào ở trên' i]",
+    "ytpp-self-certification-questionnaire ytcp-checkbox-lit:has-text('None of the above')",
+    "ytpp-self-certification-questionnaire [role='checkbox'][aria-label*='None of the above' i]",
+    "ytcp-self-certification #none-of-the-above-checkbox",
+    "ytcp-self-certification tp-yt-paper-checkbox:has-text('Không chứa nội dung nào ở trên')",
+    "ytcp-self-certification tp-yt-paper-checkbox:has-text('None of the above')",
+    "tp-yt-paper-checkbox:has-text('Không chứa nội dung nào ở trên')",
+    "tp-yt-paper-checkbox:has-text('None of the above')",
+    "[aria-label*='Không chứa nội dung nào ở trên' i]",
+    "[aria-label*='None of the above' i]",
+]
+AD_SUITABILITY_SUBMIT_SELECTORS = [
+    "ytpp-self-certification-predictor ytcp-button",
+    "ytpp-self-certification-predictor ytcp-button#submit-questionnaire-button",
+    "ytpp-self-certification-predictor #submit-questionnaire-button",
+    "ytpp-self-certification-questionnaire ytcp-button#submit-questionnaire-button",
+    "ytpp-self-certification-questionnaire ytcp-button:has-text('Gửi thông tin đánh giá')",
+    "ytpp-self-certification-questionnaire ytcp-button:has-text('Submit rating')",
+    "ytcp-self-certification ytcp-button#submit-questionnaire-button",
+    "ytcp-self-certification ytcp-button:has-text('Gửi thông tin đánh giá')",
+    "ytcp-self-certification ytcp-button:has-text('Submit rating')",
+    "ytcp-button#submit-questionnaire-button",
+    "ytcp-button:has-text('Gửi thông tin đánh giá')",
+    "ytcp-button:has-text('Submit rating')",
+    "#submit-questionnaire-button button",
+]
 
 
 def _format_date_for_picker(date_obj: dt.date, is_vietnamese: bool = True) -> str:
@@ -236,6 +270,30 @@ async def _has_visible_element(page, selectors: list[str]) -> bool:
         except Exception:
             continue
     return False
+
+
+async def _has_upload_dialog_input(page) -> bool:
+    """Check if YouTube Studio upload dialog or file input is present and attached."""
+    try:
+        for sel in (
+            "ytcp-uploads-dialog input[type='file']",
+            "ytcp-video-upload-dialog input[type='file']",
+            "input[type='file']",
+        ):
+            el = await page.query_selector(sel)
+            if el is not None:
+                return True
+        dialog = await page.query_selector("ytcp-uploads-dialog, ytcp-video-upload-dialog")
+        if dialog is not None:
+            has_content = await dialog.evaluate(
+                "d => d.children.length > 0 && !d.hasAttribute('hidden')"
+            )
+            if has_content:
+                return True
+    except Exception:
+        pass
+    return False
+
 
 
 async def _ensure_altered_content_controls_visible(page, timeout_ms: int = 10000) -> None:
@@ -797,6 +855,105 @@ async def _set_checkbox(page, selectors: list[str], desired: bool) -> bool:
     return False
 
 
+async def _wait_for_ad_suitability(
+    page,
+    *,
+    timeout_seconds: float = DEFAULT_STEP_TIMEOUT_SECONDS,
+):
+    """Wait for the visible ad-suitability questionnaire inside the upload wizard."""
+    deadline = time.monotonic() + max(0.1, timeout_seconds)
+    while time.monotonic() < deadline:
+        for selector in AD_SUITABILITY_ROOT_SELECTORS:
+            elements = await _visible_upload_dialog_elements(page, selector)
+            if elements:
+                return elements[0]
+        await asyncio.sleep(0.25)
+    return None
+
+
+async def _wait_for_ad_suitability_saved(
+    page,
+    *,
+    timeout_seconds: float = 4.0,
+) -> bool:
+    """Confirm Studio acknowledged the submitted questionnaire."""
+    deadline = time.monotonic() + max(0.1, timeout_seconds)
+    toast_selectors = [
+        "tp-yt-paper-toast:has-text('Đã lưu thông tin đánh giá')",
+        "tp-yt-paper-toast:has-text('Rating saved')",
+        "ytcp-toast:has-text('Đã lưu thông tin đánh giá')",
+        "ytcp-toast:has-text('Rating saved')",
+    ]
+    while time.monotonic() < deadline:
+        if await _has_visible_element(page, toast_selectors):
+            return True
+        for selector in AD_SUITABILITY_SUBMIT_SELECTORS:
+            for submit_btn in await _visible_upload_dialog_elements(page, selector):
+                disabled = await submit_btn.get_attribute("disabled")
+                aria_disabled = str(
+                    await submit_btn.get_attribute("aria-disabled") or ""
+                ).lower()
+                if disabled is not None or aria_disabled == "true":
+                    return True
+        await asyncio.sleep(0.3)
+    return False
+
+
+async def _complete_ad_suitability(
+    page,
+    *,
+    progress: Callable[[str, str, int], None],
+    persist_checkpoint: Callable[[str, dict[str, Any]], None],
+    timeout_seconds: float = DEFAULT_STEP_TIMEOUT_SECONDS,
+) -> None:
+    """Complete the post-upload ad-suitability step without touching file upload."""
+    ad_suitability = await _wait_for_ad_suitability(
+        page,
+        timeout_seconds=timeout_seconds,
+    )
+    if ad_suitability is None:
+        active_step = await _has_visible_element(page, list(AD_SUITABILITY_STEP_SELECTORS))
+        logger.warning(
+            "ad_suitability_not_found content_ratings_step_active=%s",
+            active_step,
+        )
+        raise BrowserUploadNeedsReview(
+            "Đã bật kiếm tiền nhưng không tìm thấy bước tự đánh giá quảng cáo."
+        )
+
+    progress("Đang hoàn tất tự đánh giá quảng cáo...", "self_certification", 70)
+    try:
+        await ad_suitability.scroll_into_view_if_needed()
+    except Exception:
+        pass
+
+    if not await _set_checkbox(page, AD_SUITABILITY_NONE_SELECTORS, True):
+        raise BrowserUploadNeedsReview(
+            "Không thể chọn 'Không chứa nội dung nào ở trên'."
+        )
+
+    try:
+        await _require_click(
+            page,
+            AD_SUITABILITY_SUBMIT_SELECTORS,
+            "Không thể gửi thông tin tự đánh giá quảng cáo.",
+            timeout_ms=5000,
+        )
+    except BrowserUploadError as exc:
+        raise BrowserUploadNeedsReview(str(exc)) from exc
+
+    if not await _wait_for_ad_suitability_saved(page):
+        raise BrowserUploadNeedsReview(
+            "Đã gửi tự đánh giá quảng cáo nhưng YouTube Studio chưa xác nhận đã lưu."
+        )
+
+    _emit_checkpoint(
+        persist_checkpoint,
+        "suitability_verified",
+        ad_suitability_state="none_of_the_above",
+    )
+
+
 def _parse_schedule_at(schedule_at: str, timezone_name: str) -> dt.datetime:
     try:
         parsed = dt.datetime.fromisoformat(str(schedule_at).replace("Z", "+00:00"))
@@ -808,6 +965,124 @@ def _parse_schedule_at(schedule_at: str, timezone_name: str) -> dt.datetime:
         return parsed.astimezone(ZoneInfo(timezone_name))
     except Exception as exc:
         raise BrowserUploadError(f"Timezone kênh không hợp lệ: {timezone_name}") from exc
+
+
+def _first_progress_percent(*texts: str) -> int | None:
+    for text in texts:
+        match = re.search(r"(\d+)\s*%", str(text or ""))
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _classify_file_upload_status(status: dict[str, Any]) -> dict[str, Any]:
+    """Keep upload progress separate from YouTube's non-blocking checks progress."""
+    dialog_found = bool(status.get("dialogFound"))
+    monitor_found = bool(status.get("monitorFound"))
+    upload_text = str(status.get("uploadText") or "").strip()
+    checks_text = str(status.get("checksText") or "").strip()
+    progress_text = str(status.get("progressText") or "").strip()
+    footer_text = str(status.get("footerText") or "").strip()
+    monitor_text = str(status.get("monitorText") or "").strip()
+    body_text = str(status.get("bodyText") or "").strip()
+
+    status_texts = (upload_text, progress_text, footer_text, monitor_text, checks_text, body_text)
+    combined = " ".join(text.lower() for text in status_texts if text)
+    interrupted = any(
+        marker in combined
+        for marker in (
+            "quá trình tải lên bị gián đoạn",
+            "upload process interrupted",
+            "upload interrupted",
+            "tạm dừng",
+            "upload paused",
+        )
+    )
+
+    checks_markers = (
+        "đang kiểm tra",
+        "quá trình kiểm tra sắp bắt đầu",
+        "kiểm tra đang diễn ra",
+        "kiểm tra hoàn tất",
+        "đã kiểm tra xong",
+        "checking",
+        "checks are running",
+        "checks in progress",
+        "checks will begin",
+        "checks complete",
+        "không tìm thấy vấn đề",
+        "không phát hiện vấn đề",
+        "no issues found",
+    )
+    processing_markers = (
+        "quá trình xử lý sắp bắt đầu",
+        "processing will begin shortly",
+        "đang xử lý phiên bản",
+        "đang xử lý",
+        "processing",
+        "đã xử lý xong",
+        "đã xử lý",
+    )
+    upload_done_markers = (
+        "đã hoàn tất quá trình tải lên",
+        "upload complete",
+        "đã tải lên 100%",
+        "100% uploaded",
+        "đã tải được 100%",
+        "đã lưu ở chế độ riêng tư",
+        "đã lưu ở chế độ riêng tư",
+        "saved as private",
+        "đã lưu ở chế độ không công khai",
+        "saved as unlisted",
+    )
+
+    def has_marker(text: str, markers: tuple[str, ...]) -> bool:
+        lowered = text.lower()
+        return any(marker in lowered for marker in markers)
+
+    checks_status_texts = tuple(
+        text for text in (checks_text, progress_text, monitor_text) if has_marker(text, checks_markers)
+    )
+    checks_active = bool(checks_status_texts)
+    checks_percent = _first_progress_percent(*checks_status_texts)
+
+    upload_percent = _first_progress_percent(upload_text)
+    if upload_percent is None:
+        upload_progress_texts = tuple(
+            text
+            for text in (progress_text, monitor_text)
+            if not has_marker(text, checks_markers)
+            and any(marker in text.lower() for marker in ("đang tải", "tải lên", "upload"))
+        )
+        upload_percent = _first_progress_percent(*upload_progress_texts)
+
+    if upload_percent is not None:
+        # An explicit upload percentage is authoritative even if checks have
+        # already started in parallel. Checks progress must never promote a
+        # partial file upload to complete.
+        upload_done = not interrupted and upload_percent >= 100
+    else:
+        upload_done = (
+            not interrupted
+            and (
+                any(marker in combined for marker in upload_done_markers)
+                or checks_active
+                or any(marker in combined for marker in processing_markers)
+                or (not dialog_found and not monitor_found)
+            )
+        )
+    if upload_done:
+        upload_percent = 100
+
+    clean_text = upload_text or progress_text or monitor_text or footer_text
+    return {
+        "isDone": upload_done,
+        "isInterrupted": interrupted,
+        "uploadPercent": upload_percent,
+        "checksPercent": checks_percent,
+        "cleanText": clean_text,
+        "checksText": " ".join(checks_status_texts).strip(),
+    }
 
 
 async def _wait_for_file_upload_complete(
@@ -829,71 +1104,29 @@ async def _wait_for_file_upload_complete(
         () => {
             const dialog = document.querySelector('ytcp-uploads-dialog, ytcp-video-upload-dialog, ytcp-video-metadata-editor');
             const bottomMonitor = document.querySelector('ytcp-multi-progress-monitor, ytcp-upload-progress, ytcp-toast, .progress-label');
-
-            if (!dialog && !bottomMonitor) {
-                const bodyText = (document.body?.innerText || '').toLowerCase();
-                const hasInterrupted = bodyText.includes('quá trình tải lên bị gián đoạn')
-                    || bodyText.includes('upload process interrupted')
-                    || bodyText.includes('upload interrupted');
-                return { isDone: !hasInterrupted, isInterrupted: hasInterrupted, cleanText: 'no_dialog', pctVal: hasInterrupted ? null : 100 };
-            }
-
-            const progressEl = (dialog ? dialog.querySelector('ytcp-video-upload-progress, .progress-label, ytcp-badge, #dialog-title + *') : null)
-                || document.querySelector('ytcp-video-upload-progress, ytcp-multi-progress-monitor .progress-label, .progress-label');
+            const uploadEl = (dialog ? dialog.querySelector('ytcp-video-upload-progress') : null)
+                || document.querySelector('ytcp-video-upload-progress');
+            const checksEl = (dialog ? dialog.querySelector('ytcp-video-checks') : null)
+                || document.querySelector('ytcp-video-checks');
+            const progressEl = (dialog ? dialog.querySelector('.progress-label, ytcp-badge, #dialog-title + *') : null)
+                || document.querySelector('ytcp-multi-progress-monitor .progress-label, .progress-label');
             const footerEl = dialog ? dialog.querySelector('ytcp-video-metadata-editor-footer, #dialog-footer, .footer, ytcp-animatable') : null;
 
+            const uploadText = uploadEl ? (uploadEl.innerText || uploadEl.textContent || '').trim() : '';
+            const checksText = checksEl ? (checksEl.innerText || checksEl.textContent || '').trim() : '';
             const progressText = progressEl ? (progressEl.innerText || progressEl.textContent || '').trim() : '';
             const footerText = footerEl ? (footerEl.innerText || footerEl.textContent || '').trim() : '';
             const monitorText = bottomMonitor ? (bottomMonitor.innerText || bottomMonitor.textContent || '').trim() : '';
-
-            const combinedProgress = (progressText + ' ' + footerText + ' ' + monitorText).toLowerCase();
-
-            const isInterrupted = combinedProgress.includes('quá trình tải lên bị gián đoạn')
-                || combinedProgress.includes('upload process interrupted')
-                || combinedProgress.includes('upload interrupted')
-                || combinedProgress.includes('tạm dừng')
-                || combinedProgress.includes('upload paused');
-
-            let pctVal = null;
-            const m = (progressText + ' ' + footerText + ' ' + monitorText).match(/(\\d+)\\s*%/);
-            if (m) {
-                pctVal = parseInt(m[1], 10);
-            }
-
-            const doneKeywords = [
-                "đã hoàn tất quá trình tải lên",
-                "upload complete",
-                "đã tải lên 100%",
-                "100% uploaded",
-                "đã tải được 100%",
-                "quá trình xử lý sắp bắt đầu",
-                "processing will begin shortly",
-                "quá trình kiểm tra sắp bắt đầu",
-                "đang xử lý phiên bản",
-                "đang xử lý",
-                "processing",
-                "đã xử lý xong",
-                "đã xử lý",
-                "kiểm tra hoàn tất",
-                "đã kiểm tra xong",
-                "checks complete",
-                "không tìm thấy vấn đề",
-                "không phát hiện vấn đề",
-                "no issues found",
-            ];
-
-            let isDone = false;
-            if (pctVal !== null) {
-                isDone = (pctVal >= 100);
-            } else {
-                isDone = doneKeywords.some(k => combinedProgress.includes(k));
-            }
-
+            const bodyText = (!dialog && !bottomMonitor) ? (document.body?.innerText || '').trim() : '';
             return {
-                isDone: Boolean(isDone && !isInterrupted),
-                isInterrupted: Boolean(isInterrupted),
-                pctVal: pctVal,
-                cleanText: progressText || footerText || monitorText || (pctVal !== null ? `${pctVal}%` : (isDone ? 'Đã tải lên và xử lý xong' : ''))
+                dialogFound: Boolean(dialog),
+                monitorFound: Boolean(bottomMonitor),
+                uploadText,
+                checksText,
+                progressText,
+                footerText,
+                monitorText,
+                bodyText,
             };
         }
         """)
@@ -902,11 +1135,15 @@ async def _wait_for_file_upload_complete(
         is_done = False
         is_interrupted = False
         pct_val = None
+        checks_pct = None
 
         if isinstance(status_info, dict):
+            if "dialogFound" in status_info or "monitorFound" in status_info:
+                status_info = _classify_file_upload_status(status_info)
             is_done = bool(status_info.get("isDone"))
             is_interrupted = bool(status_info.get("isInterrupted"))
-            pct_val = status_info.get("pctVal")
+            pct_val = status_info.get("uploadPercent", status_info.get("pctVal"))
+            checks_pct = status_info.get("checksPercent")
             clean_text = str(status_info.get("cleanText") or "").strip()
         elif isinstance(status_info, str):
             clean_text = status_info.strip()
@@ -946,6 +1183,17 @@ async def _wait_for_file_upload_complete(
                 f"Quá trình tải lên YouTube bị gián đoạn ({clean_text or 'Upload process interrupted'})."
             )
 
+        if is_done or (pct_val is not None and pct_val >= 100) or last_pct >= 100:
+            logger.info(
+                "Quá trình upload file MP4 lên YouTube đã hoàn tất (upload=%s%%, checks=%s%%, status=%s)",
+                pct_val if pct_val is not None else "unknown",
+                checks_pct if checks_pct is not None else "not-reported",
+                clean_text,
+            )
+            if progress:
+                progress("Đã tải xong 100% file video lên YouTube.", "upload_complete", 65)
+            return
+
         if pct_val is not None:
             if pct_val > last_pct:
                 last_progress_time = time.monotonic()
@@ -954,12 +1202,6 @@ async def _wait_for_file_upload_complete(
                 mapped_pct = int(20 + (pct_val * 0.45))
                 if progress:
                     progress(f"Đang tải video lên YouTube ({clean_text or f'{pct_val}%'})...", "uploading_file", mapped_pct)
-
-        if is_done or (pct_val is not None and pct_val >= 100) or last_pct >= 100:
-            logger.info("Quá trình upload file MP4 lên YouTube đã hoàn tất (%s)", clean_text)
-            if progress:
-                progress("Đã tải xong 100% file video lên YouTube.", "upload_complete", 65)
-            return
 
         # Check for stalled upload (no progress change for 15+ minutes)
         if (time.monotonic() - last_progress_time) > stall_timeout_seconds and last_pct < 100:
@@ -2959,7 +3201,9 @@ async def upload_video_via_browser(
         1800.0,
     )
 
-    tags_list = tags or []
+    title = _sanitize_youtube_metadata_field(title)
+    description = _sanitize_youtube_metadata_field(description)
+    tags_list = [_sanitize_youtube_metadata_field(t) for t in (tags or []) if _sanitize_youtube_metadata_field(t)]
     settings = dict(publishing_settings or {})
     monetization_mode = str(
         settings.get("monetization_mode") or MONETIZATION_MODE_AUTO
@@ -3230,17 +3474,23 @@ async def upload_video_via_browser(
             if not resuming_existing_draft:
                 # 2. Click Quick Upload Icon (↑) or Create button (+) -> Upload videos
                 progress("Đang mở hộp thoại Tải video lên...", "opening_upload_dialog", 15)
-                dialog_opened = bool(await page.query_selector("ytcp-uploads-dialog, ytcp-video-upload-dialog"))
+                dialog_open = await _has_upload_dialog_input(page)
 
-                # 2.1 Try direct Quick Upload Icon (↑) on header if present
-                if not dialog_opened:
-                    quick_clicked = await _safe_click(page, UPLOAD_QUICK_ICON_SELECTORS, timeout_ms=3000)
-                    if quick_clicked:
-                        await asyncio.sleep(1.0)
-                        dialog_opened = bool(await page.query_selector("ytcp-uploads-dialog, ytcp-video-upload-dialog"))
+                if not dialog_open:
+                    # 2a. Quick actions: direct upload icon on dashboard if visible
+                    quick_upload_clicked = await _safe_click(
+                        page,
+                        UPLOAD_QUICK_ICON_SELECTORS,
+                        timeout_ms=3000,
+                    )
+                    if quick_upload_clicked:
+                        await asyncio.sleep(2.0)
+                        dialog_open = await _has_upload_dialog_input(page)
 
-                # 2.2 If not opened via Quick Icon, try Create button (+) dropdown
-                if not dialog_opened:
+                if not dialog_open:
+                    # 2b. Header Create button (+) -> Dropdown "Upload videos"
+                    # Note: exact match [aria-label='Tạo' i] / [aria-label='Create' i] to avoid
+                    # falsely matching [aria-label="Trò chuyện với Bộ phận hỗ trợ nhà sáng tạo"]!
                     create_clicked = await _safe_click(
                         page,
                         UPLOAD_CREATE_BUTTON_SELECTORS,
@@ -3248,32 +3498,49 @@ async def upload_video_via_browser(
                     )
                     if create_clicked:
                         await asyncio.sleep(1.0)
-                        try:
-                            await _require_click(
-                                page,
-                                UPLOAD_CREATE_MENU_ITEM_SELECTORS,
-                                "Không thể mở upload dialog từ menu Tạo.",
-                                timeout_ms=4000,
-                            )
-                            dialog_opened = True
-                        except BrowserUploadError:
-                            logger.warning("Menu Tạo mở nhưng không click được mục Tải video lên; kích hoạt fallback điều hướng...")
+                        menu_clicked = await _safe_click(
+                            page,
+                            UPLOAD_CREATE_MENU_ITEM_SELECTORS,
+                            timeout_ms=4000,
+                        )
+                        if menu_clicked:
+                            await asyncio.sleep(2.0)
+                            dialog_open = await _has_upload_dialog_input(page)
 
-                # 2.3 Fallback to direct navigation if dialog still not opened
-                if not dialog_opened and not await page.query_selector("ytcp-uploads-dialog, ytcp-video-upload-dialog"):
-                    logger.warning("Chưa mở được dialog tải lên; điều hướng trực tiếp đến trang upload...")
+                # Wait for file input or upload dialog to be attached in the DOM
+                file_input_ready = False
+                for _ in range(15):
+                    cancel_check()
+                    if await _has_upload_dialog_input(page):
+                        file_input_ready = True
+                        break
+                    await asyncio.sleep(1.0)
+
+                if not file_input_ready:
+                    # Fallback only if clicking failed AND dialog is not present
+                    logger.warning("Chưa mở được upload dialog; thử điều hướng đến trang upload...")
                     await page.goto(
                         f"{studio_url.rstrip('/')}/videos/upload?d=pt",
                         wait_until="domcontentloaded",
                     )
-                    await asyncio.sleep(2.0)
+                    await asyncio.sleep(3.0)
+                    for _ in range(10):
+                        cancel_check()
+                        if await _has_upload_dialog_input(page):
+                            file_input_ready = True
+                            break
+                        await asyncio.sleep(1.0)
+
+                if not file_input_ready:
+                    raise BrowserUploadError("Không thể mở upload dialog trên YouTube Studio.")
 
                 # 3. Inject Video MP4 File (via CDP to bypass Playwright 50MB limit)
                 progress("Đang nạp file video MP4...", "uploading_file", 20)
                 await _cdp_set_input_files(
                     page,
                     "ytcp-uploads-dialog input[type='file'], "
-                    "ytcp-video-upload-dialog input[type='file']",
+                    "ytcp-video-upload-dialog input[type='file'], "
+                    "input[type='file']",
                     video_path,
                     timeout_ms=15000,
                 )
@@ -3695,6 +3962,9 @@ async def upload_video_via_browser(
                         "ytcp-radio-button[name='MONETIZATION_ON']",
                         "tp-yt-paper-radio-button[name='ON']",
                         "tp-yt-paper-radio-button[name='MONETIZATION_ON']",
+                        "ytcp-video-monetization-edit-dialog tp-yt-paper-radio-button[name='ON']",
+                        "ytcp-video-monetization-edit-dialog tp-yt-paper-radio-button:has-text('Bật')",
+                        "ytcp-video-monetization-edit-dialog tp-yt-paper-radio-button:has-text('On')",
                         "ytcp-dialog tp-yt-paper-radio-button:has-text('Bật')",
                         "ytcp-dialog tp-yt-paper-radio-button:has-text('On')",
                         "ytcp-dialog ytcp-radio-button:has-text('Bật')",
@@ -3710,6 +3980,9 @@ async def upload_video_via_browser(
                         "ytcp-radio-button[name='MONETIZATION_OFF']",
                         "tp-yt-paper-radio-button[name='OFF']",
                         "tp-yt-paper-radio-button[name='MONETIZATION_OFF']",
+                        "ytcp-video-monetization-edit-dialog tp-yt-paper-radio-button[name='OFF']",
+                        "ytcp-video-monetization-edit-dialog tp-yt-paper-radio-button:has-text('Tắt')",
+                        "ytcp-video-monetization-edit-dialog tp-yt-paper-radio-button:has-text('Off')",
                         "ytcp-dialog tp-yt-paper-radio-button:has-text('Tắt')",
                         "ytcp-dialog tp-yt-paper-radio-button:has-text('Off')",
                         "ytcp-dialog ytcp-radio-button:has-text('Tắt')",
@@ -3739,11 +4012,16 @@ async def upload_video_via_browser(
                 await _require_click(
                     page,
                     [
+                        "ytcp-video-monetization-edit-dialog #save-button",
+                        "ytcp-video-monetization-edit-dialog ytcp-button#save-button",
+                        "ytcp-video-monetization-edit-dialog ytcp-button:has-text('Xong')",
+                        "ytcp-video-monetization-edit-dialog ytcp-button:has-text('Done')",
                         "ytcp-video-monetization ytcp-button#save-button",
                         "ytcp-video-monetization ytcp-button:has-text('Xong')",
                         "ytcp-video-monetization ytcp-button:has-text('Done')",
                         "ytcp-dialog ytcp-button:has-text('Xong')",
                         "ytcp-dialog ytcp-button:has-text('Done')",
+                        "ytcp-button#save-button",
                         "#save-button button",
                         "ytcp-button:has-text('Xong')",
                         "ytcp-button:has-text('Done')",
@@ -3775,74 +4053,10 @@ async def upload_video_via_browser(
                         "Không thể chuyển sang bước tự đánh giá quảng cáo.",
                         timeout_ms=5000,
                     )
-                    await asyncio.sleep(2.0)
-                    ad_suitability = None
-                    for selector in AD_SUITABILITY_ROOT_SELECTORS:
-                        el = await page.query_selector(selector)
-                        if el is not None and await el.is_visible():
-                            ad_suitability = el
-                            break
-                    if ad_suitability is None:
-                        ad_suitability = await page.query_selector(
-                            ", ".join(AD_SUITABILITY_ROOT_SELECTORS)
-                        )
-                    if ad_suitability is None:
-                        raise BrowserUploadNeedsReview(
-                            "Đã bật kiếm tiền nhưng không tìm thấy bước tự đánh giá quảng cáo."
-                        )
-                    progress("Đang hoàn tất tự đánh giá quảng cáo...", "self_certification", 70)
-                    try:
-                        await ad_suitability.evaluate("element => element.scrollTop = element.scrollHeight")
-                    except Exception:
-                        pass
-                    await _require_click(
+                    await _complete_ad_suitability(
                         page,
-                        AD_SUITABILITY_NONE_SELECTORS,
-                        "Không thể chọn 'Không chứa nội dung nào ở trên'.",
-                        timeout_ms=5000,
-                    )
-                    await _require_selected(
-                        page,
-                        AD_SUITABILITY_NONE_SELECTORS,
-                        "YouTube Studio không xác nhận lựa chọn tự đánh giá quảng cáo.",
-                    )
-                    await _require_click(
-                        page,
-                        AD_SUITABILITY_SUBMIT_SELECTORS,
-                        "Không thể gửi thông tin tự đánh giá quảng cáo.",
-                        timeout_ms=5000,
-                    )
-                    suitability_saved = False
-                    for _ in range(12):
-                        saved_marker = await page.query_selector(
-                            "tp-yt-paper-toast:has-text('Đã lưu thông tin đánh giá'), "
-                            "tp-yt-paper-toast:has-text('Rating saved'), "
-                            "ytcp-toast:has-text('Đã lưu thông tin đánh giá'), "
-                            "ytcp-toast:has-text('Rating saved')"
-                        )
-                        if saved_marker is not None and await saved_marker.is_visible():
-                            suitability_saved = True
-                            break
-                        submit_btn = await page.query_selector("ytcp-self-certification ytcp-button#submit-questionnaire-button")
-                        if submit_btn is not None:
-                            disabled = await submit_btn.get_attribute("disabled")
-                            aria_disabled = await submit_btn.get_attribute("aria-disabled")
-                            if disabled is not None or str(aria_disabled).lower() == "true":
-                                suitability_saved = True
-                                break
-                        await asyncio.sleep(0.3)
-                    if not suitability_saved:
-                        next_btn = await page.query_selector("ytcp-uploads-dialog ytcp-button#next-button, ytcp-video-upload-dialog ytcp-button#next-button")
-                        if next_btn is not None and await next_btn.is_visible():
-                            suitability_saved = True
-                    if not suitability_saved:
-                        raise BrowserUploadNeedsReview(
-                            "Đã gửi tự đánh giá quảng cáo nhưng YouTube Studio chưa xác nhận đã lưu."
-                        )
-                    _emit_checkpoint(
-                        persist_checkpoint,
-                        "suitability_verified",
-                        ad_suitability_state="none_of_the_above",
+                        progress=progress,
+                        persist_checkpoint=persist_checkpoint,
                     )
                     await _require_click(
                         page,

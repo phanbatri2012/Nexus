@@ -1,7 +1,9 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useSubRoute } from './router.js'
 import { extractErrorMessage } from './apiError'
+import { findMarketByTimezone, getMarketLocalTime } from './marketConstants'
 import './TrustBuilder.css'
+import { formatDateTimeAMPM } from './publicationTime.js'
 
 const API_BASE = 'http://127.0.0.1:8080'
 
@@ -57,7 +59,11 @@ function getActivityIcon(type) {
     case 'watch': return '👁️'
     case 'like': return '👍'
     case 'comment': return '💬'
+    case 'comment_attempt': return '💬'
     case 'subscribe': return '🔔'
+    case 'subscribe_attempt': return '🔔'
+    case 'like_attempt': return '👍'
+    case 'engagement_preview': return '👁️'
     case 'branding_audit': return '🛡️'
     case 'error': return '⚠️'
     default: return '⚡'
@@ -76,7 +82,7 @@ export default function TrustBuilder() {
   const [activeJob, setActiveJob] = useState(null)
   const [actionBusy, setActionBusy] = useState(false)
   const [feedback, setFeedback] = useState({ message: '', type: '' })
-  
+
   // Keyword & Channel inputs
   const [keywordInput, setKeywordInput] = useState('')
   const [targetChannelInput, setTargetChannelInput] = useState('')
@@ -378,12 +384,14 @@ export default function TrustBuilder() {
     if (!selectedChannelId) return
     setActionBusy(true)
     try {
+      const channel = channels.find(c => c.id === selectedChannelId)
+      const isVN = !channel?.publication_timezone || channel?.publication_timezone === 'Asia/Ho_Chi_Minh'
       const res = await fetch(`${API_BASE}/api/trust-builder/plans`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           channel_db_id: selectedChannelId,
-          niche_keywords: ['công nghệ', 'xu hướng', 'kiến thức thú vị'],
+          niche_keywords: isVN ? ['công nghệ', 'xu hướng', 'kiến thức thú vị'] : [],
           target_channels: [],
           daily_watch_target: 5,
           daily_search_target: 3,
@@ -402,7 +410,8 @@ export default function TrustBuilder() {
       } else {
         showFeedback(extractErrorMessage(data, 'Không thể tạo Kế hoạch.'), 'error')
       }
-    } catch {
+    } catch (err) {
+      console.error('Lỗi khi tạo plan:', err)
       showFeedback('Lỗi kết nối khi tạo plan.', 'error')
     } finally {
       setActionBusy(false)
@@ -575,7 +584,7 @@ export default function TrustBuilder() {
   const filteredChannels = useMemo(() => {
     if (!searchFilter.trim()) return channels
     const q = searchFilter.toLowerCase()
-    return channels.filter(c => 
+    return channels.filter(c =>
       (c.title || '').toLowerCase().includes(q) ||
       (c.gpm_profile_name || '').toLowerCase().includes(q)
     )
@@ -584,6 +593,9 @@ export default function TrustBuilder() {
   const currentChannel = channels.find(c => c.id === selectedChannelId)
   const trustScore = selectedPlan ? (selectedPlan.trust_score_estimated || 0) : 0
   const phaseInfo = getPhaseLabel(selectedPlan?.warmup_phase)
+  const targetTimezone = selectedPlan?.publication_timezone || currentChannel?.publication_timezone || 'Asia/Ho_Chi_Minh'
+  const planMarket = useMemo(() => findMarketByTimezone(targetTimezone), [targetTimezone])
+  const planMarketTime = useMemo(() => getMarketLocalTime(targetTimezone), [targetTimezone])
   const checklist = selectedPlan?.branding_checklist || {}
   const checklistStates = {
     avatar: getChecklistState(checklist.avatar),
@@ -598,6 +610,12 @@ export default function TrustBuilder() {
     currentChannel?.gpm_profile_id &&
     !String(currentChannel.gpm_profile_id).startsWith('local_') &&
     selectedPlan?.gpm_proxy_configured
+  )
+  const needsEngagementRepair = Boolean(
+    selectedPlan?.status === 'completed' && (
+      (Number(selectedPlan.daily_comment_target || 0) > 0 && Number(selectedPlan.total_comments || 0) === 0) ||
+      (Number(selectedPlan.daily_subscribe_target || 0) > 0 && Number(selectedPlan.total_subscriptions || 0) === 0)
+    )
   )
 
   return (
@@ -758,6 +776,30 @@ export default function TrustBuilder() {
                       <span className={`trust-status-pill status-${selectedPlan.status}`}>
                         {getStatusLabel(selectedPlan.status)}
                       </span>
+                      {planMarket && (
+                        <span
+                          className="trust-market-pill"
+                          title={`Kênh đang chạy theo thị trường: ${planMarket.name} (${planMarket.timezone})`}
+                          style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '5px',
+                            background: '#1a202c',
+                            border: '1px solid #2d3748',
+                            borderRadius: '12px',
+                            padding: '3px 10px',
+                            fontSize: '11px',
+                            color: '#e2e8f0'
+                          }}
+                        >
+                          <span>{planMarket.flag}</span>
+                          <strong>{planMarket.name}</strong>
+                          <span style={{ color: '#63b3ed', fontFamily: 'monospace' }}>{planMarketTime.timeStr}</span>
+                          <span style={{ fontSize: '10px', color: planMarketTime.isDaytime ? '#68d391' : '#f6ad55' }}>
+                            ({planMarketTime.statusLabel})
+                          </span>
+                        </span>
+                      )}
                     </div>
                     <div className="trust-progress-bar-bg">
                       <div
@@ -781,9 +823,9 @@ export default function TrustBuilder() {
                       type="button"
                       className="trust-btn start-btn"
                       onClick={() => handlePlanAction(selectedPlan.status === 'paused' ? 'resume' : 'start')}
-                      disabled={actionBusy || selectedPlan.status === 'completed' || !profileIsReady}
+                      disabled={actionBusy || (selectedPlan.status === 'completed' && !needsEngagementRepair) || !profileIsReady}
                     >
-                      ▶ {selectedPlan.status === 'completed' ? 'Warm-up đã hoàn tất' : selectedPlan.status === 'paused' ? 'Tiếp tục Nuôi Kênh' : 'Bắt đầu Nuôi Kênh'}
+                      ▶ {needsEngagementRepair ? 'Mở lại Engagement' : selectedPlan.status === 'completed' ? 'Warm-up đã hoàn tất' : selectedPlan.status === 'paused' ? 'Tiếp tục Nuôi Kênh' : 'Bắt đầu Nuôi Kênh'}
                     </button>
                   ) : (
                     <button
@@ -1000,12 +1042,18 @@ export default function TrustBuilder() {
                       <button type="button" onClick={addKeyword} className="tag-add-btn">+</button>
                     </div>
                     <div className="tags-cloud">
-                      {(selectedPlan.niche_keywords || []).map((kw, i) => (
-                        <span key={i} className="niche-tag">
-                          {kw}
-                          <button type="button" onClick={() => removeKeyword(kw)}>×</button>
-                        </span>
-                      ))}
+                      {(selectedPlan.niche_keywords || []).length === 0 ? (
+                        <p style={{ fontSize: '0.82rem', color: '#94a3b8', margin: '4px 0', fontStyle: 'italic' }}>
+                          Chưa có từ khóa ngách. Hãy thêm từ khóa phù hợp với thị trường của kênh.
+                        </p>
+                      ) : (
+                        (selectedPlan.niche_keywords || []).map((kw, i) => (
+                          <span key={i} className="niche-tag">
+                            {kw}
+                            <button type="button" onClick={() => removeKeyword(kw)}>×</button>
+                          </span>
+                        ))
+                      )}
                     </div>
                   </div>
 
@@ -1053,6 +1101,8 @@ export default function TrustBuilder() {
                   ) : (
                     activities.map((log) => {
                       const matchedChannel = log.detail_json?.matched_channel || ''
+                      const actionStatus = log.detail_json?.status || ''
+                      const reasonCode = log.detail_json?.reason_code || ''
                       return (
                         <div key={log.id} className={`activity-log-row ${log.success ? 'success' : 'failed'}`}>
                           <div className="activity-type-icon">{getActivityIcon(log.activity_type)}</div>
@@ -1062,6 +1112,11 @@ export default function TrustBuilder() {
                             </div>
                             {log.detail_json?.comment_text && (
                               <div className="activity-detail-comment">"{log.detail_json.comment_text}"</div>
+                            )}
+                            {actionStatus && (
+                              <div className={log.success ? 'activity-detail-comment' : 'activity-detail-error'}>
+                                Trạng thái: {actionStatus}{reasonCode ? ` · ${reasonCode}` : ''}
+                              </div>
                             )}
                             {log.error_message && (
                               <div className="activity-detail-error">Lỗi: {log.error_message}</div>
@@ -1115,7 +1170,7 @@ export default function TrustBuilder() {
                   <div className="stat-pill">Like: <b>{dailyStats.like_count}/{selectedPlan.daily_like_target}</b></div>
                   <div className="stat-pill">Comment: <b>{dailyStats.comment_count}/{selectedPlan.daily_comment_target}</b></div>
                   <div className="stat-pill">Sub: <b>{dailyStats.subscribe_count}/{selectedPlan.daily_subscribe_target}</b></div>
-                  <div className="stat-pill">Lần chạy kế tiếp: <b>{selectedPlan.next_run_at ? new Date(selectedPlan.next_run_at).toLocaleString() : 'đang chờ lịch'}</b></div>
+                  <div className="stat-pill">Lần chạy kế tiếp: <b>{selectedPlan.next_run_at ? formatDateTimeAMPM(selectedPlan.next_run_at) : 'đang chờ lịch'}</b></div>
                 </div>
               )}
 
@@ -1170,7 +1225,7 @@ export default function TrustBuilder() {
               <div className="safety-sync-card">
                 <div className="safety-sync-info">
                   <div><b>URL Đồng bộ từ xa:</b> <span className="safety-url-text">{safetyConfig?.remote_sync_url || 'Mặc định (GitHub Raw)'}</span></div>
-                  <div><b>Đồng bộ lần cuối:</b> <span>{safetyConfig?.last_synced_at ? new Date(safetyConfig.last_synced_at).toLocaleString() : 'Chưa đồng bộ'}</span></div>
+                  <div><b>Đồng bộ lần cuối:</b> <span>{safetyConfig?.last_synced_at ? formatDateTimeAMPM(safetyConfig.last_synced_at) : 'Chưa đồng bộ'}</span></div>
                 </div>
                 <button
                   type="button"

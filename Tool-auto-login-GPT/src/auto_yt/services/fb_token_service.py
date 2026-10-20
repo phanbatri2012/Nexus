@@ -65,6 +65,7 @@ async def extract_permanent_fb_tokens(
     try:
         async with channel_browser_session(profile_id) as (context, _browser, p_info):
             page = await context.new_page()
+            preserve_page = True
             try:
                 # Navigate to Graph API Explorer
                 await page.goto(
@@ -233,6 +234,7 @@ async def extract_permanent_fb_tokens(
                     }, page_id=target_pid)
                     logger.info("Đã tự động lưu Permanent Token cho Fanpage %s (%s)", matched_page.get("name"), target_pid)
 
+                preserve_page = False
                 return {
                     "success": True,
                     "logged_in": True,
@@ -243,7 +245,7 @@ async def extract_permanent_fb_tokens(
                 }
 
             finally:
-                await cleanup_owned_page(context, page)
+                await cleanup_owned_page(context, page, preserve=preserve_page)
 
     except Exception as exc:
         safe_error = security_logging.redact_sensitive(exc)

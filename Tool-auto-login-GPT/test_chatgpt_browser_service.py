@@ -161,6 +161,28 @@ class ChatGPTBrowserServiceManagerTests(unittest.TestCase):
         self.assertTrue(result["connected"])
         spawn.assert_called_once_with()
 
+    def test_service_owner_retries_failed_chromium_with_bounded_backoff(self):
+        with (
+            patch.object(
+                chatgpt_browser_service,
+                "run_browser_service",
+                side_effect=[1, 1, 0],
+            ) as run_once,
+            patch.object(
+                chatgpt_browser_service,
+                "_wait_before_service_restart",
+                return_value=True,
+            ) as wait_before_restart,
+        ):
+            result = chatgpt_browser_service.run_browser_service_with_recovery()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(run_once.call_count, 3)
+        self.assertEqual(
+            [call.args for call in wait_before_restart.call_args_list],
+            [(1.0, 1), (2.0, 2)],
+        )
+
     def test_stop_uses_instance_scoped_marker(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             state_path = Path(temp_dir) / "state.json"

@@ -21,37 +21,29 @@ const DEFAULT_PIPELINE = {
 
 const GOOGLE_FLOW_IMAGE_MODELS = [
   {
-    id: 'nano_banana_2',
-    name: '🍌 Nano Banana 2',
+    id: 'nano_banana_2_1',
+    name: '🍌 Nano Banana 2.1',
     badge: '🟢 Chuẩn Google Flow',
-    creditLabel: '🟢 Tiết kiệm (~1 credit/ảnh)',
+    creditLabel: '🟢 Tiêu chuẩn (~1 credit/ảnh)',
     speed: '⚡ 3–5s',
-    description: '⭐ Model tạo ảnh mặc định mới nhất trên Google Flow. Tốc độ sinh nhanh, màu sắc chân thực, chi tiết sắc nét, phù hợp tạo 30–50 cảnh visual cho video dài.'
-  },
-  {
-    id: 'nano_banana_pro',
-    name: 'Nano Banana Pro (Legacy)',
-    badge: '🟢 Tiết kiệm Credit',
-    creditLabel: '🟢 Thấp nhất (~1 credit/ảnh)',
-    speed: '⚡ 3–5s',
-    description: 'Model thế hệ tiền nhiệm, tương thích hoàn toàn với các prompt version cũ.',
+    description: '⭐ Model tạo ảnh mặc định mới nhất trên Google Flow. Tốc độ sinh nhanh, màu sắc chân thực, chi tiết sắc nét, bám sát prompt phức tạp.',
     recommended: true
   },
   {
-    id: 'imagen_3_standard',
-    name: 'Google Imagen 3 (High-Fidelity)',
-    badge: '🟡 Chất lượng cao',
-    creditLabel: '🟡 Trung bình (~2–3 credit/ảnh)',
-    speed: '⏳ 8–12s',
-    description: 'Chất lượng siêu thực cao cấp. Tái tạo biểu cảm nhân vật, bàn tay, ánh sáng và chi tiết da xuất sắc; bám sát prompt phức tạp.'
+    id: 'nano_banana_2_lite',
+    name: '🍌 Nano Banana 2 Lite',
+    badge: '⚡ Siêu tốc',
+    creditLabel: '🟢 Tiết kiệm (~1 credit/ảnh)',
+    speed: '⚡ 2–3s',
+    description: 'Phiên bản rút gọn tối ưu tốc độ sinh ảnh, thời gian chờ cực ngắn, phù hợp tạo số lượng lớn cảnh visual.'
   },
   {
-    id: 'imagen_3_photoreal',
-    name: 'Google Imagen 3 (Photorealistic / 35mm)',
-    badge: '🟡 Tư liệu thực tế',
-    creditLabel: '🟡 Tiêu chuẩn (~2 credit/ảnh)',
-    speed: '⏳ 6–10s',
-    description: 'Phong cách ảnh tư liệu / Điện ảnh thực tế. Tối ưu đặc biệt cho video kể chuyện, phim tài liệu, hạn chế cảm giác bóng bẩy 3D/CGI.'
+    id: 'nano_banana_pro',
+    name: '🍌 Nano Banana Pro',
+    badge: '🔵 Ổn định',
+    creditLabel: '🟢 Thấp nhất (~1 credit/ảnh)',
+    speed: '⚡ 3–5s',
+    description: 'Model Pro ổn định thế hệ trước, tương thích hoàn toàn với các phong cách prompt cũ.'
   }
 ];
 
@@ -59,10 +51,11 @@ const GOOGLE_FLOW_VIDEO_MODELS = [
   {
     id: 'omni_1_1_flash',
     name: 'Omni 1.1 Flash',
-    badge: '⚡ Mặc định / Siêu tốc',
+    badge: '⚡ Mặc định / Chuẩn Flow',
     creditLabel: '🟡 Tiêu chuẩn (~10 credit/clip)',
     speed: '⚡ 15–25s',
-    description: '⭐ Model tạo video AI mặc định mới nhất của Google Flow. Tốc độ sinh siêu nhanh, chuyển động mượt mà và phối cảnh nhất quán.'
+    description: '⭐ Model tạo video AI mặc định mới nhất của Google Flow. Tốc độ sinh siêu nhanh, chuyển động mượt mà và phối cảnh nhất quán.',
+    recommended: true
   },
   {
     id: 'veo_3_1_lite',
@@ -70,8 +63,7 @@ const GOOGLE_FLOW_VIDEO_MODELS = [
     badge: '🟢 Tiết kiệm Credit',
     creditLabel: '🟢 Thấp (~8 credit/clip)',
     speed: '⏳ 20–30s',
-    description: 'Bản rút gọn của Veo 3.1, tối ưu chi phí credit cho các cảnh intro ngắn.',
-    recommended: true
+    description: 'Bản rút gọn của Veo 3.1, tối ưu chi phí credit cho các cảnh intro ngắn.'
   },
   {
     id: 'veo_3_1_fast',
@@ -141,10 +133,10 @@ const DEFAULT_IMAGE_GENERATION_SETTINGS = {
     show_animated_icon: true,
   },
   provider: 'google_flow',
-  model: 'nano_banana_pro',
+  model: 'nano_banana_2_1',
   aspect_ratio: '16:9',
   output_count: 1,
-  video_model: 'veo_3_1_lite',
+  video_model: 'omni_1_1_flash',
   video_aspect_ratio: '16:9',
   video_output_count: 1,
   style_prompt: 'Cinematic documentary film still, 35mm photography, atmospheric natural lighting, realistic textures, cinematic composition, shallow depth of field, balanced color grading, high visual fidelity, 8k raw photo.',
@@ -155,6 +147,9 @@ const DEFAULT_IMAGE_GENERATION_SETTINGS = {
   enable_intro_video: true,
   intro_scene_target_seconds: 8.0,
   intro_crop_watermark: true,
+  intro_video_max_wait_seconds: 900,
+  intro_video_max_in_flight: 4,
+  flow_image_max_in_flight: 2,
   video_style_prompt: 'Cinematic documentary film, 35mm motion picture composition, natural atmospheric lighting, realistic textures, balanced color grading, 4k cinematic video footage.',
   video_negative_prompt: 'still image, static photo, cartoon, anime, 3D CGI render, illustration, deformed hands, distorted anatomy, text, watermark, signature, logo, blurry, low resolution.',
   video_prompt_template: '{frame_directive} Scene action: {action}. Visual style: {style}. {motion} Clean video without any text, letters, watermark, or subtitles.',
@@ -873,31 +868,6 @@ export default function Settings({
     });
   };
 
-  const handleDeleteVersion = () => {
-    if (activeVersion === lockedPromptVersion) {
-      alert('Bộ prompt này đang được job sử dụng nên chưa thể xóa.');
-      return;
-    }
-    if (Object.keys(promptsData.versions).length <= 1) {
-      alert("Không thể xóa phiên bản duy nhất!");
-      return;
-    }
-    
-    if (!confirm("Bạn có chắc muốn xóa phiên bản này?")) return;
-    
-    setPromptsData(prev => {
-      const newData = { ...prev };
-      delete newData.versions[activeVersion];
-      
-      const remainingVersions = Object.keys(newData.versions);
-      const nextVersion = remainingVersions[0];
-      
-      newData.active_version = nextVersion;
-      setActiveVersion(nextVersion);
-      return newData;
-    });
-  };
-
   const saveSection = async (sectionKey, loadingText, successText, request) => {
     try {
       setSavingSection(sectionKey);
@@ -926,6 +896,43 @@ export default function Settings({
     } finally {
       setSavingSection('');
       setLoadingMsg('');
+    }
+  };
+
+  const handleDeleteVersion = async () => {
+    if (activeVersion === lockedPromptVersion) {
+      alert('Bộ prompt này đang được job sử dụng nên chưa thể xóa.');
+      return;
+    }
+    if (Object.keys(promptsData?.versions || {}).length <= 1) {
+      alert("Không thể xóa phiên bản duy nhất!");
+      return;
+    }
+    
+    if (!confirm("Bạn có chắc muốn xóa vĩnh viễn bộ prompt này?")) return;
+
+    const versionToDelete = activeVersion;
+    const result = await saveSection(
+      'delete-version',
+      'Đang xóa bộ prompt...',
+      'Đã xóa bộ prompt thành công.',
+      () => fetch(`http://127.0.0.1:8080/api/prompts/${encodeURIComponent(versionToDelete)}`, {
+        method: 'DELETE'
+      })
+    );
+
+    if (result && result.success) {
+      const nextActive = result.active_version || 'default';
+      setPromptsData(prev => {
+        const nextVersions = { ...(prev?.versions || {}) };
+        delete nextVersions[versionToDelete];
+        return {
+          ...prev,
+          active_version: nextActive,
+          versions: result.versions || nextVersions
+        };
+      });
+      setActiveVersion(nextActive);
     }
   };
 
@@ -1550,14 +1557,14 @@ export default function Settings({
           <button
             className="btn-danger"
             onClick={handleDeleteVersion}
-            disabled={activeVersionLocked}
+            disabled={activeVersionLocked || Boolean(savingSection)}
             title={
               activeVersionLocked
                 ? 'Bộ prompt này đang được job sử dụng'
                 : 'Xóa bộ prompt hiện tại'
             }
           >
-            🗑️ Xóa Bản Này
+            🗑️ {savingSection === 'delete-version' ? 'Đang xóa...' : 'Xóa Bản Này'}
           </button>
         </div>
       </div>
@@ -2379,7 +2386,7 @@ export default function Settings({
                 Model tạo ảnh
                 <select
                   className="version-select"
-                  value={currentImageGeneration.model || 'nano_banana_2'}
+                  value={currentImageGeneration.model || 'nano_banana_2_1'}
                   onChange={event => handlePromptSettingChange(
                     'image_generation_settings', 'model', event.target.value
                   )}
@@ -2468,7 +2475,7 @@ export default function Settings({
             {/* Selected Image Model Info Card */}
             {(() => {
               const selectedImgModel = GOOGLE_FLOW_IMAGE_MODELS.find(
-                m => m.id === (currentImageGeneration.model || 'nano_banana_2')
+                m => m.id === (currentImageGeneration.model || 'nano_banana_2_1')
               ) || GOOGLE_FLOW_IMAGE_MODELS[0];
               return (
                 <div
@@ -2779,6 +2786,67 @@ export default function Settings({
                     </div>
                   );
                 })()}
+
+                <details
+                  style={{
+                    marginBottom: 12,
+                    padding: '8px 12px',
+                    border: '1px solid rgba(167, 139, 250, 0.2)',
+                    borderRadius: 8,
+                    background: 'rgba(167, 139, 250, 0.04)'
+                  }}
+                >
+                  <summary style={{ cursor: 'pointer', color: '#c4b5fd', fontWeight: 600 }}>
+                    Nâng cao — hàng đợi Google Flow
+                  </summary>
+                  <div className="production-settings-grid" style={{ marginTop: 10 }}>
+                    <label>
+                      Chờ tối đa mỗi video (giây)
+                      <input
+                        type="number"
+                        min="60"
+                        max="3600"
+                        step="30"
+                        value={currentImageGeneration.intro_video_max_wait_seconds ?? 900}
+                        onChange={event => handlePromptSettingChange(
+                          'image_generation_settings', 'intro_video_max_wait_seconds', Number(event.target.value)
+                        )}
+                        disabled={activeVersionLocked}
+                      />
+                    </label>
+                    <label>
+                      Video đang xử lý tối đa
+                      <input
+                        type="number"
+                        min="1"
+                        max="12"
+                        step="1"
+                        value={currentImageGeneration.intro_video_max_in_flight ?? 4}
+                        onChange={event => handlePromptSettingChange(
+                          'image_generation_settings', 'intro_video_max_in_flight', Number(event.target.value)
+                        )}
+                        disabled={activeVersionLocked}
+                      />
+                    </label>
+                    <label>
+                      Ảnh đang xử lý tối đa
+                      <input
+                        type="number"
+                        min="1"
+                        max="4"
+                        step="1"
+                        value={currentImageGeneration.flow_image_max_in_flight ?? 2}
+                        onChange={event => handlePromptSettingChange(
+                          'image_generation_settings', 'flow_image_max_in_flight', Number(event.target.value)
+                        )}
+                        disabled={activeVersionLocked}
+                      />
+                    </label>
+                  </div>
+                  <div className="help-text" style={{ marginTop: 6 }}>
+                    Trình duyệt thao tác tuần tự; Google Flow xử lý nền tối đa 4 yêu cầu tổng cộng.
+                  </div>
+                </details>
 
                 {/* Video Style Prompt */}
                 <div style={{ marginTop: 12 }}>

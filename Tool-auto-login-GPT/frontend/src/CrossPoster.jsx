@@ -1,5 +1,7 @@
 import { useEffect, useState, useMemo, useCallback, useRef } from 'react'
 import './CrossPoster.css'
+import PublicationTimePicker from './PublicationTimePicker'
+import { formatTime12, formatDateTimeAMPM, parseTime24, formatTime24 } from './publicationTime.js'
 import { useAppRouter } from './router.js'
 import {
   normalizeYoutubeChannel,
@@ -91,18 +93,7 @@ function formatDate(dateStr) {
 
 function formatTimestamp(ts) {
   if (!ts || ts <= 0) return '-'
-  try {
-    const d = new Date(ts * 1000)
-    return d.toLocaleString('vi-VN', {
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit'
-    })
-  } catch {
-    return '-'
-  }
+  return formatDateTimeAMPM(ts, { includeSeconds: false })
 }
 
 function formatBytes(bytes) {
@@ -1002,12 +993,13 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
   // Time Slot Management
   const handleAddTimeSlot = (timeVal) => {
     const slotToAdd = (typeof timeVal === 'string' && timeVal) ? timeVal : newTimeSlot
-    if (!slotToAdd || !/^\d{1,2}:\d{2}$/.test(slotToAdd.trim())) {
-      setMessage('Vui lòng chọn hoặc nhập giờ hợp lệ theo định dạng HH:MM (VD: 14:30)')
+    if (!slotToAdd) {
+      setMessage('Vui lòng chọn hoặc nhập giờ hợp lệ.')
       setMessageType('error')
       return false
     }
-    const clean = slotToAdd.trim().padStart(5, '0')
+    const { hour, minute, period } = parseTime24(slotToAdd)
+    const clean = formatTime24(hour, minute, period)
     const currentTimes = Array.isArray(settings.schedule_times) ? settings.schedule_times : []
     if (!currentTimes.includes(clean)) {
       const updated = [...currentTimes, clean].sort()
@@ -1642,7 +1634,7 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
                 <div className="fb-chips-container" style={{ minHeight: '38px', alignItems: 'center' }}>
                   {(settings.schedule_times || []).map((slot) => (
                     <span key={slot} className="fb-chip">
-                      🕒 {slot}
+                      🕒 {formatTime12(slot)}
                       <span
                         className="fb-chip-remove"
                         onClick={() => handleRemoveTimeSlot(slot)}
@@ -1658,22 +1650,10 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
 
                   {isAddingTime ? (
                     <div className="fb-time-adder-box">
-                      <input
-                        type="time"
-                        className="fb-time-input-sm"
-                        value={newTimeSlot}
-                        onChange={(e) => setNewTimeSlot(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') {
-                            e.preventDefault()
-                            handleAddTimeSlot()
-                          } else if (e.key === 'Escape') {
-                            e.preventDefault()
-                            handleCancelAddTime()
-                          }
-                        }}
-                        autoFocus
-                      />
+                      <PublicationTimePicker
+      value={newTimeSlot || '14:30'}
+      onChange={(val) => setNewTimeSlot(val)}
+    />
                       <button
                         type="button"
                         className="fb-btn fb-btn-primary fb-btn-sm"

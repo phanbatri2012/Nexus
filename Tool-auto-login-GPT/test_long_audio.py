@@ -250,21 +250,21 @@ class LongAudioTests(unittest.TestCase):
         self.assertEqual(result["audio_task"]["status"], "completed")
 
     def test_interrupted_batch_submits_only_missing_segments(self):
-        chunks = ["Đoạn đã hoàn thành.", "Đoạn còn thiếu."]
-        segments = [
-            {
-                "index": 0,
-                "task_id": "task-1",
-                "status": "completed",
-                "audio_url": "https://audio/1.mp3",
-            },
-            {
-                "index": 1,
-                "task_id": "",
-                "status": "not_submitted",
-                "audio_url": "",
-            },
+        chunks = ["Đoạn đã hoàn thành."] + [
+            f"Đoạn còn thiếu {index}." for index in range(1, 76)
         ]
+        segments = [{
+            "index": 0,
+            "task_id": "task-1",
+            "status": "completed",
+            "audio_url": "https://audio/1.mp3",
+        }]
+        segments.extend({
+            "index": index,
+            "task_id": "",
+            "status": "not_submitted",
+            "audio_url": "",
+        } for index in range(1, 76))
         stored_task = {
             "video_id": 70,
             "request_hash": "request-hash",
@@ -282,12 +282,18 @@ class LongAudioTests(unittest.TestCase):
                 "updated_at": "2026-08-08T00:00:00+00:00",
             }
 
+        def submit_task(text, _voice_id):
+            return {
+                "id": f"task-{chunks.index(text) + 1}",
+                "status": "pending",
+            }
+
         with (
             patch.object(main.tts, "find_matching_tasks", return_value={}) as history,
             patch.object(
                 main.tts,
                 "submit_tts_task",
-                return_value={"id": "task-2", "status": "pending"},
+                side_effect=submit_task,
             ) as submit,
             patch.object(
                 main.db,
@@ -303,12 +309,20 @@ class LongAudioTests(unittest.TestCase):
                 stored_task,
             )
 
-        history.assert_called_once_with(["Đoạn còn thiếu."], main.AUDIO_VOICE_ID, None)
-        submit.assert_called_once_with(chunks[1], main.AUDIO_VOICE_ID)
+        self.assertEqual(history.call_count, 75)
+        self.assertEqual(
+            [call.args[0] for call in history.call_args_list],
+            [[chunk] for chunk in chunks[1:]],
+        )
+        self.assertEqual(submit.call_count, 75)
+        self.assertEqual(
+            [call.args[0] for call in submit.call_args_list],
+            chunks[1:],
+        )
         result_segments = json.loads(result["segments_json"])
         self.assertEqual(
             [segment["task_id"] for segment in result_segments],
-            ["task-1", "task-2"],
+            [f"task-{index}" for index in range(1, 77)],
         )
         start_watcher.assert_called_once_with(70)
 

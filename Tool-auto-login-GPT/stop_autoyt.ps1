@@ -7,6 +7,16 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+. (Join-Path $PSScriptRoot "lifecycle_admin.ps1")
+
+if (-not (Test-AutoYTAdministrator)) {
+    $forwardArguments = @()
+    if ($PSBoundParameters.ContainsKey("TimeoutSeconds")) {
+        $forwardArguments += @("-TimeoutSeconds", [string]$TimeoutSeconds)
+    }
+    exit (Invoke-AutoYTElevatedScript -ScriptPath $PSCommandPath -Arguments $forwardArguments)
+}
+
 $projectRoot = [System.IO.Path]::GetFullPath($PSScriptRoot).TrimEnd("\")
 $dataRoot = Join-Path $projectRoot "data"
 $chromeUserDataRoot = Join-Path $dataRoot "chrome_user_data"
@@ -300,7 +310,7 @@ try {
         }
     }
 
-    Write-Step "Stopping backend + Trust Builder scheduler (8080), frontend (5173), OmniVoice (8011), ChatGPT & Google Flow browser services ($($targetIds.Count) processes)..."
+    Write-Step "Stopping backend + Radar/Trust Builder schedulers (8080), frontend (5173), OmniVoice (8011), ChatGPT & Google Flow browser services ($($targetIds.Count) processes)..."
     foreach ($processId in @($targetIds) | Sort-Object -Descending) {
         Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
     }
@@ -358,7 +368,7 @@ try {
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    Write-Host "[Auto_YT] All services, including the Trust Builder scheduler, have stopped cleanly. Ports 8080, 5173, and 8011 are free." -ForegroundColor Green
+    Write-Host "[Auto_YT] All services, including Radar and Trust Builder schedulers, have stopped cleanly. Ports 8080, 5173, and 8011 are free." -ForegroundColor Green
     exit 0
 }
 catch {

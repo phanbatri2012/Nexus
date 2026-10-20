@@ -102,6 +102,20 @@
   flex-shrink: 0;
 }
 
+.nav-icon {
+  width: 17px;
+  height: 17px;
+  flex: 0 0 17px;
+}
+
+.radar-nav-icon {
+  filter: drop-shadow(0 0 5px rgba(168, 85, 247, 0.2));
+}
+
+.nav-item.active .radar-nav-icon {
+  filter: drop-shadow(0 0 6px rgba(192, 132, 252, 0.65));
+}
+
 .nav-item[data-view="dashboard"]::before { content: '📊'; }
 .nav-item[data-view="jobs"]::before { content: '⚡'; }
 .nav-item[data-view="comments"]::before { content: '💬'; }

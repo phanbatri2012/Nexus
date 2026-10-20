@@ -32,14 +32,21 @@ def list_system_job_blockers() -> list[dict[str, Any]]:
                    videos.title AS video_title
             FROM system_jobs
             LEFT JOIN videos ON videos.id = system_jobs.video_id
-            WHERE system_jobs.status IN ('running', 'processing', 'in_progress', 'queued')
+            WHERE system_jobs.status IN ('running', 'processing', 'in_progress', 'queued', 'retry_wait')
               AND system_jobs.job_type != 'comment_publish'
               AND (
-                  system_jobs.status = 'queued'
+                  system_jobs.status != 'retry_wait'
+                  OR COALESCE(system_jobs.next_retry_at, '') = ''
+                  OR system_jobs.next_retry_at <= ?
+              )
+              AND (
+                  system_jobs.status IN ('queued', 'retry_wait')
                   OR datetime(system_jobs.updated_at) >= datetime('now', '-15 minutes')
               )
             ORDER BY system_jobs.created_at ASC
             """
+            ,
+            (db.utc_now(),),
         ).fetchall()
         blockers = []
         for r in rows:

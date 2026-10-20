@@ -5,6 +5,7 @@ Hỗ trợ bóc tách các tag nhân vật như [MC]:, [KHACH_1]:, [KHACH_2]:, [
 và gom nhóm phân đoạn thoại thông minh (Consecutive Turn Batching) cho TTS Engine.
 """
 from __future__ import annotations
+import html
 import re
 import unicodedata
 from typing import TypedDict, Optional
@@ -66,6 +67,8 @@ def is_dialogue_script(script_text: str) -> bool:
 
 def clean_turn_text_for_tts(text: str) -> str:
     """Chuẩn hóa văn bản lượt thoại để sẵn sàng đọc TTS:
+    - Giải mã toàn bộ HTML entities (&#124; -> |, &quot; -> ", v.v.)
+    - Bỏ các thẻ directive container của Canvas / Document (:::writing..., :::)
     - Bỏ các nhãn vai: [MC]:, [KHACH_1]:, MC:, v.v.
     - Bỏ các nhãn vai lọt vào giữa câu: [KHACH_1], [MC], [KHACH_2], [GUEST], etc.
     - Bỏ các biến placeholder kỹ thuật: [TÊN...], [NHÂN VẬT...]
@@ -76,7 +79,13 @@ def clean_turn_text_for_tts(text: str) -> str:
     """
     if not text:
         return ""
-    cleaned = text.strip()
+    cleaned = html.unescape(text.strip())
+    cleaned = cleaned.replace("\u00a0", " ").replace("\u200b", "").replace("\ufeff", "")
+    
+    # Loại bỏ thẻ Canvas directive :::writing...:::
+    cleaned = re.sub(r":::[a-zA-Z0-9_\-]*(?:\{[^}]*\})?", "", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r"(?m)^\s*:::\s*$", "", cleaned)
+    cleaned = re.sub(r"\s*:::\s*$", "", cleaned)
 
     # Loại bỏ các tiêu đề Markdown hoặc nhãn phần: ### [INTRO], ### [BODY], [PHAN 1], etc.
     cleaned = re.sub(r'###\s*\[[^\]]+\]', '', cleaned)
@@ -117,6 +126,9 @@ def clean_turn_text_for_tts(text: str) -> str:
     cleaned = re.sub(r'[—–]', ', ', cleaned)
     # Loại bỏ dấu gạch ngang đầu dòng hoặc thừa
     cleaned = re.sub(r'^\s*[-*•]\s*', '', cleaned, flags=re.MULTILINE)
+    # Chuẩn hóa dấu câu lặp: ?? -> ?, !! -> ! để tránh lỗi ngắt nhịp TTS
+    cleaned = re.sub(r'\?{2,}', '?', cleaned)
+    cleaned = re.sub(r'!{2,}', '!', cleaned)
     # Gộp nhiều khoảng trắng liên tiếp
     cleaned = re.sub(r'[ \t]+', ' ', cleaned)
     # Loại bỏ khoảng trắng trước dấu câu và chuẩn hóa khoảng trắng sau dấu câu
@@ -129,6 +141,8 @@ def clean_turn_text_for_tts(text: str) -> str:
 
 def sanitize_dialogue_script(script_text: str) -> str:
     """Làm sạch toàn diện kịch bản đối thoại trước khi lưu DB hoặc hiển thị UI:
+    - Giải mã toàn bộ HTML entities (&#124; -> |, &quot; -> ", v.v.)
+    - Bỏ các thẻ directive container của Canvas / Document (:::writing..., :::)
     - Đảm bảo mỗi tag phân vai [MC]:, [KHACH_1]:... luôn bắt đầu trên dòng mới (\n\n)
     - Giữ nguyên các tag phân vai hợp lệ ở đầu lượt thoại: [MC]:, [KHACH_1]:, etc.
     - Loại bỏ các tag vai bị lọt vào giữa câu: [KHACH_1], [MC], [KHACH_2]...
@@ -136,6 +150,15 @@ def sanitize_dialogue_script(script_text: str) -> str:
     """
     if not script_text or not isinstance(script_text, str):
         return ""
+
+    # Giải mã HTML entities và chuẩn hóa khoảng trắng Unicode
+    script_text = html.unescape(script_text)
+    script_text = script_text.replace("\u00a0", " ").replace("\u200b", "").replace("\ufeff", "")
+    
+    # Loại bỏ thẻ Canvas directive :::writing...:::
+    script_text = re.sub(r":::[a-zA-Z0-9_\-]*(?:\{[^}]*\})?", "", script_text, flags=re.DOTALL)
+    script_text = re.sub(r"(?m)^\s*:::\s*$", "", script_text)
+    script_text = re.sub(r"\s*:::\s*$", "", script_text)
 
     # 1. Đảm bảo mọi tag vai diễn có dấu hai chấm luôn có ngắt dòng (\n\n) phía trước nếu bị dính liền vào câu trước
     formatted = re.sub(
@@ -301,6 +324,15 @@ def resolve_turn_voice(
     """
     normalized_role = normalize_role_tag(role)
     cast = cast_settings or {}
+
+    direct_entry = cast.get(normalized_role) or cast.get(str(role or "").strip())
+    direct_voice = _extract_voice_id_from_entry(direct_entry)
+    if (
+        direct_voice
+        and direct_voice.casefold() not in {"auto", "none", "distinct"}
+        and normalized_role not in {"MC", "KHACH_1", "KHACH_2", "KHACH_3"}
+    ):
+        return direct_voice
 
     if normalized_role == "MC":
         val = cast.get("mc") or cast.get("MC") or cast.get("host") or cast.get("HOST")
@@ -495,4 +527,3 @@ def build_speaker_streams(
             "total_characters": total_chars,
         }
     return streams
-

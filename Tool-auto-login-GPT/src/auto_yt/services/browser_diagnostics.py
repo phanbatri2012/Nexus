@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from auto_yt.paths import DATA_DIR, DIAGNOSTICS_DIR, LOGS_DIR
+from auto_yt.services import security_logging
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +246,30 @@ def _sanitize_dom_html(html: str) -> str:
     return cleaned
 
 
+def _redact_diagnostic_dom(html: str) -> str:
+    """Keep DOM structure for selector debugging without persisting page content."""
+    cleaned = _sanitize_dom_html(html)
+    cleaned = re.sub(
+        r"\s(?:value|src|href|alt|title|data-value|data-prompt)=(['\"]).*?\1",
+        r' data-redacted="true"',
+        cleaned,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    cleaned = re.sub(
+        r">([^<]*\S[^<]*)<",
+        ">[REDACTED_TEXT]<",
+        cleaned,
+    )
+    return security_logging.redact_sensitive(cleaned)
+
+
+SENSITIVE_SCREENSHOT_SELECTOR = (
+    "input, textarea, [contenteditable='true'], [data-message-author-role], "
+    "flow-creative-agent-prompt-box, flow-base-prompt-box, flow-prompt-box, "
+    "flow-creative-agent-message, flow-agent-message"
+)
+
+
 def _strip_non_content_tags(html: str) -> str:
     """Strip scripts, styles, svg, and comments so embedded JSON/hydration payloads don't trigger false positives."""
     if not html:
@@ -390,18 +415,29 @@ def capture_browser_diagnostics_sync(
             raw_html = str(page.content() or "")
             html_content = _sanitize_dom_html(raw_html)
             dom_file = target_dir / f"{base_name}.html"
-            dom_file.write_text(html_content, encoding="utf-8")
+            dom_file.write_text(_redact_diagnostic_dom(html_content), encoding="utf-8")
         except Exception as dom_exc:
             logger.debug("Failed to dump DOM content: %s", dom_exc)
 
         # Screenshot capture (with full_page fallback)
         try:
             screenshot_file = target_dir / f"{base_name}.png"
+            mask_locator = page.locator(SENSITIVE_SCREENSHOT_SELECTOR)
             try:
-                page.screenshot(path=str(screenshot_file), full_page=True, timeout=5000)
+                page.screenshot(
+                    path=str(screenshot_file),
+                    full_page=True,
+                    timeout=5000,
+                    mask=[mask_locator],
+                )
             except Exception:
                 # Fallback to viewport screenshot
-                page.screenshot(path=str(screenshot_file), full_page=False, timeout=5000)
+                page.screenshot(
+                    path=str(screenshot_file),
+                    full_page=False,
+                    timeout=5000,
+                    mask=[mask_locator],
+                )
             screenshot_captured = True
         except Exception as shot_exc:
             logger.debug("Failed to take screenshot: %s", shot_exc)
@@ -414,12 +450,12 @@ def capture_browser_diagnostics_sync(
         html_text=html_content,
     )
 
-    error_str = str(error) if error is not None else ""
+    error_str = security_logging.redact_sensitive(error) if error is not None else ""
     error_type = type(error).__name__ if isinstance(error, BaseException) else "UnknownError"
     stack_trace = ""
     if isinstance(error, BaseException):
-        stack_trace = "".join(
-            traceback.format_exception(type(error), error, error.__traceback__)
+        stack_trace = security_logging.redact_sensitive(
+            "".join(traceback.format_exception(type(error), error, error.__traceback__))
         )
 
     evidence_dict: dict[str, Any] = {
@@ -428,8 +464,8 @@ def capture_browser_diagnostics_sync(
         "action_name": action_name,
         "job_id": str(job_id) if job_id else None,
         "video_id": str(video_id) if video_id is not None else None,
-        "current_url": current_url,
-        "page_title": page_title,
+        "current_url": security_logging.redact_sensitive(current_url),
+        "page_title": security_logging.redact_sensitive(page_title),
         "error_type": error_type,
         "error_message": error_str,
         "stack_trace": stack_trace,
@@ -506,17 +542,28 @@ async def capture_browser_diagnostics_async(
             raw_html = str(await page.content() if asyncio.iscoroutinefunction(page.content) else page.content() or "")
             html_content = _sanitize_dom_html(raw_html)
             dom_file = target_dir / f"{base_name}.html"
-            dom_file.write_text(html_content, encoding="utf-8")
+            dom_file.write_text(_redact_diagnostic_dom(html_content), encoding="utf-8")
         except Exception as dom_exc:
             logger.debug("Failed to dump DOM content: %s", dom_exc)
 
         # Screenshot capture (with full_page fallback)
         try:
             screenshot_file = target_dir / f"{base_name}.png"
+            mask_locator = page.locator(SENSITIVE_SCREENSHOT_SELECTOR)
             try:
-                await page.screenshot(path=str(screenshot_file), full_page=True, timeout=5000)
+                await page.screenshot(
+                    path=str(screenshot_file),
+                    full_page=True,
+                    timeout=5000,
+                    mask=[mask_locator],
+                )
             except Exception:
-                await page.screenshot(path=str(screenshot_file), full_page=False, timeout=5000)
+                await page.screenshot(
+                    path=str(screenshot_file),
+                    full_page=False,
+                    timeout=5000,
+                    mask=[mask_locator],
+                )
             screenshot_captured = True
         except Exception as shot_exc:
             logger.debug("Failed to take screenshot: %s", shot_exc)
@@ -529,12 +576,12 @@ async def capture_browser_diagnostics_async(
         html_text=html_content,
     )
 
-    error_str = str(error) if error is not None else ""
+    error_str = security_logging.redact_sensitive(error) if error is not None else ""
     error_type = type(error).__name__ if isinstance(error, BaseException) else "UnknownError"
     stack_trace = ""
     if isinstance(error, BaseException):
-        stack_trace = "".join(
-            traceback.format_exception(type(error), error, error.__traceback__)
+        stack_trace = security_logging.redact_sensitive(
+            "".join(traceback.format_exception(type(error), error, error.__traceback__))
         )
 
     evidence_dict: dict[str, Any] = {
@@ -543,8 +590,8 @@ async def capture_browser_diagnostics_async(
         "action_name": action_name,
         "job_id": str(job_id) if job_id else None,
         "video_id": str(video_id) if video_id is not None else None,
-        "current_url": current_url,
-        "page_title": page_title,
+        "current_url": security_logging.redact_sensitive(current_url),
+        "page_title": security_logging.redact_sensitive(page_title),
         "error_type": error_type,
         "error_message": error_str,
         "stack_trace": stack_trace,

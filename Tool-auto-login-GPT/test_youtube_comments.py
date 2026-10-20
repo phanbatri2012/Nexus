@@ -12,6 +12,7 @@ from auto_yt.services import youtube_comments
 from auto_yt.services.chatgpt_runtime import (
     CHATGPT_LOGIN_REQUIRED_MESSAGE,
     ChatGPTAttentionRequiredError,
+    ChatGPTPreSendTransientError,
 )
 from auto_yt import main
 
@@ -477,11 +478,11 @@ class YouTubeCommentHelperTests(unittest.TestCase):
         self.assertEqual(parsed["a"], "Đúng bạn nhé")
         self.assertEqual(parsed["b"], "Cảm ơn bạn")
 
-    def test_rejects_partial_chatgpt_reply_batch(self):
-        with self.assertRaises(youtube_comments.YouTubeCommentsError):
-            youtube_comments.parse_comment_reply_response(
-                '[{"comment_id":"a","reply":"OK"}]', {"a", "b"}
-            )
+    def test_accepts_partial_chatgpt_reply_batch(self):
+        parsed = youtube_comments.parse_comment_reply_response(
+            '[{"comment_id":"a","reply":"OK"}]', {"a", "b"}
+        )
+        self.assertEqual(parsed, {"a": "OK"})
 
     def test_auto_reply_priority_skips_noise_and_prioritizes_questions(self):
         question = youtube_comments.assess_auto_reply_priority(
@@ -1061,6 +1062,67 @@ class YouTubeCommentJobTests(unittest.TestCase):
         self.assertEqual(saved["recovery_count"], 1)
         self.assertIn("đồng bộ bình luận YouTube", saved["progress"])
         self.assertIsNone(database.claim_next_system_job("comment_sync"))
+
+    def test_draft_pre_send_failure_waits_for_automatic_retry(self):
+        job = main._enqueue_comment_draft_jobs(["comment-1"])[0]
+
+        with (
+            patch.object(
+                main,
+                "_execute_comment_draft_job",
+                side_effect=ChatGPTPreSendTransientError("history unavailable"),
+            ),
+            patch.object(
+                main.security_logging,
+                "safe_user_error",
+                return_value="ChatGPT tải chưa hoàn tất; tác vụ sẽ tự thử lại.",
+            ),
+        ):
+            main._comment_queue_worker()
+
+        saved = database.get_system_job(job["id"])
+        comment = database.get_youtube_comments(["comment-1"])[0]
+        self.assertEqual(saved["status"], "retry_wait")
+        self.assertEqual(saved["recovery_count"], 1)
+        self.assertEqual(saved["attempt"], 1)
+        self.assertTrue(saved["next_retry_at"])
+        self.assertIn("tải lịch sử Chat Gốc", saved["progress"])
+        self.assertEqual(comment["status"], "drafting")
+        self.assertEqual(comment["error"], "")
+
+    def test_draft_pre_send_failure_stops_after_recovery_limit(self):
+        job = main._enqueue_comment_draft_jobs(["comment-1"])[0]
+        database.update_system_job(
+            job["id"],
+            recovery_count=len(main.COMMENT_DRAFT_PRE_SEND_RETRY_DELAYS_SECONDS),
+        )
+
+        with (
+            patch.object(
+                main,
+                "_execute_comment_draft_job",
+                side_effect=ChatGPTPreSendTransientError("history unavailable"),
+            ),
+            patch.object(
+                main.security_logging,
+                "safe_user_error",
+                return_value="Tác vụ bình luận thất bại. Mã lỗi: test.",
+            ),
+        ):
+            main._comment_queue_worker()
+
+        saved = database.get_system_job(job["id"])
+        comment = database.get_youtube_comments(["comment-1"])[0]
+        self.assertEqual(saved["status"], "error")
+        self.assertEqual(
+            saved["recovery_count"],
+            len(main.COMMENT_DRAFT_PRE_SEND_RETRY_DELAYS_SECONDS),
+        )
+        self.assertEqual(comment["status"], "error")
+        self.assertEqual(
+            comment["error"],
+            "Tác vụ bình luận thất bại. Mã lỗi: test.",
+        )
 
     def test_expired_login_starts_automatic_login_for_comment_job(self):
         job = main._create_comment_system_job(

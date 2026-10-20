@@ -1,6 +1,7 @@
 import sqlite3
 import datetime
 import json
+import os
 import re
 import unicodedata
 import urllib.parse
@@ -12,9 +13,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 # Since main.py is run from the project root usually, we can resolve relative to this file
 _HERE = Path(__file__).resolve()
 PROJECT_ROOT = _HERE.parent.parent.parent.parent
-DB_PATH = PROJECT_ROOT / "data" / "database.db"
+DB_PATH = Path(os.environ.get("AUTO_YT_DB_PATH") or PROJECT_ROOT / "data" / "database.db")
 TTS_V2_BACKUP_SUFFIX = ".pre_tts_v2.bak"
 NULLABLE_PUBLICATION_CHANNEL_BACKUP_SUFFIX = ".pre_nullable_publication_channel.bak"
+TRUST_READINESS_V1_MIGRATION = "trust_readiness_v1"
+TRUST_AUTOMATION_RESTORE_V1_MIGRATION = "trust_automation_restore_v1"
 
 VIDEO_STATUS_ACTIVE = "active"
 VIDEO_STATUS_ERROR = "error"
@@ -150,6 +153,13 @@ def extract_generated_video_title(generated_script: str) -> str:
             if cleaned and not _looks_like_outro_or_cta(cleaned):
                 return cleaned
 
+        # Fallback: if lines in TITLE section were long paragraphs, extract the first sentence
+        for line in lines:
+            line_clean = line.strip("#*` ")
+            first_sentence = _clean_generated_title(re.split(r"[.!?\n]", line_clean)[0])
+            if first_sentence and len(first_sentence) <= 100 and not _looks_like_outro_or_cta(first_sentence):
+                return first_sentence
+
     # Fallback: Check if SLUG section contains a title if title section was empty or outro
     slug_match = SLUG_SECTION_PATTERN.search(generated_script)
     if slug_match:
@@ -181,11 +191,26 @@ def extract_generated_video_title(generated_script: str) -> str:
             candidate = _clean_generated_title(following_line)
             if not candidate:
                 continue
+            if candidate.startswith("[") and candidate.endswith("]"):
+                break
             candidate_label = candidate.partition(":")[0]
             if _normalize_metadata_label(candidate_label) in {
                 "URL SLUG",
+                "SLUG",
+                "MO TA",
                 "MO TA VIDEO",
+                "DESCRIPTION",
                 "HASHTAG",
+                "HASHTAGS",
+                "TAGS",
+                "TAG",
+                "THE TU KHOA",
+                "BINH LUAN GHIM",
+                "PINNED COMMENT",
+                "QUIZ",
+                "CHAPTERS",
+                "PHAN DOAN",
+                "THUMBNAIL",
             }:
                 break
             if not _looks_like_outro_or_cta(candidate):
@@ -538,7 +563,7 @@ def _backup_database_before_video_production() -> None:
     backup_path = DB_PATH.with_name(DB_PATH.name + VIDEO_PRODUCTION_BACKUP_SUFFIX)
     if backup_path.exists():
         return
-    source = sqlite3.connect(str(DB_PATH))
+    source = sqlite3.connect(str(DB_PATH), timeout=30.0)
     try:
         existing = source.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
@@ -546,7 +571,7 @@ def _backup_database_before_video_production() -> None:
         ).fetchone()
         if existing:
             return
-        destination = sqlite3.connect(str(backup_path))
+        destination = sqlite3.connect(str(backup_path), timeout=30.0)
         try:
             source.backup(destination)
         finally:
@@ -741,6 +766,7 @@ def init_db():
     _backup_database_before_tts_v2()
     _backup_database_before_nullable_publication_channel()
     _migrate_nullable_publication_channel()
+    _backup_database_before_video_production()
     conn = sqlite3.connect(str(DB_PATH))
     c = conn.cursor()
     c.execute('''
@@ -856,6 +882,18 @@ def init_db():
         CREATE TABLE IF NOT EXISTS audio_reviews (
             video_id INTEGER PRIMARY KEY,
             script_hash TEXT NOT NULL,
+            status TEXT NOT NULL,
+            report_json TEXT DEFAULT '{}',
+            reviewed_at TEXT DEFAULT '',
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(video_id) REFERENCES videos(id) ON DELETE CASCADE
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS metadata_reviews (
+            video_id INTEGER PRIMARY KEY,
+            script_hash TEXT NOT NULL,
+            metadata_hash TEXT NOT NULL,
             status TEXT NOT NULL,
             report_json TEXT DEFAULT '{}',
             reviewed_at TEXT DEFAULT '',
@@ -1256,8 +1294,6 @@ def init_db():
             pass
     _migrate_fb_crossposter_token_storage(conn)
 
-    _backup_database_before_video_production()
-
     # Video Production columns
     for column_definition in (
         "production_snapshot_json TEXT NOT NULL DEFAULT '{}'",
@@ -1286,6 +1322,7 @@ def init_db():
         "gpm_profile_id TEXT DEFAULT ''",
         "gpm_profile_name TEXT DEFAULT ''",
         "gpm_proxy_info TEXT DEFAULT ''",
+        "gpm_proxy_info_encrypted TEXT DEFAULT ''",
         "interaction_mode TEXT DEFAULT 'gpm_browser'",
         "auto_heart INTEGER DEFAULT 1",
     ):
@@ -1293,6 +1330,7 @@ def init_db():
             c.execute(f"ALTER TABLE youtube_channels ADD COLUMN {column_definition}")
         except sqlite3.OperationalError:
             pass
+    _migrate_youtube_channel_proxy_storage(conn)
 
     # Video publication columns
     for column_definition in (
@@ -1343,6 +1381,12 @@ def init_db():
             FOREIGN KEY (video_id) REFERENCES videos (id) ON DELETE CASCADE
         )
     """)
+    try:
+        c.execute(
+            "ALTER TABLE flow_projects ADD COLUMN reset_requested INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError:
+        pass
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS youtube_publish_workflows (
@@ -1376,6 +1420,207 @@ def init_db():
     c.execute(
         'CREATE INDEX IF NOT EXISTS idx_publish_workflows_video_channel '
         'ON youtube_publish_workflows(video_id, youtube_channel_id, status)'
+    )
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS competitor_channels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id TEXT NOT NULL UNIQUE,
+            canonical_url TEXT NOT NULL,
+            handle TEXT DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            thumbnail_url TEXT DEFAULT '',
+            last_resolved_at TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS competitor_watch_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            competitor_channel_id INTEGER NOT NULL,
+            prompt_version TEXT NOT NULL,
+            target_youtube_channel_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'paused',
+            publication_mode TEXT NOT NULL DEFAULT 'inherit',
+            window_mode TEXT NOT NULL DEFAULT 'learned',
+            guest_voice_pool TEXT NOT NULL DEFAULT '',
+            manual_windows_json TEXT NOT NULL DEFAULT '[]',
+            baseline_complete INTEGER NOT NULL DEFAULT 0,
+            baseline_video_count INTEGER NOT NULL DEFAULT 0,
+            last_scan_at TEXT DEFAULT '',
+            last_success_at TEXT DEFAULT '',
+            next_scan_at TEXT DEFAULT '',
+            error_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT DEFAULT '',
+            scan_strategy TEXT NOT NULL DEFAULT 'auto',
+            last_scan_source TEXT DEFAULT '',
+            rss_failure_count INTEGER NOT NULL DEFAULT 0,
+            rss_retry_after TEXT DEFAULT '',
+            fallback_failure_count INTEGER NOT NULL DEFAULT 0,
+            last_fallback_at TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(competitor_channel_id) REFERENCES competitor_channels(id) ON DELETE CASCADE,
+            FOREIGN KEY(target_youtube_channel_id) REFERENCES youtube_channels(id) ON DELETE RESTRICT,
+            UNIQUE(prompt_version, competitor_channel_id)
+        )
+    """)
+    try:
+        c.execute(
+            "ALTER TABLE competitor_watch_rules "
+            "ADD COLUMN guest_voice_pool TEXT NOT NULL DEFAULT ''"
+        )
+    except sqlite3.OperationalError:
+        pass
+    for column_sql in (
+        "scan_strategy TEXT NOT NULL DEFAULT 'auto'",
+        "last_scan_source TEXT DEFAULT ''",
+        "rss_failure_count INTEGER NOT NULL DEFAULT 0",
+        "rss_retry_after TEXT DEFAULT ''",
+        "fallback_failure_count INTEGER NOT NULL DEFAULT 0",
+        "last_fallback_at TEXT DEFAULT ''",
+    ):
+        try:
+            c.execute(f"ALTER TABLE competitor_watch_rules ADD COLUMN {column_sql}")
+        except sqlite3.OperationalError:
+            pass
+    c.execute(
+        'CREATE INDEX IF NOT EXISTS idx_competitor_rules_due '
+        'ON competitor_watch_rules(status, next_scan_at)'
+    )
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS competitor_source_videos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            competitor_channel_id INTEGER NOT NULL,
+            youtube_video_id TEXT NOT NULL,
+            url TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            published_at TEXT NOT NULL,
+            discovered_at TEXT NOT NULL,
+            is_baseline INTEGER NOT NULL DEFAULT 0,
+            content_type TEXT NOT NULL DEFAULT 'unknown',
+            duration_seconds INTEGER NOT NULL DEFAULT 0,
+            eligibility_status TEXT NOT NULL DEFAULT 'metadata_pending',
+            exclusion_reason TEXT DEFAULT '',
+            discovery_source TEXT DEFAULT '',
+            published_at_confidence TEXT NOT NULL DEFAULT 'unknown',
+            metadata_checked_at TEXT DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            voice_profile_status TEXT NOT NULL DEFAULT 'not_analyzed',
+            voice_profile_json TEXT NOT NULL DEFAULT '{}',
+            voice_profile_version TEXT NOT NULL DEFAULT '',
+            voice_profile_updated_at TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY(competitor_channel_id) REFERENCES competitor_channels(id) ON DELETE CASCADE,
+            UNIQUE(competitor_channel_id, youtube_video_id)
+        )
+    """)
+    c.execute(
+        'CREATE INDEX IF NOT EXISTS idx_competitor_source_published '
+        'ON competitor_source_videos(competitor_channel_id, published_at DESC)'
+    )
+    for column_sql in (
+        "content_type TEXT NOT NULL DEFAULT 'unknown'",
+        "duration_seconds INTEGER NOT NULL DEFAULT 0",
+        "eligibility_status TEXT NOT NULL DEFAULT 'metadata_pending'",
+        "exclusion_reason TEXT DEFAULT ''",
+        "discovery_source TEXT DEFAULT ''",
+        "published_at_confidence TEXT NOT NULL DEFAULT 'unknown'",
+        "metadata_checked_at TEXT DEFAULT ''",
+        "voice_profile_status TEXT NOT NULL DEFAULT 'not_analyzed'",
+        "voice_profile_json TEXT NOT NULL DEFAULT '{}'",
+        "voice_profile_version TEXT NOT NULL DEFAULT ''",
+        "voice_profile_updated_at TEXT NOT NULL DEFAULT ''",
+    ):
+        try:
+            c.execute(f"ALTER TABLE competitor_source_videos ADD COLUMN {column_sql}")
+        except sqlite3.OperationalError:
+            pass
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS competitor_dispatches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_video_id INTEGER NOT NULL,
+            watch_rule_id INTEGER NOT NULL,
+            prompt_version TEXT NOT NULL,
+            system_job_id TEXT DEFAULT '',
+            video_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'reserved',
+            error TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(source_video_id) REFERENCES competitor_source_videos(id) ON DELETE CASCADE,
+            FOREIGN KEY(watch_rule_id) REFERENCES competitor_watch_rules(id) ON DELETE CASCADE,
+            FOREIGN KEY(video_id) REFERENCES videos(id) ON DELETE SET NULL,
+            UNIQUE(source_video_id, prompt_version)
+        )
+    """)
+    c.execute(
+        'CREATE INDEX IF NOT EXISTS idx_competitor_dispatch_rule '
+        'ON competitor_dispatches(watch_rule_id, created_at DESC)'
+    )
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS video_cast_assignments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            video_id INTEGER NOT NULL,
+            role_key TEXT NOT NULL,
+            speaker_key TEXT NOT NULL,
+            speaker_name TEXT NOT NULL DEFAULT '',
+            voice_id TEXT NOT NULL,
+            confidence REAL NOT NULL DEFAULT 0,
+            match_score REAL NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'auto',
+            manifest_json TEXT NOT NULL DEFAULT '{}',
+            casting_version INTEGER NOT NULL DEFAULT 1,
+            manifest_hash TEXT NOT NULL DEFAULT '',
+            approval_status TEXT NOT NULL DEFAULT 'legacy',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(video_id) REFERENCES videos(id) ON DELETE CASCADE,
+            UNIQUE(video_id, speaker_key)
+        )
+    """)
+    for column_sql in (
+        "casting_version INTEGER NOT NULL DEFAULT 1",
+        "manifest_hash TEXT NOT NULL DEFAULT ''",
+        "approval_status TEXT NOT NULL DEFAULT 'legacy'",
+    ):
+        try:
+            c.execute(f"ALTER TABLE video_cast_assignments ADD COLUMN {column_sql}")
+        except sqlite3.OperationalError:
+            pass
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS speaker_voice_registry (
+            prompt_version TEXT NOT NULL,
+            speaker_key TEXT NOT NULL,
+            speaker_name TEXT NOT NULL DEFAULT '',
+            voice_id TEXT NOT NULL,
+            profile_signature TEXT NOT NULL DEFAULT '',
+            last_video_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(prompt_version, speaker_key),
+            FOREIGN KEY(last_video_id) REFERENCES videos(id) ON DELETE SET NULL
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS video_quality_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            video_id INTEGER NOT NULL,
+            system_job_id TEXT NOT NULL,
+            attempt INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL,
+            checks_json TEXT NOT NULL DEFAULT '{}',
+            repair_stage TEXT DEFAULT '',
+            error TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(video_id) REFERENCES videos(id) ON DELETE CASCADE,
+            UNIQUE(video_id, attempt)
+        )
+    """)
+    c.execute(
+        'CREATE INDEX IF NOT EXISTS idx_video_quality_status '
+        'ON video_quality_reviews(status, updated_at DESC)'
     )
 
     c.execute("""
@@ -1445,6 +1690,19 @@ def init_db():
             total_comments INTEGER DEFAULT 0,
             total_subscriptions INTEGER DEFAULT 0,
             trust_score_estimated INTEGER DEFAULT 0,
+            legacy_trust_score_estimated INTEGER DEFAULT 0,
+            mode TEXT NOT NULL DEFAULT 'automated',
+            requires_review INTEGER NOT NULL DEFAULT 0,
+            profile_readiness_json TEXT NOT NULL DEFAULT '{}',
+            channel_readiness_json TEXT NOT NULL DEFAULT '{}',
+            profile_readiness_pct INTEGER NOT NULL DEFAULT 0,
+            channel_readiness_pct INTEGER NOT NULL DEFAULT 0,
+            readiness_state TEXT NOT NULL DEFAULT 'needs_attention',
+            profile_baseline_json TEXT NOT NULL DEFAULT '{}',
+            approved_sources TEXT NOT NULL DEFAULT '[]',
+            reminder_enabled INTEGER NOT NULL DEFAULT 0,
+            reminder_time_local TEXT DEFAULT '',
+            last_readiness_check_at TEXT DEFAULT '',
             error_message TEXT DEFAULT '',
             last_session_at TEXT DEFAULT '',
             last_attempt_at TEXT DEFAULT '',
@@ -1459,6 +1717,19 @@ def init_db():
         "min_watch_minutes INTEGER DEFAULT 10",
         "last_attempt_at TEXT DEFAULT ''",
         "next_run_at TEXT DEFAULT ''",
+        "legacy_trust_score_estimated INTEGER DEFAULT 0",
+        "mode TEXT NOT NULL DEFAULT 'guided'",
+        "requires_review INTEGER NOT NULL DEFAULT 0",
+        "profile_readiness_json TEXT NOT NULL DEFAULT '{}'",
+        "channel_readiness_json TEXT NOT NULL DEFAULT '{}'",
+        "profile_readiness_pct INTEGER NOT NULL DEFAULT 0",
+        "channel_readiness_pct INTEGER NOT NULL DEFAULT 0",
+        "readiness_state TEXT NOT NULL DEFAULT 'needs_attention'",
+        "profile_baseline_json TEXT NOT NULL DEFAULT '{}'",
+        "approved_sources TEXT NOT NULL DEFAULT '[]'",
+        "reminder_enabled INTEGER NOT NULL DEFAULT 0",
+        "reminder_time_local TEXT DEFAULT ''",
+        "last_readiness_check_at TEXT DEFAULT ''",
     ):
         try:
             c.execute(f"ALTER TABLE channel_trust_plans ADD COLUMN {column_definition}")
@@ -1476,8 +1747,41 @@ def init_db():
             detail_json TEXT DEFAULT '{}',
             success INTEGER DEFAULT 1,
             error_message TEXT DEFAULT '',
+            activity_source TEXT NOT NULL DEFAULT 'system_verified',
             executed_at TEXT NOT NULL
         )
+    ''')
+
+    try:
+        c.execute(
+            "ALTER TABLE trust_activity_log ADD COLUMN "
+            "activity_source TEXT NOT NULL DEFAULT 'system_verified'"
+        )
+    except sqlite3.OperationalError:
+        pass
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS trust_guided_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_id INTEGER NOT NULL REFERENCES channel_trust_plans(id) ON DELETE CASCADE,
+            status TEXT NOT NULL DEFAULT 'ready',
+            agenda_json TEXT NOT NULL DEFAULT '{}',
+            checklist_json TEXT NOT NULL DEFAULT '{}',
+            notes TEXT DEFAULT '',
+            started_at TEXT DEFAULT '',
+            completed_at TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    ''')
+    c.execute('''
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_trust_guided_session_active
+        ON trust_guided_sessions(plan_id)
+        WHERE status IN ('ready', 'in_progress')
+    ''')
+    c.execute('''
+        CREATE INDEX IF NOT EXISTS idx_trust_guided_session_history
+        ON trust_guided_sessions(plan_id, created_at DESC)
     ''')
 
     c.execute('''
@@ -1495,6 +1799,8 @@ def init_db():
             WHERE channel_trust_plans.id = trust_activity_log.plan_id
         )
     ''')
+    _migrate_trust_builder_guided_mode(conn)
+    _migrate_trust_builder_automation_restore(conn)
 
     c.execute('''
         CREATE TABLE IF NOT EXISTS trust_safety_blacklist (
@@ -1734,6 +2040,110 @@ def _migrate_fb_crossposter_token_storage(conn: sqlite3.Connection) -> None:
                 "WHERE id = ?",
                 (encrypted, row_id),
             )
+
+
+def _migrate_youtube_channel_proxy_storage(conn: sqlite3.Connection) -> None:
+    """Move legacy plaintext GPM proxy credentials into a DPAPI column."""
+    from auto_yt.services.secret_store import decrypt_secret, encrypt_secret
+
+    rows = conn.execute(
+        "SELECT id, gpm_proxy_info, gpm_proxy_info_encrypted FROM youtube_channels"
+    ).fetchall()
+    for row_id, plaintext_proxy, encrypted_proxy in rows:
+        plaintext = str(plaintext_proxy or "").strip()
+        encrypted = str(encrypted_proxy or "").strip()
+        if encrypted:
+            # Fail startup before workers run if an existing value cannot be recovered.
+            decrypt_secret(encrypted)
+        elif plaintext:
+            encrypted = encrypt_secret(plaintext)
+            if decrypt_secret(encrypted) != plaintext:
+                raise RuntimeError("Không thể xác minh proxy GPM sau khi mã hóa DPAPI.")
+        if plaintext or encrypted != str(encrypted_proxy or ""):
+            conn.execute(
+                "UPDATE youtube_channels "
+                "SET gpm_proxy_info = '', gpm_proxy_info_encrypted = ? WHERE id = ?",
+                (encrypted, row_id),
+            )
+
+
+def _migrate_trust_builder_guided_mode(conn: sqlite3.Connection) -> None:
+    """Preserve legacy history while disabling automated engagement plans."""
+    applied = conn.execute(
+        "SELECT 1 FROM schema_migrations WHERE name = ?",
+        (TRUST_READINESS_V1_MIGRATION,),
+    ).fetchone()
+    if applied:
+        return
+    now = utc_now()
+    conn.execute(
+        """
+        UPDATE channel_trust_plans
+        SET legacy_trust_score_estimated = trust_score_estimated,
+            trust_score_estimated = 0,
+            mode = 'guided',
+            requires_review = 1,
+            readiness_state = 'needs_attention',
+            status = CASE WHEN status = 'active' THEN 'paused' ELSE status END,
+            next_run_at = '',
+            updated_at = ?
+        """,
+        (now,),
+    )
+    conn.execute(
+        """
+        UPDATE trust_activity_log
+        SET activity_source = 'legacy_automation'
+        WHERE activity_source = 'system_verified'
+        """
+    )
+    conn.execute(
+        """
+        UPDATE system_jobs
+        SET status = 'canceled',
+            progress = 'Đã hủy khi chuyển sang Guided Readiness',
+            error = '',
+            cancel_requested = 0,
+            finished_at = ?,
+            updated_at = ?
+        WHERE job_type = 'trust_builder_session'
+          AND status IN ('queued', 'running', 'retry_wait', 'paused')
+        """,
+        (now, now),
+    )
+    conn.execute(
+        "INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)",
+        (TRUST_READINESS_V1_MIGRATION, now),
+    )
+
+
+def _migrate_trust_builder_automation_restore(conn: sqlite3.Connection) -> None:
+    """Restore legacy automation plans without restarting them or reviving jobs."""
+    applied = conn.execute(
+        "SELECT 1 FROM schema_migrations WHERE name = ?",
+        (TRUST_AUTOMATION_RESTORE_V1_MIGRATION,),
+    ).fetchone()
+    if applied:
+        return
+    now = utc_now()
+    conn.execute(
+        """
+        UPDATE channel_trust_plans
+        SET trust_score_estimated = legacy_trust_score_estimated,
+            mode = 'automated',
+            requires_review = 0,
+            readiness_state = 'legacy_restored',
+            status = 'paused',
+            next_run_at = '',
+            updated_at = ?
+        WHERE legacy_trust_score_estimated > 0
+        """,
+        (now,),
+    )
+    conn.execute(
+        "INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)",
+        (TRUST_AUTOMATION_RESTORE_V1_MIGRATION, now),
+    )
 
 
 def _migrate_channel_schedule_reservations_partial_unique(conn: sqlite3.Connection) -> None:
@@ -2045,7 +2455,7 @@ def list_video_identity_candidates() -> list[dict]:
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         '''
-        SELECT id, url, title, chat_url, prompt_version, video_status,
+        SELECT id, url, title, chat_url, prompt_version, video_status, created_at,
                COALESCE(source_type, ?) AS source_type
         FROM videos
         ORDER BY id DESC
@@ -2281,6 +2691,7 @@ def delete_video_with_dependencies(video_id: int) -> dict | None:
     conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
     try:
+        conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("BEGIN IMMEDIATE")
         video = conn.execute(
             "SELECT * FROM videos WHERE id = ?",
@@ -2294,7 +2705,10 @@ def delete_video_with_dependencies(video_id: int) -> dict | None:
             '''
             SELECT id FROM system_jobs
             WHERE video_id = ?
-              AND status IN ('queued', 'running', 'retry_wait', 'paused')
+              AND status IN (
+                  'queued', 'running', 'processing', 'in_progress',
+                  'retry_wait', 'paused'
+              )
             LIMIT 1
             ''',
             (video_id,),
@@ -2319,6 +2733,24 @@ def delete_video_with_dependencies(video_id: int) -> dict | None:
                 "Hãy đợi job kết thúc trước khi xóa."
             )
 
+        active_publish_workflow = conn.execute(
+            '''
+            SELECT id FROM youtube_publish_workflows
+            WHERE video_id = ?
+              AND status IN (
+                  'queued', 'running', 'retry_wait', 'waiting', 'processing',
+                  'ready_to_schedule', 'browser_upload', 'uploading'
+              )
+            LIMIT 1
+            ''',
+            (video_id,),
+        ).fetchone()
+        if active_publish_workflow is not None:
+            raise ValueError(
+                "Video đang có workflow xuất bản chạy hoặc chờ xử lý. "
+                "Hãy đợi workflow kết thúc trước khi xóa."
+            )
+
         system_jobs = conn.execute(
             "SELECT * FROM system_jobs WHERE video_id = ? ORDER BY created_at",
             (video_id,),
@@ -2335,7 +2767,19 @@ def delete_video_with_dependencies(video_id: int) -> dict | None:
             "SELECT * FROM video_publications WHERE video_id = ? ORDER BY id",
             (video_id,),
         ).fetchall()
+        video_artifacts = conn.execute(
+            "SELECT * FROM video_artifacts WHERE video_id = ? ORDER BY id",
+            (video_id,),
+        ).fetchall()
+        publish_workflows = conn.execute(
+            "SELECT * FROM youtube_publish_workflows WHERE video_id = ? ORDER BY created_at",
+            (video_id,),
+        ).fetchall()
 
+        conn.execute(
+            "DELETE FROM youtube_publish_workflows WHERE video_id = ?",
+            (video_id,),
+        )
         conn.execute(
             "DELETE FROM youtube_comments WHERE publication_id IN "
             "(SELECT id FROM video_publications WHERE video_id = ?)",
@@ -2362,6 +2806,8 @@ def delete_video_with_dependencies(video_id: int) -> dict | None:
         "audio_task": dict(audio_task) if audio_task else None,
         "audio_review": dict(audio_review) if audio_review else None,
         "video_publications": [dict(row) for row in publications],
+        "video_artifacts": [_decode_video_artifact(row) for row in video_artifacts],
+        "youtube_publish_workflows": [dict(row) for row in publish_workflows],
     }
 
 
@@ -2386,7 +2832,10 @@ def save_youtube_channel(
     auto_heart: int = 1,
     **extra_fields,
 ) -> dict:
+    from auto_yt.services.secret_store import encrypt_secret
+
     now = utc_now()
+    encrypted_proxy = encrypt_secret(str(gpm_proxy_info or "").strip())
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute(
@@ -2394,9 +2843,10 @@ def save_youtube_channel(
         INSERT INTO youtube_channels (
             channel_id, title, thumbnail_url, access_token_encrypted,
             refresh_token_encrypted, token_expiry, scope, oauth_client_id, status,
-            gpm_profile_id, gpm_profile_name, gpm_proxy_info, interaction_mode, auto_heart,
+            gpm_profile_id, gpm_profile_name, gpm_proxy_info,
+            gpm_proxy_info_encrypted, interaction_mode, auto_heart,
             created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'connected', ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'connected', ?, ?, '', ?, ?, ?, ?, ?)
         ON CONFLICT(channel_id) DO UPDATE SET
             title = excluded.title,
             thumbnail_url = excluded.thumbnail_url,
@@ -2422,9 +2872,11 @@ def save_youtube_channel(
                 WHEN excluded.gpm_profile_name != '' THEN excluded.gpm_profile_name
                 ELSE youtube_channels.gpm_profile_name
             END,
-            gpm_proxy_info = CASE
-                WHEN excluded.gpm_proxy_info != '' THEN excluded.gpm_proxy_info
-                ELSE youtube_channels.gpm_proxy_info
+            gpm_proxy_info = '',
+            gpm_proxy_info_encrypted = CASE
+                WHEN excluded.gpm_proxy_info_encrypted != ''
+                THEN excluded.gpm_proxy_info_encrypted
+                ELSE youtube_channels.gpm_proxy_info_encrypted
             END,
             status = 'connected',
             updated_at = excluded.updated_at
@@ -2440,7 +2892,7 @@ def save_youtube_channel(
             str(oauth_client_id or "").strip(),
             gpm_profile_id,
             gpm_profile_name,
-            gpm_proxy_info,
+            encrypted_proxy,
             interaction_mode,
             auto_heart,
             now,
@@ -2461,7 +2913,12 @@ PUBLISH_PIPELINE_V1_MIGRATION = "publish_pipeline_v1"
 def _public_youtube_channel(row: sqlite3.Row | dict | None, *, include_tokens: bool = False) -> dict | None:
     if row is None:
         return None
+    from auto_yt.services.secret_store import decrypt_secret
+
     channel = dict(row)
+    encrypted_proxy = str(channel.pop("gpm_proxy_info_encrypted", "") or "").strip()
+    legacy_proxy = str(channel.get("gpm_proxy_info") or "").strip()
+    channel["gpm_proxy_info"] = decrypt_secret(encrypted_proxy) if encrypted_proxy else legacy_proxy
     channel["has_refresh_token"] = bool(channel.get("refresh_token_encrypted"))
     try:
         slots = json.loads(channel.get("publication_slots_json") or "[]")
@@ -2472,6 +2929,21 @@ def _public_youtube_channel(row: sqlite3.Row | dict | None, *, include_tokens: b
         channel.pop("access_token_encrypted", None)
         channel.pop("refresh_token_encrypted", None)
     return channel
+
+
+def public_youtube_channel(channel: sqlite3.Row | dict | None) -> dict | None:
+    """Return channel metadata without OAuth or proxy credentials."""
+    if channel is None:
+        return None
+    from auto_yt.services.proxy_utils import parse_proxy_url
+
+    public = dict(channel)
+    proxy_info = str(public.pop("gpm_proxy_info", "") or "").strip()
+    public.pop("gpm_proxy_info_encrypted", None)
+    public.pop("access_token_encrypted", None)
+    public.pop("refresh_token_encrypted", None)
+    public["gpm_proxy_configured"] = bool(parse_proxy_url(proxy_info))
+    return public
 
 
 def get_youtube_channel(channel_db_id: int, *, include_tokens: bool = False) -> dict | None:
@@ -2554,6 +3026,13 @@ def update_youtube_channel(channel_db_id: int, **changes) -> dict | None:
         raise ValueError(f"Unsupported YouTube channel fields: {sorted(invalid)}")
     if not changes:
         return get_youtube_channel(channel_db_id)
+    if "gpm_proxy_info" in changes:
+        from auto_yt.services.secret_store import encrypt_secret
+
+        raw_proxy = str(changes.pop("gpm_proxy_info") or "").strip()
+        changes["gpm_proxy_info"] = ""
+        changes["gpm_proxy_info_encrypted"] = encrypt_secret(raw_proxy)
+        allowed.add("gpm_proxy_info_encrypted")
     changes["updated_at"] = utc_now()
     assignments = ", ".join(f"{field} = ?" for field in changes)
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
@@ -2697,13 +3176,20 @@ def save_video_publication(
         conn.execute(
             """
             UPDATE videos
-            SET is_published = CASE WHEN EXISTS (
-                SELECT 1 FROM video_publications
-                WHERE video_id = ? AND privacy_status = 'public'
-            ) THEN 1 ELSE 0 END
+            SET is_published = CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM video_publications
+                    WHERE video_id = ?
+                      AND (privacy_status IN ('public', 'unlisted') OR (scheduled_at IS NOT NULL AND scheduled_at != ''))
+                ) THEN 1
+                WHEN is_published = 1 AND EXISTS (
+                    SELECT 1 FROM video_publications WHERE video_id = ?
+                ) THEN 1
+                ELSE 0
+            END
             WHERE id = ?
             """,
-            (video_id, video_id),
+            (video_id, video_id, video_id),
         )
         row = conn.execute(
             "SELECT * FROM video_publications WHERE youtube_video_id = ?",
@@ -3194,6 +3680,17 @@ def update_video_generation(
     return success
 
 
+def update_video_production_snapshot(video_id: int, snapshot: dict) -> bool:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    cursor = conn.execute(
+        "UPDATE videos SET production_snapshot_json = ? WHERE id = ?",
+        (json.dumps(snapshot or {}, ensure_ascii=False), video_id),
+    )
+    conn.commit()
+    conn.close()
+    return cursor.rowcount > 0
+
+
 def update_audio_duration(video_id: int, duration_seconds: float | None) -> bool:
     conn = sqlite3.connect(str(DB_PATH))
     c = conn.cursor()
@@ -3337,6 +3834,64 @@ def list_audio_reviews(limit: int | None = 100) -> list[dict]:
         review.pop("report_json", None)
         reviews.append(review)
     return reviews
+
+
+def get_metadata_review(video_id: int) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute('SELECT * FROM metadata_reviews WHERE video_id = ?', (video_id,))
+    row = c.fetchone()
+    conn.close()
+    if row is None:
+        return None
+    review = dict(row)
+    try:
+        review["report"] = json.loads(review.get("report_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        review["report"] = {}
+    review.pop("report_json", None)
+    return review
+
+
+def upsert_metadata_review(
+    video_id: int,
+    script_hash: str,
+    metadata_hash: str,
+    status: str,
+    report: dict,
+    reviewed_at: str = "",
+) -> dict:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH))
+    c = conn.cursor()
+    c.execute(
+        '''
+        INSERT INTO metadata_reviews (
+            video_id, script_hash, metadata_hash, status, report_json,
+            reviewed_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(video_id) DO UPDATE SET
+            script_hash = excluded.script_hash,
+            metadata_hash = excluded.metadata_hash,
+            status = excluded.status,
+            report_json = excluded.report_json,
+            reviewed_at = excluded.reviewed_at,
+            updated_at = excluded.updated_at
+        ''',
+        (
+            video_id,
+            script_hash,
+            metadata_hash,
+            status,
+            json.dumps(report, ensure_ascii=False),
+            reviewed_at,
+            now,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return get_metadata_review(video_id)
 
 def get_audio_task_by_request_hash(request_hash: str) -> dict:
     conn = sqlite3.connect(str(DB_PATH))
@@ -4107,7 +4662,8 @@ def claim_next_system_job(job_type: str) -> dict | None:
             WHERE job_type = ? AND cancel_requested = 0
               AND status IN ('queued', 'retry_wait')
               AND (
-                  ? NOT IN ('comment_publish', 'comment_sync') OR status = 'queued'
+                  ? NOT IN ('comment_publish', 'comment_sync', 'comment_draft', 'flow_media_generation')
+                  OR status = 'queued'
                   OR next_retry_at = '' OR next_retry_at <= ?
               )
               AND (
@@ -4268,7 +4824,8 @@ def has_claimable_system_jobs(job_type: str) -> bool:
         WHERE job_type = ? AND cancel_requested = 0
           AND status IN ('queued', 'retry_wait')
           AND (
-              ? NOT IN ('comment_publish', 'comment_sync') OR status = 'queued'
+              ? NOT IN ('comment_publish', 'comment_sync', 'comment_draft', 'flow_media_generation')
+              OR status = 'queued'
               OR next_retry_at = '' OR next_retry_at <= ?
           )
           AND (
@@ -4311,8 +4868,8 @@ def get_next_system_job_retry_delay(job_type: str) -> float | None:
               )
           )
         ORDER BY
-            CASE WHEN ? IN ('comment_publish', 'comment_sync') AND status = 'queued' THEN 0 ELSE 1 END,
-            CASE WHEN ? IN ('comment_publish', 'comment_sync') THEN next_retry_at ELSE created_at END ASC,
+            CASE WHEN ? IN ('comment_publish', 'comment_sync', 'comment_draft', 'flow_media_generation') AND status = 'queued' THEN 0 ELSE 1 END,
+            CASE WHEN ? IN ('comment_publish', 'comment_sync', 'comment_draft', 'flow_media_generation') THEN next_retry_at ELSE created_at END ASC,
             created_at ASC
         LIMIT 1
         ''',
@@ -5743,6 +6300,74 @@ def delete_video_artifact(artifact_id: int) -> bool:
     return cursor.rowcount > 0
 
 
+# ==============================================================================
+# Google Flow projects
+# ==============================================================================
+
+def get_flow_project(video_id: int) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM flow_projects WHERE video_id = ?",
+        (int(video_id),),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row is not None else None
+
+
+def upsert_flow_project(video_id: int, project_id: str, project_url: str) -> dict:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        INSERT INTO flow_projects (video_id, project_id, project_url, reset_requested)
+        VALUES (?, ?, ?, 0)
+        ON CONFLICT(video_id) DO UPDATE SET
+            project_id = excluded.project_id,
+            project_url = excluded.project_url,
+            reset_requested = 0
+        """,
+        (int(video_id), str(project_id or ""), str(project_url or "")),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM flow_projects WHERE video_id = ?",
+        (int(video_id),),
+    ).fetchone()
+    conn.close()
+    return dict(row)
+
+
+def request_new_flow_project(video_id: int) -> dict:
+    """Persist a reset request until a new Flow project is created successfully."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        INSERT INTO flow_projects (video_id, project_id, project_url, reset_requested)
+        VALUES (?, '__reset__', '', 1)
+        ON CONFLICT(video_id) DO UPDATE SET reset_requested = 1
+        """,
+        (int(video_id),),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM flow_projects WHERE video_id = ?",
+        (int(video_id),),
+    ).fetchone()
+    conn.close()
+    return dict(row)
+
+
+def list_video_artifact_paths() -> list[str]:
+    conn = sqlite3.connect(str(DB_PATH))
+    rows = conn.execute(
+        "SELECT DISTINCT path FROM video_artifacts WHERE TRIM(path) != ''"
+    ).fetchall()
+    conn.close()
+    return [str(row[0]) for row in rows if row[0]]
+
+
 def get_video_ids_with_ready_final_mp4(video_ids: list[int] | set[int]) -> set[int]:
     if not video_ids:
         return set()
@@ -6441,6 +7066,15 @@ def complete_youtube_schedule(
             """,
             (scheduled_at, now, workflow_id),
         )
+        publication_video = conn.execute(
+            "SELECT video_id FROM video_publications WHERE id = ?",
+            (publication_id,),
+        ).fetchone()
+        if publication_video is not None:
+            conn.execute(
+                "UPDATE videos SET is_published = 1 WHERE id = ?",
+                (int(publication_video[0]),),
+            )
         row = conn.execute(
             "SELECT * FROM youtube_publish_workflows WHERE id = ?",
             (workflow_id,),
@@ -6585,13 +7219,20 @@ def update_video_publication(publication_id: int, **changes) -> dict | None:
         conn.execute(
             """
             UPDATE videos
-            SET is_published = CASE WHEN EXISTS (
-                SELECT 1 FROM video_publications
-                WHERE video_id = ? AND privacy_status = 'public'
-            ) THEN 1 ELSE 0 END
+            SET is_published = CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM video_publications
+                    WHERE video_id = ?
+                      AND (privacy_status IN ('public', 'unlisted') OR (scheduled_at IS NOT NULL AND scheduled_at != ''))
+                ) THEN 1
+                WHEN is_published = 1 AND EXISTS (
+                    SELECT 1 FROM video_publications WHERE video_id = ?
+                ) THEN 1
+                ELSE 0
+            END
             WHERE id = ?
             """,
-            (video_id, video_id),
+            (video_id, video_id, video_id),
         )
     conn.commit()
     row = conn.execute(
@@ -6626,7 +7267,10 @@ def upsert_youtube_channel(
     auto_heart: int = 1,
     **extra_fields,
 ) -> dict:
+    from auto_yt.services.secret_store import encrypt_secret
+
     now = utc_now()
+    encrypted_proxy = encrypt_secret(str(gpm_proxy_info or "").strip())
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
     existing = conn.execute(
@@ -6640,7 +7284,8 @@ def upsert_youtube_channel(
                 thumbnail_url = ?,
                 gpm_profile_id = ?,
                 gpm_profile_name = ?,
-                gpm_proxy_info = ?,
+                gpm_proxy_info = '',
+                gpm_proxy_info_encrypted = ?,
                 interaction_mode = ?,
                 auto_heart = ?,
                 updated_at = ?
@@ -6651,7 +7296,7 @@ def upsert_youtube_channel(
                 thumbnail_url,
                 gpm_profile_id,
                 gpm_profile_name,
-                gpm_proxy_info,
+                encrypted_proxy,
                 interaction_mode,
                 auto_heart,
                 now,
@@ -6665,8 +7310,9 @@ def upsert_youtube_channel(
                 channel_id, title, thumbnail_url, access_token_encrypted,
                 refresh_token_encrypted, token_expiry, scope, status,
                 gpm_profile_id, gpm_profile_name, gpm_proxy_info,
+                gpm_proxy_info_encrypted,
                 interaction_mode, auto_heart, created_at, updated_at
-            ) VALUES (?, ?, ?, '', '', '', '', 'connected', ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, '', '', '', '', 'connected', ?, ?, '', ?, ?, ?, ?, ?)
             """,
             (
                 channel_id,
@@ -6674,7 +7320,7 @@ def upsert_youtube_channel(
                 thumbnail_url,
                 gpm_profile_id,
                 gpm_profile_name,
-                gpm_proxy_info,
+                encrypted_proxy,
                 interaction_mode,
                 auto_heart,
                 now,
@@ -6800,12 +7446,21 @@ def _decode_trust_plan(row: sqlite3.Row | dict | None) -> dict | None:
     data["niche_keywords"] = _decode_json_field(data.get("niche_keywords"), [])
     data["target_channels"] = _decode_json_field(data.get("target_channels"), [])
     data["branding_checklist"] = _decode_json_field(data.get("branding_checklist"), {})
+    data["profile_readiness"] = _decode_json_field(data.pop("profile_readiness_json", None), {})
+    data["channel_readiness"] = _decode_json_field(data.pop("channel_readiness_json", None), {})
+    data["profile_baseline"] = _decode_json_field(data.pop("profile_baseline_json", None), {})
+    data["approved_sources"] = _decode_json_field(data.get("approved_sources"), [])
     data["total_videos_watched"] = int(data.get("total_videos_watched") or 0)
     data["total_searches"] = int(data.get("total_searches") or 0)
     data["total_likes"] = int(data.get("total_likes") or 0)
     data["total_comments"] = int(data.get("total_comments") or 0)
     data["total_subscriptions"] = int(data.get("total_subscriptions") or 0)
     data["trust_score_estimated"] = int(data.get("trust_score_estimated") or 0)
+    data["legacy_trust_score_estimated"] = int(data.get("legacy_trust_score_estimated") or 0)
+    data["profile_readiness_pct"] = int(data.get("profile_readiness_pct") or 0)
+    data["channel_readiness_pct"] = int(data.get("channel_readiness_pct") or 0)
+    data["requires_review"] = bool(data.get("requires_review"))
+    data["reminder_enabled"] = bool(data.get("reminder_enabled"))
     data["daily_watch_target"] = int(5 if data.get("daily_watch_target") is None else data["daily_watch_target"])
     data["daily_search_target"] = int(3 if data.get("daily_search_target") is None else data["daily_search_target"])
     data["daily_like_target"] = int(3 if data.get("daily_like_target") is None else data["daily_like_target"])
@@ -6836,6 +7491,7 @@ def create_channel_trust_plan(
     daily_subscribe_target: int = 0,
     min_watch_minutes: int = 10,
     branding_checklist: dict | None = None,
+    approved_sources: list[str] | None = None,
     status: str = "draft",
     warmup_phase: str = "idle",
 ) -> dict:
@@ -6843,6 +7499,7 @@ def create_channel_trust_plan(
     keywords_json = json.dumps(niche_keywords or [], ensure_ascii=False)
     channels_json = json.dumps(target_channels or [], ensure_ascii=False)
     branding_json = json.dumps(branding_checklist or {}, ensure_ascii=False)
+    approved_sources_json = json.dumps(approved_sources or [], ensure_ascii=False)
 
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
@@ -6852,15 +7509,15 @@ def create_channel_trust_plan(
             channel_db_id, niche_keywords, target_channels,
             daily_watch_target, daily_search_target, daily_like_target,
             daily_comment_target, daily_subscribe_target, min_watch_minutes,
-            branding_checklist, status, warmup_phase,
+            branding_checklist, approved_sources, status, warmup_phase, mode,
             created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'automated', ?, ?)
         """,
         (
             channel_db_id, keywords_json, channels_json,
             daily_watch_target, daily_search_target, daily_like_target,
             daily_comment_target, daily_subscribe_target, min_watch_minutes,
-            branding_json, status, warmup_phase,
+            branding_json, approved_sources_json, status, warmup_phase,
             now, now
         )
     )
@@ -6936,7 +7593,12 @@ def update_channel_trust_plan(plan_id: int, **changes) -> dict | None:
         "daily_comment_target", "daily_subscribe_target", "min_watch_minutes",
         "branding_checklist", "status", "total_videos_watched", "total_searches",
         "total_likes", "total_comments", "total_subscriptions", "trust_score_estimated",
-        "error_message", "last_session_at", "last_attempt_at", "next_run_at"
+        "error_message", "last_session_at", "last_attempt_at", "next_run_at",
+        "legacy_trust_score_estimated", "mode", "requires_review",
+        "profile_readiness", "channel_readiness", "profile_readiness_pct",
+        "channel_readiness_pct", "readiness_state", "profile_baseline",
+        "approved_sources", "reminder_enabled", "reminder_time_local",
+        "last_readiness_check_at"
     }
 
     set_clauses = []
@@ -6946,7 +7608,10 @@ def update_channel_trust_plan(plan_id: int, **changes) -> dict | None:
             continue
         if key in ("niche_keywords", "target_channels") and isinstance(value, list):
             value = json.dumps(value, ensure_ascii=False)
-        elif key == "branding_checklist" and isinstance(value, dict):
+        elif key in {"branding_checklist", "profile_readiness", "channel_readiness", "profile_baseline"} and isinstance(value, dict):
+            value = json.dumps(value, ensure_ascii=False)
+            key = f"{key}_json" if key in {"profile_readiness", "channel_readiness", "profile_baseline"} else key
+        elif key == "approved_sources" and isinstance(value, list):
             value = json.dumps(value, ensure_ascii=False)
         set_clauses.append(f"{key} = ?")
         params.append(value)
@@ -6984,6 +7649,7 @@ def delete_channel_trust_plan(plan_id: int) -> bool:
     conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
     try:
         conn.execute("BEGIN IMMEDIATE")
+        conn.execute("DELETE FROM trust_guided_sessions WHERE plan_id = ?", (plan_id,))
         conn.execute("DELETE FROM trust_activity_log WHERE plan_id = ?", (plan_id,))
         cursor = conn.execute(
             "DELETE FROM channel_trust_plans WHERE id = ?", (plan_id,)
@@ -7006,6 +7672,7 @@ def create_trust_activity_log(
     detail_json: dict | None = None,
     success: bool = True,
     error_message: str = "",
+    activity_source: str = "system_verified",
 ) -> dict:
     now = utc_now()
     detail_str = json.dumps(detail_json or {}, ensure_ascii=False)
@@ -7016,12 +7683,14 @@ def create_trust_activity_log(
         """
         INSERT INTO trust_activity_log (
             plan_id, activity_type, target_url, target_title,
-            duration_seconds, detail_json, success, error_message, executed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            duration_seconds, detail_json, success, error_message,
+            activity_source, executed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             plan_id, activity_type, target_url, target_title,
-            duration_seconds, detail_str, 1 if success else 0, error_message, now
+            duration_seconds, detail_str, 1 if success else 0, error_message,
+            activity_source, now
         )
     )
     log_id = cursor.lastrowid
@@ -7051,6 +7720,112 @@ def list_trust_activity_logs(
     ).fetchall()
     conn.close()
     return [_decode_trust_activity_log(row) for row in rows]
+
+
+GUIDED_SESSION_STATUSES = {"ready", "in_progress", "completed", "abandoned"}
+
+
+def _decode_guided_session(row: sqlite3.Row | dict | None) -> dict | None:
+    if row is None:
+        return None
+    data = dict(row)
+    data["agenda"] = _decode_json_field(data.pop("agenda_json", None), {})
+    data["checklist"] = _decode_json_field(data.pop("checklist_json", None), {})
+    return data
+
+
+def create_trust_guided_session(plan_id: int, agenda: dict) -> dict:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            """
+            SELECT * FROM trust_guided_sessions
+            WHERE plan_id = ? AND status IN ('ready', 'in_progress')
+            ORDER BY created_at ASC LIMIT 1
+            """,
+            (plan_id,),
+        ).fetchone()
+        if existing:
+            conn.execute("COMMIT")
+            return _decode_guided_session(existing)
+        cursor = conn.execute(
+            """
+            INSERT INTO trust_guided_sessions (
+                plan_id, status, agenda_json, checklist_json, notes,
+                started_at, completed_at, created_at, updated_at
+            ) VALUES (?, 'ready', ?, '{}', '', '', '', ?, ?)
+            """,
+            (plan_id, json.dumps(agenda, ensure_ascii=False), now, now),
+        )
+        session_id = int(cursor.lastrowid)
+        row = conn.execute(
+            "SELECT * FROM trust_guided_sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        conn.execute("COMMIT")
+        return _decode_guided_session(row)
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def get_trust_guided_session(session_id: int) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM trust_guided_sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    conn.close()
+    return _decode_guided_session(row)
+
+
+def list_trust_guided_sessions(
+    plan_id: int,
+    *,
+    limit: int = 30,
+    offset: int = 0,
+) -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT * FROM trust_guided_sessions
+        WHERE plan_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT ? OFFSET ?
+        """,
+        (plan_id, max(1, min(int(limit), 200)), max(0, int(offset))),
+    ).fetchall()
+    conn.close()
+    return [_decode_guided_session(row) for row in rows]
+
+
+def update_trust_guided_session(session_id: int, **changes) -> dict | None:
+    valid_fields = {"status", "checklist", "notes", "started_at", "completed_at"}
+    invalid = set(changes) - valid_fields
+    if invalid:
+        raise ValueError(f"Unsupported guided session fields: {sorted(invalid)}")
+    if "status" in changes and changes["status"] not in GUIDED_SESSION_STATUSES:
+        raise ValueError("Trạng thái guided session không hợp lệ.")
+    if "checklist" in changes:
+        changes["checklist_json"] = json.dumps(changes.pop("checklist") or {}, ensure_ascii=False)
+    if not changes:
+        return get_trust_guided_session(session_id)
+    changes["updated_at"] = utc_now()
+    assignments = ", ".join(f"{field} = ?" for field in changes)
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.execute(
+        f"UPDATE trust_guided_sessions SET {assignments} WHERE id = ?",
+        (*changes.values(), session_id),
+    )
+    conn.commit()
+    conn.close()
+    return get_trust_guided_session(session_id)
 
 
 def get_trust_activity_stats(
@@ -7338,7 +8113,7 @@ def get_safety_config() -> dict:
     conn.close()
     config = {
         "shield_enabled": True,
-        "remote_sync_url": "https://raw.githubusercontent.com/Auto-YT/safety-shield/main/vietnam_blacklist.json",
+        "remote_sync_url": "",
         "last_synced_at": "",
         "auto_sync_interval_hours": 24,
     }
@@ -7356,6 +8131,9 @@ def get_safety_config() -> dict:
                 config["auto_sync_interval_hours"] = int(v)
             except ValueError:
                 pass
+    config["sync_mode"] = (
+        "remote" if str(config.get("remote_sync_url") or "").strip() else "local_only"
+    )
     return config
 
 
@@ -7397,3 +8175,908 @@ def get_all_active_safety_rules() -> dict[str, list[dict]]:
         elif etype in {"regex_pattern", "regex"}:
             result["regex_patterns"].append(d)
     return result
+
+
+def _decode_competitor_rule(row: sqlite3.Row | dict | None) -> dict | None:
+    if row is None:
+        return None
+    result = dict(row)
+    try:
+        windows = json.loads(result.get("manual_windows_json") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        windows = []
+    result["manual_windows"] = windows if isinstance(windows, list) else []
+    result.pop("manual_windows_json", None)
+    result["baseline_complete"] = bool(result.get("baseline_complete"))
+    return result
+
+
+def upsert_competitor_channel(
+    *,
+    channel_id: str,
+    canonical_url: str,
+    handle: str = "",
+    title: str = "",
+    thumbnail_url: str = "",
+) -> dict:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        INSERT INTO competitor_channels (
+            channel_id, canonical_url, handle, title, thumbnail_url,
+            last_resolved_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(channel_id) DO UPDATE SET
+            canonical_url = excluded.canonical_url,
+            handle = CASE WHEN excluded.handle != '' THEN excluded.handle ELSE competitor_channels.handle END,
+            title = CASE WHEN excluded.title != '' THEN excluded.title ELSE competitor_channels.title END,
+            thumbnail_url = CASE WHEN excluded.thumbnail_url != '' THEN excluded.thumbnail_url ELSE competitor_channels.thumbnail_url END,
+            last_resolved_at = excluded.last_resolved_at,
+            updated_at = excluded.updated_at
+        """,
+        (
+            channel_id,
+            canonical_url,
+            handle,
+            title,
+            thumbnail_url,
+            now,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM competitor_channels WHERE channel_id = ?", (channel_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row)
+
+
+def get_competitor_channel(competitor_channel_id: int) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM competitor_channels WHERE id = ?", (competitor_channel_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def create_competitor_watch_rule(
+    *,
+    competitor_channel_id: int,
+    prompt_version: str,
+    target_youtube_channel_id: int,
+    status: str = "paused",
+    publication_mode: str = "inherit",
+    window_mode: str = "learned",
+    guest_voice_pool: str = "",
+    manual_windows: list[dict] | None = None,
+) -> dict:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.execute(
+        """
+        INSERT INTO competitor_watch_rules (
+            competitor_channel_id, prompt_version, target_youtube_channel_id,
+            status, publication_mode, window_mode, guest_voice_pool,
+            manual_windows_json, next_scan_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            competitor_channel_id,
+            prompt_version,
+            target_youtube_channel_id,
+            status,
+            publication_mode,
+            window_mode,
+            guest_voice_pool,
+            json.dumps(manual_windows or [], ensure_ascii=False),
+            now if status == "enabled" else "",
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM competitor_watch_rules WHERE id = ?", (cursor.lastrowid,)
+    ).fetchone()
+    conn.close()
+    return _decode_competitor_rule(row)
+
+
+def _competitor_rule_select() -> str:
+    return """
+        SELECT r.*, c.channel_id AS competitor_youtube_channel_id,
+               c.canonical_url AS competitor_url, c.handle AS competitor_handle,
+               c.title AS competitor_title, c.thumbnail_url AS competitor_thumbnail_url,
+               y.channel_id AS target_channel_id, y.title AS target_channel_title,
+               y.gpm_profile_id AS target_gpm_profile_id,
+               y.publication_timezone AS target_publication_timezone,
+               CASE WHEN COALESCE(y.gpm_proxy_info_encrypted, '') != ''
+                          OR COALESCE(y.gpm_proxy_info, '') != ''
+                    THEN 1 ELSE 0 END AS target_proxy_configured
+        FROM competitor_watch_rules r
+        JOIN competitor_channels c ON c.id = r.competitor_channel_id
+        JOIN youtube_channels y ON y.id = r.target_youtube_channel_id
+    """
+
+
+def get_competitor_watch_rule(rule_id: int) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        _competitor_rule_select() + " WHERE r.id = ?", (rule_id,)
+    ).fetchone()
+    conn.close()
+    return _decode_competitor_rule(row)
+
+
+def list_competitor_watch_rules(*, status: str = "") -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    params: tuple = ()
+    where = ""
+    if status:
+        where = " WHERE r.status = ?"
+        params = (status,)
+    rows = conn.execute(
+        _competitor_rule_select() + where + " ORDER BY r.created_at DESC, r.id DESC",
+        params,
+    ).fetchall()
+    conn.close()
+    return [_decode_competitor_rule(row) for row in rows]
+
+
+def list_due_competitor_watch_rules(now: str, *, limit: int = 20) -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        _competitor_rule_select()
+        + " WHERE r.status = 'enabled' AND (r.next_scan_at = '' OR r.next_scan_at <= ?)"
+        + " ORDER BY r.next_scan_at, r.id LIMIT ?",
+        (now, max(1, int(limit))),
+    ).fetchall()
+    conn.close()
+    return [_decode_competitor_rule(row) for row in rows]
+
+
+def update_competitor_watch_rule(rule_id: int, **changes) -> dict | None:
+    allowed = {
+        "status",
+        "publication_mode",
+        "window_mode",
+        "guest_voice_pool",
+        "baseline_complete",
+        "baseline_video_count",
+        "last_scan_at",
+        "last_success_at",
+        "next_scan_at",
+        "error_count",
+        "last_error",
+        "scan_strategy",
+        "last_scan_source",
+        "rss_failure_count",
+        "rss_retry_after",
+        "fallback_failure_count",
+        "last_fallback_at",
+    }
+    assignments: list[str] = []
+    values: list = []
+    for key, value in changes.items():
+        if key == "manual_windows":
+            assignments.append("manual_windows_json = ?")
+            values.append(json.dumps(value or [], ensure_ascii=False))
+        elif key in allowed:
+            assignments.append(f"{key} = ?")
+            if key == "baseline_complete":
+                value = 1 if value else 0
+            values.append(value)
+    if not assignments:
+        return get_competitor_watch_rule(rule_id)
+    assignments.append("updated_at = ?")
+    values.extend([utc_now(), rule_id])
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.execute(
+        f"UPDATE competitor_watch_rules SET {', '.join(assignments)} WHERE id = ?",
+        values,
+    )
+    conn.commit()
+    conn.close()
+    return get_competitor_watch_rule(rule_id)
+
+
+def delete_competitor_watch_rule(rule_id: int) -> bool:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.execute("PRAGMA foreign_keys = ON")
+    cursor = conn.execute("DELETE FROM competitor_watch_rules WHERE id = ?", (rule_id,))
+    conn.commit()
+    conn.close()
+    return cursor.rowcount > 0
+
+
+def delete_competitor_rules_for_prompt(prompt_version: str) -> int:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.execute("PRAGMA foreign_keys = ON")
+    cursor = conn.execute(
+        "DELETE FROM competitor_watch_rules WHERE prompt_version = ?", (prompt_version,)
+    )
+    conn.commit()
+    conn.close()
+    return cursor.rowcount
+
+
+def upsert_competitor_source_video(
+    *,
+    competitor_channel_id: int,
+    youtube_video_id: str,
+    url: str,
+    title: str,
+    published_at: str,
+    is_baseline: bool,
+    content_type: str = "unknown",
+    duration_seconds: int = 0,
+    eligibility_status: str = "metadata_pending",
+    exclusion_reason: str = "",
+    discovery_source: str = "",
+    published_at_confidence: str = "unknown",
+    metadata_checked_at: str = "",
+    metadata: dict | None = None,
+) -> tuple[dict, bool]:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO competitor_source_videos (
+                competitor_channel_id, youtube_video_id, url, title, published_at,
+                discovered_at, is_baseline, content_type, duration_seconds,
+                eligibility_status, exclusion_reason, discovery_source,
+                published_at_confidence, metadata_checked_at, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                competitor_channel_id,
+                youtube_video_id,
+                url,
+                title,
+                published_at,
+                now,
+                1 if is_baseline else 0,
+                content_type,
+                max(0, int(duration_seconds or 0)),
+                eligibility_status,
+                exclusion_reason,
+                discovery_source,
+                published_at_confidence,
+                metadata_checked_at or now,
+                json.dumps(metadata or {}, ensure_ascii=False),
+            ),
+        )
+        created = cursor.rowcount > 0
+        if not created:
+            conn.execute(
+                """
+                UPDATE competitor_source_videos
+                SET url = CASE WHEN ? != '' THEN ? ELSE url END,
+                    title = CASE WHEN ? != '' THEN ? ELSE title END,
+                    published_at = CASE WHEN ? != '' THEN ? ELSE published_at END,
+                    is_baseline = CASE WHEN is_baseline = 1 OR ? = 1 THEN 1 ELSE 0 END,
+                    content_type = ?, duration_seconds = ?, eligibility_status = ?,
+                    exclusion_reason = ?, discovery_source = ?,
+                    published_at_confidence = ?, metadata_checked_at = ?, metadata_json = ?
+                WHERE competitor_channel_id = ? AND youtube_video_id = ?
+                """,
+                (
+                    url,
+                    url,
+                    title,
+                    title,
+                    published_at,
+                    published_at,
+                    1 if is_baseline else 0,
+                    content_type,
+                    max(0, int(duration_seconds or 0)),
+                    eligibility_status,
+                    exclusion_reason,
+                    discovery_source,
+                    published_at_confidence,
+                    metadata_checked_at or now,
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                    competitor_channel_id,
+                    youtube_video_id,
+                ),
+            )
+        row = conn.execute(
+            """
+            SELECT * FROM competitor_source_videos
+            WHERE competitor_channel_id = ? AND youtube_video_id = ?
+            """,
+            (competitor_channel_id, youtube_video_id),
+        ).fetchone()
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+    result = dict(row)
+    try:
+        result["metadata"] = json.loads(result.pop("metadata_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        result["metadata"] = {}
+    return result, created
+
+
+def list_competitor_source_videos(
+    competitor_channel_id: int, *, limit: int = 50
+) -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT * FROM competitor_source_videos
+        WHERE competitor_channel_id = ?
+        ORDER BY published_at DESC, id DESC LIMIT ?
+        """,
+        (competitor_channel_id, max(1, int(limit))),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_competitor_source_video(source_video_id: int) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM competitor_source_videos WHERE id = ?",
+        (source_video_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    result = dict(row)
+    try:
+        result["voice_profile"] = json.loads(result.get("voice_profile_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        result["voice_profile"] = {}
+    return result
+
+
+def update_competitor_source_voice_profile(
+    source_video_id: int,
+    *,
+    status: str,
+    profile: dict,
+    version: str,
+) -> dict | None:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        UPDATE competitor_source_videos
+        SET voice_profile_status = ?, voice_profile_json = ?,
+            voice_profile_version = ?, voice_profile_updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            str(status or "not_analyzed"),
+            json.dumps(profile or {}, ensure_ascii=False),
+            str(version or ""),
+            now,
+            source_video_id,
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM competitor_source_videos WHERE id = ?", (source_video_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def reserve_competitor_dispatch(
+    *, source_video_id: int, watch_rule_id: int, prompt_version: str
+) -> tuple[dict, bool]:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO competitor_dispatches (
+                source_video_id, watch_rule_id, prompt_version, status, created_at, updated_at
+            ) VALUES (?, ?, ?, 'reserved', ?, ?)
+            """,
+            (source_video_id, watch_rule_id, prompt_version, now, now),
+        )
+        created = cursor.rowcount > 0
+        row = conn.execute(
+            """
+            SELECT * FROM competitor_dispatches
+            WHERE source_video_id = ? AND prompt_version = ?
+            """,
+            (source_video_id, prompt_version),
+        ).fetchone()
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+    return dict(row), created
+
+
+def get_competitor_dispatch(source_video_id: int, prompt_version: str) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        """
+        SELECT * FROM competitor_dispatches
+        WHERE source_video_id = ? AND prompt_version = ?
+        """,
+        (source_video_id, prompt_version),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def update_competitor_dispatch(dispatch_id: int, **changes) -> dict | None:
+    allowed = {"system_job_id", "video_id", "status", "error"}
+    assignments: list[str] = []
+    values: list = []
+    for key, value in changes.items():
+        if key in allowed:
+            assignments.append(f"{key} = ?")
+            values.append(value)
+    if not assignments:
+        return None
+    assignments.append("updated_at = ?")
+    values.extend([utc_now(), dispatch_id])
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        f"UPDATE competitor_dispatches SET {', '.join(assignments)} WHERE id = ?",
+        values,
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM competitor_dispatches WHERE id = ?", (dispatch_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_competitor_dispatch_for_job(system_job_id: str) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM competitor_dispatches WHERE system_job_id = ?", (system_job_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_competitor_dispatch_for_video(video_id: int) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        """
+        SELECT d.*, s.youtube_video_id, s.url AS source_url,
+               s.title AS source_title, s.duration_seconds,
+               s.voice_profile_status, s.voice_profile_json,
+               s.voice_profile_version, s.voice_profile_updated_at,
+               r.guest_voice_pool, r.target_youtube_channel_id
+        FROM competitor_dispatches d
+        JOIN competitor_source_videos s ON s.id = d.source_video_id
+        JOIN competitor_watch_rules r ON r.id = d.watch_rule_id
+        WHERE d.video_id = ?
+        ORDER BY d.id DESC LIMIT 1
+        """,
+        (video_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    result = dict(row)
+    try:
+        result["voice_profile"] = json.loads(result.get("voice_profile_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        result["voice_profile"] = {}
+    return result
+
+
+def reconcile_competitor_dispatches_from_jobs() -> int:
+    """Repair stale active dispatches without reviving terminal work."""
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    repaired = 0
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            """
+            SELECT d.id, j.status AS job_status, j.error AS job_error
+            FROM competitor_dispatches d
+            JOIN system_jobs j ON j.id = d.system_job_id
+            WHERE d.status IN ('reserved', 'queued', 'processing')
+              AND j.status IN ('error', 'failed', 'canceled', 'paused')
+            """
+        ).fetchall()
+        for row in rows:
+            dispatch_status = (
+                "error"
+                if str(row["job_status"] or "") in {"error", "failed"}
+                else "needs_attention"
+            )
+            conn.execute(
+                """
+                UPDATE competitor_dispatches
+                SET status = ?, error = ?, updated_at = ?
+                WHERE id = ? AND status IN ('reserved', 'queued', 'processing')
+                """,
+                (
+                    dispatch_status,
+                    str(row["job_error"] or ""),
+                    now,
+                    int(row["id"]),
+                ),
+            )
+            repaired += 1
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+    return repaired
+
+
+def list_competitor_dispatches(*, rule_id: int | None = None, limit: int = 100) -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    where = " WHERE d.watch_rule_id = ?" if rule_id is not None else ""
+    params: list = [rule_id] if rule_id is not None else []
+    params.append(max(1, int(limit)))
+    rows = conn.execute(
+        """
+        SELECT d.*, s.youtube_video_id, s.url AS source_url, s.title AS source_title,
+               s.published_at, r.publication_mode, c.title AS competitor_title
+        FROM competitor_dispatches d
+        JOIN competitor_source_videos s ON s.id = d.source_video_id
+        JOIN competitor_watch_rules r ON r.id = d.watch_rule_id
+        JOIN competitor_channels c ON c.id = r.competitor_channel_id
+        """
+        + where
+        + " ORDER BY d.created_at DESC, d.id DESC LIMIT ?",
+        params,
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def upsert_video_cast_assignment(
+    *,
+    video_id: int,
+    role_key: str,
+    speaker_key: str,
+    speaker_name: str,
+    voice_id: str,
+    confidence: float,
+    match_score: float,
+    source: str,
+    manifest: dict,
+    casting_version: int = 2,
+    manifest_hash: str = "",
+    approval_status: str = "auto",
+) -> dict:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        INSERT INTO video_cast_assignments (
+            video_id, role_key, speaker_key, speaker_name, voice_id,
+            confidence, match_score, source, manifest_json, casting_version,
+            manifest_hash, approval_status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(video_id, speaker_key) DO UPDATE SET
+            role_key = excluded.role_key,
+            speaker_name = excluded.speaker_name,
+            voice_id = excluded.voice_id,
+            confidence = excluded.confidence,
+            match_score = excluded.match_score,
+            source = excluded.source,
+            manifest_json = excluded.manifest_json,
+            casting_version = excluded.casting_version,
+            manifest_hash = excluded.manifest_hash,
+            approval_status = excluded.approval_status,
+            updated_at = excluded.updated_at
+        """,
+        (
+            video_id,
+            role_key,
+            speaker_key,
+            speaker_name,
+            voice_id,
+            float(confidence),
+            float(match_score),
+            source,
+            json.dumps(manifest or {}, ensure_ascii=False),
+            max(1, int(casting_version or 1)),
+            str(manifest_hash or ""),
+            str(approval_status or "auto"),
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM video_cast_assignments WHERE video_id = ? AND speaker_key = ?",
+        (video_id, speaker_key),
+    ).fetchone()
+    conn.close()
+    return dict(row)
+
+
+def approve_radar_casting(
+    *,
+    video_id: int,
+    system_job_id: str,
+    assignments: list[dict],
+    production_snapshot: dict,
+) -> dict:
+    """Atomically persist manual casting and resume the same paused Radar job."""
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        job = conn.execute(
+            "SELECT * FROM system_jobs WHERE id = ? AND video_id = ?",
+            (system_job_id, video_id),
+        ).fetchone()
+        if job is None or job["job_type"] != "video_generation":
+            raise ValueError("Không tìm thấy job Radar gốc của video.")
+        if job["status"] != "paused":
+            raise ValueError("Job Radar không còn ở trạng thái chờ duyệt casting.")
+        try:
+            job_result = json.loads(job["result_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            job_result = {}
+        if job_result.get("attention_required") != "auto_cast":
+            raise ValueError("Job không tạm dừng vì casting.")
+
+        conn.execute("DELETE FROM video_cast_assignments WHERE video_id = ?", (video_id,))
+        for assignment in assignments:
+            conn.execute(
+                """
+                INSERT INTO video_cast_assignments (
+                    video_id, role_key, speaker_key, speaker_name, voice_id,
+                    confidence, match_score, source, manifest_json,
+                    casting_version, manifest_hash, approval_status,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    video_id,
+                    assignment["role_key"],
+                    assignment["speaker_key"],
+                    assignment.get("speaker_name", ""),
+                    assignment["voice_id"],
+                    float(assignment.get("confidence") or 0),
+                    float(assignment.get("match_score") or 0),
+                    assignment.get("source", "manual_override"),
+                    json.dumps(assignment, ensure_ascii=False),
+                    max(1, int(assignment.get("casting_version") or 2)),
+                    str(assignment.get("manifest_hash") or ""),
+                    str(assignment.get("approval_status") or "approved"),
+                    now,
+                    now,
+                ),
+            )
+        conn.execute(
+            "UPDATE videos SET production_snapshot_json = ? WHERE id = ?",
+            (json.dumps(production_snapshot, ensure_ascii=False), video_id),
+        )
+        conn.execute(
+            """
+            UPDATE system_jobs
+            SET status = 'queued', progress = ?, result_json = '{}', error = '',
+                next_retry_at = '', started_at = '', finished_at = '', updated_at = ?
+            WHERE id = ?
+            """,
+            ("Casting đã duyệt; đang chờ tiếp tục", now, system_job_id),
+        )
+        conn.execute(
+            """
+            UPDATE competitor_dispatches
+            SET status = 'queued', error = '', updated_at = ?
+            WHERE system_job_id = ? AND video_id = ?
+            """,
+            (now, system_job_id, video_id),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+    resumed = get_system_job(system_job_id)
+    if not resumed:
+        raise RuntimeError("Không đọc được job Radar sau khi duyệt casting.")
+    return resumed
+
+
+def list_video_cast_assignments(video_id: int) -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM video_cast_assignments WHERE video_id = ? ORDER BY id", (video_id,)
+    ).fetchall()
+    conn.close()
+    result = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["manifest"] = json.loads(item.pop("manifest_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            item["manifest"] = {}
+        result.append(item)
+    return result
+
+
+def delete_video_cast_assignments(video_id: int) -> int:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    cursor = conn.execute(
+        "DELETE FROM video_cast_assignments WHERE video_id = ?", (video_id,)
+    )
+    conn.commit()
+    conn.close()
+    return cursor.rowcount
+
+
+def get_speaker_voice_registry(prompt_version: str, speaker_key: str) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        """
+        SELECT * FROM speaker_voice_registry
+        WHERE prompt_version = ? AND speaker_key = ?
+        """,
+        (prompt_version, speaker_key),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def upsert_speaker_voice_registry(
+    *,
+    prompt_version: str,
+    speaker_key: str,
+    speaker_name: str,
+    voice_id: str,
+    profile_signature: str,
+    last_video_id: int,
+) -> dict:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        INSERT INTO speaker_voice_registry (
+            prompt_version, speaker_key, speaker_name, voice_id,
+            profile_signature, last_video_id, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(prompt_version, speaker_key) DO UPDATE SET
+            speaker_name = excluded.speaker_name,
+            voice_id = excluded.voice_id,
+            profile_signature = excluded.profile_signature,
+            last_video_id = excluded.last_video_id,
+            updated_at = excluded.updated_at
+        """,
+        (
+            prompt_version,
+            speaker_key,
+            speaker_name,
+            voice_id,
+            profile_signature,
+            last_video_id,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        """
+        SELECT * FROM speaker_voice_registry
+        WHERE prompt_version = ? AND speaker_key = ?
+        """,
+        (prompt_version, speaker_key),
+    ).fetchone()
+    conn.close()
+    return dict(row)
+
+
+def create_video_quality_review(
+    *,
+    video_id: int,
+    system_job_id: str,
+    attempt: int,
+    status: str,
+    checks: dict,
+    repair_stage: str = "",
+    error: str = "",
+) -> dict:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        INSERT INTO video_quality_reviews (
+            video_id, system_job_id, attempt, status, checks_json,
+            repair_stage, error, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(video_id, attempt) DO UPDATE SET
+            system_job_id = excluded.system_job_id,
+            status = excluded.status,
+            checks_json = excluded.checks_json,
+            repair_stage = excluded.repair_stage,
+            error = excluded.error,
+            updated_at = excluded.updated_at
+        """,
+        (
+            video_id,
+            system_job_id,
+            max(1, int(attempt)),
+            status,
+            json.dumps(checks or {}, ensure_ascii=False),
+            repair_stage,
+            error,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM video_quality_reviews WHERE video_id = ? AND attempt = ?",
+        (video_id, max(1, int(attempt))),
+    ).fetchone()
+    conn.close()
+    return dict(row)
+
+
+def list_video_quality_reviews(video_id: int) -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM video_quality_reviews WHERE video_id = ? ORDER BY attempt",
+        (video_id,),
+    ).fetchall()
+    conn.close()
+    result = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["checks"] = json.loads(item.pop("checks_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            item["checks"] = {}
+        result.append(item)
+    return result
+
+
+def get_latest_video_quality_review(video_id: int) -> dict | None:
+    reviews = list_video_quality_reviews(video_id)
+    return reviews[-1] if reviews else None

@@ -9,6 +9,19 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
+. (Join-Path $PSScriptRoot "lifecycle_admin.ps1")
+
+if (-not (Test-AutoYTAdministrator)) {
+    $forwardArguments = @()
+    if ($NoBrowser) {
+        $forwardArguments += "-NoBrowser"
+    }
+    if ($PSBoundParameters.ContainsKey("ReadyTimeoutSeconds")) {
+        $forwardArguments += @("-ReadyTimeoutSeconds", [string]$ReadyTimeoutSeconds)
+    }
+    exit (Invoke-AutoYTElevatedScript -ScriptPath $PSCommandPath -Arguments $forwardArguments)
+}
+
 $projectRoot = [System.IO.Path]::GetFullPath($PSScriptRoot).TrimEnd("\")
 $frontendRoot = Join-Path $projectRoot "frontend"
 $dataRoot = Join-Path $projectRoot "data"
@@ -247,6 +260,8 @@ function Test-BackendReady {
             $health.status -eq "ok" -and
             $null -ne $health.production_coordinator -and
             [bool]$health.production_coordinator.ready -and
+            $null -ne $health.competitor_radar_scheduler -and
+            [bool]$health.competitor_radar_scheduler.running -and
             $null -ne $health.trust_builder_scheduler -and
             [bool]$health.trust_builder_scheduler.ready
         )
@@ -337,11 +352,15 @@ function Test-ChatGPTBrowserReady {
             return $false
         }
         $cdpUrl = [string]$data.cdp_url
-        if ($cdpUrl -match ":(\d+)") {
-            $port = [int]$Matches[1]
-            return (Test-PortInUse $port)
+        if ($cdpUrl -notmatch "^http://127\.0\.0\.1:\d+/?$") {
+            return $false
         }
-        return $true
+        $version = Invoke-RestMethod `
+            -Uri "$($cdpUrl.TrimEnd('/'))/json/version" `
+            -TimeoutSec 2
+        return -not [string]::IsNullOrWhiteSpace(
+            [string]$version.webSocketDebuggerUrl
+        )
     } catch {
         return $false
     }
@@ -358,11 +377,15 @@ function Test-GoogleFlowBrowserReady {
             return $false
         }
         $cdpUrl = [string]$data.cdp_url
-        if ($cdpUrl -match ":(\d+)") {
-            $port = [int]$Matches[1]
-            return (Test-PortInUse $port)
+        if ($cdpUrl -notmatch "^http://127\.0\.0\.1:\d+/?$") {
+            return $false
         }
-        return $true
+        $version = Invoke-RestMethod `
+            -Uri "$($cdpUrl.TrimEnd('/'))/json/version" `
+            -TimeoutSec 2
+        return -not [string]::IsNullOrWhiteSpace(
+            [string]$version.webSocketDebuggerUrl
+        )
     } catch {
         return $false
     }
@@ -872,6 +895,7 @@ try {
     Write-Host "=================================================================" -ForegroundColor Green
     Write-Host " [OK] Backend API Server:     $backendUrl" -ForegroundColor Green
     Write-Host " [OK] Production Coordinator: Ready (render + YouTube publish)" -ForegroundColor Green
+    Write-Host " [OK] Competitor Radar:       Ready (delayed scan, no startup GPM launch)" -ForegroundColor Green
     Write-Host " [OK] Trust Builder Scheduler: Ready (delayed first run, no startup GPM launch)" -ForegroundColor Green
     Write-Host " [OK] Frontend Web UI:        $frontendUrl" -ForegroundColor Green
     if ($omniVoiceReady) {

@@ -6,6 +6,7 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -14,6 +15,7 @@ from playwright.async_api import Page, Locator
 
 from auto_yt.services.google_flow_login import FLOW_HOME_URL
 from auto_yt.services.browser_diagnostics import capture_browser_diagnostics_async
+from auto_yt.services import security_logging
 
 
 logger = logging.getLogger(__name__)
@@ -29,7 +31,7 @@ REFERENCE_RESULT_UI_ERROR = "ui_error"
 REFERENCE_ASSET_SCAN_LIMIT = 100
 IMAGE_GENERATION_TIMEOUT_SECONDS = 240.0
 AGENT_IMAGE_GENERATION_TIMEOUT_SECONDS = 600.0
-VIDEO_GENERATION_TIMEOUT_SECONDS = 180.0
+VIDEO_GENERATION_TIMEOUT_SECONDS = 300.0
 VIDEO_QUEUE_TIMEOUT_SECONDS = 180.0
 GENERATION_START_TIMEOUT_SECONDS = 45.0
 GENERATION_IDLE_GRACE_SECONDS = 20.0
@@ -49,11 +51,18 @@ MIN_GENERATED_IMAGE_HEIGHT = 400
 MIN_GENERATED_IMAGE_ASPECT_RATIO = 1.15
 VIDEO_FRAME_ATTACH_TIMEOUT_SECONDS = 8.0
 VIDEO_FRAME_UPLOAD_ATTACH_TIMEOUT_SECONDS = 30.0
+VIDEO_FRAME_UPLOAD_RETRY_COUNT = 2
 VIDEO_COMPLETION_SOURCE_GRACE_SECONDS = 5.0
 VIDEO_COMPLETION_FAST_POLL_SECONDS = 0.25
 VIDEO_DETAIL_SCAN_TIMEOUT_SECONDS = 5.0
+FLOW_IMAGE_MODEL_LABELS = {
+    "nano_banana_2_1": ("Nano Banana 2.1",),
+    "nano_banana_2": ("Nano Banana 2.1",),
+    "nano_banana_2_lite": ("Nano Banana 2 Lite",),
+    "nano_banana_pro": ("Nano Banana Pro",),
+}
 FLOW_VIDEO_MODEL_LABELS = {
-    "omni_1_1_flash": ("Omni 1.1 Flash",),
+    "omni_1_1_flash": ("Omni 1.1 Flash", "Omni Flash", "Omni 1.1"),
     "veo_3_1_lite": ("Veo 3.1 Lite", "Veo 3.1 – Lite", "Veo 3.1 - Lite"),
     "veo_3_1_fast": ("Veo 3.1 Fast", "Veo 3.1 – Fast", "Veo 3.1 - Fast"),
     "veo_3_1_quality": (
@@ -61,9 +70,27 @@ FLOW_VIDEO_MODEL_LABELS = {
         "Veo 3.1 – Quality",
         "Veo 3.1 - Quality",
     ),
+    "google_veo_intro": ("Omni 1.1 Flash", "Omni Flash", "Omni 1.1"),
 }
 PROMPT_ROOT_SELECTOR = (
     "flow-creative-agent-prompt-box, flow-base-prompt-box, flow-prompt-box"
+)
+ADD_MEDIA_BUTTON_SELECTOR = (
+    "button[aria-label*='Add ingredients' i], "
+    "button[aria-label*='Thêm thành phần' i], "
+    "button[aria-label*='Add image' i], "
+    "button[aria-label*='Thêm hình ảnh' i], "
+    "button.add-menu-trigger"
+)
+ACTIVE_UPLOAD_ROOT_SELECTOR = (
+    ".cdk-overlay-pane, mat-dialog-container, [role='menu']"
+)
+UPLOAD_ACTION_SELECTOR = (
+    "button:has-text('Upload media'), button:has-text('Tải nội dung'), "
+    "button:has-text('Tải lên'), button:has-text('Upload'), "
+    "button:has-text('File'), [role='menuitem']:has-text('Upload media'), "
+    "[role='menuitem']:has-text('Upload'), [role='menuitem']:has-text('Tải lên'), "
+    "[role='menuitem']:has-text('File'), .sidebar-upload-btn"
 )
 
 
@@ -101,6 +128,78 @@ class FlowGenerationTimeout(RuntimeError):
     """Raised when Flow remains active beyond the hard generation deadline."""
 
 
+@dataclass(frozen=True)
+class FlowGenerationReceipt:
+    """Stable request identity persisted without expiring media URLs."""
+
+    request_key: str
+    media_type: str
+    scene_index: int
+    project_id: str
+    prompt_hash: str
+    frame_hashes: list[str]
+    submitted_at: str
+    deadline_at: str
+    identity_keys: list[str] = field(default_factory=list)
+    attempt: int = 1
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+class FlowMediaPending(RuntimeError):
+    """Raised after Flow accepts work that may still complete later."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_code: str = "flow_video_pending",
+        queued_since: str = "",
+        pending_scene_indices: list[int] | None = None,
+        next_retry_at: str = "",
+        reconciliation_poll_count: int = 0,
+        retry_delay_seconds: float = 60.0,
+        pending_image_scene_indices: list[int] | None = None,
+        pending_video_scene_indices: list[int] | None = None,
+        receipt: dict[str, object] | None = None,
+    ):
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.queued_since = queued_since
+        self.pending_scene_indices = list(pending_scene_indices or [])
+        self.next_retry_at = next_retry_at
+        self.reconciliation_poll_count = max(0, int(reconciliation_poll_count or 0))
+        self.retry_delay_seconds = max(1.0, float(retry_delay_seconds or 60.0))
+        self.pending_image_scene_indices = list(pending_image_scene_indices or [])
+        self.pending_video_scene_indices = list(pending_video_scene_indices or [])
+        self.receipt = dict(receipt or {})
+
+
+class FlowImagePending(FlowMediaPending):
+    """Raised after Flow accepts an image request that is not complete yet."""
+
+    def __init__(self, message: str, **kwargs):
+        kwargs.setdefault("reason_code", "flow_image_pending")
+        super().__init__(message, **kwargs)
+
+
+class FlowVideoPending(FlowMediaPending):
+    """Raised after Flow accepts a video request that is not complete yet."""
+
+
+class FlowImageNeedsAttention(RuntimeError):
+    """Raised after bounded transient image retries have been exhausted."""
+
+
+class FlowVideoWaitExpired(FlowGenerationTimeout):
+    """Raised when a persisted video request exceeds its reconciliation TTL."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.reason_code = "flow_video_wait_expired"
+
+
 class FlowAgentStalledError(FlowGenerationTimeout):
     """Raised when the Flow agent remains active beyond its extended deadline."""
 
@@ -119,6 +218,18 @@ class FlowAgentInteractionError(RuntimeError):
 
 class FlowFrameAttachmentError(RuntimeError):
     """Raised when an Agent video frame cannot be attached without duplication."""
+
+    def __init__(self, message: str, *, reason_code: str = "frame_sync_failed"):
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
+class FlowUploadInteractionError(RuntimeError):
+    """Raised when the active Flow upload UI cannot accept a local file."""
+
+    def __init__(self, message: str, *, reason_code: str = "upload_ui_failed"):
+        super().__init__(message)
+        self.reason_code = reason_code
 
 
 class FlowInvalidOutputError(RuntimeError):
@@ -223,6 +334,7 @@ class GoogleFlowWorker:
     _session_uploaded_image_urls: set[str] = set()
     _session_video_frame_assets: dict[str, dict[str, dict[str, str]]] = {}
     _session_configured_agent_projects: set[str] = set()
+    _session_configured_agent_image_projects: dict[str, tuple[str, str, int]] = {}
 
     def __init__(self, page: Page):
         self.page = page
@@ -242,7 +354,9 @@ class GoogleFlowWorker:
         self._video_completed_candidate_seen_at: dict[str, float] = {}
         self._inspected_video_detail_keys: set[str] = set()
         self._last_video_timing: dict[str, object] = {}
+        self._last_generation_receipt: dict[str, object] = {}
         self._active_video_submitted_at: float | None = None
+        self._frame_failure_diagnostic_saved = False
 
     @staticmethod
     def _utc_timestamp() -> str:
@@ -266,6 +380,56 @@ class GoogleFlowWorker:
 
     def get_last_video_timing(self) -> dict[str, object]:
         return dict(self._last_video_timing)
+
+    def get_last_generation_receipt(self) -> dict[str, object]:
+        return dict(self._last_generation_receipt)
+
+    @staticmethod
+    def _request_marker(request_key: str) -> str:
+        key = re.sub(r"[^A-Za-z0-9_-]", "", str(request_key or ""))[:80]
+        return f" Internal tracking token: AYT-{key}; do not render this token." if key else ""
+
+    def _remember_generation_receipt(
+        self,
+        *,
+        request_key: str,
+        media_type: str,
+        scene_index: int | None,
+        full_prompt: str,
+        submitted_at: str,
+        deadline_seconds: float,
+        frame_paths: list[Path] | None = None,
+        attempt: int = 1,
+    ) -> dict[str, object]:
+        try:
+            submitted = dt.datetime.fromisoformat(submitted_at)
+        except (TypeError, ValueError):
+            submitted = dt.datetime.now(dt.timezone.utc)
+            submitted_at = submitted.isoformat()
+        if submitted.tzinfo is None:
+            submitted = submitted.replace(tzinfo=dt.timezone.utc)
+        prompt_hash = hashlib.sha256(full_prompt.encode("utf-8")).hexdigest()
+        frame_hashes = [
+            self._file_sha256(Path(path))
+            for path in (frame_paths or [])
+            if Path(path).is_file()
+        ]
+        receipt = FlowGenerationReceipt(
+            request_key=str(request_key or ""),
+            media_type=media_type,
+            scene_index=int(scene_index if scene_index is not None else -1),
+            project_id=self._project_id(),
+            prompt_hash=prompt_hash,
+            frame_hashes=frame_hashes,
+            submitted_at=submitted_at,
+            deadline_at=(
+                submitted + dt.timedelta(seconds=max(0.0, float(deadline_seconds)))
+            ).isoformat(),
+            identity_keys=[f"request:{request_key}", f"prompt:{prompt_hash}"],
+            attempt=max(1, int(attempt or 1)),
+        ).to_dict()
+        self._last_generation_receipt = receipt
+        return receipt
 
     @staticmethod
     def _project_root_from_url(url: str) -> str:
@@ -482,6 +646,203 @@ class GoogleFlowWorker:
 
         # 5. Check and approve credit or assistant confirmation prompts
         await self.handle_confirmation_prompts()
+
+    async def _is_locator_actionable(self, locator: Locator) -> bool:
+        """Return whether a control can be clicked without forcing through an overlay."""
+        try:
+            if not await locator.is_visible(timeout=500):
+                return False
+            if not await locator.is_enabled(timeout=500):
+                return False
+            box = await locator.bounding_box()
+            if not box or box["width"] <= 0 or box["height"] <= 0:
+                return False
+            viewport = self.page.viewport_size
+            if viewport:
+                center_x = box["x"] + (box["width"] / 2)
+                center_y = box["y"] + (box["height"] / 2)
+                if not (
+                    0 <= center_x < viewport["width"]
+                    and 0 <= center_y < viewport["height"]
+                ):
+                    return False
+            return bool(
+                await locator.evaluate(
+                    """element => {
+                        const rect = element.getBoundingClientRect();
+                        const x = rect.left + rect.width / 2;
+                        const y = rect.top + rect.height / 2;
+                        const hit = document.elementFromPoint(x, y);
+                        return Boolean(hit && (hit === element || element.contains(hit)));
+                    }"""
+                )
+            )
+        except Exception:
+            return False
+
+    async def _visible_upload_roots(self) -> list[Locator]:
+        """Return newest visible upload overlays followed by the active prompt box."""
+        roots: list[Locator] = []
+        overlay_roots = self.page.locator(ACTIVE_UPLOAD_ROOT_SELECTOR)
+        try:
+            overlay_count = await overlay_roots.count()
+        except Exception:
+            overlay_count = 0
+        for index in range(overlay_count - 1, -1, -1):
+            candidate = overlay_roots.nth(index)
+            try:
+                if await candidate.is_visible(timeout=200):
+                    roots.append(candidate)
+            except Exception:
+                continue
+
+        prompt_roots = self.page.locator(PROMPT_ROOT_SELECTOR)
+        try:
+            prompt_count = await prompt_roots.count()
+        except Exception:
+            prompt_count = 0
+        for index in range(prompt_count - 1, -1, -1):
+            candidate = prompt_roots.nth(index)
+            try:
+                if await candidate.is_visible(timeout=200):
+                    roots.append(candidate)
+                    break
+            except Exception:
+                continue
+        return roots
+
+    async def _find_add_media_button(self) -> Locator | None:
+        prompt_roots = self.page.locator(PROMPT_ROOT_SELECTOR)
+        try:
+            prompt_count = await prompt_roots.count()
+        except Exception:
+            return None
+        for root_index in range(prompt_count - 1, -1, -1):
+            root = prompt_roots.nth(root_index)
+            try:
+                if not await root.is_visible(timeout=200):
+                    continue
+                controls = root.locator(ADD_MEDIA_BUTTON_SELECTOR)
+                control_count = await controls.count()
+            except Exception:
+                continue
+            for control_index in range(control_count - 1, -1, -1):
+                candidate = controls.nth(control_index)
+                if await self._is_locator_actionable(candidate):
+                    return candidate
+        return None
+
+    async def _find_upload_file_input(self, roots: list[Locator]) -> Locator | None:
+        for root in roots:
+            try:
+                inputs = root.locator("input[type='file']")
+                input_count = await inputs.count()
+            except Exception:
+                continue
+            for input_index in range(input_count - 1, -1, -1):
+                candidate = inputs.nth(input_index)
+                try:
+                    if await candidate.is_enabled(timeout=300):
+                        return candidate
+                except Exception:
+                    continue
+        return None
+
+    async def _find_upload_action(self, roots: list[Locator]) -> Locator | None:
+        for root in roots:
+            try:
+                actions = root.locator(UPLOAD_ACTION_SELECTOR)
+                action_count = await actions.count()
+            except Exception:
+                continue
+            for action_index in range(action_count - 1, -1, -1):
+                candidate = actions.nth(action_index)
+                if await self._is_locator_actionable(candidate):
+                    return candidate
+        return None
+
+    @staticmethod
+    def _classify_upload_error(error: Exception) -> str:
+        if isinstance(error, FlowUploadInteractionError):
+            return error.reason_code
+        message = str(error).casefold()
+        if "file chooser" in message or "filechooser" in message:
+            return "filechooser_timeout"
+        if "intercepts pointer events" in message or "outside of the viewport" in message:
+            return "upload_control_blocked"
+        if "upload control" in message or "add media" in message:
+            return "upload_control_missing"
+        if "timeout" in message:
+            return "upload_timeout"
+        return "upload_ui_failed"
+
+    async def _submit_file_from_add_menu(self, file_path: Path) -> None:
+        """Send a file exactly once after locating the current Flow upload UI."""
+        last_error: Exception | None = None
+        reason_code = "upload_ui_failed"
+        for attempt in range(VIDEO_FRAME_UPLOAD_RETRY_COUNT):
+            set_files_started = False
+            try:
+                add_button = await self._find_add_media_button()
+                if add_button is None:
+                    raise FlowUploadInteractionError(
+                        "Không tìm thấy nút Add media đang hoạt động.",
+                        reason_code="upload_control_missing",
+                    )
+                await add_button.click(timeout=3000)
+                await asyncio.sleep(0.3)
+
+                roots = await self._visible_upload_roots()
+                file_input = await self._find_upload_file_input(roots)
+                if file_input is not None:
+                    set_files_started = True
+                    await file_input.set_input_files(str(file_path), timeout=5000)
+                    return
+
+                upload_action = await self._find_upload_action(roots)
+                if upload_action is None:
+                    raise FlowUploadInteractionError(
+                        "Không tìm thấy Upload trong menu đang hiển thị.",
+                        reason_code="upload_control_missing",
+                    )
+                async with self.page.expect_file_chooser(timeout=5000) as chooser_info:
+                    await upload_action.click(timeout=3000)
+                chooser = await chooser_info.value
+                set_files_started = True
+                await chooser.set_files(str(file_path), timeout=5000)
+                return
+            except Exception as exc:
+                if set_files_started:
+                    raise FlowUploadInteractionError(
+                        "Không thể xác nhận trạng thái file sau khi gửi lên Google Flow.",
+                        reason_code="upload_submit_unconfirmed",
+                    ) from exc
+                last_error = exc
+                reason_code = self._classify_upload_error(exc)
+                logger.warning(
+                    "flow_upload status=pre_submit_retry project=%s attempt=%s reason=%s detail=%s",
+                    self._project_id(),
+                    attempt + 1,
+                    reason_code,
+                    security_logging.redact_sensitive(exc),
+                )
+                if attempt + 1 < VIDEO_FRAME_UPLOAD_RETRY_COUNT:
+                    await self._close_reference_ui()
+                    await asyncio.sleep(0.3)
+
+        raise FlowUploadInteractionError(
+            "Google Flow không nhận được file từ giao diện upload hiện hành.",
+            reason_code=reason_code,
+        ) from last_error
+
+    async def _capture_frame_failure_diagnostic_once(self, error: Exception) -> None:
+        if self._frame_failure_diagnostic_saved:
+            return
+        self._frame_failure_diagnostic_saved = True
+        await self._save_debug_screenshot(
+            "video_frame_attach_failed",
+            error=security_logging.redact_sensitive(error),
+        )
 
     async def close_agent_instructions_panel(self) -> bool:
         """Close Flow's Agent Instructions panel without touching the generation chat."""
@@ -787,21 +1148,39 @@ class GoogleFlowWorker:
                 return None
             await asyncio.sleep(0.2)
 
-    async def ensure_agent_video_settings(self, video_settings: dict | None = None) -> None:
-        """Persist deterministic Agent defaults once for the active Flow project."""
-        project_id = self._project_id()
-        if project_id in self._session_configured_agent_projects:
-            return
+    async def ensure_agent_image_settings(self, image_settings: dict | None = None) -> None:
+        """Persist deterministic Agent image defaults once for the active Flow project."""
+        settings = image_settings if isinstance(image_settings, dict) else {}
+        aspect_ratio = str(settings.get("aspect_ratio") or "16:9").strip()
+        if aspect_ratio not in {"16:9", "4:3", "1:1", "3:4", "9:16"}:
+            aspect_ratio = "16:9"
 
-        settings = video_settings if isinstance(video_settings, dict) else {}
-        aspect_ratio = "16:9"
-        output_count = 1
-        model_id = str(settings.get("video_model") or "veo_3_1_lite").strip()
-        model_labels = FLOW_VIDEO_MODEL_LABELS.get(model_id)
+        try:
+            output_count = int(settings.get("output_count", 1))
+            if output_count not in {1, 2, 3, 4}:
+                output_count = 1
+        except (TypeError, ValueError):
+            output_count = 1
+
+        raw_model_id = str(settings.get("model") or "nano_banana_2_1").strip()
+        model_id = (
+            "nano_banana_2_1"
+            if raw_model_id in {"nano_banana_2", "imagen_3_standard", "imagen_3_photoreal"}
+            else raw_model_id
+        )
+        model_labels = FLOW_IMAGE_MODEL_LABELS.get(model_id)
         if not model_labels:
             raise FlowAgentSettingsError(
-                f"Model video '{model_id}' chưa có ánh xạ giao diện Google Flow Agent."
+                f"Model ảnh '{model_id}' chưa có ánh xạ giao diện Google Flow Agent."
             )
+
+        project_id = self._project_id()
+        settings_signature = (model_id, aspect_ratio, output_count)
+        if (
+            self._session_configured_agent_image_projects.get(project_id)
+            == settings_signature
+        ):
+            return
 
         try:
             settings_button = await self._find_agent_settings_button()
@@ -824,11 +1203,116 @@ class GoogleFlowWorker:
             if not await self._click_agent_setting_text(
                 panel,
                 (aspect_ratio,),
-                use_last=True,
+                use_last=False,
             ):
                 raise FlowAgentSettingsError(
-                    f"Không chọn được tỷ lệ video Agent {aspect_ratio}."
+                    f"Không chọn được tỷ lệ ảnh Agent {aspect_ratio}."
                 )
+            if not await self._click_agent_setting_text(
+                panel,
+                (f"x{output_count}",),
+                use_last=False,
+            ):
+                raise FlowAgentSettingsError(
+                    f"Không chọn được số lượng ảnh Agent x{output_count}."
+                )
+
+            model_select = panel.locator(
+                "[role='combobox'], mat-select, button:has(mat-icon:text-is('arrow_drop_down'))"
+            ).first
+            if not await model_select.is_visible(timeout=1000):
+                raise FlowAgentSettingsError("Không tìm thấy bộ chọn model ảnh Agent.")
+            await model_select.click(timeout=2000)
+            await asyncio.sleep(0.2)
+            model_option = None
+            for label in model_labels:
+                option = self.page.locator("[role='option'], mat-option").filter(
+                    has_text=re.compile(rf"{re.escape(label)}", re.IGNORECASE)
+                ).first
+                if await option.is_visible(timeout=500):
+                    model_option = option
+                    break
+                fallback_opt = self.page.get_by_text(label, exact=False).first
+                if await fallback_opt.is_visible(timeout=500):
+                    model_option = fallback_opt
+                    break
+            if model_option is None:
+                raise FlowAgentSettingsError(
+                    f"Model ảnh '{model_id}' không có trong Google Flow Agent."
+                )
+            await model_option.click(force=True, timeout=2000)
+            await asyncio.sleep(0.2)
+
+            save_button = await self._find_agent_settings_save_button(panel)
+            if save_button is None:
+                raise FlowAgentSettingsError("Không tìm thấy nút Lưu cài đặt Agent.")
+            await save_button.click(timeout=2000)
+            deadline = time.monotonic() + 5.0
+            while await panel.is_visible(timeout=100):
+                if time.monotonic() >= deadline:
+                    raise FlowAgentSettingsError("Bảng Cài đặt tác nhân không đóng sau khi lưu.")
+                await asyncio.sleep(0.2)
+        except FlowAgentSettingsError:
+            await self._save_debug_screenshot("agent_image_settings_failed")
+            raise
+        except Exception as exc:
+            await self._save_debug_screenshot("agent_image_settings_failed")
+            raise FlowAgentSettingsError("Không thể lưu cài đặt Google Flow Agent (Hình ảnh).") from exc
+
+        self._session_configured_agent_image_projects[project_id] = settings_signature
+        logger.info(
+            "flow_generation media=image state=agent_settings_saved project=%s "
+            "aspect=%s outputs=%d model=%s",
+            project_id,
+            aspect_ratio,
+            output_count,
+            model_id,
+        )
+
+    async def ensure_agent_video_settings(self, video_settings: dict | None = None) -> None:
+        """Persist deterministic Agent defaults once for the active Flow project."""
+        settings = video_settings if isinstance(video_settings, dict) else {}
+        try:
+            output_count = int(settings.get("video_output_count") or settings.get("output_count") or 1)
+            if output_count not in {1, 2, 3, 4}:
+                output_count = 1
+        except (TypeError, ValueError):
+            output_count = 1
+
+        raw_model_id = str(settings.get("video_model") or "omni_1_1_flash").strip()
+        model_id = "omni_1_1_flash" if raw_model_id == "google_veo_intro" else raw_model_id
+        model_labels = FLOW_VIDEO_MODEL_LABELS.get(model_id)
+        if not model_labels:
+            raise FlowAgentSettingsError(
+                f"Model video '{model_id}' chưa có ánh xạ giao diện Google Flow Agent."
+            )
+
+        project_id = self._project_id()
+        if project_id in self._session_configured_agent_projects:
+            return
+
+        try:
+            settings_button = await self._find_agent_settings_button()
+            if settings_button is None:
+                raise FlowAgentSettingsError("Không tìm thấy nút Cài đặt tác nhân.")
+            await settings_button.click(timeout=2000)
+            await asyncio.sleep(0.4)
+
+            panel = self.page.locator(
+                "flow-agent-settings, flow-agent-panel, .cdk-overlay-pane, mat-dialog-container"
+            ).filter(has_text=re.compile("Cài đặt tác nhân|Agent settings", re.IGNORECASE)).first
+            if not await panel.is_visible(timeout=3000):
+                raise FlowAgentSettingsError("Bảng Cài đặt tác nhân không xuất hiện.")
+
+            if not await self._click_agent_setting_text(
+                panel,
+                ("Không bao giờ", "Never"),
+            ):
+                raise FlowAgentSettingsError("Không chọn được chế độ xác nhận 'Không bao giờ'.")
+
+            # NOTE: On modern Google Flow Agent, video aspect ratio is inherited from reference frames / canvas;
+            # the Agent Settings panel only has aspect ratio buttons in the Image block.
+            # We preserve output_count in the Video block using use_last=True.
             if not await self._click_agent_setting_text(
                 panel,
                 (f"x{output_count}",),
@@ -846,11 +1330,25 @@ class GoogleFlowWorker:
             await model_select.click(timeout=2000)
             await asyncio.sleep(0.2)
             model_option = None
-            for label in model_labels:
-                option = self.page.get_by_text(label, exact=True).last
+
+            # Build list of candidate labels: first try desired model labels, then fallback to Omni 1.1 Flash labels
+            candidate_labels = list(model_labels or ())
+            for omni_label in FLOW_VIDEO_MODEL_LABELS.get("omni_1_1_flash", ()):
+                if omni_label not in candidate_labels:
+                    candidate_labels.append(omni_label)
+
+            for label in candidate_labels:
+                option = self.page.locator("[role='option'], mat-option").filter(
+                    has_text=re.compile(rf"{re.escape(label)}", re.IGNORECASE)
+                ).first
                 if await option.is_visible(timeout=500):
                     model_option = option
                     break
+                fallback_opt = self.page.get_by_text(label, exact=False).last
+                if await fallback_opt.is_visible(timeout=500):
+                    model_option = fallback_opt
+                    break
+
             if model_option is None:
                 raise FlowAgentSettingsError(
                     f"Model video '{model_id}' không có trong Google Flow Agent."
@@ -877,9 +1375,8 @@ class GoogleFlowWorker:
         self._session_configured_agent_projects.add(project_id)
         logger.info(
             "flow_generation media=video state=agent_settings_saved project=%s "
-            "aspect=%s outputs=%d model=%s",
+            "outputs=%d model=%s",
             project_id,
-            aspect_ratio,
             output_count,
             model_id,
         )
@@ -1192,42 +1689,17 @@ class GoogleFlowWorker:
         filename = self._reference_filename(reference_path)
         if not filename or not Path(reference_path).is_file():
             raise RuntimeError(f"Reference image does not exist: {reference_path}")
-        add_btn = self.page.locator(
-            "flow-creative-agent-prompt-box button[aria-label*='Add ingredients' i], "
-            "flow-creative-agent-prompt-box button[aria-label*='Thêm thành phần' i], "
-            "flow-base-prompt-box button[aria-label*='Add ingredients' i], "
-            "flow-base-prompt-box button[aria-label*='Thêm thành phần' i], "
-            "button[aria-label*='Add ingredients' i], button[aria-label*='Thêm thành phần' i], "
-            "button.add-menu-trigger"
-        ).first
-        if not await add_btn.is_visible(timeout=3000):
-            raise RuntimeError("Add ingredients button is not visible for reference upload.")
-
         try:
-            await add_btn.click()
-            await asyncio.sleep(1)
-            async with self.page.expect_file_chooser(timeout=5000) as fc_info:
-                file_opt = self.page.locator(
-                    "button:has-text('Upload media'), .sidebar-upload-btn, "
-                    "button:has-text('Tải nội dung'), button:has-text('Tải lên'), "
-                    "button:has-text('Upload'), button:has-text('File'), "
-                    "[role='menuitem']:has-text('File'), [role='menuitem']:has-text('Upload'), "
-                    "[role='menuitem']:has-text('Tải lên')"
-                ).first
-                if not await file_opt.is_visible(timeout=3000):
-                    raise RuntimeError("Reference upload menu item is not visible.")
-                await file_opt.click()
-            file_chooser = await fc_info.value
-            await file_chooser.set_files(reference_path)
-            # Treat an accepted file chooser as an upload attempt immediately. This
-            # prevents a transient UI verification failure from causing duplicates.
+            await self._submit_file_from_add_menu(Path(reference_path))
+            # The file has crossed the submission boundary. From this point onward
+            # the picker must be used for recovery instead of uploading it again.
             self._project_reference_cache().add(filename.casefold())
             await self.wait_for_load()
             await asyncio.sleep(2.5)
             uploaded_snapshot = await self._get_existing_images()
             self._uploaded_image_urls.update(uploaded_snapshot)
         finally:
-            await self.dismiss_blocking_dialogs()
+            await self._close_reference_ui()
 
     async def upload_reference(self, reference_path: str, label: str):
         """Upload a non-scene reference while preserving legacy best-effort behavior."""
@@ -1245,7 +1717,11 @@ class GoogleFlowWorker:
             await self._upload_reference_file(reference_path)
             self._log_reference_event("uploaded", filename, detail="legacy_upload")
         except Exception as exc:
-            logger.warning("Could not upload reference '%s': %s", label or filename, exc)
+            logger.warning(
+                "Could not upload reference '%s': %s",
+                label or filename,
+                security_logging.redact_sensitive(exc),
+            )
 
     @staticmethod
     def _media_key(url: str) -> str:
@@ -1692,15 +2168,18 @@ class GoogleFlowWorker:
             // Only inspect the latest turn so an old queue message cannot keep a
             // later request alive indefinitely.
             const queueBubbles = Array.from(document.querySelectorAll(
-                'flow-chat-bubble, [data-message-role="assistant"], .agent-bubble'
+                'flow-chat-bubble, flow-chat-message, .message-row, ' +
+                '[data-message-role], [data-role], .agent-bubble'
             )).filter(visible);
             const latestQueueBubble = queueBubbles.length
                 ? queueBubbles[queueBubbles.length - 1] : null;
             if (latestQueueBubble) {
                 const isAgentBubble = latestQueueBubble.matches(
-                    '[data-message-role="assistant"], .agent-bubble'
+                    '[data-message-role="assistant"], [data-role="assistant"], ' +
+                    '.message-row.agent-row, .agent-bubble'
                 ) || Boolean(latestQueueBubble.querySelector(
-                    '[data-message-role="assistant"], .agent-bubble'
+                    '[data-message-role="assistant"], [data-role="assistant"], ' +
+                    '.message-row.agent-row, .agent-bubble'
                 ));
                 const queueText = (latestQueueBubble.textContent || '').toLowerCase();
                 if (isAgentBubble && (
@@ -1844,6 +2323,390 @@ class GoogleFlowWorker:
     def _normalize_prompt_text(value: str) -> str:
         return re.sub(r"\s+", " ", str(value or "")).strip()
 
+    @staticmethod
+    def _build_video_prompt(prompt: str, avoid_prompt: str) -> str:
+        strict_avoid = (
+            "still frame, static image, cartoon, text, letters, words, typography, "
+            "watermark, logo, headline, caption, subtitle, poster text"
+        )
+        combined_avoid = f"{avoid_prompt}, {strict_avoid}" if avoid_prompt else strict_avoid
+        clean_prompt = re.sub(r"\[IMAGE_URL:[^\]]*\]", "", prompt)
+        clean_prompt = re.sub(r"https?://\S+", "", clean_prompt)
+        clean_prompt = re.sub(r"/api/thumbnails/\S+", "", clean_prompt).strip()
+        clean_prompt = re.sub(
+            r"(?i)\b(?:still photograph|photography|35mm photography|photo|film still|raw photo|movie still|still photo)\b",
+            "cinematic video",
+            clean_prompt,
+        )
+        clean_prompt = re.sub(r"\s+", " ", clean_prompt).strip()
+        return f"{clean_prompt}. Avoid: {combined_avoid}"
+
+    async def _find_video_for_prompt(self, *prompts: str) -> dict[str, object]:
+        """Find a completed or pending video tied to the latest matching user turn."""
+        expected_prompts = [
+            self._normalize_prompt_text(prompt).casefold()
+            for prompt in prompts
+            if self._normalize_prompt_text(prompt)
+        ]
+        if not expected_prompts:
+            return {"state": "missing", "source": ""}
+        try:
+            result = await self.page.evaluate(
+                r'''(expectedPrompts) => {
+                    const normalize = (value) => String(value || '')
+                        .replace(/\s+/g, ' ').trim().toLowerCase();
+                    const visible = (element) => {
+                        if (!element) return false;
+                        const style = getComputedStyle(element);
+                        const rect = element.getBoundingClientRect();
+                        return style.display !== 'none' && style.visibility !== 'hidden' &&
+                            rect.width > 0 && rect.height > 0;
+                    };
+                    let turns = Array.from(document.querySelectorAll('flow-chat-bubble'));
+                    if (!turns.length) {
+                        turns = Array.from(document.querySelectorAll(
+                            'flow-chat-message, .message-row, [data-message-role], [data-role]'
+                        ));
+                    }
+                    let promptIndex = -1;
+                    for (let index = turns.length - 1; index >= 0; index -= 1) {
+                        const turn = turns[index];
+                        const user = turn.matches(
+                            '.message-row.user-row, [data-message-role="user"], [data-role="user"]'
+                        ) ? turn : turn.querySelector(
+                            '.user-bubble, [data-message-role="user"], [data-role="user"]'
+                        );
+                        if (!user) continue;
+                        const prompt = user.querySelector('.prompt-text') || user;
+                        const text = normalize(prompt.textContent);
+                        if (expectedPrompts.some((expected) =>
+                            text === expected || text.includes(expected)
+                        )) {
+                            promptIndex = index;
+                            break;
+                        }
+                    }
+                    if (promptIndex < 0) {
+                        return {promptFound: false, queued: false, candidates: []};
+                    }
+
+                    let queued = false;
+                    let error = '';
+                    let followedByNewUser = false;
+                    const candidates = [];
+                    const seen = new Set();
+                    for (let index = promptIndex + 1; index < turns.length; index += 1) {
+                        const turn = turns[index];
+                        const nextUser = turn.matches(
+                            '.message-row.user-row, [data-message-role="user"], [data-role="user"]'
+                        ) || turn.querySelector(
+                            '.user-bubble, [data-message-role="user"], [data-role="user"]'
+                        );
+                        if (nextUser) {
+                            followedByNewUser = true;
+                            break;
+                        }
+                        const agent = turn.matches(
+                            '.message-row.agent-row, .agent-bubble, ' +
+                            '[data-message-role="assistant"], [data-role="assistant"]'
+                        ) ? turn : turn.querySelector(
+                            '.agent-bubble, [data-message-role="assistant"], [data-role="assistant"]'
+                        );
+                        if (!agent || !visible(agent)) continue;
+                        const text = normalize(agent.textContent);
+                        if (/(không thành công|vi phạm chính sách|unsuccessful|violates our policy|policy violation|hoàn tiền cho lượt tạo|failed to generate|generation failed)/i.test(text)) {
+                            error = (agent.textContent || '').trim();
+                        }
+                        if (/(currently in the queue|queued|waiting in the queue|high demand|processed as soon as possible|check back in a few minutes|hàng đợi|xếp hàng|nhu cầu cao|đang chờ xử lý)/i.test(text)) {
+                            queued = true;
+                        }
+                        if (agent.querySelector(
+                            '[role="progressbar"], [aria-busy="true"], mat-progress-spinner, ' +
+                            '[data-state="generating"], [data-state="processing"], [data-state="queued"]'
+                        )) {
+                            queued = true;
+                        }
+                        const nodes = Array.from(agent.querySelectorAll(
+                            'flow-media-tile, flow-canvas-tile, flow-canvas-item, ' +
+                            '[data-testid*="media" i], .media-card, .canvas-tile, ' +
+                            'video, source[src], ' +
+                            '[data-video-url], [data-media-url], [data-download-url], ' +
+                            'a[download][href], [data-media-id], [data-asset-id]'
+                        ));
+                        for (const node of nodes) {
+                            const card = node.closest('[data-media-id], [data-asset-id]') || node;
+                            const assetId = card.getAttribute('data-media-id') ||
+                                card.getAttribute('data-asset-id') || '';
+                            const urls = [];
+                            const matchUrls = [];
+                            const addUrl = (value, playable) => {
+                                const url = String(value || '').trim();
+                                if (!url || url.startsWith('data:')) return;
+                                if (!matchUrls.includes(url)) matchUrls.push(url);
+                                const lower = url.toLowerCase();
+                                const videoUrl = lower.startsWith('blob:') ||
+                                    /\.(?:mp4|webm|mov)(?:\?|$)/i.test(url) ||
+                                    lower.includes('/videoplayback') || lower.includes('/video/');
+                                const imageUrl = /\.(?:png|jpe?g|webp|gif)(?:\?|$)/i.test(url) ||
+                                    lower.includes('/image/') || lower.includes('/asb/');
+                                if ((playable || videoUrl) && !imageUrl && !urls.includes(url)) {
+                                    urls.push(url);
+                                }
+                            };
+                            const mediaNodes = [card, ...card.querySelectorAll(
+                                'video, source[src], a[href], [data-video-url], ' +
+                                '[data-media-url], [data-download-url], img[src]'
+                            )];
+                            for (const media of mediaNodes) {
+                                const playable = media.tagName === 'VIDEO' ||
+                                    media.tagName === 'SOURCE' || media.hasAttribute('download') ||
+                                    media.hasAttribute('data-video-url');
+                                addUrl(media.currentSrc, playable);
+                                addUrl(media.src, playable);
+                                addUrl(media.href, playable);
+                                addUrl(media.getAttribute('data-video-url'), true);
+                                addUrl(media.getAttribute('data-media-url'), playable);
+                                addUrl(media.getAttribute('data-download-url'), true);
+                            }
+                            const state = (
+                                `${card.getAttribute('data-state') || ''} ` +
+                                `${card.getAttribute('data-tile-state') || ''}`
+                            ).toLowerCase();
+                            const controls = normalize(Array.from(card.querySelectorAll(
+                                'button, [role="button"], mat-icon, .material-icons, ' +
+                                '.material-symbols-outlined'
+                            )).map((item) => `${item.textContent || ''} ` +
+                                `${item.getAttribute('aria-label') || ''}`).join(' '));
+                            const completed = /completed|complete|ready|succeeded|success/.test(state) ||
+                                /(^|\s)(play|phát|play_arrow|play_circle)(\s|$)/i.test(controls) ||
+                                urls.length > 0;
+                            if (!assetId && !matchUrls.length) continue;
+                            const key = `${assetId}|${matchUrls[0] || ''}`;
+                            if (seen.has(key)) continue;
+                            seen.add(key);
+                            candidates.push({
+                                src: urls[0] || '', urls, matchUrls, assetId,
+                                identityKeys: assetId
+                                    ? [`asset:${assetId}`]
+                                    : (matchUrls.length ? [`poster:${matchUrls[0]}`] : []),
+                                completed,
+                            });
+                        }
+                    }
+                    return {
+                        promptFound: true,
+                        queued,
+                        error,
+                        isLatestPrompt: !followedByNewUser,
+                        candidates,
+                    };
+                }''',
+                expected_prompts,
+            )
+        except Exception as exc:
+            logger.warning(
+                "flow_generation media=video state=late_output_scan_failed project=%s detail=%s",
+                self._project_id(),
+                exc,
+            )
+            return {"state": "missing", "source": ""}
+
+        if not isinstance(result, dict) or not result.get("promptFound"):
+            return {"state": "missing", "source": ""}
+        error_text = str(result.get("error") or "").strip()
+        if error_text and _is_valid_flow_error_text(error_text):
+            return {
+                "state": "failed",
+                "source": "",
+                "error": error_text,
+                "is_latest_prompt": bool(result.get("isLatestPrompt")),
+            }
+        candidates = [
+            item for item in (result.get("candidates") or []) if isinstance(item, dict)
+        ]
+        source = self._find_new_video_source(candidates, set())
+        if source:
+            logger.info(
+                "flow_generation media=video state=late_output_reused project=%s",
+                self._project_id(),
+            )
+            return {"state": "completed", "source": source}
+        detail_baseline: set[str] = set()
+        try:
+            for existing_candidate in await self._collect_video_candidates():
+                for url in [
+                    existing_candidate.get("src"),
+                    existing_candidate.get("url"),
+                    *(existing_candidate.get("urls") or []),
+                ]:
+                    if str(url or "").strip():
+                        detail_baseline.add(self._media_key(str(url)))
+        except Exception as exc:
+            logger.warning(
+                "flow_generation media=video state=late_output_baseline_failed "
+                "project=%s detail=%s",
+                self._project_id(),
+                exc,
+            )
+        for candidate in reversed(candidates):
+            if not candidate.get("completed"):
+                continue
+            try:
+                source = await self._inspect_video_candidate_detail(
+                    candidate,
+                    detail_baseline,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "flow_generation media=video state=late_output_detail_failed project=%s detail=%s",
+                    self._project_id(),
+                    exc,
+                )
+                source = ""
+            if source:
+                logger.info(
+                    "flow_generation media=video state=late_output_reused project=%s",
+                    self._project_id(),
+                )
+                return {"state": "completed", "source": source}
+
+        return {
+            "state": "queued" if result.get("queued") else "pending",
+            "source": "",
+            "is_latest_prompt": bool(result.get("isLatestPrompt")),
+        }
+
+    async def cancel_generation_for_prompt(self, *prompts: str) -> bool:
+        """Best-effort cancellation limited to the response following a matching prompt."""
+        expected_prompts = [
+            self._normalize_prompt_text(prompt).casefold()
+            for prompt in prompts
+            if self._normalize_prompt_text(prompt)
+        ]
+        if not expected_prompts:
+            return False
+        try:
+            canceled = await self.page.evaluate(
+                r'''(expectedPrompts) => {
+                    const normalize = (value) => String(value || '')
+                        .replace(/\s+/g, ' ').trim().toLowerCase();
+                    let turns = Array.from(document.querySelectorAll('flow-chat-bubble'));
+                    if (!turns.length) {
+                        turns = Array.from(document.querySelectorAll(
+                            'flow-chat-message, .message-row, [data-message-role], [data-role]'
+                        ));
+                    }
+                    let promptIndex = -1;
+                    for (let index = turns.length - 1; index >= 0; index -= 1) {
+                        const turn = turns[index];
+                        const user = turn.matches(
+                            '.message-row.user-row, [data-message-role="user"], [data-role="user"]'
+                        ) ? turn : turn.querySelector(
+                            '.user-bubble, [data-message-role="user"], [data-role="user"]'
+                        );
+                        if (!user) continue;
+                        const text = normalize((user.querySelector('.prompt-text') || user).textContent);
+                        if (expectedPrompts.some((expected) => text === expected || text.includes(expected))) {
+                            promptIndex = index;
+                            break;
+                        }
+                    }
+                    if (promptIndex < 0) return false;
+                    for (let index = promptIndex + 1; index < turns.length; index += 1) {
+                        const turn = turns[index];
+                        if (turn.matches('.message-row.user-row, [data-message-role="user"], [data-role="user"]') ||
+                            turn.querySelector('.user-bubble, [data-message-role="user"], [data-role="user"]')) {
+                            break;
+                        }
+                        const buttons = Array.from(turn.querySelectorAll('button, [role="button"]'));
+                        const cancel = buttons.find((button) => {
+                            const label = normalize(
+                                `${button.textContent || ''} ${button.getAttribute('aria-label') || ''}`
+                            );
+                            return /(^|\s)(cancel|stop|hủy|dừng)(\s|$)/i.test(label);
+                        });
+                        if (cancel && !cancel.disabled) {
+                            cancel.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }''',
+                expected_prompts,
+            )
+        except Exception as exc:
+            logger.warning(
+                "flow_generation state=cancel_failed project=%s detail=%s",
+                self._project_id(),
+                security_logging.redact_sensitive(exc),
+            )
+            return False
+        logger.info(
+            "flow_generation state=cancel_%s project=%s",
+            "requested" if canceled else "unavailable",
+            self._project_id(),
+        )
+        return bool(canceled)
+
+    async def _raise_latest_video_error(
+        self,
+        prompt: str,
+        result: dict[str, object] | None = None,
+        *,
+        include_existing_canvas_errors: bool = True,
+        video_error_count_before_submit: int | None = None,
+        video_tile_count_before_submit: int | None = None,
+    ) -> dict[str, object]:
+        """Raise terminal Flow video errors scoped by prompt or video tile."""
+        matched = result or await self._find_video_for_prompt(prompt)
+        matched_state = str(matched.get("state") or "")
+        if matched_state == "failed":
+            self._record_video_timing("error_seen")
+            raise FlowGenerationError(
+                "Google Flow báo lỗi khi tạo video: "
+                f"{matched.get('error') or 'Thao tác không thành công'}"
+            )
+        if include_existing_canvas_errors and matched.get("is_latest_prompt"):
+            if video_tile_count_before_submit is not None:
+                active_errors = await self._get_video_error_texts_since(
+                    video_tile_count_before_submit
+                )
+            elif video_error_count_before_submit is not None:
+                current_video_error_count = await self._get_existing_video_error_count()
+                active_errors = (
+                    await self._get_existing_video_error_texts()
+                    if current_video_error_count > video_error_count_before_submit
+                    else set()
+                )
+            else:
+                active_errors = await self._get_existing_error_texts()
+            if active_errors:
+                self._record_video_timing("error_seen")
+                raise FlowGenerationError(
+                    "Google Flow báo lỗi khi tạo video: "
+                    f"{next(iter(active_errors))}"
+                )
+        elif include_existing_canvas_errors and matched_state == "missing":
+            if video_tile_count_before_submit is not None:
+                video_errors = await self._get_video_error_texts_since(
+                    video_tile_count_before_submit
+                )
+                has_new_video_error = bool(video_errors)
+            else:
+                video_errors = await self._get_existing_video_error_texts()
+                current_video_error_count = await self._get_existing_video_error_count()
+                has_new_video_error = (
+                    video_error_count_before_submit is None
+                    or current_video_error_count > video_error_count_before_submit
+                )
+            if video_errors and has_new_video_error:
+                self._record_video_timing("error_seen")
+                raise FlowGenerationError(
+                    "Google Flow báo lỗi khi tạo video: "
+                    f"{next(iter(video_errors))}"
+                )
+        return matched
+
     async def _find_completed_image_for_prompt(self, *prompts: str) -> str:
         """Reuse a late Agent result only when it follows the exact submitted prompt."""
         expected_prompts = [
@@ -1873,11 +2736,17 @@ class GoogleFlowWorker:
                     if (promptIndex < 0) return [];
 
                     const found = [];
+                    let error = '';
                     const seen = new Set();
                     for (let index = promptIndex + 1; index < bubbles.length; index += 1) {
                         const bubble = bubbles[index];
                         if (bubble.querySelector('.user-bubble')) break;
-                        if (!bubble.querySelector('.agent-bubble')) continue;
+                        const agent = bubble.querySelector('.agent-bubble');
+                        if (!agent) continue;
+                        const agentText = normalize(agent.textContent);
+                        if (/(không thành công|vi phạm chính sách|unsuccessful|violates our policy|policy violation|failed to generate|generation failed)/i.test(agentText)) {
+                            error = (agent.textContent || '').trim();
+                        }
                         const nodes = bubble.querySelectorAll(
                             'img[src], img[srcset], [data-image-url], [data-media-url], ' +
                             '[data-download-url], a[download][href]'
@@ -1921,7 +2790,7 @@ class GoogleFlowWorker:
                             });
                         }
                     }
-                    return found;
+                    return {candidates: found, error};
                 }''',
                 expected_prompts,
             )
@@ -1932,6 +2801,13 @@ class GoogleFlowWorker:
                 exc,
             )
             return ""
+        if isinstance(candidates, dict):
+            error_text = str(candidates.get("error") or "").strip()
+            if error_text and _is_valid_flow_error_text(error_text):
+                raise FlowGenerationError(
+                    f"Google Flow báo lỗi khi tạo image: {error_text}"
+                )
+            candidates = candidates.get("candidates") or []
         if not isinstance(candidates, list):
             return ""
         for candidate in reversed(candidates):
@@ -2160,7 +3036,7 @@ class GoogleFlowWorker:
 
             button = await self._find_prompt_submit_button(editor)
             method = ""
-            if button is not None:
+            if button is not None and (agent_interface or "button" not in attempted_methods):
                 method = "button"
                 attempted_methods.append(method)
                 await self.dismiss_blocking_dialogs()
@@ -2194,6 +3070,8 @@ class GoogleFlowWorker:
                         continue
 
             if not method:
+                if not agent_interface and "enter" in attempted_methods:
+                    break
                 method = "enter"
                 attempted_methods.append(method)
                 try:
@@ -2379,6 +3257,7 @@ class GoogleFlowWorker:
             "flow-media-tile[data-error='true']",
             "[data-tile-state='error']",
             ".error-tile",
+            "[role='alert']",
         ]
         for sel in canvas_err_selectors:
             try:
@@ -2386,11 +3265,102 @@ class GoogleFlowWorker:
                 count = await locs.count()
                 for i in range(min(count, 10)):
                     t = (await locs.nth(i).inner_text() or "").strip()
-                    if t:
+                    if t and _is_valid_flow_error_text(t):
                         err_texts.add(t)
             except Exception:
                 pass
+        try:
+            detected = await self.page.evaluate(
+                r'''() => {
+                    const patterns = [
+                        'không thành công',
+                        'vi phạm chính sách',
+                        'unsuccessful',
+                        'violates our policy',
+                        'policy violation',
+                        'hoàn tiền cho lượt tạo',
+                        'người nổi tiếng',
+                        'failed to generate',
+                        'generation failed',
+                    ];
+                    const elements = Array.from(document.querySelectorAll(
+                        'flow-error-tile, flow-media-tile, flow-canvas-tile, flow-canvas-item, ' +
+                        '.error-tile, [data-tile-state="error"], [role="alert"], ' +
+                        '.canvas-tile, .message-row, [data-testid*="error" i]'
+                    ));
+                    const results = [];
+                    for (const el of elements) {
+                        const text = (el.innerText || el.textContent || '').trim();
+                        const lower = text.toLowerCase();
+                        if (patterns.some(p => lower.includes(p)) && text.length > 5 && text.length < 1000) {
+                            results.push(text);
+                        }
+                    }
+                    return results;
+                }'''
+            )
+            if isinstance(detected, list):
+                for item in detected:
+                    t = str(item or "").strip()
+                    if t and _is_valid_flow_error_text(t):
+                        err_texts.add(t)
+        except Exception:
+            pass
         return err_texts
+
+    async def _get_existing_video_error_texts(self) -> set[str]:
+        """Return terminal errors rendered inside Google Flow video tiles only."""
+        err_texts: set[str] = set()
+        selectors = [
+            "flow-video-tile flow-error-tile",
+            "flow-video-tile .error-tile",
+            "flow-video-tile [data-tile-state='error']",
+            "flow-video-tile [role='alert']",
+        ]
+        for selector in selectors:
+            try:
+                locators = self.page.locator(selector)
+                count = await locators.count()
+                for index in range(min(count, 10)):
+                    text = (await locators.nth(index).inner_text() or "").strip()
+                    if text and _is_valid_flow_error_text(text):
+                        err_texts.add(text)
+            except Exception:
+                pass
+        return err_texts
+
+    async def _get_existing_video_error_count(self) -> int:
+        """Count video error tiles without collapsing identical policy messages."""
+        selector = (
+            "flow-video-tile flow-error-tile, "
+            "flow-video-tile .error-tile, "
+            "flow-video-tile [data-tile-state='error'], "
+            "flow-video-tile [role='alert']"
+        )
+        try:
+            return max(0, int(await self.page.locator(selector).count()))
+        except Exception:
+            return len(await self._get_existing_video_error_texts())
+
+    async def _get_existing_video_tile_count(self) -> int:
+        try:
+            return max(0, int(await self.page.locator("flow-video-tile").count()))
+        except Exception:
+            return 0
+
+    async def _get_video_error_texts_since(self, first_tile_index: int) -> list[str]:
+        """Return errors only from video tiles created for the current request."""
+        errors: list[str] = []
+        try:
+            tiles = self.page.locator("flow-video-tile")
+            tile_count = await tiles.count()
+            for index in range(max(0, int(first_tile_index)), min(tile_count, 100)):
+                text = (await tiles.nth(index).inner_text() or "").strip()
+                if text and _is_valid_flow_error_text(text):
+                    errors.append(text)
+        except Exception:
+            return []
+        return errors
 
     async def clear_ingredient_chips(self) -> None:
         """Clear all ingredient chips currently attached to the prompt box."""
@@ -2935,7 +3905,11 @@ class GoogleFlowWorker:
             attached = await self._wait_for_prompt_attachment_count(expected_count)
             return REFERENCE_RESULT_ATTACHED if attached else REFERENCE_RESULT_UI_ERROR
         except Exception as exc:
-            logger.warning("Video frame picker failed for '%s': %s", frame_path.name, exc)
+            logger.warning(
+                "Video frame picker failed for '%s': %s",
+                frame_path.name,
+                security_logging.redact_sensitive(exc),
+            )
             await self._close_reference_ui()
             return REFERENCE_RESULT_UI_ERROR
 
@@ -2944,32 +3918,19 @@ class GoogleFlowWorker:
         frame_path: Path,
         expected_count: int,
     ) -> bool:
-        add_btn = self.page.locator(
-            "flow-creative-agent-prompt-box button[aria-label*='Add ingredients' i], "
-            "flow-creative-agent-prompt-box button[aria-label*='Thêm thành phần' i], "
-            "button.add-menu-trigger"
-        ).first
-        if not await add_btn.is_visible(timeout=3000):
-            raise FlowFrameAttachmentError("Không tìm thấy nút thêm frame video.")
-        await add_btn.click()
-        await asyncio.sleep(0.5)
         try:
-            async with self.page.expect_file_chooser(timeout=5000) as chooser_info:
-                upload_option = self.page.locator(
-                    "button:has-text('Upload media'), button:has-text('Tải nội dung'), "
-                    "button:has-text('Tải lên'), [role='menuitem']:has-text('Upload'), "
-                    "[role='menuitem']:has-text('Tải lên')"
-                ).first
-                if not await upload_option.is_visible(timeout=2000):
-                    raise FlowFrameAttachmentError("Không tìm thấy lệnh upload frame video.")
-                await upload_option.click()
-            chooser = await chooser_info.value
-            await chooser.set_files(str(frame_path))
+            await self._submit_file_from_add_menu(frame_path)
             await self.wait_for_load()
             return await self._wait_for_prompt_attachment_count(
                 expected_count,
                 timeout=VIDEO_FRAME_UPLOAD_ATTACH_TIMEOUT_SECONDS,
             )
+        except FlowUploadInteractionError as exc:
+            await self._capture_frame_failure_diagnostic_once(exc)
+            raise FlowFrameAttachmentError(
+                "Không thể gửi frame video lên Google Flow.",
+                reason_code=exc.reason_code,
+            ) from exc
         finally:
             await self._close_reference_ui()
 
@@ -3041,7 +4002,10 @@ class GoogleFlowWorker:
             attached = await self._wait_for_prompt_attachment_count(expected_count)
             return REFERENCE_RESULT_ATTACHED if attached else REFERENCE_RESULT_UI_ERROR
         except Exception as exc:
-            logger.warning("Video frame gallery lookup failed: %s", exc)
+            logger.warning(
+                "Video frame gallery lookup failed: %s",
+                security_logging.redact_sensitive(exc),
+            )
             await self._close_reference_ui()
             return REFERENCE_RESULT_UI_ERROR
 
@@ -3075,7 +4039,10 @@ class GoogleFlowWorker:
     ) -> None:
         path = Path(frame_path)
         if not path.is_file():
-            raise FlowFrameAttachmentError(f"Video {role} frame không tồn tại: {path}")
+            raise FlowFrameAttachmentError(
+                f"Video {role} frame không tồn tại: {path}",
+                reason_code="frame_file_missing",
+            )
         frame_key = self._video_frame_key(path)
         cache = self._project_video_frame_cache()
         record = cache.get(frame_key)
@@ -3125,36 +4092,20 @@ class GoogleFlowWorker:
             )
             return
 
-        missing_generated_asset = (
-            result == REFERENCE_RESULT_NOT_FOUND
-            and record is not None
-            and record.get("source") == "generated"
-        )
-        if result == REFERENCE_RESULT_UI_ERROR or (
-            record is not None and not missing_generated_asset
-        ):
+        if result in (REFERENCE_RESULT_UI_ERROR, REFERENCE_RESULT_NOT_FOUND):
+            if record is not None:
+                cache.pop(frame_key, None)
             self._log_video_frame_event(
-                "frame_attach_failed",
+                "frame_cached_asset_reupload",
                 path,
                 role,
                 scene_index=scene_index,
-                detail="picker_ui_error" if result == REFERENCE_RESULT_UI_ERROR else "known_asset_missing",
-            )
-            raise FlowFrameAttachmentError(
-                f"Không thể gắn {role} frame đã có '{path.name}' trong project Flow."
+                detail=f"picker_{str(result).lower()}_fallback_upload",
             )
 
-        if missing_generated_asset:
-            self._log_video_frame_event(
-                "frame_generated_reupload",
-                path,
-                role,
-                scene_index=scene_index,
-                detail="generated_asset_not_selectable",
-            )
-
-        # Mark the frame as known before opening the file chooser. A later UI
-        # confirmation failure must never cause the same file to be uploaded again.
+        attached = await self._upload_video_frame_file(path, expected_count)
+        # The helper returns only after set_files succeeds, so recording the upload
+        # here prevents duplicate submissions without poisoning cache on UI retries.
         cache[frame_key] = {
             "filename": path.name,
             "frame_sha256": frame_key.rsplit(":", 1)[-1],
@@ -3163,7 +4114,6 @@ class GoogleFlowWorker:
             "flow_media_key": "",
             "source": "upload",
         }
-        attached = await self._upload_video_frame_file(path, expected_count)
         if not attached:
             retry = await self._attach_video_frame_from_picker(
                 path,
@@ -3185,7 +4135,8 @@ class GoogleFlowWorker:
                 detail="uploaded_but_not_attached",
             )
             raise FlowFrameAttachmentError(
-                f"Frame '{path.name}' đã upload nhưng không thể gắn vào prompt Agent."
+                f"Frame '{path.name}' đã upload nhưng không thể gắn vào prompt Agent.",
+                reason_code="frame_uploaded_unconfirmed",
             )
         identities = await self._prompt_attachment_identities()
         identity = identities[expected_count - 1] if len(identities) >= expected_count else {}
@@ -3216,31 +4167,54 @@ class GoogleFlowWorker:
         *,
         scene_index: int | None = None,
     ) -> None:
-        await self.clear_ingredient_chips()
-        if not await self._wait_for_prompt_attachment_count(0):
-            raise FlowFrameAttachmentError("Không thể xóa attachment cũ trước khi tạo video.")
-        await self._ensure_agent_video_frame(
-            Path(start_frame_path),
-            "start",
-            1,
-            scene_index=scene_index,
-        )
-        await self._ensure_agent_video_frame(
-            Path(end_frame_path),
-            "end",
-            2,
-            scene_index=scene_index,
-        )
-        identities = await self._prompt_attachment_identities()
-        if len(identities) != 2:
-            raise FlowFrameAttachmentError(
-                f"Prompt Agent phải có đúng 2 frame, hiện có {len(identities)}."
+        try:
+            await self.clear_ingredient_chips()
+            if not await self._wait_for_prompt_attachment_count(0):
+                raise FlowFrameAttachmentError(
+                    "Không thể xóa attachment cũ trước khi tạo video.",
+                    reason_code="frame_clear_failed",
+                )
+            await self._ensure_agent_video_frame(
+                Path(start_frame_path),
+                "start",
+                1,
+                scene_index=scene_index,
             )
+            await self._ensure_agent_video_frame(
+                Path(end_frame_path),
+                "end",
+                2,
+                scene_index=scene_index,
+            )
+            identities = await self._prompt_attachment_identities()
+            if len(identities) != 2:
+                raise FlowFrameAttachmentError(
+                    f"Prompt Agent phải có đúng 2 frame, hiện có {len(identities)}.",
+                    reason_code="frame_count_mismatch",
+                )
+        except FlowFrameAttachmentError as exc:
+            await self._capture_frame_failure_diagnostic_once(exc)
+            raise
 
     async def _close_reference_ui(self) -> None:
         try:
             await self.page.keyboard.press("Escape")
-            await asyncio.sleep(0.3)
+            deadline = time.monotonic() + 1.5
+            backdrops = self.page.locator(".cdk-overlay-backdrop-showing")
+            while time.monotonic() < deadline:
+                try:
+                    if not await backdrops.count():
+                        break
+                    if not any(
+                        [
+                            await backdrops.nth(index).is_visible(timeout=100)
+                            for index in range(await backdrops.count())
+                        ]
+                    ):
+                        break
+                except Exception:
+                    break
+                await asyncio.sleep(0.15)
         except Exception:
             pass
         await self.dismiss_blocking_dialogs()
@@ -3477,7 +4451,7 @@ class GoogleFlowWorker:
                 detail=f"upload_failed:{type(exc).__name__}",
             )
             raise ReferenceAttachmentError(
-                f"Không thể upload ảnh tham chiếu '{filename}': {exc}"
+                f"Không thể upload ảnh tham chiếu '{filename}' lên Google Flow."
             ) from exc
 
         for _ in range(REFERENCE_POST_UPLOAD_RETRY_COUNT):
@@ -3540,7 +4514,10 @@ class GoogleFlowWorker:
             await add_btn.click()
             await asyncio.sleep(0.8)
         except Exception as exc:
-            logger.warning("Could not click add ingredients button: %s", exc)
+            logger.warning(
+                "Could not click add ingredients button: %s",
+                security_logging.redact_sensitive(exc),
+            )
             await self.dismiss_blocking_dialogs()
             return
 
@@ -3555,7 +4532,10 @@ class GoogleFlowWorker:
                 await uploads_tab.click()
                 await asyncio.sleep(0.5)
         except Exception as exc:
-            logger.warning("Could not switch to Uploads tab in add menu: %s", exc)
+            logger.warning(
+                "Could not switch to Uploads tab in add menu: %s",
+                security_logging.redact_sensitive(exc),
+            )
 
         clean_ref = target_ref.replace(".jpg", "").replace(".png", "").replace(".webp", "").strip()
 
@@ -4075,6 +5055,9 @@ class GoogleFlowWorker:
         initial_error_texts: set[str],
         submitted_at: float,
         timeout_seconds: float,
+        submitted_prompt: str = "",
+        initial_video_error_count: int | None = None,
+        initial_video_tile_count: int | None = None,
     ) -> str:
         agent_timeout = (
             media_type == "image" and self._agent_interface_detected
@@ -4125,11 +5108,11 @@ class GoogleFlowWorker:
                 continue
 
             if media_type == "video" and self._generation_queue_active:
-                hard_deadline = max(
-                    hard_deadline,
-                    submitted_at + VIDEO_QUEUE_TIMEOUT_SECONDS,
-                )
                 if not queue_logged:
+                    hard_deadline = max(
+                        hard_deadline,
+                        now + VIDEO_QUEUE_TIMEOUT_SECONDS,
+                    )
                     self._log_generation_event(media_type, "queued", submitted_at)
                     queue_logged = True
 
@@ -4150,11 +5133,24 @@ class GoogleFlowWorker:
                     f"{media_type}. Hãy chạy tiếp để tool mở phiên mới tại checkpoint này."
                 )
 
-            current_errors = await self._get_existing_error_texts()
-            new_errors = [
-                text for text in current_errors
-                if text not in initial_error_texts and _is_valid_flow_error_text(text)
-            ]
+            if media_type == "video" and initial_video_tile_count is not None:
+                new_errors = await self._get_video_error_texts_since(
+                    initial_video_tile_count
+                )
+            elif media_type == "video" and initial_video_error_count is not None:
+                current_video_error_count = await self._get_existing_video_error_count()
+                current_errors = await self._get_existing_video_error_texts()
+                new_errors = (
+                    [text for text in current_errors if _is_valid_flow_error_text(text)]
+                    if current_video_error_count > initial_video_error_count
+                    else []
+                )
+            else:
+                current_errors = await self._get_existing_error_texts()
+                new_errors = [
+                    text for text in current_errors
+                    if text not in initial_error_texts and _is_valid_flow_error_text(text)
+                ]
             snackbar_error = ""
             try:
                 snackbar_error = await self._get_snackbar_error()
@@ -4197,6 +5193,17 @@ class GoogleFlowWorker:
                     await self._raise_invalid_image_output(media_type, submitted_at)
                     await self._save_debug_screenshot(f"{media_type}_start_failed")
                     self._log_generation_event(media_type, "start_failed", submitted_at)
+                    if media_type == "video":
+                        await self._raise_latest_video_error(
+                            submitted_prompt,
+                            video_error_count_before_submit=initial_video_error_count,
+                            video_tile_count_before_submit=initial_video_tile_count,
+                        )
+                        raise FlowVideoPending(
+                            "Google Flow đã nhận yêu cầu video nhưng chưa hiển thị tiến trình; "
+                            "sẽ đối soát lại thay vì gửi trùng.",
+                            reason_code="flow_video_start_pending",
+                        )
                     raise FlowGenerationStartError(
                         f"Google Flow không bắt đầu tạo {media_type} sau "
                         f"{GENERATION_START_TIMEOUT_SECONDS:.0f} giây."
@@ -4216,6 +5223,17 @@ class GoogleFlowWorker:
                     await self._raise_invalid_image_output(media_type, submitted_at)
                     await self._save_debug_screenshot(f"{media_type}_result_missing")
                     self._log_generation_event(media_type, "result_missing", submitted_at)
+                    if media_type == "video":
+                        await self._raise_latest_video_error(
+                            submitted_prompt,
+                            video_error_count_before_submit=initial_video_error_count,
+                            video_tile_count_before_submit=initial_video_tile_count,
+                        )
+                        raise FlowVideoPending(
+                            "Google Flow đã nhận yêu cầu video nhưng kết quả chưa xuất hiện; "
+                            "sẽ đối soát lại thay vì dùng ảnh.",
+                            reason_code="flow_video_result_pending",
+                        )
                     raise FlowResultMissingError(
                         f"Google Flow đã dừng nhưng không tìm thấy {media_type} mới."
                     )
@@ -4233,6 +5251,17 @@ class GoogleFlowWorker:
                     await self._raise_invalid_image_output(media_type, submitted_at)
                 await self._save_debug_screenshot(f"{media_type}_hard_timeout")
                 self._log_generation_event(media_type, "hard_timeout", submitted_at)
+                if media_type == "video":
+                    await self._raise_latest_video_error(
+                        submitted_prompt,
+                        video_error_count_before_submit=initial_video_error_count,
+                        video_tile_count_before_submit=initial_video_tile_count,
+                    )
+                    raise FlowVideoPending(
+                        "Google Flow vẫn có thể đang xử lý video sau thời hạn theo dõi; "
+                        "sẽ đối soát lại thay vì gửi trùng hoặc dùng ảnh.",
+                        reason_code="flow_video_wait_pending",
+                    )
                 if agent_timeout and is_generating:
                     raise FlowAgentStalledError(
                         "Google Flow Agent vẫn đang xử lý nhưng không trả về "
@@ -4252,6 +5281,12 @@ class GoogleFlowWorker:
         *,
         scene_index: int | None = None,
         scene_count: int | None = None,
+        image_settings: dict | None = None,
+        request_key: str = "",
+        reconcile_only: bool = False,
+        submit_only: bool = False,
+        request_attempt: int = 1,
+        deadline_seconds: float = AGENT_IMAGE_GENERATION_TIMEOUT_SECONDS,
     ) -> str:
         self._set_active_reference_filenames(reference_ids, reference_paths)
         self._reset_image_candidate_state()
@@ -4264,6 +5299,12 @@ class GoogleFlowWorker:
                 reference_paths,
                 scene_index=scene_index,
                 scene_count=scene_count,
+                image_settings=image_settings,
+                request_key=request_key,
+                reconcile_only=reconcile_only,
+                submit_only=submit_only,
+                request_attempt=request_attempt,
+                deadline_seconds=deadline_seconds,
             )
         finally:
             if self._is_asset_edit_url(str(self.page.url or "")):
@@ -4278,6 +5319,12 @@ class GoogleFlowWorker:
         *,
         scene_index: int | None = None,
         scene_count: int | None = None,
+        image_settings: dict | None = None,
+        request_key: str = "",
+        reconcile_only: bool = False,
+        submit_only: bool = False,
+        request_attempt: int = 1,
+        deadline_seconds: float = AGENT_IMAGE_GENERATION_TIMEOUT_SECONDS,
     ) -> str:
         # Clean any URL / bracket tags from prompt
         clean_prompt = re.sub(r"\[IMAGE_URL:[^\]]*\]", "", prompt)
@@ -4300,7 +5347,9 @@ class GoogleFlowWorker:
                 "choices, do not organize assets, do not write a script, and do not animate. "
                 "Return only the requested image. "
             )
-        full_prompt = f"{scene_instruction}{legacy_full_prompt}"
+        full_prompt = (
+            f"{scene_instruction}{legacy_full_prompt}{self._request_marker(request_key)}"
+        )
 
         late_source = await self._find_completed_image_for_prompt(
             full_prompt,
@@ -4308,8 +5357,15 @@ class GoogleFlowWorker:
         )
         if late_source:
             return late_source
+        if reconcile_only:
+            raise FlowImagePending(
+                "Google Flow đã nhận yêu cầu ảnh và chưa có kết quả gắn đúng request; "
+                "sẽ tiếp tục đối soát mà không gửi lại prompt."
+            )
 
         await self._ensure_agent_session_ready()
+        if await self._is_agent_interface_active():
+            await self.ensure_agent_image_settings(image_settings)
 
         # References must be visible before the baseline is captured so they can
         # never be mistaken for the result of the next prompt.
@@ -4375,9 +5431,23 @@ class GoogleFlowWorker:
             baseline_keys=baseline_keys,
             on_agent_session_reset=restore_references_after_session_reset,
         )
+        receipt = self._remember_generation_receipt(
+            request_key=request_key,
+            media_type="image",
+            scene_index=scene_index,
+            full_prompt=full_prompt,
+            submitted_at=self._utc_timestamp(),
+            deadline_seconds=deadline_seconds,
+            attempt=request_attempt,
+        )
         if immediate_source:
             self._log_generation_event("image", "completed", submitted_at)
             return immediate_source
+        if submit_only:
+            raise FlowImagePending(
+                "Google Flow đã nhận yêu cầu ảnh; sẽ đối soát kết quả theo request.",
+                receipt=receipt,
+            )
 
         return await self._wait_for_new_media(
             media_type="image",
@@ -4641,6 +5711,13 @@ class GoogleFlowWorker:
         reference_ids: list[str] | None = None,
         video_settings: dict | None = None,
         scene_index: int | None = None,
+        reconcile_only: bool = False,
+        video_error_count_before_submit: int | None = None,
+        video_tile_count_before_submit: int | None = None,
+        request_key: str = "",
+        submit_only: bool = False,
+        request_attempt: int = 1,
+        deadline_seconds: float = 900.0,
     ) -> str:
         await self._ensure_project_canvas()
         try:
@@ -4652,6 +5729,13 @@ class GoogleFlowWorker:
                 reference_ids=reference_ids,
                 video_settings=video_settings,
                 scene_index=scene_index,
+                reconcile_only=reconcile_only,
+                video_error_count_before_submit=video_error_count_before_submit,
+                video_tile_count_before_submit=video_tile_count_before_submit,
+                request_key=request_key,
+                submit_only=submit_only,
+                request_attempt=request_attempt,
+                deadline_seconds=deadline_seconds,
             )
         finally:
             if self._is_asset_edit_url(str(self.page.url or "")):
@@ -4666,6 +5750,13 @@ class GoogleFlowWorker:
         reference_ids: list[str] | None = None,
         video_settings: dict | None = None,
         scene_index: int | None = None,
+        reconcile_only: bool = False,
+        video_error_count_before_submit: int | None = None,
+        video_tile_count_before_submit: int | None = None,
+        request_key: str = "",
+        submit_only: bool = False,
+        request_attempt: int = 1,
+        deadline_seconds: float = 900.0,
     ) -> str:
         """Generate a video clip from start (and optional end) frame using Veo on Google Flow."""
         if not start_frame_path or not Path(start_frame_path).is_file():
@@ -4679,6 +5770,36 @@ class GoogleFlowWorker:
         self._video_completed_candidate_seen_at.clear()
         self._inspected_video_detail_keys.clear()
         self._record_video_timing("prepare_started")
+
+        full_prompt = (
+            self._build_video_prompt(prompt, avoid_prompt)
+            + self._request_marker(request_key)
+        )
+        if reconcile_only:
+            if video_error_count_before_submit is not None:
+                self._last_video_timing["video_error_count_before_submit"] = max(
+                    0, int(video_error_count_before_submit)
+                )
+            if video_tile_count_before_submit is not None:
+                self._last_video_timing["video_tile_count_before_submit"] = max(
+                    0, int(video_tile_count_before_submit)
+                )
+            existing_result = await self._find_video_for_prompt(full_prompt)
+            existing_state = str(existing_result.get("state") or "missing")
+            existing_source = str(existing_result.get("source") or "").strip()
+            if existing_state == "completed" and existing_source:
+                self._record_video_timing("playable_url_seen")
+                return existing_source
+            await self._raise_latest_video_error(
+                full_prompt,
+                existing_result,
+                video_error_count_before_submit=video_error_count_before_submit,
+                video_tile_count_before_submit=video_tile_count_before_submit,
+            )
+            raise FlowVideoPending(
+                "Google Flow đã nhận yêu cầu video và chưa có file tải xuống; "
+                "sẽ tiếp tục đối soát mà không gửi lại prompt."
+            )
 
         await self._ensure_agent_session_ready()
         editor = await self.wait_for_editor(timeout=25.0)
@@ -4715,20 +5836,14 @@ class GoogleFlowWorker:
         baseline_keys = await self._capture_video_baseline()
         self._record_video_timing("baseline_captured")
         initial_error_texts = await self._get_existing_error_texts()
-
-        # 2. Add strict negative prompt for text/watermarks and static still frames
-        strict_avoid = "still frame, static image, cartoon, text, letters, words, typography, watermark, logo, headline, caption, subtitle, poster text"
-        combined_avoid = f"{avoid_prompt}, {strict_avoid}" if avoid_prompt else strict_avoid
-        clean_prompt = re.sub(r"\[IMAGE_URL:[^\]]*\]", "", prompt)
-        clean_prompt = re.sub(r"https?://\S+", "", clean_prompt)
-        clean_prompt = re.sub(r"/api/thumbnails/\S+", "", clean_prompt).strip()
-        clean_prompt = re.sub(
-            r"(?i)\b(?:still photograph|photography|35mm photography|photo|film still|raw photo|movie still|still photo)\b",
-            "cinematic video",
-            clean_prompt,
+        initial_video_error_count = await self._get_existing_video_error_count()
+        initial_video_tile_count = await self._get_existing_video_tile_count()
+        self._last_video_timing["video_error_count_before_submit"] = (
+            initial_video_error_count
         )
-        clean_prompt = re.sub(r"\s+", " ", clean_prompt).strip()
-        full_prompt = f"{clean_prompt}. Avoid: {combined_avoid}"
+        self._last_video_timing["video_tile_count_before_submit"] = (
+            initial_video_tile_count
+        )
 
         for click_attempt in range(3):
             await self.dismiss_blocking_dialogs()
@@ -4759,6 +5874,16 @@ class GoogleFlowWorker:
             on_agent_session_reset=restore_agent_video_frames,
         )
         self._active_video_submitted_at = submitted_at
+        receipt = self._remember_generation_receipt(
+            request_key=request_key,
+            media_type="video",
+            scene_index=scene_index,
+            full_prompt=full_prompt,
+            submitted_at=self._utc_timestamp(),
+            deadline_seconds=deadline_seconds,
+            frame_paths=[Path(start_frame_path), Path(end_frame_path)],
+            attempt=request_attempt,
+        )
         self._record_video_timing("submitted")
         logger.info(
             "flow_generation media=video state=video_submitted project=%s scene=%s",
@@ -4769,6 +5894,11 @@ class GoogleFlowWorker:
             self._record_video_timing("playable_url_seen")
             self._log_generation_event("video", "video_completed", submitted_at)
             return immediate_source
+        if submit_only:
+            raise FlowVideoPending(
+                "Google Flow đã nhận yêu cầu video; sẽ đối soát kết quả theo request.",
+                receipt=receipt,
+            )
 
         result = await self._wait_for_new_media(
             media_type="video",
@@ -4776,6 +5906,9 @@ class GoogleFlowWorker:
             initial_error_texts=initial_error_texts,
             submitted_at=submitted_at,
             timeout_seconds=VIDEO_GENERATION_TIMEOUT_SECONDS,
+            submitted_prompt=full_prompt,
+            initial_video_error_count=initial_video_error_count,
+            initial_video_tile_count=initial_video_tile_count,
         )
         self._log_generation_event("video", "video_completed", submitted_at)
         return result
@@ -4845,4 +5978,3 @@ class GoogleFlowWorker:
         except Exception as e:
             logger.warning("Failed to save debug diagnostics: %s", e)
             return {}
-

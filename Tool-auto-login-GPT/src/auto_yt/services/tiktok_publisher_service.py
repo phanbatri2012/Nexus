@@ -52,87 +52,90 @@ async def upload_video_via_gpm(
         timeout_seconds=timeout_seconds,
     ) as (context, _browser, _p_info):
         page = await context.new_page()
-
-        await page.goto(
-            TIKTOK_UPLOAD_URL,
-            wait_until="domcontentloaded",
-            timeout=int(timeout_seconds * 1000),
-        )
-        await asyncio.sleep(2.0)
-
-        # Check if login is required
-        if "/login" in page.url or await page.locator("text='Log in'").is_visible(timeout=3000):
-            raise RuntimeError(
-                "Chưa đăng nhập TikTok trong Profile này. Vui lòng mở trình duyệt và đăng nhập tài khoản trước."
-            )
-
-        # Locate file input element (supports standard input[type=file] or drag-drop frame)
-        file_input = page.locator('input[type="file"]')
-        if not await file_input.count():
-            # Try finding inside iframes
-            for frame in page.frames:
-                frame_input = frame.locator('input[type="file"]')
-                if await frame_input.count():
-                    file_input = frame_input
-                    break
-
-        if not await file_input.count():
-            raise RuntimeError("Không tìm thấy khung tải file video trên giao diện TikTok Creator Center.")
-
-        # Use CDP to set file directly, bypassing Playwright 50MB transfer limit
-        cdp = await page.context.new_cdp_session(page)
+        preserve_page = True
         try:
-            doc = await cdp.send("DOM.getDocument")
-            node = await cdp.send("DOM.querySelector", {
-                "nodeId": doc["root"]["nodeId"],
-                "selector": 'input[type="file"]',
-            })
-            node_id = node.get("nodeId", 0)
-            if not node_id:
-                raise RuntimeError("CDP không tìm thấy input[type='file'] trên TikTok.")
-            await cdp.send("DOM.setFileInputFiles", {
-                "files": [str(Path(video_path).resolve())],
-                "nodeId": node_id,
-            })
-        finally:
-            await cdp.detach()
-        logger.info("Đã đưa file video vào input upload TikTok, đang chờ xử lý...")
+            await page.goto(
+                TIKTOK_UPLOAD_URL,
+                wait_until="domcontentloaded",
+                timeout=int(timeout_seconds * 1000),
+            )
+            await asyncio.sleep(2.0)
 
-        # Wait for upload processing container
-        await asyncio.sleep(5.0)
+            # Check if login is required
+            if "/login" in page.url or await page.locator("text='Log in'").is_visible(timeout=3000):
+                raise RuntimeError(
+                    "Chưa đăng nhập TikTok trong Profile này. Vui lòng mở trình duyệt và đăng nhập tài khoản trước."
+                )
 
-        # Fill caption / description editor
-        caption_editor = page.locator(
-            '[contenteditable="true"], .DraftEditor-editorContainer, textarea[placeholder*="caption"], textarea[placeholder*="tiêu đề"]'
-        )
-        if await caption_editor.first.is_visible(timeout=10000):
+            # Locate file input element (supports standard input[type=file] or drag-drop frame)
+            file_input = page.locator('input[type="file"]')
+            if not await file_input.count():
+                # Try finding inside iframes
+                for frame in page.frames:
+                    frame_input = frame.locator('input[type="file"]')
+                    if await frame_input.count():
+                        file_input = frame_input
+                        break
+
+            if not await file_input.count():
+                raise RuntimeError("Không tìm thấy khung tải file video trên giao diện TikTok Creator Center.")
+
+            # Use CDP to set file directly, bypassing Playwright 50MB transfer limit
+            cdp = await page.context.new_cdp_session(page)
             try:
-                await caption_editor.first.click()
-                await page.keyboard.press("Control+A")
-                await page.keyboard.press("Backspace")
-                if full_caption:
-                    await page.keyboard.type(full_caption[:2000], delay=20)
-            except Exception as cap_err:
-                logger.warning("Không thể nhập caption tự động: %s", cap_err)
+                doc = await cdp.send("DOM.getDocument")
+                node = await cdp.send("DOM.querySelector", {
+                    "nodeId": doc["root"]["nodeId"],
+                    "selector": 'input[type="file"]',
+                })
+                node_id = node.get("nodeId", 0)
+                if not node_id:
+                    raise RuntimeError("CDP không tìm thấy input[type='file'] trên TikTok.")
+                await cdp.send("DOM.setFileInputFiles", {
+                    "files": [str(Path(video_path).resolve())],
+                    "nodeId": node_id,
+                })
+            finally:
+                await cdp.detach()
+            logger.info("Đã đưa file video vào input upload TikTok, đang chờ xử lý...")
 
-        # Post / Schedule button locator
-        post_btn = page.locator(
-            "button:has-text('Post'), button:has-text('Đăng'), button.btn-post, [data-e2e='post_video_button']"
-        )
-        if await post_btn.first.is_visible(timeout=10000):
-            # Click post
-            await post_btn.first.click()
-            await asyncio.sleep(4.0)
-            logger.info("Đã bấm nút Đăng video lên TikTok!")
+            # Wait for upload processing container
+            await asyncio.sleep(5.0)
 
-        result = {
-            "success": True,
-            "message": "Đã tải và đăng video lên TikTok Creator Center thành công!",
-            "profile_id": profile_id,
-            "video_name": video_path.name,
-        }
-        await cleanup_owned_page(context, page)
-        return result
+            # Fill caption / description editor
+            caption_editor = page.locator(
+                '[contenteditable="true"], .DraftEditor-editorContainer, textarea[placeholder*="caption"], textarea[placeholder*="tiêu đề"]'
+            )
+            if await caption_editor.first.is_visible(timeout=10000):
+                try:
+                    await caption_editor.first.click()
+                    await page.keyboard.press("Control+A")
+                    await page.keyboard.press("Backspace")
+                    if full_caption:
+                        await page.keyboard.type(full_caption[:2000], delay=20)
+                except Exception as cap_err:
+                    logger.warning("Không thể nhập caption tự động: %s", cap_err)
+
+            # Post / Schedule button locator
+            post_btn = page.locator(
+                "button:has-text('Post'), button:has-text('Đăng'), button.btn-post, [data-e2e='post_video_button']"
+            )
+            if await post_btn.first.is_visible(timeout=10000):
+                # Click post
+                await post_btn.first.click()
+                await asyncio.sleep(4.0)
+                logger.info("Đã bấm nút Đăng video lên TikTok!")
+
+            result = {
+                "success": True,
+                "message": "Đã tải và đăng video lên TikTok Creator Center thành công!",
+                "profile_id": profile_id,
+                "video_name": video_path.name,
+            }
+            preserve_page = False
+            return result
+        finally:
+            await cleanup_owned_page(context, page, preserve=preserve_page)
 
 
 def start_tiktok_publish_job(

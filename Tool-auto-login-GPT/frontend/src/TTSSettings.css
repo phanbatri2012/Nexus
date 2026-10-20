@@ -50,6 +50,12 @@
 .tts-status { position: sticky; bottom: 12px; margin-top: 10px; padding: 12px; border-radius: 8px; background: #25212a; text-align: center; }
 .tts-status.success { color: #42e2c2; }
 .tts-status.error, .tts-error-inline { color: #ff6f6f; }
+.tts-casting-profile { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; flex-basis: 100%; margin-top: 4px; }
+.tts-casting-label { color: #d6c8f4; font-size: .78rem; font-weight: 700; }
+.tts-casting-profile > label { display: inline-flex; align-items: center; gap: 6px; color: #a9bfd5; font-size: .78rem; }
+.tts-casting-profile > label.tts-toggle { margin-left: 0; }
+.tts-casting-profile select { min-width: 92px; padding: 5px 7px; }
+.tts-casting-profile .tts-button { padding: 5px 8px; font-size: .75rem; }
 @media (max-width: 820px) {
   .tts-provider-grid, .tts-create-grid { grid-template-columns: 1fr; }
   .tts-voice { align-items: flex-start; flex-direction: column; }

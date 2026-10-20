@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { openVideoStudioInGpm } from './gpmOpener.js'
+import { formatDateTimeAMPM } from './publicationTime.js'
 
 const API_BASE = 'http://127.0.0.1:8080'
 const BULK_ACTIONS = ['retry', 'pause', 'resume', 'cancel', 'force_stop']
@@ -16,7 +17,7 @@ const STATUS_META = {
   running: { label: 'Đang chạy', color: '#2ecc71' },
   retry_wait: { label: 'Chờ tự phục hồi', color: '#4dd0e1' },
   paused: { label: 'Tạm dừng', color: '#f1c40f' },
-  awaiting_review: { label: 'Chưa tự động kiểm tra', color: '#f5b041' },
+  awaiting_review: { label: 'Chờ duyệt thủ công', color: '#f5b041' },
   review_blocked: { label: 'Tự kiểm tra không đạt', color: '#ff6b6b' },
   done: { label: 'Hoàn thành', color: '#4dd0e1' },
   error: { label: 'Lỗi', color: '#ff5c5c' },
@@ -25,8 +26,7 @@ const STATUS_META = {
 
 function formatDate(value) {
   if (!value) return '—'
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString('vi-VN')
+  return formatDateTimeAMPM(value, { includeSeconds: true })
 }
 
 const PIPELINE_LABELS = {
@@ -42,6 +42,7 @@ const PIPELINE_LABELS = {
   thumbnail_without_text: 'Ảnh không chữ',
   audio: 'Audio',
   video_render: 'Dựng MP4',
+  video_qc: 'Kiểm tra chất lượng',
   youtube_upload: 'Upload Private',
   youtube_schedule: 'Đặt lịch'
 }
@@ -574,7 +575,9 @@ function JobCenter({ onOpenVideo, refreshKey }) {
           <option value="visual_scene_plan">Lập kế hoạch cảnh</option>
           <option value="flow_media_generation">Tạo media Google Flow</option>
           <option value="video_render">Dựng video MP4</option>
+          <option value="video_qc">Kiểm tra chất lượng video</option>
           <option value="youtube_publish">Upload / đặt lịch YouTube</option>
+          <option value="competitor_scan">Quét đối thủ</option>
           <option value="youtube_download">Tải YouTube</option>
           <option value="chatgpt">Tác vụ ChatGPT</option>
           <option value="comment_sync">Đồng bộ bình luận</option>
@@ -751,6 +754,34 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                     <div style={{ color: '#999', marginTop: '7px', fontSize: '0.86em' }}>
                       {job.progress || 'Chưa có cập nhật'}
                     </div>
+                    {Number(job.intro_video_summary?.fallback_count || 0) > 0 && (
+                      <div
+                        role="status"
+                        data-testid="intro-video-fallback-warning"
+                        style={{
+                          color: '#facc15',
+                          background: 'rgba(250, 204, 21, 0.08)',
+                          border: '1px solid rgba(250, 204, 21, 0.35)',
+                          borderRadius: '8px',
+                          marginTop: '9px',
+                          padding: '8px 10px',
+                          fontSize: '0.84em'
+                        }}
+                      >
+                        <strong>
+                          ⚠ Intro {Number(job.intro_video_summary.generated_count || 0)}/
+                          {Number(job.intro_video_summary.requested_count || 0)} clip ·{' '}
+                          {Number(job.intro_video_summary.fallback_count || 0)} cảnh dùng ảnh tĩnh
+                        </strong>
+                        {job.intro_video_summary.fallback_scenes?.length > 0 && (
+                          <div style={{ marginTop: '4px', color: '#fde68a' }}>
+                            Cảnh fallback: {job.intro_video_summary.fallback_scenes
+                              .map(scene => Number(scene.scene_index) + 1)
+                              .join(', ')}
+                          </div>
+                        )}
+                      </div>
+                    )}
                     {job.publish_stage && (
                       <div style={{ color: '#76d7c4', marginTop: '6px', fontSize: '0.8em' }}>
                         Bước YouTube: {PUBLISH_STAGE_LABELS[job.publish_stage] || job.publish_stage}
@@ -778,7 +809,12 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                         Đã kiểm tra processing {job.processing_poll_count} lần · timeout an toàn 24 giờ
                       </div>
                     )}
-                    {job.recovery_count > 0 && !(job.processing_poll_count > 0 && job.publish_stage === 'processing') && (
+                    {job.type === 'flow_media_generation' && job.reconcile_pending_count > 0 && (
+                      <div style={{ color: '#4dd0e1', marginTop: '6px', fontSize: '0.8em' }}>
+                        Đối soát Flow: {(job.pending_image_scene_indices || []).length} ảnh, {(job.pending_video_scene_indices || job.pending_scene_indices || []).length} video đang chờ · {job.reconcile_poll_count || 0} lượt kiểm tra
+                      </div>
+                    )}
+                    {job.type !== 'flow_media_generation' && job.recovery_count > 0 && !(job.processing_poll_count > 0 && job.publish_stage === 'processing') && (
                       <div style={{ color: '#4dd0e1', marginTop: '6px', fontSize: '0.8em' }}>
                         Tự phục hồi: {job.recovery_count}/{job.recovery_limit || 3}
                         {job.resume_from_step ? ` · Tiếp tục từ ${job.resume_from_step}` : ''}
@@ -827,7 +863,11 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                             </div>
                           </>
                         ) : (
+                          job.attention_required === 'youtube_browser_retry' ? (
+                          <div>Quá trình upload gặp sự cố trên trình duyệt. Hãy bấm “Tiếp tục” để tự động thử lại.</div>
+                        ) : (
                           <div>Video đã được tải lên YouTube. Hãy bấm “Tiếp tục” để tự động hoàn tất lưu và đặt lịch phát sóng.</div>
+                        )
                         )}
                       </div>
                     )}

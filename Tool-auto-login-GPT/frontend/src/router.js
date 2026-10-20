@@ -36,6 +36,12 @@ export const ROUTE_REGISTRY = {
     aliases: ['/channels', '/channel-hub', '/kenh', '/channel-manager'],
     title: 'Channel Hub'
   },
+  competitors: {
+    id: 'competitors',
+    canonicalPath: '/competitors',
+    aliases: ['/competitors', '/competitor-radar', '/radar-doi-thu'],
+    title: 'Competitor Radar'
+  },
   trustbuilder: {
     id: 'trustbuilder',
     canonicalPath: '/trust-builder',

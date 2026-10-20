@@ -1,0 +1,76 @@
+import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
+import test from 'node:test'
+
+
+test('wires Competitor Radar navigation and automatic rule management', async () => {
+  const appSource = await readFile(new URL('./App.jsx', import.meta.url), 'utf8')
+  const appStyles = await readFile(new URL('./App.css', import.meta.url), 'utf8')
+  const radarSource = await readFile(new URL('./CompetitorRadar.jsx', import.meta.url), 'utf8')
+  const jobCenterSource = await readFile(new URL('./JobCenter.jsx', import.meta.url), 'utf8')
+  const routerSource = await readFile(new URL('./router.js', import.meta.url), 'utf8')
+
+  assert.match(appSource, /import CompetitorRadar from ['"]\.\/CompetitorRadar['"]/)
+  assert.match(appSource, /activeView === ['"]competitors['"]/)
+  assert.match(appSource, /function RadarNavIcon/)
+  assert.match(appSource, /className="nav-icon radar-nav-icon"/)
+  assert.match(appSource, /<span>Competitor Radar<\/span>/)
+  assert.match(appSource, /<CompetitorRadar[\s\S]*?\/>/)
+  assert.match(appStyles, /\.nav-item\.active \.radar-nav-icon/)
+  assert.match(routerSource, /title: ['"]Competitor Radar['"]/)
+  assert.match(radarSource, /<h1>Competitor Radar<\/h1>/)
+  assert.match(radarSource, /request\(['"]\/competitors\/rules['"]/)
+  assert.match(radarSource, /\/scan`/)
+  assert.match(radarSource, /\/status`/)
+  assert.match(radarSource, /\/competitors\/history/)
+  assert.match(radarSource, /\/casting`/)
+  assert.match(radarSource, /\/qc`/)
+  assert.match(radarSource, /publication_mode/)
+  assert.match(radarSource, /manual_windows/)
+  assert.match(radarSource, /guest_voice_pool/)
+  assert.match(radarSource, /Nhóm giọng khách/)
+  assert.match(radarSource, /chỉ video dài ≥ 3 phút/i)
+  assert.match(radarSource, /scanSourceLabel/)
+  assert.match(radarSource, /rss_retry_after/)
+  assert.match(radarSource, /GPM Browser/)
+  assert.match(radarSource, /item\.voice_name/)
+  assert.match(radarSource, /source_voice_profile/)
+  assert.match(radarSource, /unresolved_roles/)
+  assert.match(radarSource, /candidateGroup\?\.items/)
+  assert.match(radarSource, /casting\/approve/)
+  assert.match(radarSource, /Lưu & tiếp tục/)
+  assert.match(radarSource, /some\(role => !castSelections\[role\.speaker_key\]\)/)
+  assert.match(radarSource, /casting\/recast-stale/)
+  assert.match(radarSource, /dry_run: true/)
+  assert.match(radarSource, /setError\(err\.message\)/)
+  assert.doesNotMatch(radarSource, /<td>\{item\.voice_id\}<\/td>/)
+  assert.match(jobCenterSource, /value="competitor_scan"/)
+  assert.match(jobCenterSource, /value="video_qc"/)
+})
+
+
+test('Competitor Radar displays prompt names instead of stored version IDs', async () => {
+  const radarSource = await readFile(new URL('./CompetitorRadar.jsx', import.meta.url), 'utf8')
+
+  assert.match(radarSource, /promptVersions\?\.\[promptVersion\]\?\.name \|\| promptVersion/)
+  assert.match(radarSource, /promptLabel\(prompts\.versions, rule\.prompt_version\)/)
+  assert.match(radarSource, /promptLabel\(prompts\.versions, item\.prompt_version\)/)
+  assert.doesNotMatch(radarSource, /<td>\{item\.prompt_version\}<\/td>/)
+})
+
+
+test('TTS catalog exposes usage permissions and safe guest pools', async () => {
+  const source = await readFile(new URL('./TTSSettings.jsx', import.meta.url), 'utf8')
+
+  assert.match(source, /casting_profile/)
+  assert.match(source, /usage_modes/)
+  assert.match(source, /single_narrator/)
+  assert.match(source, /multi_host/)
+  assert.match(source, /multi_guest/)
+  assert.match(source, /voice_pools/)
+  assert.match(source, /gender/)
+  assert.match(source, /age_group/)
+  assert.match(source, /languages/)
+  assert.match(source, /roles/)
+  assert.match(source, /styles/)
+})

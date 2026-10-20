@@ -11,6 +11,10 @@ class ChatGPTAttentionRequiredError(RuntimeError):
     """Raised when a person must repair the saved ChatGPT browser session."""
 
 
+class ChatGPTPreSendTransientError(RuntimeError):
+    """Raised when a transient ChatGPT failure occurs before prompt submission."""
+
+
 def is_chatgpt_login_required(error: BaseException | str) -> bool:
     """Return whether Playwright positively identified an expired login."""
     return str(error or "").strip().startswith(CHATGPT_LOGIN_REQUIRED_MESSAGE)

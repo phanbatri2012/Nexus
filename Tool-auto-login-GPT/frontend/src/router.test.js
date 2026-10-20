@@ -9,9 +9,9 @@ import {
   stringifyQueryParams
 } from './router.js'
 
-test('registers all 11 primary modules in ROUTE_REGISTRY', () => {
+test('registers all 13 primary modules in ROUTE_REGISTRY', () => {
   const expectedKeys = [
-    'dashboard', 'jobs', 'comments', 'channels', 'trustbuilder', 'crossposter',
+    'dashboard', 'jobs', 'competitors', 'comments', 'channels', 'trustbuilder', 'crossposter',
     'fetcher', 'downloader', 'autologin', 'flowlogin', 'tts', 'settings'
   ]
   for (const key of expectedKeys) {
@@ -38,12 +38,13 @@ test('parses query strings and formats them back reliably', () => {
   assert.equal(formatted, '?status=failed&limit=10')
 })
 
-test('parses primary routes across all 11 menus correctly', () => {
+test('parses primary routes across all 13 menus correctly', () => {
   const expectedMappings = [
     { url: '/', viewId: 'dashboard' },
     { url: '/dashboard', viewId: 'dashboard' },
     { url: '/jobs', viewId: 'jobs' },
     { url: '/job-center', viewId: 'jobs' },
+    { url: '/competitors', viewId: 'competitors' },
     { url: '/comments', viewId: 'comments' },
     { url: '/youtube-comments', viewId: 'comments' },
     { url: '/channels', viewId: 'channels' },
