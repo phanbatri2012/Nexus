@@ -205,18 +205,47 @@ def apply_manifest(manifest: dict) -> dict:
     )
     quarantine_dir.mkdir(parents=True, exist_ok=False)
     moved_files = []
-    for item in manifest["items"]:
-        if not item["file_exists"]:
-            continue
-        source = Path(item["resolved_path"])
-        destination = quarantine_dir / f"artifact_{item['id']}_{source.name}"
-        shutil.move(str(source), str(destination))
-        moved_files.append({"from": str(source), "to": str(destination)})
-
     artifact_ids = [int(item["id"]) for item in manifest["items"]]
     connection = _connect()
     try:
         connection.execute("BEGIN IMMEDIATE")
+        publication_state = connection.execute(
+            "SELECT is_published FROM videos WHERE id = ?",
+            (video_id,),
+        ).fetchone()
+        publication_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM video_publications WHERE video_id = ?",
+                (video_id,),
+            ).fetchone()[0]
+        )
+        active_job_count = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM system_jobs
+                WHERE video_id = ?
+                  AND status IN ('queued', 'running', 'processing', 'retry_wait')
+                """,
+                (video_id,),
+            ).fetchone()[0]
+        )
+        if publication_state is None:
+            raise RuntimeError(f"Không tìm thấy video {video_id} khi bắt đầu repair.")
+        if bool(publication_state[0]) or publication_count:
+            raise RuntimeError(
+                "Từ chối repair vì video vừa có trạng thái hoặc bản ghi xuất bản."
+            )
+        if active_job_count:
+            raise RuntimeError("Từ chối repair vì video vừa có job hoạt động.")
+
+        for item in manifest["items"]:
+            if not item["file_exists"]:
+                continue
+            source = Path(item["resolved_path"])
+            destination = quarantine_dir / f"artifact_{item['id']}_{source.name}"
+            shutil.move(str(source), str(destination))
+            moved_files.append({"from": str(source), "to": str(destination)})
+
         deleted_rows = 0
         if artifact_ids:
             placeholders = ",".join("?" for _ in artifact_ids)
@@ -236,6 +265,12 @@ def apply_manifest(manifest: dict) -> dict:
         connection.commit()
     except Exception:
         connection.rollback()
+        for moved in reversed(moved_files):
+            source = Path(moved["to"])
+            destination = Path(moved["from"])
+            if source.exists() and not destination.exists():
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(source), str(destination))
         raise
     finally:
         connection.close()

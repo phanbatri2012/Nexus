@@ -115,6 +115,26 @@ class RepairFlowVideoArtifactsTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "đã có trạng thái"):
             repair_flow_video_artifacts.apply_manifest(manifest)
 
+    def test_apply_rechecks_active_jobs_after_manifest(self):
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=repair-race",
+            "Repair race",
+            "Transcript",
+            "Script",
+        )
+        manifest = repair_flow_video_artifacts.build_manifest(video_id)
+        job = database.create_system_job(
+            job_id="repair-race-job",
+            job_type="flow_media_generation",
+            title="Flow repair race",
+            payload={"video_id": video_id},
+            video_id=video_id,
+        )
+        database.update_system_job(job["id"], status="running")
+
+        with self.assertRaisesRegex(RuntimeError, "vừa có job hoạt động"):
+            repair_flow_video_artifacts.apply_manifest(manifest)
+
 
 if __name__ == "__main__":
     unittest.main()

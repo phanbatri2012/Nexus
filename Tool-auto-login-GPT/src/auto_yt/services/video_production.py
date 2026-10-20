@@ -1437,6 +1437,8 @@ async def _generate_scene_image_async(
                     )
 
                 perceptual_duplicate_retries += 1
+                is_reconciliation_checkpoint = False
+                request_key = secrets.token_hex(10)
                 target.unlink(missing_ok=True)
                 logger.warning(
                     "Generated scene %s duplicates an earlier scene (%s); retrying with a different composition (%s/%s).",

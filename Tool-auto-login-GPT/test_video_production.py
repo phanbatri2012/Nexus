@@ -1799,6 +1799,99 @@ class VideoProductionServiceTests(unittest.TestCase):
             )
         )
 
+    def test_reconciled_duplicate_image_submits_a_new_request(self):
+        from PIL import Image, ImageDraw
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=reconciled-image-duplicate",
+            "Reconciled image duplicate",
+            "Transcript",
+            "Script",
+        )
+        scene = {
+            "index": 1,
+            "prompt": "A distinct documentary scene inside a laboratory.",
+            "action": "A laboratory team examines a circular instrument",
+        }
+        content_hash = video_production._scene_hash(video_id, scene, {}, "", "")
+        target = Path(self.temporary_directory.name) / "queued-scene.png"
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene:1",
+            path=str(target),
+            content_hash=content_hash,
+            status="queued",
+            mime_type="image/png",
+            metadata={
+                "generation_attempt": 1,
+                "flow_receipt": {
+                    "request_key": "original-request",
+                    "deadline_at": (
+                        dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)
+                    ).isoformat(),
+                },
+            },
+        )
+        previous_path = Path(self.temporary_directory.name) / "queued-previous.png"
+        previous = Image.new("RGB", (1376, 768), color=(230, 230, 230))
+        ImageDraw.Draw(previous).rectangle((0, 0, 688, 768), fill=(25, 25, 25))
+        previous.save(previous_path)
+        previous_fingerprint = video_production._image_perceptual_fingerprint(
+            previous_path
+        )
+
+        worker = MagicMock()
+        worker.generate_scene = AsyncMock(
+            side_effect=[
+                "https://flow/image/reconciled-duplicate",
+                "https://flow/image/new-composition",
+            ]
+        )
+        download_count = 0
+
+        async def write_generated_image(_asset_url, save_path):
+            nonlocal download_count
+            download_count += 1
+            if download_count == 1:
+                Image.open(previous_path).save(save_path)
+                return
+            image = Image.new("RGB", (1376, 768), color=(30, 70, 130))
+            ImageDraw.Draw(image).ellipse(
+                (380, 80, 1000, 700), fill=(245, 200, 40)
+            )
+            image.save(save_path)
+
+        worker.download_image = AsyncMock(side_effect=write_generated_image)
+
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            asyncio.run(
+                video_production._generate_scene_image_async(
+                    video_id=video_id,
+                    scene=scene,
+                    scene_count=2,
+                    profile={},
+                    settings={},
+                    reference_path=None,
+                    reference_id="",
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                    worker=worker,
+                    existing_hashes={video_production._sha256_file(previous_path)},
+                    existing_perceptual_hashes=[previous_fingerprint],
+                )
+            )
+
+        first_call, second_call = worker.generate_scene.await_args_list
+        self.assertTrue(first_call.kwargs["reconcile_only"])
+        self.assertFalse(second_call.kwargs["reconcile_only"])
+        self.assertNotEqual(
+            first_call.kwargs["request_key"],
+            second_call.kwargs["request_key"],
+        )
+
     def test_scene_image_timeout_is_scheduled_for_bounded_retry(self):
         from auto_yt.services.google_flow_worker import FlowGenerationTimeout, FlowImagePending
 
