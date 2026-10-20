@@ -290,6 +290,10 @@ export default function YouTubeChannelSettings({
   }
 
   const connectChannel = async ({ clientId = '', expectedChannel = null, gpmProfileId = '' } = {}) => {
+    if (expectedChannel?.oauth_client_choice === 'none') {
+      setMessage('⚠️ Kênh này được thiết lập không dùng OAuth Client.')
+      return
+    }
     const selectedClientId = String(
       clientId ||
       expectedChannel?.oauth_client_choice ||
@@ -297,7 +301,7 @@ export default function YouTubeChannelSettings({
       (oauthConfigs[0]?.client_id || '')
     ).trim()
 
-    if (!selectedClientId) {
+    if (!selectedClientId || selectedClientId === 'none') {
       setMessage('❌ Vui lòng chọn hoặc cấu hình OAuth Client (Google Client ID) trước khi kết nối.')
       return
     }
@@ -440,13 +444,14 @@ export default function YouTubeChannelSettings({
           gpm_profile_id: channel.gpm_profile_id || '',
           gpm_profile_name: channel.gpm_profile_name || '',
           interaction_mode: channel.interaction_mode || 'gpm_browser',
-          auto_heart: channel.auto_heart !== undefined ? Boolean(channel.auto_heart) : true
+          auto_heart: channel.auto_heart !== undefined ? Boolean(channel.auto_heart) : true,
+          oauth_client_id: channel.oauth_client_choice || ''
         })
       })
       const data = await response.json()
       if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
       setChannels(previous => previous.map(item => item.id === channel.id
-        ? { ...item, ...data, oauth_client_choice: item.oauth_client_choice }
+        ? { ...item, ...data, oauth_client_choice: data.oauth_client_id ?? item.oauth_client_choice }
         : item))
       setMessage(`✅ Đã lưu thiết lập và gán Profile GPM cho kênh "${channel.title}".`)
     } catch (error) {
@@ -746,7 +751,9 @@ export default function YouTubeChannelSettings({
               <strong style={{ fontSize: '1.05rem' }}>{channel.title}</strong>
               <div className="help-text">{channel.channel_id}</div>
               <div className="help-text">
-                OAuth Client: {channel.oauth_client_id || 'Chưa xác định (sẽ tự nhận diện khi làm mới token)'}
+                OAuth Client: {channel.oauth_client_choice === 'none' || channel.oauth_client_id === 'none'
+                  ? 'Không có OAuth client'
+                  : (channel.oauth_client_id || 'Chưa xác định (sẽ tự nhận diện khi làm mới token)')}
               </div>
             </div>
             <button className="btn-danger" disabled={busy} onClick={() => disconnect(channel)}>Ngắt kết nối</button>
@@ -850,6 +857,7 @@ export default function YouTubeChannelSettings({
               onChange={event => changeChannel(channel.id, 'oauth_client_choice', event.target.value)}
             >
               <option value="">Chọn OAuth Client cho kênh này</option>
+              <option value="none">Không có OAuth client</option>
               {oauthConfigs.map(item => (
                 <option key={item.client_id} value={item.client_id}>
                   {item.client_name || 'OAuth Client'} — {item.client_id.slice(0, 12)}…
@@ -858,13 +866,18 @@ export default function YouTubeChannelSettings({
             </select>
             <button
               className="btn-run"
-              disabled={busy || (!channel.oauth_client_choice && !config.client_id && oauthConfigs.length === 0)}
+              disabled={
+                busy ||
+                channel.oauth_client_choice === 'none' ||
+                (!channel.oauth_client_choice && !config.client_id && oauthConfigs.length === 0)
+              }
+              title={channel.oauth_client_choice === 'none' ? 'Kênh này được thiết lập không dùng OAuth client' : undefined}
               onClick={() => connectChannel({
                 clientId: channel.oauth_client_choice || config.client_id || (oauthConfigs[0]?.client_id || ''),
                 expectedChannel: channel
               })}
             >
-              {busy ? '⏳ Đang kết nối...' : '↻ Kết nối lại đúng kênh này'}
+              {channel.oauth_client_choice === 'none' ? 'Không dùng OAuth' : busy ? '⏳ Đang kết nối...' : '↻ Kết nối lại đúng kênh này'}
             </button>
           </div>
           <div className="help-text" style={{ marginTop: 6 }}>

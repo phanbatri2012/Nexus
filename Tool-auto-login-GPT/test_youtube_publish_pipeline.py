@@ -215,6 +215,13 @@ class YouTubePublishPipelineTests(unittest.TestCase):
         self.assertEqual(updated["publication_paused"], 1)
         self.assertEqual(updated["public_upload_verified"], 1)
 
+        request_no_oauth = main.YouTubeChannelSettingsRequest(
+            oauth_client_id="none",
+        )
+        updated_no_oauth = main.update_youtube_comment_channel(channel["id"], request_no_oauth)
+        self.assertEqual(updated_no_oauth["oauth_client_id"], "none")
+
+
         invalid = main.YouTubeChannelSettingsRequest(
             publication_timezone="Invalid/Timezone",
             publication_slots=[{"day": 0, "time": "09:30"}],

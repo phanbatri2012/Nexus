@@ -760,6 +760,7 @@ class YouTubeChannelSettingsRequest(BaseModel):
     gpm_proxy_info: Optional[str] = Field(default=None, max_length=500)
     interaction_mode: Optional[Literal["gpm_browser", "direct_api"]] = "gpm_browser"
     auto_heart: Optional[bool] = True
+    oauth_client_id: Optional[str] = Field(default=None, max_length=500)
 
 
 class GpmConfigRequest(BaseModel):
@@ -1141,6 +1142,8 @@ def update_youtube_comment_channel(
         update_data["interaction_mode"] = request.interaction_mode
     if request.auto_heart is not None:
         update_data["auto_heart"] = int(bool(request.auto_heart))
+    if request.oauth_client_id is not None:
+        update_data["oauth_client_id"] = request.oauth_client_id.strip()
 
     channel = db.update_youtube_channel(channel_db_id, **update_data)
     if not request.reply_paused:

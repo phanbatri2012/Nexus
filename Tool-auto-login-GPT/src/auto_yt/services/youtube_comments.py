@@ -499,6 +499,8 @@ def access_token_for_channel(channel: dict, persist_refreshed_token, proxy: str 
     if not refresh_token:
         raise YouTubeCommentsError("Kênh đã hết phiên và không có refresh token; hãy kết nối lại.")
     bound_client_id = str(channel.get("oauth_client_id") or "").strip()
+    if bound_client_id.lower() == "none":
+        raise YouTubeCommentsError("Kênh này được thiết lập không sử dụng OAuth Client.")
     if bound_client_id:
         configs = [load_oauth_config(bound_client_id)]
     else:
