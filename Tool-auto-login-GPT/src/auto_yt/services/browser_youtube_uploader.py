@@ -95,6 +95,35 @@ UPLOAD_PLAYLIST_TRIGGER_SELECTORS = [
     "ytcp-uploads-dialog ytcp-button:has-text('Danh sách phát')",
     "ytcp-video-upload-dialog #playlists ytcp-dropdown-trigger",
 ]
+UPLOAD_QUICK_ICON_SELECTORS = [
+    "ytcp-icon-button#upload-icon",
+    "a[test-id='upload-icon-url']",
+    "#upload-icon button",
+    "ytcp-icon-button[aria-label='Tải video lên']",
+    "ytcp-icon-button[aria-label='Upload videos']",
+    "[aria-label='Tải video lên'][role='button']",
+    "[aria-label='Upload videos'][role='button']",
+]
+UPLOAD_CREATE_BUTTON_SELECTORS = [
+    "ytcp-button.ytcpAppHeaderCreateIcon button",
+    "ytcp-button.ytcpAppHeaderCreateIcon",
+    "button#create-icon",
+    "ytcp-button#create-icon",
+    "#create-icon button",
+    "ytcp-icon-button#create-icon",
+    "button[aria-label='Tạo']",
+    "button[aria-label='Create']",
+    "[aria-label='Tạo'][role='button']",
+    "[aria-label='Create'][role='button']",
+]
+UPLOAD_CREATE_MENU_ITEM_SELECTORS = [
+    "tp-yt-paper-item#text-item-0",
+    "tp-yt-paper-item:has-text('Tải video lên')",
+    "tp-yt-paper-item:has-text('Upload videos')",
+    "ytd-menu-service-item-renderer:has-text('Tải video lên')",
+    "ytd-menu-service-item-renderer:has-text('Upload videos')",
+    "#items tp-yt-paper-item:first-child",
+]
 UPLOAD_THUMBNAIL_PREVIEW_SELECTOR = (
     "ytcp-uploads-dialog ytcp-video-custom-still-editor img[src], "
     "ytcp-uploads-dialog ytcp-video-thumbnail-editor img[src], "
@@ -3160,41 +3189,45 @@ async def upload_video_via_browser(
                             )
 
             if not resuming_existing_draft:
-                # 2. Click Create button (+) -> Upload videos
+                # 2. Click Quick Upload Icon (↑) or Create button (+) -> Upload videos
                 progress("Đang mở hộp thoại Tải video lên...", "opening_upload_dialog", 15)
-                create_clicked = await _safe_click(
-                    page,
-                    [
-                        "button#create-icon",
-                        "ytcp-button#create-icon",
-                        "#create-icon button",
-                        "ytcp-icon-button#create-icon",
-                        "[aria-label*='Tạo' i]",
-                        "[aria-label*='Create' i]",
-                    ],
-                    timeout_ms=10000,
-                )
-                if not create_clicked:
-                    logger.warning("Không click được nút Tạo; điều hướng trực tiếp đến trang upload...")
+                dialog_opened = bool(await page.query_selector("ytcp-uploads-dialog, ytcp-video-upload-dialog"))
+
+                # 2.1 Try direct Quick Upload Icon (↑) on header if present
+                if not dialog_opened:
+                    quick_clicked = await _safe_click(page, UPLOAD_QUICK_ICON_SELECTORS, timeout_ms=3000)
+                    if quick_clicked:
+                        await asyncio.sleep(1.0)
+                        dialog_opened = bool(await page.query_selector("ytcp-uploads-dialog, ytcp-video-upload-dialog"))
+
+                # 2.2 If not opened via Quick Icon, try Create button (+) dropdown
+                if not dialog_opened:
+                    create_clicked = await _safe_click(
+                        page,
+                        UPLOAD_CREATE_BUTTON_SELECTORS,
+                        timeout_ms=5000,
+                    )
+                    if create_clicked:
+                        await asyncio.sleep(1.0)
+                        try:
+                            await _require_click(
+                                page,
+                                UPLOAD_CREATE_MENU_ITEM_SELECTORS,
+                                "Không thể mở upload dialog từ menu Tạo.",
+                                timeout_ms=4000,
+                            )
+                            dialog_opened = True
+                        except BrowserUploadError:
+                            logger.warning("Menu Tạo mở nhưng không click được mục Tải video lên; kích hoạt fallback điều hướng...")
+
+                # 2.3 Fallback to direct navigation if dialog still not opened
+                if not dialog_opened and not await page.query_selector("ytcp-uploads-dialog, ytcp-video-upload-dialog"):
+                    logger.warning("Chưa mở được dialog tải lên; điều hướng trực tiếp đến trang upload...")
                     await page.goto(
                         f"{studio_url.rstrip('/')}/videos/upload?d=pt",
                         wait_until="domcontentloaded",
                     )
                     await asyncio.sleep(2.0)
-                else:
-                    await asyncio.sleep(1.0)
-                    await _require_click(
-                        page,
-                        [
-                            "tp-yt-paper-item#text-item-0",
-                            "tp-yt-paper-item:has-text('Tải video lên')",
-                            "tp-yt-paper-item:has-text('Upload videos')",
-                            "ytd-menu-service-item-renderer:has-text('Tải video lên')",
-                            "ytd-menu-service-item-renderer:has-text('Upload videos')",
-                        ],
-                        "Không thể mở upload dialog từ menu Tạo.",
-                        timeout_ms=5000,
-                    )
 
                 # 3. Inject Video MP4 File (via CDP to bypass Playwright 50MB limit)
                 progress("Đang nạp file video MP4...", "uploading_file", 20)
