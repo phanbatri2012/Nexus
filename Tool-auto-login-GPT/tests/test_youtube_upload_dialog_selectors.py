@@ -5,6 +5,10 @@ from auto_yt.services.browser_youtube_uploader import (
     UPLOAD_QUICK_ICON_SELECTORS,
     UPLOAD_CREATE_BUTTON_SELECTORS,
     UPLOAD_CREATE_MENU_ITEM_SELECTORS,
+    UPLOAD_MONETIZATION_TRIGGER_SELECTORS,
+    AD_SUITABILITY_ROOT_SELECTORS,
+    AD_SUITABILITY_NONE_SELECTORS,
+    AD_SUITABILITY_SUBMIT_SELECTORS,
     BrowserUploadError,
 )
 
@@ -15,16 +19,12 @@ class TestYouTubeUploadDialogSelectors(unittest.TestCase):
         matches the YPP Partner Support Chat button (which previously caused misclicks)."""
         chat_aria_label = "Trò chuyện với Bộ phận hỗ trợ nhà sáng tạo"
 
-        # Check each selector
         for selector in UPLOAD_CREATE_BUTTON_SELECTORS + UPLOAD_QUICK_ICON_SELECTORS:
-            # We must never have substring match *='Tạo' or *='Create' that matches 'nhà sáng tạo'
             self.assertNotIn("*='Tạo'", selector)
             self.assertNotIn("*=\"Tạo\"", selector)
             self.assertNotIn("*='Create'", selector)
 
-            # If selector checks aria-label, ensure it does not match chat_aria_label
             if "aria-label=" in selector:
-                # Extract expected label from selector, e.g. [aria-label='Tạo']
                 for exact_target in ("Tạo", "Create", "Tải video lên", "Upload videos"):
                     if f"aria-label='{exact_target}'" in selector or f'aria-label="{exact_target}"' in selector:
                         self.assertNotEqual(exact_target, chat_aria_label)
@@ -35,6 +35,19 @@ class TestYouTubeUploadDialogSelectors(unittest.TestCase):
         self.assertIn("button[aria-label='Create']", UPLOAD_CREATE_BUTTON_SELECTORS)
         self.assertIn("ytcp-button.ytcpAppHeaderCreateIcon button", UPLOAD_CREATE_BUTTON_SELECTORS)
         self.assertIn("ytcp-icon-button#upload-icon", UPLOAD_QUICK_ICON_SELECTORS)
+
+    def test_monetization_trigger_selectors_support_lit_and_legacy(self):
+        """Ensure monetization dropdown trigger contains both new Lit and legacy Polymer elements."""
+        self.assertTrue(any(".m10n-text" in s for s in UPLOAD_MONETIZATION_TRIGGER_SELECTORS))
+        self.assertTrue(any(".edit-button" in s for s in UPLOAD_MONETIZATION_TRIGGER_SELECTORS))
+        self.assertTrue(any("ytcp-dropdown-trigger" in s for s in UPLOAD_MONETIZATION_TRIGGER_SELECTORS))
+
+    def test_ad_suitability_selectors_cover_new_questionnaire(self):
+        """Ensure Ad Suitability questionnaire supports both ytpp-self-certification and legacy ytcp."""
+        self.assertTrue(any("ytpp-self-certification-questionnaire" in s for s in AD_SUITABILITY_ROOT_SELECTORS))
+        self.assertTrue(any("ytcp-self-certification" in s for s in AD_SUITABILITY_ROOT_SELECTORS))
+        self.assertTrue(any("all-none-checkbox" in s for s in AD_SUITABILITY_NONE_SELECTORS))
+        self.assertTrue(any("predictor" in s for s in AD_SUITABILITY_SUBMIT_SELECTORS))
 
 
 class TestYouTubeUploadDialogFlow(unittest.IsolatedAsyncioTestCase):

@@ -124,6 +124,45 @@ UPLOAD_CREATE_MENU_ITEM_SELECTORS = [
     "ytd-menu-service-item-renderer:has-text('Upload videos')",
     "#items tp-yt-paper-item:first-child",
 ]
+UPLOAD_MONETIZATION_TRIGGER_SELECTORS = [
+    "ytcp-video-monetization .m10n-text.clickable",
+    "ytcp-video-monetization .edit-button",
+    "ytcp-video-monetization [aria-label*='kiếm tiền' i]",
+    "ytcp-video-monetization [aria-label*='monetization' i]",
+    "ytcp-video-monetization #text-container",
+    "ytcp-video-monetization #container",
+    "ytcp-uploads-dialog ytcp-video-monetization ytcp-dropdown-trigger",
+    "ytcp-uploads-dialog #monetization-step ytcp-dropdown-trigger",
+    "ytcp-video-upload-dialog ytcp-video-monetization ytcp-dropdown-trigger",
+]
+AD_SUITABILITY_ROOT_SELECTORS = [
+    "ytpp-self-certification-questionnaire",
+    "ytcp-uploads-dialog ytpp-self-certification-questionnaire",
+    "ytcp-uploads-dialog ytcp-self-certification",
+    "ytcp-video-upload-dialog ytcp-self-certification",
+    "ytcp-uploads-dialog [test-id='self-certification']",
+    "ytcp-self-certification",
+]
+AD_SUITABILITY_NONE_SELECTORS = [
+    "ytcp-checkbox-lit.all-none-checkbox",
+    "ytpp-self-certification-questionnaire ytcp-checkbox-lit",
+    "ytcp-self-certification #none-of-the-above-checkbox",
+    "ytcp-self-certification tp-yt-paper-checkbox:has-text('Không chứa nội dung nào ở trên')",
+    "ytcp-self-certification tp-yt-paper-checkbox:has-text('None of the above')",
+    "tp-yt-paper-checkbox:has-text('Không chứa nội dung nào ở trên')",
+    "tp-yt-paper-checkbox:has-text('None of the above')",
+    "[aria-label*='Không chứa nội dung nào ở trên' i]",
+    "[aria-label*='None of the above' i]",
+]
+AD_SUITABILITY_SUBMIT_SELECTORS = [
+    "ytpp-self-certification-predictor ytcp-button",
+    "ytpp-self-certification-predictor #submit-questionnaire-button",
+    "ytcp-self-certification ytcp-button#submit-questionnaire-button",
+    "ytcp-button#submit-questionnaire-button",
+    "ytcp-button:has-text('Gửi thông tin đánh giá')",
+    "ytcp-button:has-text('Submit rating')",
+    "#submit-questionnaire-button button",
+]
 UPLOAD_THUMBNAIL_PREVIEW_SELECTOR = (
     "ytcp-uploads-dialog ytcp-video-custom-still-editor img[src], "
     "ytcp-uploads-dialog ytcp-video-thumbnail-editor img[src], "
@@ -3642,11 +3681,7 @@ async def upload_video_via_browser(
                 progress("Đang cấu hình kiếm tiền...", "enabling_monetization", 60)
                 if not await _safe_click(
                     page,
-                    [
-                        "ytcp-uploads-dialog ytcp-video-monetization ytcp-dropdown-trigger",
-                        "ytcp-uploads-dialog #monetization-step ytcp-dropdown-trigger",
-                        "ytcp-video-upload-dialog ytcp-video-monetization ytcp-dropdown-trigger",
-                    ],
+                    UPLOAD_MONETIZATION_TRIGGER_SELECTORS,
                     timeout_ms=5000,
                 ):
                     raise BrowserUploadNeedsReview(
@@ -3656,17 +3691,33 @@ async def upload_video_via_browser(
                 desired_on = monetization_mode != MONETIZATION_MODE_KEEP_OFF
                 monetization_selectors = (
                     [
+                        "ytcp-radio-button[name='ON']",
+                        "ytcp-radio-button[name='MONETIZATION_ON']",
                         "tp-yt-paper-radio-button[name='ON']",
                         "tp-yt-paper-radio-button[name='MONETIZATION_ON']",
                         "ytcp-dialog tp-yt-paper-radio-button:has-text('Bật')",
                         "ytcp-dialog tp-yt-paper-radio-button:has-text('On')",
+                        "ytcp-dialog ytcp-radio-button:has-text('Bật')",
+                        "ytcp-dialog ytcp-radio-button:has-text('On')",
+                        "ytcp-radio-button:has-text('Bật')",
+                        "ytcp-radio-button:has-text('On')",
+                        "tp-yt-paper-radio-button:has-text('Bật')",
+                        "tp-yt-paper-radio-button:has-text('On')",
                     ]
                     if desired_on
                     else [
+                        "ytcp-radio-button[name='OFF']",
+                        "ytcp-radio-button[name='MONETIZATION_OFF']",
                         "tp-yt-paper-radio-button[name='OFF']",
                         "tp-yt-paper-radio-button[name='MONETIZATION_OFF']",
                         "ytcp-dialog tp-yt-paper-radio-button:has-text('Tắt')",
                         "ytcp-dialog tp-yt-paper-radio-button:has-text('Off')",
+                        "ytcp-dialog ytcp-radio-button:has-text('Tắt')",
+                        "ytcp-dialog ytcp-radio-button:has-text('Off')",
+                        "ytcp-radio-button:has-text('Tắt')",
+                        "ytcp-radio-button:has-text('Off')",
+                        "tp-yt-paper-radio-button:has-text('Tắt')",
+                        "tp-yt-paper-radio-button:has-text('Off')",
                     ]
                 )
                 if not await _safe_click(
@@ -3693,6 +3744,9 @@ async def upload_video_via_browser(
                         "ytcp-video-monetization ytcp-button:has-text('Done')",
                         "ytcp-dialog ytcp-button:has-text('Xong')",
                         "ytcp-dialog ytcp-button:has-text('Done')",
+                        "#save-button button",
+                        "ytcp-button:has-text('Xong')",
+                        "ytcp-button:has-text('Done')",
                     ],
                     "Không thể lưu trạng thái kiếm tiền.",
                     timeout_ms=5000,
@@ -3722,40 +3776,39 @@ async def upload_video_via_browser(
                         timeout_ms=5000,
                     )
                     await asyncio.sleep(2.0)
-                    ad_suitability = await page.query_selector(
-                        "ytcp-uploads-dialog ytcp-self-certification, "
-                        "ytcp-video-upload-dialog ytcp-self-certification, "
-                        "ytcp-uploads-dialog [test-id='self-certification']"
-                    )
+                    ad_suitability = None
+                    for selector in AD_SUITABILITY_ROOT_SELECTORS:
+                        el = await page.query_selector(selector)
+                        if el is not None and await el.is_visible():
+                            ad_suitability = el
+                            break
+                    if ad_suitability is None:
+                        ad_suitability = await page.query_selector(
+                            ", ".join(AD_SUITABILITY_ROOT_SELECTORS)
+                        )
                     if ad_suitability is None:
                         raise BrowserUploadNeedsReview(
                             "Đã bật kiếm tiền nhưng không tìm thấy bước tự đánh giá quảng cáo."
                         )
                     progress("Đang hoàn tất tự đánh giá quảng cáo...", "self_certification", 70)
-                    await ad_suitability.evaluate("element => element.scrollTop = element.scrollHeight")
-                    none_selectors = [
-                        "ytcp-self-certification #none-of-the-above-checkbox",
-                        "ytcp-self-certification tp-yt-paper-checkbox:has-text('Không chứa nội dung nào ở trên')",
-                        "ytcp-self-certification tp-yt-paper-checkbox:has-text('None of the above')",
-                    ]
+                    try:
+                        await ad_suitability.evaluate("element => element.scrollTop = element.scrollHeight")
+                    except Exception:
+                        pass
                     await _require_click(
                         page,
-                        none_selectors,
+                        AD_SUITABILITY_NONE_SELECTORS,
                         "Không thể chọn 'Không chứa nội dung nào ở trên'.",
                         timeout_ms=5000,
                     )
                     await _require_selected(
                         page,
-                        none_selectors,
+                        AD_SUITABILITY_NONE_SELECTORS,
                         "YouTube Studio không xác nhận lựa chọn tự đánh giá quảng cáo.",
                     )
                     await _require_click(
                         page,
-                        [
-                            "ytcp-self-certification ytcp-button#submit-questionnaire-button",
-                            "ytcp-self-certification ytcp-button:has-text('Gửi thông tin đánh giá')",
-                            "ytcp-self-certification ytcp-button:has-text('Submit rating')",
-                        ],
+                        AD_SUITABILITY_SUBMIT_SELECTORS,
                         "Không thể gửi thông tin tự đánh giá quảng cáo.",
                         timeout_ms=5000,
                     )
