@@ -30,6 +30,7 @@ from auto_yt.services.trust_builder_actions import (
     action_audit_feature_eligibility,
     action_audit_channel_branding,
     action_browse_and_pick_video,
+    action_browse_and_read_comments,
     action_comment_video,
     action_like_video,
     action_search_and_pick_video,

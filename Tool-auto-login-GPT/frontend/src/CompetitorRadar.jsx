@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import './CompetitorRadar.css'
+import PublicationTimePicker from './PublicationTimePicker'
+import { formatDateTimeAMPM } from './publicationTime'
 
 const API = 'http://127.0.0.1:8080/api'
 
@@ -24,8 +26,7 @@ async function request(path, options = {}) {
 
 function formatDate(value) {
   if (!value) return '—'
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString('vi-VN')
+  return formatDateTimeAMPM(value, { includeSeconds: true })
 }
 
 function statusLabel(status) {
@@ -243,8 +244,8 @@ export default function CompetitorRadar({ onOpenJobCenter }) {
             </select>
           </label>
           {form.window_mode === 'manual' && <>
-            <label>Bắt đầu <input type="time" required value={form.start} onChange={event => setForm({ ...form, start: event.target.value })} /></label>
-            <label>Kết thúc <input type="time" required value={form.end} onChange={event => setForm({ ...form, end: event.target.value })} /></label>
+            <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>Bắt đầu <PublicationTimePicker value={form.start || '08:00'} onChange={val => setForm({ ...form, start: val })} /></label>
+            <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>Kết thúc <PublicationTimePicker value={form.end || '22:00'} onChange={val => setForm({ ...form, end: val })} /></label>
           </>}
         </div>
         <div className="radar-create-footer">

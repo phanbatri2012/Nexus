@@ -584,6 +584,121 @@ async def action_browse_and_pick_video(
     return selected
 
 
+async def action_browse_and_read_comments(
+    page: Any,
+    min_dwell_seconds: float = 15.0,
+    max_dwell_seconds: float = 35.0,
+    cancel_check: Callable[[], bool] | None = None,
+    return_to_top: bool = True,
+) -> dict[str, Any]:
+    """Scroll down into the comments section, spend realistic time reading comments, and return.
+
+    Performs human-like incremental scrolling, dwell pauses proportional to reading speed,
+    intermittent micro-adjustments/mouse movements, and extracts visible comments for telemetry.
+    """
+    logger.info("Bắt đầu lướt đọc bình luận tự nhiên...")
+    extracted_comments: list[str] = []
+    time_spent = 0.0
+
+    try:
+        # 1. Smoothly scroll down towards comments section (typically 600 - 1000px down)
+        initial_scrolls = random.randint(2, 4)
+        for _ in range(initial_scrolls):
+            if cancel_check and cancel_check():
+                break
+            delta = random.randint(260, 480)
+            await page.mouse.wheel(0, delta)
+            await asyncio.sleep(random.uniform(0.4, 0.9))
+
+        target_dwell = max(min_dwell_seconds, random.uniform(min_dwell_seconds, max_dwell_seconds))
+
+        # Try to read visible comments without throwing if evaluation fails
+        try:
+            raw_extracted = await page.evaluate(
+                """() => {
+                    const selectors = [
+                        'ytd-comment-thread-renderer #content-text',
+                        'ytd-comment-view-model #content-text',
+                        '#comment #content-text',
+                        '#contents ytd-comment-thread-renderer yt-formatted-string#content-text'
+                    ];
+                    for (const sel of selectors) {
+                        const nodes = Array.from(document.querySelectorAll(sel));
+                        if (nodes.length > 0) {
+                            return nodes.slice(0, 5).map(n => (n.textContent || '').trim()).filter(t => t.length > 0);
+                        }
+                    }
+                    return [];
+                }"""
+            )
+            if isinstance(raw_extracted, list):
+                extracted_comments = [str(c).strip() for c in raw_extracted if str(c).strip()]
+                if extracted_comments:
+                    logger.info(
+                        "Đã lướt thấy %d bình luận đầu trang. Bắt đầu dừng lại đọc chi tiết...",
+                        len(extracted_comments),
+                    )
+        except Exception:
+            extracted_comments = []
+
+        # 2. Reading loop with variable pauses and micro-scrolls
+        while time_spent < target_dwell:
+            if cancel_check and cancel_check():
+                break
+
+            # Dwell slice for reading a comment (3.5 - 7.5s)
+            slice_time = min(random.uniform(3.5, 7.5), max(1.0, target_dwell - time_spent))
+            await asyncio.sleep(slice_time)
+            time_spent += slice_time
+
+            if time_spent >= target_dwell or (cancel_check and cancel_check()):
+                break
+
+            # Human micro-interaction while reading
+            sub_action = random.choices(["scroll_next", "mouse_hover", "scroll_back"], weights=[0.55, 0.30, 0.15])[0]
+            if sub_action == "scroll_next":
+                # Scroll down slightly to read the next comment thread
+                scroll_down = random.randint(140, 280)
+                await page.mouse.wheel(0, scroll_down)
+            elif sub_action == "mouse_hover":
+                # Move cursor over comment area naturally
+                await page.mouse.move(random.randint(200, 650), random.randint(250, 600))
+            elif sub_action == "scroll_back":
+                # Small scroll back up as if re-reading
+                scroll_up = random.randint(60, 150)
+                await page.mouse.wheel(0, -scroll_up)
+
+            micro_pause = random.uniform(0.3, 0.8)
+            await asyncio.sleep(micro_pause)
+            time_spent += micro_pause
+
+        # 3. Smoothly scroll back up towards the video player if requested
+        if return_to_top:
+            return_scrolls = random.randint(2, 4)
+            for _ in range(return_scrolls):
+                if cancel_check and cancel_check():
+                    break
+                delta = random.randint(280, 520)
+                await page.mouse.wheel(0, -delta)
+                await asyncio.sleep(random.uniform(0.3, 0.6))
+
+        logger.info(
+            "Hoàn tất lướt đọc bình luận: %.1fs dừng đọc thực tế (%d bình luận trích xuất).",
+            time_spent,
+            len(extracted_comments),
+        )
+    except Exception as exc:
+        logger.debug(
+            "Lỗi khi lướt đọc bình luận tự nhiên: %s",
+            security_logging.redact_sensitive(exc),
+        )
+
+    return {
+        "dwell_seconds": round(time_spent, 2),
+        "comments": extracted_comments,
+    }
+
+
 async def action_watch_video(
     page: Any,
     video_url: str,
@@ -701,15 +816,47 @@ async def action_watch_video(
                 security_logging.redact_sensitive(exc),
             )
 
-        if (watched_seconds - last_interaction) > random.uniform(70.0, 130.0) and watched_seconds < (target_seconds - 15.0):
+        if (watched_seconds - last_interaction) > random.uniform(50.0, 95.0) and watched_seconds < (target_seconds - 15.0):
             last_interaction = watched_seconds
-            action_choice = random.choice(["scroll_comments", "pause_briefly", "mouse_move"])
+            action_choice = random.choices(
+                ["scroll_comments", "pause_briefly", "mouse_move"],
+                weights=[0.55, 0.25, 0.20],
+            )[0]
             try:
                 if action_choice == "scroll_comments":
-                    scroll_amount = random.randint(180, 450)
-                    await page.mouse.wheel(0, scroll_amount)
-                    await asyncio.sleep(random.uniform(2.0, 4.5))
-                    await page.mouse.wheel(0, -scroll_amount)
+                    remaining_watch = max(5.0, target_seconds - watched_seconds - 5.0)
+                    min_dwell = min(15.0, remaining_watch)
+                    max_dwell = min(35.0, max(min_dwell + 3.0, remaining_watch))
+                    read_res = await action_browse_and_read_comments(
+                        page,
+                        min_dwell_seconds=min_dwell,
+                        max_dwell_seconds=max_dwell,
+                        cancel_check=cancel_check,
+                    )
+                    dwell_done = float(read_res.get("dwell_seconds") or 0.0)
+                    try:
+                        snapshot = await page.evaluate(snapshot_script) or {}
+                        current_time = float(snapshot.get("currentTime") or 0.0)
+                        current_video_id = str(snapshot.get("videoId") or "")
+                        if expected_video_id and current_video_id not in {"", expected_video_id}:
+                            raise RuntimeError("YouTube đã tự chuyển sang video khác trong lúc xem.")
+                        if not snapshot.get("adShowing") and not snapshot.get("paused") and int(snapshot.get("readyState") or 0) >= 2:
+                            time_diff = max(0.0, current_time - previous_time)
+                            progress = min(time_diff, max(step * 1.5, dwell_done * 1.5))
+                            watched_seconds += progress
+                        previous_time = current_time
+                        wall_seconds += dwell_done
+                        if snapshot.get("ended") or current_time >= max(0.0, total_duration - 1.0):
+                            watched_seconds = min(total_duration, max(watched_seconds, current_time))
+                            logger.info("Video đã phát đến cuối. Hoàn tất xem.")
+                            break
+                    except RuntimeError:
+                        raise
+                    except Exception as exc:
+                        logger.debug(
+                            "Không đọc được trạng thái phát video sau khi đọc bình luận: %s",
+                            security_logging.redact_sensitive(exc),
+                        )
                 elif action_choice == "pause_briefly":
                     pause_time = random.uniform(2.5, 6.0)
                     logger.debug("Giả lập tạm dừng video trong %.1fs...", pause_time)
@@ -827,9 +974,9 @@ async def action_comment_video(page: Any, comment_text: str) -> dict[str, str]:
 
     logger.info("Thực hiện bình luận video: '%s'", clean_text)
     try:
-        # Scroll to comments section
-        await natural_scroll(page, min_scrolls=2, max_scrolls=3)
-        await asyncio.sleep(random.uniform(1.5, 2.5))
+        # Scroll to comments section and pause naturally as if reading
+        await natural_scroll(page, min_scrolls=3, max_scrolls=5)
+        await asyncio.sleep(random.uniform(6.0, 12.0))
 
         composer_info = await page.evaluate(
             """() => {

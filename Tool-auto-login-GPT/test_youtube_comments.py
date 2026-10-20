@@ -1407,6 +1407,24 @@ class YouTubeOAuthIsolationTests(unittest.TestCase):
         self.assertEqual(token, "fresh-access")
         self.assertEqual(persisted[0][3], "client-right")
 
+    def test_refresh_rejects_channel_configured_without_oauth(self):
+        channel = {
+            "id": 9,
+            "oauth_client_id": "none",
+            "access_token_encrypted": "expired-access",
+            "refresh_token_encrypted": "refresh-token",
+            "token_expiry": "2000-01-01T00:00:00+00:00",
+        }
+        with patch.object(
+            youtube_comments,
+            "decrypt_secret",
+            side_effect=lambda value: value,
+        ):
+            with self.assertRaises(youtube_comments.YouTubeCommentsError) as raised:
+                youtube_comments.access_token_for_channel(channel, lambda *values: None)
+        self.assertIn("không sử dụng OAuth Client", str(raised.exception))
+
+
 
 class YouTubeOAuthDatabaseBindingTests(unittest.TestCase):
     def setUp(self):

@@ -123,3 +123,17 @@ test('channel reconnect is locked to its channel and named OAuth client', () => 
   assert.match(channelSettingsSource, /Kết nối lại đúng kênh này/)
   assert.match(channelSettingsSource, /Tên hiện trên màn hình Google là tên ứng dụng OAuth/)
 })
+
+
+test('channel hub exposes option for no OAuth client and disables reconnect', () => {
+  const channelManagerSource = readFileSync(
+    new URL('./ChannelManager.jsx', import.meta.url),
+    'utf8'
+  )
+  assert.match(channelManagerSource, /<option value="none">Không có OAuth client<\/option>/)
+  assert.match(channelSettingsSource, /<option value="none">Không có OAuth client<\/option>/)
+  assert.match(channelManagerSource, /channel\.oauth_client_choice === 'none'/)
+  assert.match(channelSettingsSource, /channel\.oauth_client_choice === 'none'/)
+  assert.match(channelManagerSource, /oauth_client_id: channel\.oauth_client_choice/)
+  assert.match(channelSettingsSource, /oauth_client_id: channel\.oauth_client_choice/)
+})

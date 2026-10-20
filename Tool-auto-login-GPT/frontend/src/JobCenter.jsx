@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { openVideoStudioInGpm } from './gpmOpener.js'
+import { formatDateTimeAMPM } from './publicationTime.js'
 
 const API_BASE = 'http://127.0.0.1:8080'
 const BULK_ACTIONS = ['retry', 'pause', 'resume', 'cancel', 'force_stop']
@@ -25,8 +26,7 @@ const STATUS_META = {
 
 function formatDate(value) {
   if (!value) return '—'
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString('vi-VN')
+  return formatDateTimeAMPM(value, { includeSeconds: true })
 }
 
 const PIPELINE_LABELS = {

@@ -2098,7 +2098,7 @@ def reconcile_fb_queue_item(item_id: int, *, dry_run: bool = False) -> dict[str,
                     "message": f"Đã khớp với bài đăng thực tế trên Meta: {meta_post_id}",
                 }
             else:
-                sched_str = datetime.datetime.fromtimestamp(requested_schedule).strftime('%d/%m/%Y %H:%M') if requested_schedule else ""
+                sched_str = datetime.datetime.fromtimestamp(requested_schedule).strftime('%d/%m/%Y %I:%M %p') if requested_schedule else ""
                 fields = {
                     "fb_post_id": meta_post_id,
                     "upload_video_id": meta_post_id,
@@ -2126,7 +2126,7 @@ def reconcile_fb_queue_item(item_id: int, *, dry_run: bool = False) -> dict[str,
             or item.get("status") in {"meta_scheduled", "verifying", "processing"}
         )
         if is_browser_submitted and requested_schedule and requested_schedule > (now_ts + 60):
-            sched_str = datetime.datetime.fromtimestamp(requested_schedule).strftime('%d/%m/%Y %H:%M')
+            sched_str = datetime.datetime.fromtimestamp(requested_schedule).strftime('%d/%m/%Y %I:%M %p')
             fields = {
                 "status": "meta_scheduled",
                 "meta_state": "scheduled",
@@ -2479,7 +2479,7 @@ def reconcile_fb_queue(
                 })
                 continue
             else:
-                sched_str = datetime.datetime.fromtimestamp(sched_ts).strftime('%d/%m/%Y %H:%M') if sched_ts else ""
+                sched_str = datetime.datetime.fromtimestamp(sched_ts).strftime('%d/%m/%Y %I:%M %p') if sched_ts else ""
                 update_fields = {
                     "fb_post_id": meta_post_id,
                     "upload_video_id": meta_post_id,
@@ -2510,7 +2510,7 @@ def reconcile_fb_queue(
             or item.get("status") in {"meta_scheduled", "verifying", "processing"}
         )
         if is_browser_submitted and sched_ts and sched_ts > (now_ts + 60):
-            sched_str = datetime.datetime.fromtimestamp(sched_ts).strftime('%d/%m/%Y %H:%M')
+            sched_str = datetime.datetime.fromtimestamp(sched_ts).strftime('%d/%m/%Y %I:%M %p')
             update_fields = {
                 "status": "meta_scheduled",
                 "meta_state": "scheduled",

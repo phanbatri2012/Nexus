@@ -861,6 +861,7 @@ class YouTubeChannelSettingsRequest(BaseModel):
     gpm_proxy_info: Optional[str] = Field(default=None, max_length=500)
     interaction_mode: Optional[Literal["gpm_browser", "direct_api"]] = "gpm_browser"
     auto_heart: Optional[bool] = True
+    oauth_client_id: Optional[str] = Field(default=None, max_length=500)
 
 
 class GpmConfigRequest(BaseModel):
@@ -1182,9 +1183,12 @@ def list_youtube_comment_channels(response: Response):
 
 @app.patch("/api/youtube-comments/channels/{channel_db_id}")
 def update_youtube_comment_channel(
-    channel_db_id: int, request: YouTubeChannelSettingsRequest, response: Response
+    channel_db_id: int,
+    request: YouTubeChannelSettingsRequest,
+    response: Response = None,
 ):
-    response.headers["Cache-Control"] = "no-store"
+    if response is not None:
+        response.headers["Cache-Control"] = "no-store"
     existing_channel = db.get_youtube_channel(channel_db_id, include_tokens=True)
     if not existing_channel:
         raise HTTPException(status_code=404, detail="Không tìm thấy kênh YouTube.")
@@ -1270,6 +1274,8 @@ def update_youtube_comment_channel(
         update_data["interaction_mode"] = request.interaction_mode
     if request.auto_heart is not None:
         update_data["auto_heart"] = int(bool(request.auto_heart))
+    if request.oauth_client_id is not None:
+        update_data["oauth_client_id"] = request.oauth_client_id.strip()
 
     channel = db.update_youtube_channel(channel_db_id, **update_data)
     if channel:
@@ -11508,7 +11514,7 @@ def _format_iso_datetime(iso_str: str | None) -> str:
         from datetime import datetime
         clean_str = str(iso_str).replace("Z", "+00:00")
         dt_obj = datetime.fromisoformat(clean_str)
-        return dt_obj.strftime("%H:%M:%S · %d/%m/%Y")
+        return dt_obj.strftime("%I:%M:%S %p · %d/%m/%Y")
     except Exception:
         return str(iso_str)[:19]
 

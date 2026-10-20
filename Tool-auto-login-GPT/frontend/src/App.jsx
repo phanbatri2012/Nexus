@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import './App.css'
+import { formatDateTimeAMPM } from './publicationTime.js'
 import BackgroundCanvas, { BACKGROUND_MODES } from './BackgroundCanvas'
 import { useAppRouter } from './router.js'
 import AutoLogin from './AutoLogin'
@@ -2190,7 +2191,7 @@ function App() {
                           </span>
                         </div>
                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', marginBottom: '8px' }}>
-                          <p style={{ color: '#888', fontSize: '0.9em', margin: 0 }}>{new Date(video.created_at).toLocaleString('vi-VN')}</p>
+                          <p style={{ color: '#888', fontSize: '0.9em', margin: 0 }}>{formatDateTimeAMPM(video.created_at)}</p>
                           {isError ? (
                             <span style={{ color: '#e74c3c', fontSize: '0.8em' }}>Đã bỏ qua xử lý</span>
                           ) : (
@@ -4246,7 +4247,7 @@ function App() {
                     ? ` — ${duplicateWarningDialog.warning.existing_video.title}`
                     : ''}
                   {duplicateWarningDialog.warning.existing_video.created_at
-                    ? ` — ${new Date(duplicateWarningDialog.warning.existing_video.created_at).toLocaleString('vi-VN')}`
+                    ? ` — ${formatDateTimeAMPM(duplicateWarningDialog.warning.existing_video.created_at)}`
                     : ''}
                 </div>
               )}

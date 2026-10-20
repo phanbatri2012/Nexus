@@ -3,6 +3,7 @@ import { useSubRoute } from './router.js'
 import { extractErrorMessage } from './apiError'
 import { findMarketByTimezone, getMarketLocalTime } from './marketConstants'
 import './TrustBuilder.css'
+import { formatDateTimeAMPM } from './publicationTime.js'
 
 const API_BASE = 'http://127.0.0.1:8080'
 
@@ -1169,7 +1170,7 @@ export default function TrustBuilder() {
                   <div className="stat-pill">Like: <b>{dailyStats.like_count}/{selectedPlan.daily_like_target}</b></div>
                   <div className="stat-pill">Comment: <b>{dailyStats.comment_count}/{selectedPlan.daily_comment_target}</b></div>
                   <div className="stat-pill">Sub: <b>{dailyStats.subscribe_count}/{selectedPlan.daily_subscribe_target}</b></div>
-                  <div className="stat-pill">Lần chạy kế tiếp: <b>{selectedPlan.next_run_at ? new Date(selectedPlan.next_run_at).toLocaleString() : 'đang chờ lịch'}</b></div>
+                  <div className="stat-pill">Lần chạy kế tiếp: <b>{selectedPlan.next_run_at ? formatDateTimeAMPM(selectedPlan.next_run_at) : 'đang chờ lịch'}</b></div>
                 </div>
               )}
 
@@ -1224,7 +1225,7 @@ export default function TrustBuilder() {
               <div className="safety-sync-card">
                 <div className="safety-sync-info">
                   <div><b>URL Đồng bộ từ xa:</b> <span className="safety-url-text">{safetyConfig?.remote_sync_url || 'Mặc định (GitHub Raw)'}</span></div>
-                  <div><b>Đồng bộ lần cuối:</b> <span>{safetyConfig?.last_synced_at ? new Date(safetyConfig.last_synced_at).toLocaleString() : 'Chưa đồng bộ'}</span></div>
+                  <div><b>Đồng bộ lần cuối:</b> <span>{safetyConfig?.last_synced_at ? formatDateTimeAMPM(safetyConfig.last_synced_at) : 'Chưa đồng bộ'}</span></div>
                 </div>
                 <button
                   type="button"

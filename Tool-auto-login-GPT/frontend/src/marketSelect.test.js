@@ -87,7 +87,7 @@ test('filterMarkets supports real-time search with Vietnamese accents and Englis
 
 test('getMarketLocalTime returns valid local time and day/night status', () => {
   const vnTime = getMarketLocalTime('Asia/Ho_Chi_Minh')
-  assert.match(vnTime.timeStr, /^\d{2}:\d{2}$/)
+  assert.match(vnTime.timeStr, /^\d{2}:\d{2}\s+(AM|PM)$/)
   assert.equal(typeof vnTime.isDaytime, 'boolean')
   assert.ok(vnTime.statusLabel.includes('☀️') || vnTime.statusLabel.includes('🌙'))
 })

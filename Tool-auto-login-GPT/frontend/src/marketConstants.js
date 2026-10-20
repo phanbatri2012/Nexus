@@ -443,11 +443,11 @@ export function getMarketLocalTime(timezone) {
   const targetTz = timezone || DEFAULT_MARKET_TIMEZONE
   try {
     const now = new Date()
-    const timeFormatter = new Intl.DateTimeFormat('vi-VN', {
+    const timeFormatter = new Intl.DateTimeFormat('en-US', {
       timeZone: targetTz,
       hour: '2-digit',
       minute: '2-digit',
-      hour12: false
+      hour12: true
     })
     const hourFormatter = new Intl.DateTimeFormat('en-US', {
       timeZone: targetTz,

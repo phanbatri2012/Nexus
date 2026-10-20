@@ -19,6 +19,7 @@ from auto_yt.services.trust_builder_actions import (
     ACTION_UNCERTAIN,
     action_audit_channel_branding,
     action_browse_and_pick_video,
+    action_browse_and_read_comments,
     action_search_and_pick_video,
     action_watch_video,
     action_like_video,
@@ -293,6 +294,51 @@ def test_action_browse_and_pick_video_filters_seen_and_unsafe_candidates():
 
         assert result["url"].endswith("fresh1")
         mock_page.goto.assert_awaited_once()
+
+    asyncio.run(_run())
+
+
+def test_action_browse_and_read_comments_dwell_and_extraction():
+    """Verify that action_browse_and_read_comments performs natural scrolls, dwells, and extracts comments."""
+    async def _run():
+        mock_page = AsyncMock()
+        mock_page.evaluate.return_value = ["Bình luận rất hay!", "Cảm ơn tác giả."]
+        with patch("auto_yt.services.trust_builder_actions.asyncio.sleep", new=AsyncMock()):
+            res = await action_browse_and_read_comments(
+                mock_page,
+                min_dwell_seconds=15.0,
+                max_dwell_seconds=20.0,
+            )
+        assert res["dwell_seconds"] >= 15.0
+        assert res["comments"] == ["Bình luận rất hay!", "Cảm ơn tác giả."]
+        assert mock_page.mouse.wheel.await_count >= 4
+
+    asyncio.run(_run())
+
+
+def test_action_browse_and_read_comments_early_cancel():
+    """Verify that action_browse_and_read_comments exits early when cancel_check is triggered."""
+    async def _run():
+        mock_page = AsyncMock()
+        cancel_flag = False
+
+        def _check():
+            nonlocal cancel_flag
+            return cancel_flag
+
+        async def _fake_sleep(duration):
+            nonlocal cancel_flag
+            cancel_flag = True
+
+        mock_page.evaluate.return_value = ["Comment 1"]
+        with patch("auto_yt.services.trust_builder_actions.asyncio.sleep", side_effect=_fake_sleep):
+            res = await action_browse_and_read_comments(
+                mock_page,
+                min_dwell_seconds=30.0,
+                max_dwell_seconds=40.0,
+                cancel_check=_check,
+            )
+        assert res["dwell_seconds"] < 30.0
 
     asyncio.run(_run())
 

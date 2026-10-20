@@ -14,6 +14,7 @@ from auto_yt.services import database
 from auto_yt.services import publication_scheduler
 from auto_yt.services import youtube_publish_workflow
 from auto_yt.services import youtube_publisher
+from auto_yt.services import secret_store
 
 
 class YouTubePublishPipelineTests(unittest.TestCase):
@@ -34,8 +35,18 @@ class YouTubePublishPipelineTests(unittest.TestCase):
         self.thumbnails_dir = self.root / "thumbnails"
         self.thumbnails_dir.mkdir()
         (self.thumbnails_dir / "publish.png").write_bytes(b"thumbnail")
+        self.encrypt_patch = patch.object(
+            secret_store, "encrypt_secret", side_effect=lambda value: f"encrypted:{value}"
+        )
+        self.encrypt_patch.start()
+        self.decrypt_patch = patch.object(
+            secret_store, "decrypt_secret", side_effect=lambda value: str(value).removeprefix("encrypted:") if value else ""
+        )
+        self.decrypt_patch.start()
 
     def tearDown(self):
+        self.decrypt_patch.stop()
+        self.encrypt_patch.stop()
         self.browser_readiness_patch.stop()
         self.database_patch.stop()
         self.temporary_directory.cleanup()
@@ -48,7 +59,7 @@ class YouTubePublishPipelineTests(unittest.TestCase):
             "Publish title",
             "Transcript",
             (
-                "### [METADATA & QUIZ]\nMÔ TẢ VIDEO: Publish description\n\n"
+                "### [METADATA & QUIZ]\nTIÊU ĐỀ VIDEO: Tiê u đề video hợp lệ\nMÔ TẢ VIDEO: Publish description dài hơn tám mươi ký tự để vượt qua validation kiểm tra độ dài mô tả hợp lệ.\n\n"
                 "### [THUMBNAIL KHÔNG CHỮ]\n"
                 "[IMAGE_URL:/api/thumbnails/publish.png]"
             ),
@@ -214,6 +225,13 @@ class YouTubePublishPipelineTests(unittest.TestCase):
         self.assertEqual(updated["publication_lead_minutes"], 180)
         self.assertEqual(updated["publication_paused"], 1)
         self.assertEqual(updated["public_upload_verified"], 1)
+
+        request_no_oauth = main.YouTubeChannelSettingsRequest(
+            oauth_client_id="none",
+        )
+        updated_no_oauth = main.update_youtube_comment_channel(channel["id"], request_no_oauth)
+        self.assertEqual(updated_no_oauth["oauth_client_id"], "none")
+
 
         invalid = main.YouTubeChannelSettingsRequest(
             publication_timezone="Invalid/Timezone",
@@ -1432,7 +1450,7 @@ class YouTubePublishPipelineTests(unittest.TestCase):
             "https://www.youtube.com/watch?v=auto-sub-test",
             "Auto Sub Title",
             "Transcript",
-            "### [METADATA & QUIZ]\nMÔ TẢ VIDEO: Description\n\n### [THUMBNAIL CÓ CHỮ]\n[IMAGE_URL:/api/thumbnails/publish.png]\n\n### [THUMBNAIL KHÔNG CHỮ]\n[IMAGE_URL:/api/thumbnails/publish.png]",
+            "### [METADATA & QUIZ]\nTIÊU ĐỀ VIDEO: Tiê u đề video hợp lệ\nMÔ TẢ VIDEO: Mô tả video hợp lệ dài hơn tám mươi ký tự rất nhiều để vượt qua quy tắc kiểm tra độ dài tối thiểu của mô tả video.\n\n### [THUMBNAIL CÓ CHỮ]\n[IMAGE_URL:/api/thumbnails/publish.png]\n\n### [THUMBNAIL KHÔNG CHỮ]\n[IMAGE_URL:/api/thumbnails/publish.png]",
             prompt_version="default",
         )
         mp4_path = self.root / "video_auto_sub.mp4"
@@ -1509,7 +1527,7 @@ class YouTubePublishPipelineTests(unittest.TestCase):
             "https://www.youtube.com/watch?v=no-sub-test",
             "No Sub Title",
             "Transcript",
-            "### [METADATA & QUIZ]\nMÔ TẢ VIDEO: Description\n\n### [THUMBNAIL CÓ CHỮ]\n[IMAGE_URL:/api/thumbnails/publish.png]\n\n### [THUMBNAIL KHÔNG CHỮ]\n[IMAGE_URL:/api/thumbnails/publish.png]",
+            "### [METADATA & QUIZ]\nTIÊU ĐỀ VIDEO: Tiê u đề video hợp lệ\nMÔ TẢ VIDEO: Mô tả video hợp lệ dài hơn tám mươi ký tự rất nhiều để vượt qua quy tắc kiểm tra độ dài tối thiểu của mô tả video.\n\n### [THUMBNAIL CÓ CHỮ]\n[IMAGE_URL:/api/thumbnails/publish.png]\n\n### [THUMBNAIL KHÔNG CHỮ]\n[IMAGE_URL:/api/thumbnails/publish.png]",
             prompt_version="default",
         )
         mp4_path = self.root / "video_no_sub.mp4"
