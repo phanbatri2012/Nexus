@@ -20,6 +20,13 @@ from auto_yt.services.browser_youtube_uploader import (
     _fill_single_element,
     _read_control_value,
     _text_value_matches,
+    _complete_ad_suitability,
+    _set_checkbox,
+    _wait_for_ad_suitability,
+    _wait_for_ad_suitability_saved,
+    AD_SUITABILITY_NONE_SELECTORS,
+    AD_SUITABILITY_ROOT_SELECTORS,
+    AD_SUITABILITY_SUBMIT_SELECTORS,
     UPLOAD_TITLE_EDITOR_SELECTORS,
     UPLOAD_DESCRIPTION_EDITOR_SELECTORS,
 )
@@ -104,6 +111,236 @@ class TestBrowserYouTubeUploader(unittest.IsolatedAsyncioTestCase):
         res = _classify_monetization_snapshot(snap)
         self.assertEqual(res.capability, MonetizationCapability.UNAVAILABLE)
 
+    def test_ad_suitability_selectors_cover_new_and_legacy_dom(self):
+        self.assertTrue(
+            any("ytpp-self-certification-questionnaire" in selector for selector in AD_SUITABILITY_ROOT_SELECTORS)
+        )
+        self.assertTrue(
+            any("ytcp-self-certification" in selector for selector in AD_SUITABILITY_ROOT_SELECTORS)
+        )
+        self.assertTrue(
+            any("ytcp-checkbox-lit.all-none-checkbox" in selector for selector in AD_SUITABILITY_NONE_SELECTORS)
+        )
+        self.assertTrue(
+            any("ytpp-self-certification-predictor" in selector for selector in AD_SUITABILITY_SUBMIT_SELECTORS)
+        )
+
+    async def test_wait_for_ad_suitability_accepts_delayed_new_dom(self):
+        page = MagicMock()
+        questionnaire = AsyncMock()
+        calls = []
+
+        async def find_elements(_page, selector):
+            calls.append(selector)
+            if len(calls) <= len(AD_SUITABILITY_ROOT_SELECTORS):
+                return []
+            if "ytpp-self-certification-questionnaire" in selector:
+                return [questionnaire]
+            return []
+
+        with patch(
+            "auto_yt.services.browser_youtube_uploader._visible_upload_dialog_elements",
+            side_effect=find_elements,
+        ), patch(
+            "auto_yt.services.browser_youtube_uploader.asyncio.sleep",
+            new=AsyncMock(),
+        ) as sleep_mock:
+            result = await _wait_for_ad_suitability(page, timeout_seconds=1.0)
+
+        self.assertIs(result, questionnaire)
+        sleep_mock.assert_awaited_once_with(0.25)
+
+    async def test_wait_for_ad_suitability_keeps_legacy_dom_fallback(self):
+        page = MagicMock()
+        questionnaire = AsyncMock()
+
+        async def find_elements(_page, selector):
+            if "ytcp-self-certification" in selector:
+                return [questionnaire]
+            return []
+
+        with patch(
+            "auto_yt.services.browser_youtube_uploader._visible_upload_dialog_elements",
+            side_effect=find_elements,
+        ):
+            result = await _wait_for_ad_suitability(page, timeout_seconds=1.0)
+
+        self.assertIs(result, questionnaire)
+
+    async def test_set_checkbox_supports_new_lit_checkbox(self):
+        page = MagicMock()
+        wrapper = MagicMock()
+        wrapper.click = AsyncMock()
+        wrapper.get_attribute = AsyncMock(return_value=None)
+        nested_checkbox = MagicMock()
+        nested_checkbox.get_attribute = AsyncMock(
+            side_effect=lambda name: (
+                "true" if name == "aria-checked" and wrapper.click.await_count else "false"
+            )
+        )
+        wrapper.query_selector = AsyncMock(return_value=nested_checkbox)
+
+        with patch(
+            "auto_yt.services.browser_youtube_uploader._visible_upload_dialog_elements",
+            new=AsyncMock(return_value=[wrapper]),
+        ), patch(
+            "auto_yt.services.browser_youtube_uploader.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            selected = await _set_checkbox(
+                page,
+                ["ytpp-self-certification-questionnaire ytcp-checkbox-lit.all-none-checkbox"],
+                True,
+            )
+
+        self.assertTrue(selected)
+        wrapper.click.assert_awaited_once()
+
+    async def test_wait_for_ad_suitability_saved_finds_new_submit_button(self):
+        page = MagicMock()
+        submit_button = MagicMock()
+        submit_button.get_attribute = AsyncMock(
+            side_effect=lambda name: "true" if name == "aria-disabled" else None
+        )
+
+        async def find_elements(_page, selector):
+            if "ytpp-self-certification-predictor" in selector:
+                return [submit_button]
+            return []
+
+        with patch(
+            "auto_yt.services.browser_youtube_uploader._has_visible_element",
+            new=AsyncMock(return_value=False),
+        ), patch(
+            "auto_yt.services.browser_youtube_uploader._visible_upload_dialog_elements",
+            side_effect=find_elements,
+        ):
+            saved = await _wait_for_ad_suitability_saved(page, timeout_seconds=1.0)
+
+        self.assertTrue(saved)
+
+    async def test_complete_ad_suitability_new_dom_emits_verified_without_upload(self):
+        page = MagicMock()
+        page.set_input_files = AsyncMock()
+        questionnaire = MagicMock()
+        questionnaire.scroll_into_view_if_needed = AsyncMock()
+        progress = MagicMock()
+        checkpoint = MagicMock()
+        require_click = AsyncMock()
+
+        with patch(
+            "auto_yt.services.browser_youtube_uploader._wait_for_ad_suitability",
+            new=AsyncMock(return_value=questionnaire),
+        ), patch(
+            "auto_yt.services.browser_youtube_uploader._set_checkbox",
+            new=AsyncMock(return_value=True),
+        ), patch(
+            "auto_yt.services.browser_youtube_uploader._require_click",
+            require_click,
+        ), patch(
+            "auto_yt.services.browser_youtube_uploader._wait_for_ad_suitability_saved",
+            new=AsyncMock(return_value=True),
+        ):
+            await _complete_ad_suitability(
+                page,
+                progress=progress,
+                persist_checkpoint=checkpoint,
+            )
+
+        progress.assert_called_once_with(
+            "Đang hoàn tất tự đánh giá quảng cáo...",
+            "self_certification",
+            70,
+        )
+        self.assertIn(
+            "ytpp-self-certification-predictor ytcp-button#submit-questionnaire-button",
+            require_click.await_args.args[1],
+        )
+        checkpoint.assert_called_once_with(
+            "suitability_verified",
+            {
+                "stage": "suitability_verified",
+                "ad_suitability_state": "none_of_the_above",
+            },
+        )
+        page.set_input_files.assert_not_awaited()
+
+    async def test_complete_ad_suitability_missing_or_locked_controls_fail_closed(self):
+        page = MagicMock()
+        page.set_input_files = AsyncMock()
+        progress = MagicMock()
+        checkpoint = MagicMock()
+
+        with patch(
+            "auto_yt.services.browser_youtube_uploader._wait_for_ad_suitability",
+            new=AsyncMock(return_value=None),
+        ), patch(
+            "auto_yt.services.browser_youtube_uploader._has_visible_element",
+            new=AsyncMock(return_value=True),
+        ):
+            with self.assertRaises(BrowserUploadNeedsReview):
+                await _complete_ad_suitability(
+                    page,
+                    progress=progress,
+                    persist_checkpoint=checkpoint,
+                )
+
+        progress.assert_not_called()
+        checkpoint.assert_not_called()
+        page.set_input_files.assert_not_awaited()
+
+        questionnaire = MagicMock()
+        questionnaire.scroll_into_view_if_needed = AsyncMock()
+        require_click = AsyncMock()
+        with patch(
+            "auto_yt.services.browser_youtube_uploader._wait_for_ad_suitability",
+            new=AsyncMock(return_value=questionnaire),
+        ), patch(
+            "auto_yt.services.browser_youtube_uploader._set_checkbox",
+            new=AsyncMock(return_value=False),
+        ), patch(
+            "auto_yt.services.browser_youtube_uploader._require_click",
+            require_click,
+        ):
+            with self.assertRaises(BrowserUploadNeedsReview):
+                await _complete_ad_suitability(
+                    page,
+                    progress=progress,
+                    persist_checkpoint=checkpoint,
+                )
+
+        require_click.assert_not_awaited()
+        checkpoint.assert_not_called()
+        page.set_input_files.assert_not_awaited()
+
+    async def test_complete_ad_suitability_requires_saved_confirmation(self):
+        page = MagicMock()
+        questionnaire = MagicMock()
+        questionnaire.scroll_into_view_if_needed = AsyncMock()
+        checkpoint = MagicMock()
+
+        with patch(
+            "auto_yt.services.browser_youtube_uploader._wait_for_ad_suitability",
+            new=AsyncMock(return_value=questionnaire),
+        ), patch(
+            "auto_yt.services.browser_youtube_uploader._set_checkbox",
+            new=AsyncMock(return_value=True),
+        ), patch(
+            "auto_yt.services.browser_youtube_uploader._require_click",
+            new=AsyncMock(),
+        ), patch(
+            "auto_yt.services.browser_youtube_uploader._wait_for_ad_suitability_saved",
+            new=AsyncMock(return_value=False),
+        ):
+            with self.assertRaises(BrowserUploadNeedsReview):
+                await _complete_ad_suitability(
+                    page,
+                    progress=MagicMock(),
+                    persist_checkpoint=checkpoint,
+                )
+
+        checkpoint.assert_not_called()
+
     async def test_read_control_value_input(self):
         mock_el = AsyncMock()
         mock_el.input_value.return_value = "Hello World"
@@ -162,6 +399,79 @@ class TestBrowserYouTubeUploader(unittest.IsolatedAsyncioTestCase):
         await _wait_for_file_upload_complete(page, timeout_seconds=5.0, progress=on_prog)
         self.assertTrue(len(progress_called) > 0)
         self.assertEqual(progress_called[-1][1], "upload_complete")
+
+    def test_classify_file_upload_status_separates_checks_percent(self):
+        from auto_yt.services.browser_youtube_uploader import _classify_file_upload_status
+
+        status = _classify_file_upload_status({
+            "dialogFound": True,
+            "monitorFound": True,
+            "uploadText": "Đã lưu ở chế độ riêng tư",
+            "checksText": "",
+            "progressText": "Đã lưu ở chế độ riêng tư",
+            "footerText": "",
+            "monitorText": "Đang kiểm tra 20% ... Còn 8 phút",
+        })
+
+        self.assertTrue(status["isDone"])
+        self.assertEqual(status["uploadPercent"], 100)
+        self.assertEqual(status["checksPercent"], 20)
+
+    def test_classify_file_upload_status_keeps_waiting_for_real_upload(self):
+        from auto_yt.services.browser_youtube_uploader import _classify_file_upload_status
+
+        status = _classify_file_upload_status({
+            "dialogFound": True,
+            "monitorFound": True,
+            "uploadText": "Đang tải lên 35% ... Còn 10 phút",
+            "checksText": "Đang kiểm tra 20% ... Còn 8 phút",
+            "progressText": "",
+            "footerText": "",
+            "monitorText": "Đang tải lên 35% ... Còn 10 phút",
+        })
+
+        self.assertFalse(status["isDone"])
+        self.assertEqual(status["uploadPercent"], 35)
+        self.assertEqual(status["checksPercent"], 20)
+
+    def test_classify_file_upload_status_preserves_interruption_without_dialog(self):
+        from auto_yt.services.browser_youtube_uploader import _classify_file_upload_status
+
+        status = _classify_file_upload_status({
+            "dialogFound": False,
+            "monitorFound": False,
+            "bodyText": "Quá trình tải lên bị gián đoạn",
+        })
+
+        self.assertFalse(status["isDone"])
+        self.assertTrue(status["isInterrupted"])
+        self.assertIsNone(status["uploadPercent"])
+
+    async def test_wait_for_file_upload_complete_does_not_wait_for_checks(self):
+        from auto_yt.services.browser_youtube_uploader import _wait_for_file_upload_complete
+
+        page = AsyncMock()
+        page.evaluate.return_value = {
+            "dialogFound": True,
+            "monitorFound": True,
+            "uploadText": "Đã lưu ở chế độ riêng tư",
+            "checksText": "",
+            "progressText": "Đã lưu ở chế độ riêng tư",
+            "footerText": "",
+            "monitorText": "Đang kiểm tra 20% ... Còn 8 phút",
+        }
+        progress_called = []
+
+        await _wait_for_file_upload_complete(
+            page,
+            timeout_seconds=0.1,
+            progress=lambda msg, stage, pct: progress_called.append((msg, stage, pct)),
+        )
+
+        page.evaluate.assert_awaited_once()
+        self.assertEqual(progress_called, [
+            ("Đã tải xong 100% file video lên YouTube.", "upload_complete", 65),
+        ])
 
     async def test_wait_for_file_upload_complete_dict_success(self):
         from auto_yt.services.browser_youtube_uploader import _wait_for_file_upload_complete
@@ -387,8 +697,96 @@ class TestBrowserYouTubeUploader(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(res)
         page.evaluate.assert_awaited()
 
+    def test_build_upload_metadata_uses_description_template_over_raw_source_description(self):
+        from auto_yt.services.youtube_publisher import build_upload_metadata
+
+        video = {
+            "title": "Old Source Title",
+            "description": "Old Raw Description from Source YouTube Channel",
+            "generated_title": "AI Title 2026",
+            "generated_script": (
+                "### [TIÊU ĐỀ]\nAI Title 2026\n\n"
+                "### [MÔ TẢ]\nĐây là mô tả AI tóm tắt câu chuyện.\n\n"
+                "### [HASHTAGS]\n#AiStory #VanSam\n\n"
+                "### [CHAPTERS]\n00:00 - Mở đầu\n05:00 - Diễn biến\n10:00 - Kết thúc"
+            ),
+        }
+        publishing_settings = {
+            "description_template": "{title}\n\n{description}\n\n{chapters}\n\nMIỄN TRỪ TRÁCH NHIỆM\n\n{hashtags}",
+            "category_id": "24",
+            "made_for_kids": False,
+        }
+
+        meta = build_upload_metadata(video, publishing_settings)
+        desc = meta["snippet"]["description"]
+
+        self.assertIn("AI Title 2026", desc)
+        self.assertIn("Đây là mô tả AI tóm tắt câu chuyện.", desc)
+        self.assertIn("00:00 - Mở đầu", desc)
+        self.assertIn("MIỄN TRỪ TRÁCH NHIỆM", desc)
+        self.assertIn("#AiStory #VanSam", desc)
+        self.assertNotIn("Old Raw Description from Source YouTube Channel", desc)
+
+    def test_build_upload_metadata_falls_back_to_raw_description_if_template_yields_empty(self):
+        from auto_yt.services.youtube_publisher import build_upload_metadata
+
+        video = {
+            "title": "Raw Title",
+            "description": "Raw Source Fallback Description",
+            "generated_script": "",
+        }
+        publishing_settings = {
+            "description_template": "",
+            "category_id": "24",
+            "made_for_kids": False,
+        }
+
+        meta = build_upload_metadata(video, publishing_settings)
+        self.assertEqual(meta["snippet"]["description"], "Raw Source Fallback Description")
+
+    def test_build_upload_metadata_does_not_fallback_to_source_title_for_generated_video(self):
+        from auto_yt.services.youtube_publisher import (
+            YouTubePublishError,
+            build_upload_metadata,
+        )
+
+        video = {
+            "source_type": "generated",
+            "title": "Original source title must not be published",
+            "generated_title": "",
+            "generated_script": "### [TIÊU ĐỀ]\n" + ("Mô tả dài bị đặt sai vị trí. " * 8),
+            "description": "Original source description",
+        }
+
+        with self.assertRaisesRegex(YouTubePublishError, "tiêu đề được tạo"):
+            build_upload_metadata(video, {"description_template": "{description}"})
+
+    def test_build_upload_metadata_prefers_valid_script_title_for_generated_video(self):
+        from auto_yt.services.youtube_publisher import build_upload_metadata
+
+        script_title = "Tiêu Đề Mới Trong Script | MC Văn Sâm"
+        description = (
+            "Đây là phần mô tả hợp lệ cho video, trình bày rõ nội dung câu chuyện "
+            "và thông điệp để người xem hiểu chính xác trước khi theo dõi."
+        )
+        video = {
+            "source_type": "generated",
+            "title": "Original source title",
+            "generated_title": "Stale generated title",
+            "generated_script": (
+                f"### [TIÊU ĐỀ]\n{script_title}\n\n"
+                f"### [MÔ TẢ]\n{description}"
+            ),
+        }
+
+        meta = build_upload_metadata(
+            video,
+            {"description_template": "{title}\n\n{description}"},
+        )
+
+        self.assertEqual(meta["snippet"]["title"], script_title)
+        self.assertTrue(meta["snippet"]["description"].startswith(script_title))
+
 
 if __name__ == "__main__":
     unittest.main()
-
-

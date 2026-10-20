@@ -570,4 +570,28 @@ D. Thiếu tá
     assert "20:00 - Sự thật hé lộ" in chapters
 
 
+def test_get_active_prompts_with_explicit_version():
+    from auto_yt.services.chatgpt_worker import get_active_prompts
+    # Default prompts
+    prompts_default = get_active_prompts("default")
+    assert "outline" in prompts_default
+    assert "title" in prompts_default
+
+    # Non-existent version falls back gracefully
+    prompts_fallback = get_active_prompts("non_existent_version_xyz")
+    assert "outline" in prompts_fallback
+
+
+def test_history_prompt_matching_self_and_cross():
+    from auto_yt.services.chatgpt_worker import history_prompt_text_matches, get_active_prompts
+    prompts = get_active_prompts()
+    title_p = prompts.get("title", "")
+    slug_p = prompts.get("slug", "")
+    if title_p:
+        assert history_prompt_text_matches(title_p, title_p) is True
+    if title_p and slug_p:
+        assert history_prompt_text_matches(title_p, slug_p) is False
+
+
+
 

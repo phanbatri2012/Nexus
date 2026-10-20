@@ -1629,6 +1629,7 @@ async def _generate_scene_video_async(
         failure_stage_by_error = {
             "FlowAgentInteractionError": "agent_interaction",
             "FlowAgentSettingsError": "agent_settings",
+            "FlowCreditExhausted": "credit_exhausted",
             "FlowFrameAttachmentError": "frame_sync",
             "FlowModeError": "legacy_video_mode",
             "FlowSubmissionError": "submit",
@@ -1799,11 +1800,13 @@ def generate_scene_media(
 
             media_paths: list[Path] = []
             flow_video_unsupported = False
+            flow_video_credit_exhausted = False
             for index, scene in enumerate(scenes):
                 cancel_check()
                 is_video = bool(
                     enable_intro_video
                     and not flow_video_unsupported
+                    and not flow_video_credit_exhausted
                     and (scene.get("is_video") or scene.get("media_type") == "video")
                 )
                 if not is_video:
@@ -1833,14 +1836,29 @@ def generate_scene_media(
                     media_paths.append(video_path)
                 except Exception as exc:
                     from auto_yt.services.google_flow_worker import (
+                        FlowCreditExhausted,
                         FlowModeError,
                         FlowAgentSettingsError,
                     )
+                    if isinstance(exc, FlowCreditExhausted):
+                        logger.warning(
+                            "flow_video credits are explicitly exhausted (%s); "
+                            "falling back all remaining video scenes to base images.",
+                            exc,
+                        )
+                        flow_video_credit_exhausted = True
+                        progress(
+                            "Google Flow đã xác nhận hết credit video; "
+                            "chuyển các cảnh video còn lại sang dùng ảnh",
+                            "flow_video_credit_exhausted",
+                        )
                     is_system_unsupported = isinstance(
                         exc, (FlowModeError, FlowAgentSettingsError)
                     ) or "không hỗ trợ" in str(exc).lower()
 
-                    if is_system_unsupported:
+                    if flow_video_credit_exhausted:
+                        pass
+                    elif is_system_unsupported:
                         logger.warning(
                             "flow_video is completely unsupported by account/interface (%s); fast-falling back remaining scenes to base image.",
                             exc,

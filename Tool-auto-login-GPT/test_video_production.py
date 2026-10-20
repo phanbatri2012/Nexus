@@ -1138,6 +1138,60 @@ class VideoProductionServiceTests(unittest.TestCase):
         self.assertIs(generate_video.await_args.kwargs["worker"], shared_worker)
         self.assertEqual(result, [video_path, image_paths[1]])
 
+    def test_scene_media_stops_video_generation_after_confirmed_credit_exhaustion(self):
+        from auto_yt.services.google_flow_worker import FlowCreditExhausted
+
+        shared_worker = MagicMock()
+        image_paths = [
+            Path(self.temporary_directory.name) / f"scene-{index}.png"
+            for index in range(3)
+        ]
+        progress_updates = []
+
+        @asynccontextmanager
+        async def fake_session(video_id, *, force_new_project=False):
+            yield shared_worker
+
+        scenes = [
+            {"index": 0, "prompt": "scene zero", "is_video": True},
+            {"index": 1, "prompt": "scene one", "is_video": True},
+            {"index": 2, "prompt": "scene two", "is_video": False},
+        ]
+        with (
+            patch.object(video_production, "_flow_worker_session", fake_session),
+            patch.object(
+                video_production,
+                "_generate_scene_images_with_worker",
+                AsyncMock(return_value=image_paths),
+            ),
+            patch.object(
+                video_production,
+                "_generate_scene_video_async",
+                AsyncMock(
+                    side_effect=FlowCreditExhausted(
+                        "Google Flow reached your credit quota"
+                    )
+                ),
+            ) as generate_video,
+            patch.object(video_production, "cleanup_duplicate_scene_artifacts"),
+        ):
+            result = video_production.generate_scene_media(
+                video_id=42,
+                scenes=scenes,
+                settings={"enable_intro_video": True},
+                progress=lambda message, stage: progress_updates.append(
+                    (message, stage)
+                ),
+                cancel_check=lambda: None,
+            )
+
+        generate_video.assert_awaited_once()
+        self.assertEqual(result, image_paths)
+        self.assertIn(
+            "flow_video_credit_exhausted",
+            [stage for _, stage in progress_updates],
+        )
+
     def test_scene_media_stops_immediately_when_veo_fails(self):
         from auto_yt.services.google_flow_worker import FlowModeError
 

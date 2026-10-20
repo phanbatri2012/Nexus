@@ -11,6 +11,7 @@ from auto_yt.services.google_flow_worker import (
     FlowAgentInteractionError,
     FlowAgentSettingsError,
     FlowAgentStalledError,
+    FlowCreditExhausted,
     FlowFrameAttachmentError,
     FlowGenerationStartError,
     FlowInvalidOutputError,
@@ -835,6 +836,37 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result, "blob:https://flow.google/video-new")
+
+    async def test_wait_for_video_raises_when_credit_exhaustion_is_explicit(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        quota_message = (
+            "It looks like you've reached your credit quota for this model. "
+            "You might need more AI credits to complete this request."
+        )
+
+        with (
+            patch.object(worker, "_resolve_new_media_source", AsyncMock(return_value="")),
+            patch.object(worker, "_read_generation_activity", AsyncMock(return_value=False)),
+            patch.object(
+                worker,
+                "_get_existing_error_texts",
+                AsyncMock(return_value={quota_message}),
+            ),
+            patch.object(worker, "_get_snackbar_error", AsyncMock(return_value="")),
+            patch.object(worker, "_save_debug_screenshot", AsyncMock()),
+            patch.object(worker, "handle_confirmation_prompts", AsyncMock()),
+            patch("auto_yt.services.google_flow_worker.asyncio.sleep", AsyncMock()),
+        ):
+            with self.assertRaises(FlowCreditExhausted):
+                await worker._wait_for_new_media(
+                    media_type="video",
+                    baseline_keys=set(),
+                    initial_error_texts=set(),
+                    submitted_at=asyncio.get_event_loop().time(),
+                    timeout_seconds=180.0,
+                )
 
     async def test_video_candidate_keys_include_asset_and_poster_identity(self):
         page = MagicMock()

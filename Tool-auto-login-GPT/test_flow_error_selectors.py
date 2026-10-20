@@ -7,7 +7,11 @@ src_path = Path(__file__).resolve().parent / "src"
 if str(src_path) not in sys.path:
     sys.path.insert(0, str(src_path))
 
-from auto_yt.services.google_flow_worker import _is_valid_flow_error_text, GoogleFlowWorker
+from auto_yt.services.google_flow_worker import (
+    GoogleFlowWorker,
+    _is_flow_credit_exhausted_error,
+    _is_valid_flow_error_text,
+)
 
 class TestFlowErrorFiltering(unittest.TestCase):
     def test_text_sanitizer_rejects_prompt_placeholders(self):
@@ -33,6 +37,32 @@ class TestFlowErrorFiltering(unittest.TestCase):
 
         for e in real_errors:
             self.assertTrue(_is_valid_flow_error_text(e), f"Should accept real error: {e}")
+
+    def test_credit_exhaustion_requires_explicit_confirmation(self):
+        exhausted_messages = [
+            "It looks like you've reached your credit quota for this model. You might need more AI credits.",
+            "Credit quota exceeded. No credits were charged for this failed generation.",
+            "Bạn đã hết tín dụng AI cho mô hình này.",
+            "Không đủ tín dụng AI để hoàn thành yêu cầu.",
+        ]
+        for message in exhausted_messages:
+            self.assertTrue(
+                _is_flow_credit_exhausted_error(message),
+                f"Should confirm exhausted credits: {message}",
+            )
+
+    def test_credit_exhaustion_rejects_low_credit_and_generic_quota_messages(self):
+        uncertain_messages = [
+            "You're running low on Google Flow credits. Your credits will reset monthly.",
+            "Bạn sắp dùng hết tín dụng Google Flow.",
+            "Quota exceeded for image generation.",
+            "No credits were charged for this failed generation.",
+        ]
+        for message in uncertain_messages:
+            self.assertFalse(
+                _is_flow_credit_exhausted_error(message),
+                f"Should not infer exhausted credits: {message}",
+            )
 
     def test_canvas_error_selectors_do_not_contain_virtual_item_container(self):
         import inspect

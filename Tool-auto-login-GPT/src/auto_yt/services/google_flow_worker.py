@@ -75,6 +75,12 @@ class FlowGenerationError(RuntimeError):
     """Raised when Flow explicitly rejects or fails a generation request."""
 
 
+class FlowCreditExhausted(FlowGenerationError):
+    """Raised only when Flow explicitly confirms that AI credits are exhausted."""
+
+    reason_code = "flow_credit_exhausted"
+
+
 class FlowGenerationStartError(RuntimeError):
     """Raised when Flow never shows progress or a new result after submission."""
 
@@ -167,6 +173,37 @@ def _is_valid_flow_error_text(text: str) -> bool:
     if any(kw in norm for kw in ignored_keywords):
         return False
     return True
+
+
+def _is_flow_credit_exhausted_error(text: str) -> bool:
+    """Return True only for explicit credit exhaustion, not low-credit warnings."""
+    if not text:
+        return False
+    import unicodedata
+
+    normalized = unicodedata.normalize(
+        "NFKD", str(text).replace("Đ", "D").replace("đ", "d")
+    )
+    normalized = normalized.encode("ASCII", "ignore").decode("utf-8").casefold()
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return False
+
+    explicit_phrases = (
+        "reached your credit quota",
+        "credit quota has been reached",
+        "credit quota exceeded",
+        "exceeded your credit quota",
+        "not enough ai credits",
+        "insufficient ai credits",
+        "out of ai credits",
+        "no ai credits remaining",
+        "da het tin dung",
+        "khong du tin dung",
+        "da dat han muc tin dung",
+        "vuot qua han muc tin dung",
+    )
+    return any(phrase in normalized for phrase in explicit_phrases)
 
 
 def _upgrade_google_cdn_image_url(url: str) -> str:
@@ -4132,6 +4169,11 @@ class GoogleFlowWorker:
                     submitted_at,
                     detail=explicit_error,
                 )
+                if _is_flow_credit_exhausted_error(explicit_error):
+                    raise FlowCreditExhausted(
+                        f"Google Flow đã xác nhận hết credit khi tạo {media_type}: "
+                        f"{explicit_error}"
+                    )
                 raise FlowGenerationError(
                     f"Google Flow báo lỗi khi tạo {media_type}: {explicit_error}"
                 )
