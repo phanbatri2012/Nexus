@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import signal
 import socket
@@ -35,6 +36,7 @@ MUSE_SERVICE_STATE_PATH = DATA_DIR / "muse_studio_service.json"
 MUSE_STUDIO_STDOUT_PATH = LOGS_DIR / "muse-studio-ui.current.stdout.log"
 MUSE_STUDIO_STDERR_PATH = LOGS_DIR / "muse-studio-ui.current.stderr.log"
 MUSE_STUDIO_STARTUP_CHECK_SECONDS = 1.5
+MUSE_ORPHAN_CLEANUP_TIMEOUT_SECONDS = 5.0
 
 
 class MuseStudioServiceError(RuntimeError):
@@ -98,6 +100,159 @@ def _port_in_use(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(0.25)
         return sock.connect_ex((MUSE_API_HOST, int(port))) == 0
+
+
+def _windows_port_process(port: int) -> dict | None:
+    """Return sanitized ownership metadata for one Windows listening port."""
+
+    if os.name != "nt":
+        return None
+    script = f"""
+$connection = Get-NetTCPConnection -State Listen -LocalPort {int(port)} -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+if ($connection) {{
+    $process = Get-CimInstance Win32_Process -Filter ("ProcessId=" + [int]$connection.OwningProcess) -ErrorAction SilentlyContinue
+    if ($process) {{
+        $parent = Get-CimInstance Win32_Process -Filter ("ProcessId=" + [int]$process.ParentProcessId) -ErrorAction SilentlyContinue
+        [pscustomobject]@{{
+            process_id = [int]$process.ProcessId
+            parent_process_id = [int]$process.ParentProcessId
+            parent_running = [bool]($null -ne $parent)
+            name = [string]$process.Name
+            command_line = [string]$process.CommandLine
+        }} | ConvertTo-Json -Compress
+    }}
+}}
+"""
+    try:
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=MUSE_ORPHAN_CLEANUP_TIMEOUT_SECONDS,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        raw = str(completed.stdout or "").strip()
+        if completed.returncode != 0 or not raw:
+            return None
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            return None
+        return {
+            "process_id": int(payload.get("process_id") or 0),
+            "parent_process_id": int(payload.get("parent_process_id") or 0),
+            "parent_running": bool(payload.get("parent_running")),
+            "name": str(payload.get("name") or ""),
+            "command_line": str(payload.get("command_line") or ""),
+        }
+    except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired):
+        return None
+
+
+def _is_expected_muse_browser(process: dict, studio_path: Path) -> bool:
+    if str(process.get("name") or "").strip().lower() not in {"chrome.exe", "chromium.exe"}:
+        return False
+    command_line = str(process.get("command_line") or "")
+    normalized_command = command_line.replace("/", "\\").casefold()
+    if "--headless" not in normalized_command:
+        return False
+    if f"--remote-debugging-port={MUSE_CDP_PORT}" not in normalized_command:
+        return False
+    profile_match = re.search(r'--user-data-dir=(?:"([^"]+)"|(\S+))', command_line, re.IGNORECASE)
+    if not profile_match:
+        return False
+    profile_path = str(profile_match.group(1) or profile_match.group(2) or "")
+    normalized_profile = profile_path.replace("/", "\\").rstrip("\\").casefold()
+    expected_roots = (
+        studio_path / "chrome_user_data" / "muse_profiles",
+        Path.home() / "muse2api-profiles",
+    )
+    return any(
+        normalized_profile == normalized_root
+        or normalized_profile.startswith(normalized_root + "\\")
+        for root in expected_roots
+        for normalized_root in (
+            str(root.resolve()).replace("/", "\\").rstrip("\\").casefold(),
+        )
+    )
+
+
+def _cdp_is_muse_browser() -> bool:
+    try:
+        request = urllib.request.Request(
+            f"http://{MUSE_API_HOST}:{MUSE_CDP_PORT}/json/version",
+            headers={"Accept": "application/json", "User-Agent": "Auto_YT-Muse/1"},
+            method="GET",
+        )
+        opener = urllib.request.build_opener(_NoRedirectHandler())
+        with opener.open(request, timeout=1.0) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if not isinstance(payload, dict):
+            return False
+        browser = str(payload.get("Browser") or "").strip().lower()
+        return browser.startswith(("chrome/", "chromium/", "headlesschrome/"))
+    except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError):
+        return False
+
+
+def _recover_orphaned_muse_browser(studio_path: Path) -> bool:
+    """Remove only a verified Muse Chrome orphan that owns the CDP port."""
+
+    if os.name != "nt" or _port_in_use(MUSE_API_PORT) or not _port_in_use(MUSE_CDP_PORT):
+        return False
+    try:
+        if _has_active_muse_jobs():
+            return False
+    except Exception:
+        logger.warning("Không thể xác minh trạng thái job Muse; bỏ qua dọn browser orphan.")
+        return False
+    process = _windows_port_process(MUSE_CDP_PORT)
+    if not process or process.get("parent_running"):
+        return False
+    if int(process.get("process_id") or 0) <= 0:
+        return False
+    if not _is_expected_muse_browser(process, studio_path) or not _cdp_is_muse_browser():
+        return False
+
+    pid = int(process["process_id"])
+    confirmed_process = _windows_port_process(MUSE_CDP_PORT)
+    if (
+        not confirmed_process
+        or int(confirmed_process.get("process_id") or 0) != pid
+        or confirmed_process.get("parent_running")
+        or not _is_expected_muse_browser(confirmed_process, studio_path)
+    ):
+        return False
+    try:
+        completed = subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            capture_output=True,
+            timeout=MUSE_ORPHAN_CLEANUP_TIMEOUT_SECONDS,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if completed.returncode != 0:
+        return False
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if not _port_in_use(MUSE_CDP_PORT):
+            logger.info("Đã thu hồi Muse browser orphan PID %s trên cổng %s.", pid, MUSE_CDP_PORT)
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _muse_ports_available(studio_path: Path) -> bool:
+    api_busy = _port_in_use(MUSE_API_PORT)
+    cdp_busy = _port_in_use(MUSE_CDP_PORT)
+    if not api_busy and cdp_busy and _recover_orphaned_muse_browser(studio_path):
+        api_busy = _port_in_use(MUSE_API_PORT)
+        cdp_busy = _port_in_use(MUSE_CDP_PORT)
+    return not api_busy and not cdp_busy
 
 
 def _write_state(process: subprocess.Popen[Any], studio_path: Path) -> None:
@@ -200,9 +355,9 @@ def _cancel_idle_timer() -> None:
 
 def _has_active_muse_jobs() -> bool:
     now = db.utc_now()
-    for job in db.list_active_system_jobs("muse_media_generation"):
+    for job in db.list_system_jobs(limit=None, job_type="muse_media_generation"):
         status = str(job.get("status") or "").strip().lower()
-        if status in {"queued", "running"}:
+        if status in {"processing", "queued", "running"}:
             return True
         if status == "retry_wait":
             next_retry_at = str(job.get("next_retry_at") or "").strip()
@@ -225,7 +380,7 @@ def ensure_started(*, timeout_seconds: float = 20.0) -> dict:
             _process = None
             _close_log_handles()
             _remove_state()
-        if _port_in_use(MUSE_API_PORT) or _port_in_use(MUSE_CDP_PORT):
+        if not _muse_ports_available(studio_path):
             raise MuseStudioServiceBusy(
                 "Cổng Muse 18610/19210 đang do tiến trình khác sử dụng; hãy đóng Muse Studio trước."
             )
@@ -438,7 +593,7 @@ def open_studio() -> dict:
         raise MuseStudioServiceBusy(
             "Muse2API do Auto_YT đang chạy; hãy chờ service tự đóng sau thời gian rảnh."
         )
-    if _port_in_use(MUSE_API_PORT) or _port_in_use(MUSE_CDP_PORT):
+    if not _muse_ports_available(studio_path):
         raise MuseStudioServiceBusy(
             "Muse Studio hoặc Muse2API khác đang chạy; Auto_YT không mở thêm phiên mới."
         )

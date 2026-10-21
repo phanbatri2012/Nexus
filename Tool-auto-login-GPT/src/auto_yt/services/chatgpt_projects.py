@@ -411,7 +411,7 @@ def normalize_image_generation_settings(value: object) -> dict:
         coverage_mode = "intro_only"
     try:
         coverage_minutes = max(
-            1, min(90, int(muse_settings.get("video_coverage_minutes", 5) or 5))
+            1, int(muse_settings.get("video_coverage_minutes", 5) or 5)
         )
     except (TypeError, ValueError):
         coverage_minutes = 5

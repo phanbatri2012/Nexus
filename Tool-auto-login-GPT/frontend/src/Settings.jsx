@@ -2527,7 +2527,6 @@ export default function Settings({
                       className="version-input"
                       type="number"
                       min="1"
-                      max="90"
                       value={currentImageGeneration.muse_settings.video_coverage_minutes}
                       onChange={event => updateMusePromptSettings({ video_coverage_minutes: Number(event.target.value) || 1 })}
                       disabled={activeVersionLocked}

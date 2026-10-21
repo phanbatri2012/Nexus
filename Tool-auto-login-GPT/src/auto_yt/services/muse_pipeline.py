@@ -33,7 +33,6 @@ from auto_yt.services.muse_provider import (
 
 logger = logging.getLogger(__name__)
 SCENE_SECONDS = 10.0
-MAX_VIDEO_SECONDS = 90 * 60
 MAX_REQUEST_ATTEMPTS = 3
 RETRY_DELAYS_SECONDS = (60.0, 300.0)
 
@@ -74,14 +73,15 @@ def build_fixed_scene_windows(
     duration = float(duration_seconds)
     if duration <= 0:
         raise video_production.VideoProductionError("Audio không có thời lượng hợp lệ.")
-    if duration > MAX_VIDEO_SECONDS:
-        raise video_production.VideoProductionError(
-            "Muse chỉ hỗ trợ video tối đa 90 phút."
-        )
     mode = str(coverage_mode or "intro_only").strip().lower()
     if mode not in {"intro_only", "first_n_minutes", "full"}:
         mode = "intro_only"
-    coverage_limit = max(1, min(90, int(coverage_minutes or 5))) * 60.0
+    coverage_minute_count = max(1, int(coverage_minutes or 5))
+    coverage_limit = (
+        duration
+        if coverage_minute_count >= duration / 60.0
+        else coverage_minute_count * 60.0
+    )
     windows: list[dict] = []
     start = 0.0
     while start < duration:

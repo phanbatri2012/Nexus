@@ -63,7 +63,7 @@ class TestMuseSettings(unittest.TestCase):
         self.assertEqual(normalized["render_mode"], "muse_ai")
         self.assertEqual(normalized["provider"], "muse_ai")
         self.assertEqual(normalized["muse_settings"]["video_coverage_mode"], "intro_only")
-        self.assertEqual(normalized["muse_settings"]["video_coverage_minutes"], 90)
+        self.assertEqual(normalized["muse_settings"]["video_coverage_minutes"], 500)
         reference_set = normalized["muse_settings"]["reference_sets"][0]
         self.assertEqual(reference_set["aliases"], ["An", "Anh An"])
         self.assertEqual(len(reference_set["images"]), 6)
@@ -138,15 +138,32 @@ class TestMuseScenePlan(unittest.TestCase):
         self.assertEqual(sum(item["is_video"] for item in first_minute), 6)
         self.assertTrue(all(item["is_video"] for item in full))
 
-    def test_rejects_video_over_ninety_minutes(self):
-        with self.assertRaisesRegex(Exception, "90 phút"):
-            muse_pipeline.build_fixed_scene_windows(
-                _captions(10),
-                muse_pipeline.MAX_VIDEO_SECONDS + 0.1,
-                intro_end_seconds=0,
-                coverage_mode="full",
-                coverage_minutes=5,
-            )
+    def test_accepts_video_over_ninety_minutes(self):
+        duration = 91 * 60 + 5
+        windows = muse_pipeline.build_fixed_scene_windows(
+            _captions(10),
+            duration,
+            intro_end_seconds=0,
+            coverage_mode="full",
+            coverage_minutes=5,
+        )
+        self.assertEqual(len(windows), 547)
+        self.assertEqual(windows[-1]["start"], 5460.0)
+        self.assertEqual(windows[-1]["end"], float(duration))
+        self.assertEqual(windows[-1]["duration"], 5.0)
+        self.assertTrue(all(item["is_video"] for item in windows))
+
+    def test_first_n_minutes_coverage_can_extend_beyond_ninety_minutes(self):
+        duration = 121 * 60
+        windows = muse_pipeline.build_fixed_scene_windows(
+            _captions(10),
+            duration,
+            intro_end_seconds=0,
+            coverage_mode="first_n_minutes",
+            coverage_minutes=120,
+        )
+        self.assertTrue(windows[719]["is_video"])
+        self.assertFalse(windows[720]["is_video"])
 
     def test_plan_hash_changes_when_reference_content_changes(self):
         first = muse_pipeline._bind_reference_hashes(
@@ -759,6 +776,117 @@ class TestMuseStudioServiceLifecycle(unittest.TestCase):
                     "dừng ngay khi khởi động",
                 ):
                     muse_studio_service.open_studio()
+
+    @unittest.skipUnless(muse_studio_service.os.name == "nt", "Windows-only recovery")
+    def test_recover_verified_orphaned_muse_browser(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            profile_dir = root / "chrome_user_data" / "muse_profiles" / "generate"
+            process = {
+                "process_id": 4321,
+                "parent_process_id": 9876,
+                "parent_running": False,
+                "name": "chrome.exe",
+                "command_line": (
+                    'chrome.exe --headless=new --remote-debugging-port=19210 '
+                    f'--user-data-dir="{profile_dir}" about:blank'
+                ),
+            }
+            completed = MagicMock(returncode=0)
+            with (
+                patch.object(
+                    muse_studio_service,
+                    "_port_in_use",
+                    side_effect=[False, True, False],
+                ),
+                patch.object(muse_studio_service, "_has_active_muse_jobs", return_value=False),
+                patch.object(
+                    muse_studio_service,
+                    "_windows_port_process",
+                    return_value=process,
+                ),
+                patch.object(muse_studio_service, "_cdp_is_muse_browser", return_value=True),
+                patch.object(
+                    muse_studio_service.subprocess,
+                    "run",
+                    return_value=completed,
+                ) as run,
+            ):
+                recovered = muse_studio_service._recover_orphaned_muse_browser(root)
+
+        self.assertTrue(recovered)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["taskkill", "/F", "/T", "/PID", "4321"],
+        )
+
+    @unittest.skipUnless(muse_studio_service.os.name == "nt", "Windows-only recovery")
+    def test_recovery_refuses_browser_with_live_parent(self):
+        process = {
+            "process_id": 4321,
+            "parent_process_id": 9876,
+            "parent_running": True,
+            "name": "chrome.exe",
+            "command_line": "",
+        }
+        with (
+            patch.object(muse_studio_service, "_port_in_use", side_effect=[False, True]),
+            patch.object(muse_studio_service, "_has_active_muse_jobs", return_value=False),
+            patch.object(muse_studio_service, "_windows_port_process", return_value=process),
+            patch.object(muse_studio_service.subprocess, "run") as run,
+        ):
+            recovered = muse_studio_service._recover_orphaned_muse_browser(Path("C:/Muse"))
+
+        self.assertFalse(recovered)
+        run.assert_not_called()
+
+    @unittest.skipUnless(muse_studio_service.os.name == "nt", "Windows-only recovery")
+    def test_recovery_refuses_foreign_headless_browser_profile(self):
+        process = {
+            "process_id": 4321,
+            "parent_process_id": 9876,
+            "parent_running": False,
+            "name": "chrome.exe",
+            "command_line": (
+                'chrome.exe --headless=new --remote-debugging-port=19210 '
+                '--user-data-dir="C:\\Users\\Public\\unrelated-profile" about:blank'
+            ),
+        }
+        with (
+            patch.object(muse_studio_service, "_port_in_use", side_effect=[False, True]),
+            patch.object(muse_studio_service, "_has_active_muse_jobs", return_value=False),
+            patch.object(muse_studio_service, "_windows_port_process", return_value=process),
+            patch.object(muse_studio_service, "_cdp_is_muse_browser") as cdp_probe,
+            patch.object(muse_studio_service.subprocess, "run") as run,
+        ):
+            recovered = muse_studio_service._recover_orphaned_muse_browser(Path("C:/Muse"))
+
+        self.assertFalse(recovered)
+        cdp_probe.assert_not_called()
+        run.assert_not_called()
+
+    @unittest.skipUnless(muse_studio_service.os.name == "nt", "Windows-only recovery")
+    def test_recovery_refuses_browser_while_muse_job_is_active(self):
+        with (
+            patch.object(muse_studio_service, "_port_in_use", side_effect=[False, True]),
+            patch.object(muse_studio_service, "_has_active_muse_jobs", return_value=True),
+            patch.object(muse_studio_service, "_windows_port_process") as port_process,
+            patch.object(muse_studio_service.subprocess, "run") as run,
+        ):
+            recovered = muse_studio_service._recover_orphaned_muse_browser(Path("C:/Muse"))
+
+        self.assertFalse(recovered)
+        port_process.assert_not_called()
+        run.assert_not_called()
+
+    def test_processing_muse_job_blocks_idle_cleanup(self):
+        with patch.object(
+            muse_studio_service.db,
+            "list_system_jobs",
+            return_value=[{"status": "processing"}],
+        ) as list_jobs:
+            self.assertTrue(muse_studio_service._has_active_muse_jobs())
+        list_jobs.assert_called_once_with(limit=None, job_type="muse_media_generation")
 
     def test_foreign_port_is_never_reused_or_killed(self):
         with (
