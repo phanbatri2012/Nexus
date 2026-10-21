@@ -1,7 +1,12 @@
 export function splitMuseAliasDraft(value) {
-  return String(value ?? '')
-    .split(',')
-    .map(part => part.replace(/^\s+/, ''))
+  return String(value ?? '').split(',')
+}
+
+export function getMuseAliasInputValue(referenceSet) {
+  if (typeof referenceSet?.aliases_draft === 'string') {
+    return referenceSet.aliases_draft
+  }
+  return (Array.isArray(referenceSet?.aliases) ? referenceSet.aliases : []).join(', ')
 }
 
 export function normalizeMuseAliases(value) {

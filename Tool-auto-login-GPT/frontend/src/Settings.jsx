@@ -1,6 +1,10 @@
 import { useState, useEffect } from 'react';
 import './Settings.css';
-import { normalizeMuseAliases, splitMuseAliasDraft } from './museAliases';
+import {
+  getMuseAliasInputValue,
+  normalizeMuseAliases,
+  splitMuseAliasDraft
+} from './museAliases';
 
 const DEFAULT_PIPELINE = {
   title: true,
@@ -2620,12 +2624,14 @@ export default function Settings({
                         Aliases (phân cách dấu phẩy)
                         <input
                           className="version-input"
-                          value={(referenceSet.aliases || []).join(', ')}
+                          value={getMuseAliasInputValue(referenceSet)}
                           onChange={event => updateMuseReferenceSet(setIndex, {
-                            aliases: splitMuseAliasDraft(event.target.value)
+                            aliases: splitMuseAliasDraft(event.target.value),
+                            aliases_draft: event.target.value
                           })}
                           onBlur={event => updateMuseReferenceSet(setIndex, {
-                            aliases: normalizeMuseAliases(event.target.value)
+                            aliases: normalizeMuseAliases(event.target.value),
+                            aliases_draft: undefined
                           })}
                           disabled={activeVersionLocked}
                         />
