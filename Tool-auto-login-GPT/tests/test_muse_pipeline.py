@@ -699,6 +699,67 @@ class TestMuseStudioServiceLifecycle(unittest.TestCase):
             legacy_data.mkdir(parents=True)
             self.assertEqual(muse_studio_service._studio_data_dir(root), legacy_data.resolve())
 
+    @unittest.skipUnless(muse_studio_service.sys.platform == "win32", "Windows-only launcher")
+    def test_open_studio_uses_nexus_python_and_confirms_process_stays_alive(self):
+        process = MagicMock(pid=4321)
+        process.wait.side_effect = muse_studio_service.subprocess.TimeoutExpired("Muse", 1.5)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "main.py").write_text("", encoding="utf-8")
+            with (
+                patch.object(muse_studio_service, "_validate_studio_path", return_value=root),
+                patch.object(muse_studio_service, "_port_in_use", return_value=False),
+                patch.object(muse_studio_service, "LOGS_DIR", root / "logs"),
+                patch.object(
+                    muse_studio_service,
+                    "MUSE_STUDIO_STDOUT_PATH",
+                    root / "logs" / "muse-ui.stdout.log",
+                ),
+                patch.object(
+                    muse_studio_service,
+                    "MUSE_STUDIO_STDERR_PATH",
+                    root / "logs" / "muse-ui.stderr.log",
+                ),
+                patch.object(muse_studio_service.subprocess, "Popen", return_value=process) as popen,
+            ):
+                result = muse_studio_service.open_studio()
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["pid"], 4321)
+        command = popen.call_args.args[0]
+        self.assertEqual(command[0], str(Path(muse_studio_service.sys.executable).resolve()))
+        self.assertEqual(Path(command[1]).name, "main.py")
+        self.assertNotIn("PYTHONPATH", popen.call_args.kwargs["env"])
+
+    @unittest.skipUnless(muse_studio_service.sys.platform == "win32", "Windows-only launcher")
+    def test_open_studio_reports_early_process_exit(self):
+        process = MagicMock(pid=4321)
+        process.wait.return_value = 1
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "main.py").write_text("", encoding="utf-8")
+            with (
+                patch.object(muse_studio_service, "_validate_studio_path", return_value=root),
+                patch.object(muse_studio_service, "_port_in_use", return_value=False),
+                patch.object(muse_studio_service, "LOGS_DIR", root / "logs"),
+                patch.object(
+                    muse_studio_service,
+                    "MUSE_STUDIO_STDOUT_PATH",
+                    root / "logs" / "muse-ui.stdout.log",
+                ),
+                patch.object(
+                    muse_studio_service,
+                    "MUSE_STUDIO_STDERR_PATH",
+                    root / "logs" / "muse-ui.stderr.log",
+                ),
+                patch.object(muse_studio_service.subprocess, "Popen", return_value=process),
+            ):
+                with self.assertRaisesRegex(
+                    muse_studio_service.MuseStudioServiceUnavailable,
+                    "dừng ngay khi khởi động",
+                ):
+                    muse_studio_service.open_studio()
+
     def test_foreign_port_is_never_reused_or_killed(self):
         with (
             patch.object(muse_studio_service, "_validate_studio_path", return_value=Path("C:/Muse")),

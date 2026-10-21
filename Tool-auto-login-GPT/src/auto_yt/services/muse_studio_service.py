@@ -32,6 +32,9 @@ MUSE_API_BASE_URL = f"http://{MUSE_API_HOST}:{MUSE_API_PORT}"
 MUSE_IDLE_CLOSE_SECONDS = 60.0
 MUSE_SERVICE_PROCESS_KEY = "muse-studio-service"
 MUSE_SERVICE_STATE_PATH = DATA_DIR / "muse_studio_service.json"
+MUSE_STUDIO_STDOUT_PATH = LOGS_DIR / "muse-studio-ui.current.stdout.log"
+MUSE_STUDIO_STDERR_PATH = LOGS_DIR / "muse-studio-ui.current.stderr.log"
+MUSE_STUDIO_STARTUP_CHECK_SECONDS = 1.5
 
 
 class MuseStudioServiceError(RuntimeError):
@@ -439,15 +442,49 @@ def open_studio() -> dict:
         raise MuseStudioServiceBusy(
             "Muse Studio hoặc Muse2API khác đang chạy; Auto_YT không mở thêm phiên mới."
         )
-    if os.name != "nt":
+    if sys.platform != "win32":
         raise MuseStudioConfigurationError("Mở Muse Studio chỉ được hỗ trợ trên Windows.")
-    launcher = studio_path / "MUSE_AI_STUDIO.vbs"
-    if not launcher.is_file():
-        launcher = studio_path / "RUN_MUSE_AI.bat"
-    if not launcher.is_file():
-        raise MuseStudioConfigurationError("Không tìm thấy launcher Muse Studio.")
-    os.startfile(str(launcher))  # type: ignore[attr-defined]
-    return {"success": True, "studio_path": str(studio_path), "launcher": launcher.name}
+    python_executable = Path(sys.executable).resolve()
+    if not python_executable.is_file():
+        raise MuseStudioConfigurationError("Không tìm thấy Python runtime của Nexus.")
+
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
+        subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+    )
+    try:
+        with (
+            open(MUSE_STUDIO_STDOUT_PATH, "a", encoding="utf-8") as stdout_handle,
+            open(MUSE_STUDIO_STDERR_PATH, "a", encoding="utf-8") as stderr_handle,
+        ):
+            process = subprocess.Popen(
+                [str(python_executable), str((studio_path / "main.py").resolve())],
+                cwd=str(studio_path),
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                creationflags=creationflags,
+            )
+    except OSError as exc:
+        logger.exception("Không thể khởi chạy giao diện Muse Studio.")
+        raise MuseStudioServiceUnavailable("Không thể khởi chạy Muse Studio.") from exc
+
+    try:
+        return_code = process.wait(timeout=MUSE_STUDIO_STARTUP_CHECK_SECONDS)
+    except subprocess.TimeoutExpired:
+        return {
+            "success": True,
+            "studio_path": str(studio_path),
+            "launcher": python_executable.name,
+            "pid": int(process.pid),
+        }
+    raise MuseStudioServiceUnavailable(
+        f"Muse Studio dừng ngay khi khởi động (mã {return_code}); "
+        f"xem log {MUSE_STUDIO_STDERR_PATH.name}."
+    )
 
 
 def shutdown_muse_resources() -> None:
