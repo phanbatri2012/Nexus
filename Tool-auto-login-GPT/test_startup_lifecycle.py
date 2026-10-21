@@ -54,6 +54,9 @@ BROWSER_SERVICE_SCRIPTS = (
     / "services"
     / "google_flow_browser_service.py",
 )
+WIN32_WINDOW_HELPER = (
+    Path(__file__).parent / "src" / "auto_yt" / "services" / "win32_window.py"
+)
 
 
 class StartupLifecycleTests(unittest.TestCase):
@@ -126,42 +129,73 @@ class StartupLifecycleTests(unittest.TestCase):
             self.assertIn(declaration, script)
             self.assertLess(script.index(declaration), readiness_probe_position)
 
-    def test_missing_browser_services_are_started_in_background_without_forcing_show(self):
+    def test_browser_services_are_on_demand_and_never_started_by_startup(self):
         script = STARTUP_SCRIPT.read_text(encoding="utf-8")
 
-        for expected_action in (
-            'Invoke-BrowserServiceAction "chatgpt_browser_service" "start" "ChatGPT"',
-            'Invoke-BrowserServiceAction "google_flow_browser_service" "start" "Google Flow"',
+        for forbidden_marker in (
+            "Invoke-BrowserServiceAction",
+            "Test-ChatGPTBrowserReady",
+            "Test-GoogleFlowBrowserReady",
+            "chatgptReady",
+            "flowReady",
         ):
-            self.assertIn(expected_action, script)
+            self.assertNotIn(forbidden_marker, script)
 
-        for forbidden_action in (
-            'Invoke-BrowserServiceAction "chatgpt_browser_service" "show" "ChatGPT"',
-            'Invoke-BrowserServiceAction "google_flow_browser_service" "show" "Google Flow"',
-        ):
-            self.assertNotIn(forbidden_action, script)
+        self.assertIn("ChatGPT Automation:     On demand", script)
+        self.assertIn("Google Flow Automation: On demand", script)
 
-    def test_startup_requires_every_registered_service(self):
+    def test_startup_requires_only_three_core_services(self):
         script = STARTUP_SCRIPT.read_text(encoding="utf-8")
 
         self.assertIn(
-            "-not ($backendReady -and $frontendReady -and $omniVoiceReady "
-            "-and $chatgptReady -and $flowReady)",
+            "-not ($backendReady -and $frontendReady -and $omniVoiceReady)",
             script,
         )
+        self.assertIn("Waiting for all 3 core services", script)
 
-    def test_browser_readiness_probes_real_loopback_cdp_endpoint(self):
+    def test_startup_does_not_probe_browser_cdp_endpoints(self):
         script = STARTUP_SCRIPT.read_text(encoding="utf-8")
 
-        self.assertGreaterEqual(script.count("/json/version"), 2)
-        self.assertGreaterEqual(script.count("webSocketDebuggerUrl"), 2)
-        self.assertGreaterEqual(script.count("^http://127\\.0\\.0\\.1:"), 2)
+        self.assertNotIn("/json/version", script)
+        self.assertNotIn("webSocketDebuggerUrl", script)
+
+    def test_backend_startup_only_adopts_existing_browser_services(self):
+        source = MAIN_MODULE.read_text(encoding="utf-8")
+
+        self.assertNotIn("chatgpt-browser-startup", source)
+        self.assertNotIn("google-flow-browser-startup", source)
+        self.assertIn(
+            "chatgpt_browser_service.arm_browser_service_idle_watchdog()",
+            source,
+        )
+        self.assertIn(
+            "google_flow_browser_service.arm_browser_service_idle_watchdog()",
+            source,
+        )
+
+    def test_chatgpt_login_flows_do_not_restart_background_owner(self):
+        source = MAIN_MODULE.read_text(encoding="utf-8")
+        blocking_start = source.index("def _run_chatgpt_login_blocking")
+        blocking_end = source.index("def _run_automatic_chatgpt_login", blocking_start)
+        endpoint_start = source.index('@app.post("/api/login-chatgpt")')
+        endpoint_end = source.index('if __name__ == "__main__"', endpoint_start)
+
+        self.assertNotIn(
+            "start_browser_service",
+            source[blocking_start:blocking_end],
+        )
+        self.assertNotIn(
+            "start_browser_service",
+            source[endpoint_start:endpoint_end],
+        )
 
     def test_visible_window_waits_for_restore_before_moving(self):
         for service_script in BROWSER_SERVICE_SCRIPTS:
             script = service_script.read_text(encoding="utf-8")
-            function_start = script.index("def _set_cdp_window_visibility")
-            hidden_branch_start = script.index("\n        else:", function_start)
+            function_start = script.index(
+                "def _set_connected_browser_window_visibility"
+            )
+            hidden_branch_start = script.index("\n    else:", function_start)
             visible_branch = script[function_start:hidden_branch_start]
 
             restore_position = visible_branch.index('"windowState": "normal"')
@@ -169,6 +203,13 @@ class StartupLifecycleTests(unittest.TestCase):
             bounds_position = visible_branch.index("_visible_window_bounds()")
             self.assertLess(restore_position, wait_position)
             self.assertLess(wait_position, bounds_position)
+
+    def test_hidden_browser_window_uses_win32_hide_not_minimize(self):
+        source = WIN32_WINDOW_HELPER.read_text(encoding="utf-8")
+
+        self.assertIn("SW_HIDE = 0", source)
+        self.assertIn("user32.ShowWindow(hwnd, SW_HIDE)", source)
+        self.assertNotIn("SW_MINIMIZE", source)
 
 
 if __name__ == "__main__":

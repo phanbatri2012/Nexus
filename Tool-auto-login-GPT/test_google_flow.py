@@ -183,6 +183,7 @@ class GoogleFlowEndpointTests(unittest.IsolatedAsyncioTestCase):
             "success": True,
             "message": "Phiên Google hợp lệ và Google Flow đã mở.",
         }
+        usage_lease = Mock()
         with (
             patch.object(
                 main.google_flow_account,
@@ -191,9 +192,9 @@ class GoogleFlowEndpointTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(
                 main.google_flow_browser_service,
-                "get_browser_service_status",
-                return_value={"connected": True},
-            ),
+                "acquire_browser_service",
+                return_value=usage_lease,
+            ) as acquire,
             patch.object(
                 main,
                 "_verify_google_flow_browser_session",
@@ -203,7 +204,9 @@ class GoogleFlowEndpointTests(unittest.IsolatedAsyncioTestCase):
             result = await main.check_flow_login()
 
         self.assertTrue(result["success"])
+        acquire.assert_called_once_with()
         verify_session.assert_awaited_once_with(account)
+        usage_lease.close.assert_called_once_with()
 
     async def test_start_endpoint_does_not_report_false_success(self):
         with (
@@ -217,6 +220,23 @@ class GoogleFlowEndpointTests(unittest.IsolatedAsyncioTestCase):
             main.manage_flow_browser("start")
 
         self.assertEqual(error.exception.status_code, 503)
+
+    async def test_stop_endpoint_rejects_browser_in_use(self):
+        with (
+            patch.object(
+                main.google_flow_browser_service,
+                "stop_browser_service",
+                return_value={
+                    "process_alive": True,
+                    "in_use": True,
+                    "message": "Google Flow đang được tác vụ sử dụng",
+                },
+            ),
+            self.assertRaises(HTTPException) as error,
+        ):
+            main.manage_flow_browser("stop")
+
+        self.assertEqual(error.exception.status_code, 409)
 
 
 if __name__ == "__main__":

@@ -363,6 +363,10 @@ class ChatGPTBrowserServiceStatus(BaseModel):
     pid: Optional[int] = None
     started_at: str = ""
     window_visible: bool = False
+    in_use: bool = False
+    active_lease_count: int = 0
+    idle_shutdown_at: str = ""
+    idle_timeout_seconds: int = 300
     message: str = ""
 
 class PromptPipelineData(BaseModel):
@@ -5123,7 +5127,13 @@ def _run_chatgpt_login_blocking() -> dict:
             return {"success": False, "error": CHATGPT_BUSY_ERROR}
         profile_reserved = True
 
-        chatgpt_browser_service.stop_browser_service()
+        browser_status = chatgpt_browser_service.stop_browser_service()
+        if browser_status.get("process_alive"):
+            return {
+                "success": False,
+                "error": browser_status.get("message")
+                or "Không thể dừng trình duyệt ChatGPT để đăng nhập.",
+            }
 
         async def _do_login():
             from playwright.async_api import async_playwright
@@ -5168,11 +5178,6 @@ def _run_chatgpt_login_blocking() -> dict:
         return {"success": False, "error": str(exc)}
     finally:
         if profile_reserved:
-            try:
-                from auto_yt.services import chatgpt_browser_service
-                chatgpt_browser_service.start_browser_service()
-            except Exception:
-                pass
             _finish_chatgpt_operation()
 
 
@@ -5419,32 +5424,6 @@ def _comment_sync_scheduler() -> None:
             continue
 
 
-def _start_chatgpt_browser_safely() -> None:
-    try:
-        browser_status = chatgpt_browser_service.start_browser_service()
-        if not browser_status.get("connected"):
-            print(
-                "ChatGPT Browser Service is unavailable; ChatGPT jobs will pause "
-                f"instead of opening a new window: {browser_status.get('message', '')}",
-                file=sys.stderr,
-            )
-    except Exception as exc:
-        print(f"ChatGPT Browser Service startup error: {exc}", file=sys.stderr)
-
-
-def _start_google_flow_browser_safely() -> None:
-    try:
-        flow_browser_status = google_flow_browser_service.start_browser_service()
-        if not flow_browser_status.get("connected"):
-            print(
-                "Google Flow Browser Service is unavailable: "
-                f"{flow_browser_status.get('message', '')}",
-                file=sys.stderr,
-            )
-    except Exception as exc:
-        print(f"Google Flow Browser Service startup error: {exc}", file=sys.stderr)
-
-
 @app.on_event("startup")
 def resume_background_jobs() -> None:
     from auto_yt.services import drain_mode
@@ -5455,16 +5434,10 @@ def resume_background_jobs() -> None:
     # consume them. Secrets remain decrypted only in the current process.
     account_store.load_account(migrate=True)
     tts.migrate_api_key_storage()
-    threading.Thread(
-        target=_start_chatgpt_browser_safely,
-        daemon=True,
-        name="chatgpt-browser-startup",
-    ).start()
-    threading.Thread(
-        target=_start_google_flow_browser_safely,
-        daemon=True,
-        name="google-flow-browser-startup",
-    ).start()
+    # Adopt browser owners that survived a direct backend restart, but never
+    # launch Chromium as a side effect of application startup.
+    chatgpt_browser_service.arm_browser_service_idle_watchdog()
+    google_flow_browser_service.arm_browser_service_idle_watchdog()
     for task in db.get_active_audio_tasks():
         _start_audio_watcher(task["video_id"])
     db.recover_interrupted_system_jobs("video_generation")
@@ -5591,6 +5564,7 @@ def stop_video_queue_wakeup_timer() -> None:
     if _radar_coordinator is not None:
         _radar_coordinator.stop()
     chatgpt_browser_service.stop_browser_service()
+    google_flow_browser_service.stop_browser_service()
 
 
 class VideoJobCanceled(RuntimeError):
@@ -13755,7 +13729,6 @@ async def trigger_login():
         return {"success": False, "error": str(e)}
     finally:
         if profile_reserved:
-            await asyncio.to_thread(chatgpt_browser_service.start_browser_service)
             _finish_chatgpt_operation()
 
 @app.post("/api/open-profile")
@@ -13814,14 +13787,12 @@ async def open_profile():
                         pass
                     await context.close()
         finally:
-            await asyncio.to_thread(chatgpt_browser_service.start_browser_service)
             _finish_chatgpt_operation()
 
     # Launch as a separate asyncio task so it doesn't block the API
     try:
         asyncio.create_task(_launch())
     except Exception:
-        await asyncio.to_thread(chatgpt_browser_service.start_browser_service)
         _finish_chatgpt_operation()
         raise
     return {"success": True, "message": "Browser profile opened on server."}
@@ -13901,6 +13872,10 @@ async def _verify_google_flow_browser_session(account: dict) -> dict:
         if not browser.contexts:
             raise RuntimeError("Browser Google Flow chưa có browser context.")
         context = browser.contexts[0]
+        await google_flow_browser_service.keep_attached_browser_hidden(
+            browser,
+            context,
+        )
         page = context.pages[0] if context.pages else await context.new_page()
         page.set_default_timeout(60_000)
         result = await login_google_flow(account, page)
@@ -13917,20 +13892,12 @@ async def _verify_google_flow_browser_session(account: dict) -> dict:
 
 @app.post("/api/flow/login-check")
 async def check_flow_login():
+    usage_lease = None
     try:
         account = google_flow_account.load_account()
-        browser_status = google_flow_browser_service.get_browser_service_status()
-        if not browser_status.get("connected"):
-            browser_status = await asyncio.to_thread(
-                google_flow_browser_service.start_browser_service
-            )
-        if not browser_status.get("connected"):
-            return {
-                "success": False,
-                "error": browser_status.get("message")
-                or "Không thể khởi động trình duyệt Flow.",
-            }
-
+        usage_lease = await asyncio.to_thread(
+            google_flow_browser_service.acquire_browser_service
+        )
         result = await _verify_google_flow_browser_session(account)
         return {
             "success": True,
@@ -13938,6 +13905,9 @@ async def check_flow_login():
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
+    finally:
+        if usage_lease is not None:
+            usage_lease.close()
 
 @app.post("/api/flow/test-generation")
 def test_flow_generation(confirm_credit_charge: bool = False):

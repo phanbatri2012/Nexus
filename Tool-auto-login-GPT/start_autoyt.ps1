@@ -344,113 +344,6 @@ function Start-OmniVoiceWorker {
         -RedirectStandardError $stderrLog
 }
 
-function Test-ChatGPTBrowserReady {
-    $chatgptStateFile = Join-Path $dataRoot "chatgpt_browser_service.json"
-    if (-not (Test-Path -LiteralPath $chatgptStateFile -PathType Leaf)) {
-        return $false
-    }
-    try {
-        $data = Get-Content -LiteralPath $chatgptStateFile -Raw | ConvertFrom-Json
-        if (-not [bool]$data.ready) {
-            return $false
-        }
-        $cdpUrl = [string]$data.cdp_url
-        if ($cdpUrl -notmatch "^http://127\.0\.0\.1:\d+/?$") {
-            return $false
-        }
-        $version = Invoke-RestMethod `
-            -Uri "$($cdpUrl.TrimEnd('/'))/json/version" `
-            -TimeoutSec 2
-        return -not [string]::IsNullOrWhiteSpace(
-            [string]$version.webSocketDebuggerUrl
-        )
-    } catch {
-        return $false
-    }
-}
-
-function Test-GoogleFlowBrowserReady {
-    $flowStateFile = Join-Path $dataRoot "google_flow_browser_service.json"
-    if (-not (Test-Path -LiteralPath $flowStateFile -PathType Leaf)) {
-        return $false
-    }
-    try {
-        $data = Get-Content -LiteralPath $flowStateFile -Raw | ConvertFrom-Json
-        if (-not [bool]$data.ready) {
-            return $false
-        }
-        $cdpUrl = [string]$data.cdp_url
-        if ($cdpUrl -notmatch "^http://127\.0\.0\.1:\d+/?$") {
-            return $false
-        }
-        $version = Invoke-RestMethod `
-            -Uri "$($cdpUrl.TrimEnd('/'))/json/version" `
-            -TimeoutSec 2
-        return -not [string]::IsNullOrWhiteSpace(
-            [string]$version.webSocketDebuggerUrl
-        )
-    } catch {
-        return $false
-    }
-}
-
-function Test-BrowserServicesReady {
-    return @{
-        ChatGPT = (Test-ChatGPTBrowserReady)
-        GoogleFlow = (Test-GoogleFlowBrowserReady)
-    }
-}
-
-function Invoke-BrowserServiceAction {
-    param(
-        [ValidateSet("chatgpt_browser_service", "google_flow_browser_service")]
-        [string]$ModuleName,
-        [ValidateSet("start", "show")]
-        [string]$Action,
-        [string]$DisplayName
-    )
-
-    $methodCall = if ($Action -eq "start") {
-        "service.start_browser_service()"
-    }
-    else {
-        "service.set_browser_service_window_visibility(True)"
-    }
-    $pythonCode = "import sys; from auto_yt.services import $ModuleName as service; status = $methodCall; sys.stdout.reconfigure(encoding='utf-8') if hasattr(sys.stdout, 'reconfigure') else None; print(status.get('message', '')); raise SystemExit(0 if status.get('connected') else 1)"
-    $previousPythonPath = $env:PYTHONPATH
-    $previousPythonIoEncoding = $env:PYTHONIOENCODING
-    $previousPythonUtf8 = $env:PYTHONUTF8
-    try {
-        $env:PYTHONPATH = Join-Path $projectRoot "src"
-        $env:PYTHONIOENCODING = "utf-8"
-        $env:PYTHONUTF8 = "1"
-        Invoke-ExternalCommand `
-            $venvPython `
-            @("-c", $pythonCode) `
-            "$DisplayName browser service action '$Action' failed"
-    }
-    finally {
-        if ($null -eq $previousPythonPath) {
-            Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
-        }
-        else {
-            $env:PYTHONPATH = $previousPythonPath
-        }
-        if ($null -eq $previousPythonIoEncoding) {
-            Remove-Item Env:PYTHONIOENCODING -ErrorAction SilentlyContinue
-        }
-        else {
-            $env:PYTHONIOENCODING = $previousPythonIoEncoding
-        }
-        if ($null -eq $previousPythonUtf8) {
-            Remove-Item Env:PYTHONUTF8 -ErrorAction SilentlyContinue
-        }
-        else {
-            $env:PYTHONUTF8 = $previousPythonUtf8
-        }
-    }
-}
-
 function Test-PortInUse {
     param([int]$Port)
 
@@ -754,11 +647,9 @@ try {
     $backendReady = Test-BackendReady
     $frontendReady = Test-FrontendReady
     $omniVoiceReady = Test-OmniVoiceReady
-    $chatgptReady = Test-ChatGPTBrowserReady
-    $flowReady = Test-GoogleFlowBrowserReady
 
-    if ($backendReady -and $frontendReady -and $omniVoiceReady -and $chatgptReady -and $flowReady) {
-        Write-Step "All core services and browser automations are already running."
+    if ($backendReady -and $frontendReady -and $omniVoiceReady) {
+        Write-Step "All core services are already running."
     }
     else {
         # --- 1. PARALLEL DISPATCH (All services are launched simultaneously) ---
@@ -787,25 +678,9 @@ try {
             }
         }
 
-        if (-not $chatgptReady -or -not $flowReady) {
-            if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
-                Ensure-PythonEnvironment
-            }
-            if (-not (Test-ChatGPTBrowserReady)) {
-                Write-Step "Starting ChatGPT browser service..."
-                Invoke-BrowserServiceAction "chatgpt_browser_service" "start" "ChatGPT"
-                $chatgptReady = Test-ChatGPTBrowserReady
-            }
-            if (-not (Test-GoogleFlowBrowserReady)) {
-                Write-Step "Starting Google Flow browser service..."
-                Invoke-BrowserServiceAction "google_flow_browser_service" "start" "Google Flow"
-                $flowReady = Test-GoogleFlowBrowserReady
-            }
-        }
-
         # --- 2. UI-LAST BARRIER SYNCHRONIZATION ---
-        # Wait until ALL 5 services are 100% ready before opening the UI
-        Write-Step "Waiting for all 5 services to be ready (Backend, Frontend, OmniVoice, ChatGPT, Google Flow)..."
+        # Browser automation owners start only when a job or explicit user action needs them.
+        Write-Step "Waiting for all 3 core services to be ready (Backend, Frontend, OmniVoice)..."
         $barrierTimer = [System.Diagnostics.Stopwatch]::StartNew()
         $reported = @{}
 
@@ -857,39 +732,21 @@ try {
                     Write-Step "OmniVoice TTS Worker (8011) is ready ($([math]::Round($barrierTimer.Elapsed.TotalSeconds, 1)) s)."
                 }
             }
-            if (-not $chatgptReady -and (Test-ChatGPTBrowserReady)) {
-                $chatgptReady = $true
-                if (-not $reported.ContainsKey("chatgpt")) {
-                    $reported["chatgpt"] = $true
-                    Write-Step "ChatGPT Automation (CDP) is ready ($([math]::Round($barrierTimer.Elapsed.TotalSeconds, 1)) s)."
-                }
-            }
-            if (-not $flowReady -and (Test-GoogleFlowBrowserReady)) {
-                $flowReady = $true
-                if (-not $reported.ContainsKey("flow")) {
-                    $reported["flow"] = $true
-                    Write-Step "Google Flow Automation (CDP) is ready ($([math]::Round($barrierTimer.Elapsed.TotalSeconds, 1)) s)."
-                }
-            }
-
-            if ($backendReady -and $frontendReady -and $omniVoiceReady -and $chatgptReady -and $flowReady) {
+            if ($backendReady -and $frontendReady -and $omniVoiceReady) {
                 break
             }
             Start-Sleep -Milliseconds 300
         }
 
-        if (-not ($backendReady -and $frontendReady -and $omniVoiceReady -and $chatgptReady -and $flowReady)) {
+        if (-not ($backendReady -and $frontendReady -and $omniVoiceReady)) {
             $missingServices = @()
             if (-not $backendReady) { $missingServices += "Backend" }
             if (-not $frontendReady) { $missingServices += "Frontend" }
             if (-not $omniVoiceReady) { $missingServices += "OmniVoice" }
-            if (-not $chatgptReady) { $missingServices += "ChatGPT" }
-            if (-not $flowReady) { $missingServices += "Google Flow" }
             throw "Nexus Studio Engine services did not become ready within $ReadyTimeoutSeconds seconds: $($missingServices -join ', ')."
         }
     }
 
-    $finalBrowserState = Test-BrowserServicesReady
     $omniVoiceReady = Test-OmniVoiceReady
 
     Write-Host ""
@@ -907,16 +764,8 @@ try {
     } else {
         Write-Host " [!]  OmniVoice TTS Server:   Offline (remote voice fallback)" -ForegroundColor Yellow
     }
-    if ($finalBrowserState.ChatGPT) {
-        Write-Host " [OK] ChatGPT Automation:     Ready (Chromium CDP connected)" -ForegroundColor Green
-    } else {
-        Write-Host " [!]  ChatGPT Automation:     Connecting in background" -ForegroundColor Yellow
-    }
-    if ($finalBrowserState.GoogleFlow) {
-        Write-Host " [OK] Google Flow Automation: Ready (Chromium CDP connected)" -ForegroundColor Green
-    } else {
-        Write-Host " [!]  Google Flow Automation: Connecting in background" -ForegroundColor Yellow
-    }
+    Write-Host " [i]  ChatGPT Automation:     On demand (hidden, stops after 5 min idle)" -ForegroundColor Cyan
+    Write-Host " [i]  Google Flow Automation: On demand (hidden, stops after 5 min idle)" -ForegroundColor Cyan
     Write-Host "=================================================================" -ForegroundColor Green
     Write-Host ""
 

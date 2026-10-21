@@ -1805,10 +1805,12 @@ def get_chatgpt_composer_diagnostics(page: Page) -> dict:
 class SharedBrowserContextLease:
     """Proxy a shared persistent context without letting a worker close it."""
 
-    def __init__(self, context, browser):
+    def __init__(self, context, browser, usage_lease=None):
         self._context = context
         # Keep the CDP Browser wrapper alive until the Playwright client exits.
         self._browser = browser
+        self._usage_lease = usage_lease
+        self._closed = False
 
     def __getattr__(self, name):
         return getattr(self._context, name)
@@ -1816,6 +1818,11 @@ class SharedBrowserContextLease:
     def close(self) -> None:
         # The Browser Service is the only owner allowed to close this context.
         # Exiting sync_playwright() disconnects this client automatically.
+        if self._closed:
+            return None
+        self._closed = True
+        if self._usage_lease is not None:
+            self._usage_lease.close()
         return None
 
 
@@ -1825,35 +1832,61 @@ def launch_chatgpt_context(
     wait_timeout: float = CHATGPT_BROWSER_CONNECT_TIMEOUT_SECONDS,
     retry_interval: float = CHATGPT_BROWSER_CONNECT_RETRY_SECONDS,
 ):
-    """Attach to the long-lived Browser Service without launching a window."""
+    """Lazily start and attach to the hidden shared Browser Service."""
+    try:
+        usage_lease = chatgpt_browser_service.acquire_browser_service()
+    except Exception as exc:
+        raise ChatGPTAttentionRequiredError(
+            "Trình duyệt ChatGPT nền chưa khởi động được. "
+            f"Chi tiết: {exc}"
+        ) from exc
+
     deadline = time.monotonic() + wait_timeout
     last_error: Exception | None = None
 
-    while True:
-        endpoint = chatgpt_browser_service.get_browser_service_endpoint()
-        if endpoint:
-            try:
-                browser = browser_type.connect_over_cdp(
-                    endpoint,
-                    timeout=min(3_000, max(250, int(wait_timeout * 1000))),
-                )
-                if not browser.contexts:
-                    raise RuntimeError(
-                        "ChatGPT Browser Service has no persistent context."
+    try:
+        while True:
+            endpoint = chatgpt_browser_service.get_browser_service_endpoint()
+            if endpoint:
+                try:
+                    browser = browser_type.connect_over_cdp(
+                        endpoint,
+                        timeout=min(3_000, max(250, int(wait_timeout * 1000))),
                     )
-                return SharedBrowserContextLease(browser.contexts[0], browser)
-            except Exception as exc:
-                last_error = exc
+                    if not browser.contexts:
+                        raise RuntimeError(
+                            "ChatGPT Browser Service has no persistent context."
+                        )
+                    context = browser.contexts[0]
+                    try:
+                        chatgpt_browser_service.keep_attached_browser_hidden(
+                            browser,
+                            context,
+                        )
+                    except Exception as exc:
+                        print(
+                            f"ChatGPT background window hide skipped: {exc}",
+                            file=sys.stderr,
+                        )
+                    return SharedBrowserContextLease(
+                        context,
+                        browser,
+                        usage_lease,
+                    )
+                except Exception as exc:
+                    last_error = exc
 
-        remaining_seconds = deadline - time.monotonic()
-        if remaining_seconds <= 0:
-            detail = f" Chi tiết: {last_error}" if last_error else ""
-            raise ChatGPTAttentionRequiredError(
-                "Trình duyệt ChatGPT nền chưa kết nối. Mở Settings và bấm "
-                "'Khởi động trình duyệt nền', sau đó tiếp tục job trong "
-                f"Trung tâm Job.{detail}"
-            ) from last_error
-        time.sleep(min(retry_interval, remaining_seconds))
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                detail = f" Chi tiết: {last_error}" if last_error else ""
+                raise ChatGPTAttentionRequiredError(
+                    "Trình duyệt ChatGPT nền chưa kết nối được sau khi tự khởi động. "
+                    f"Hãy kiểm tra trang Auto Login rồi tiếp tục job.{detail}"
+                ) from last_error
+            time.sleep(min(retry_interval, remaining_seconds))
+    except Exception:
+        usage_lease.close()
+        raise
 
 def get_active_prompts(prompt_version: str = ""):
     try:

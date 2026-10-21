@@ -12,20 +12,36 @@ class ChatGPTBrowserServiceWorkerTests(unittest.TestCase):
         browser.contexts = [context]
         browser_type = Mock()
         browser_type.connect_over_cdp.return_value = browser
+        usage_lease = Mock()
 
-        with patch.object(
-            chatgpt_worker.chatgpt_browser_service,
-            "get_browser_service_endpoint",
-            return_value="http://127.0.0.1:43123",
+        with (
+            patch.object(
+                chatgpt_worker.chatgpt_browser_service,
+                "acquire_browser_service",
+                return_value=usage_lease,
+            ) as acquire,
+            patch.object(
+                chatgpt_worker.chatgpt_browser_service,
+                "get_browser_service_endpoint",
+                return_value="http://127.0.0.1:43123",
+            ),
+            patch.object(
+                chatgpt_worker.chatgpt_browser_service,
+                "keep_attached_browser_hidden",
+            ) as keep_hidden,
         ):
             lease = chatgpt_worker.launch_chatgpt_context(
                 browser_type, "profile", wait_timeout=1
             )
 
         self.assertIs(lease.pages, context.pages)
+        acquire.assert_called_once_with()
+        keep_hidden.assert_called_once_with(browser, context)
         browser_type.connect_over_cdp.assert_called_once_with(
             "http://127.0.0.1:43123", timeout=1000
         )
+        lease.close()
+        usage_lease.close.assert_called_once_with()
 
     def test_worker_waits_briefly_for_service_startup(self):
         context = Mock()
@@ -33,16 +49,26 @@ class ChatGPTBrowserServiceWorkerTests(unittest.TestCase):
         browser.contexts = [context]
         browser_type = Mock()
         browser_type.connect_over_cdp.return_value = browser
+        usage_lease = Mock()
 
         with (
+            patch.object(
+                chatgpt_worker.chatgpt_browser_service,
+                "acquire_browser_service",
+                return_value=usage_lease,
+            ),
             patch.object(
                 chatgpt_worker.chatgpt_browser_service,
                 "get_browser_service_endpoint",
                 side_effect=["", "http://127.0.0.1:43123"],
             ),
+            patch.object(
+                chatgpt_worker.chatgpt_browser_service,
+                "keep_attached_browser_hidden",
+            ),
             patch.object(chatgpt_worker.time, "sleep") as sleep,
         ):
-            chatgpt_worker.launch_chatgpt_context(
+            lease = chatgpt_worker.launch_chatgpt_context(
                 browser_type,
                 "profile",
                 wait_timeout=10,
@@ -51,30 +77,34 @@ class ChatGPTBrowserServiceWorkerTests(unittest.TestCase):
 
         sleep.assert_called_once_with(1)
         browser_type.connect_over_cdp.assert_called_once()
+        lease.close()
 
-    def test_worker_never_starts_a_missing_browser_service(self):
+    def test_worker_releases_lazy_lease_when_endpoint_is_missing(self):
         browser_type = Mock()
+        usage_lease = Mock()
 
         with (
+            patch.object(
+                chatgpt_worker.chatgpt_browser_service,
+                "acquire_browser_service",
+                return_value=usage_lease,
+            ) as acquire,
             patch.object(
                 chatgpt_worker.chatgpt_browser_service,
                 "get_browser_service_endpoint",
                 return_value="",
             ),
-            patch.object(
-                chatgpt_worker.chatgpt_browser_service,
-                "start_browser_service",
-            ) as start_service,
             self.assertRaisesRegex(
                 ChatGPTAttentionRequiredError,
-                "Khởi động trình duyệt nền",
+                "tự khởi động",
             ),
         ):
             chatgpt_worker.launch_chatgpt_context(
                 browser_type, "profile", wait_timeout=0
             )
 
-        start_service.assert_not_called()
+        acquire.assert_called_once_with()
+        usage_lease.close.assert_called_once_with()
         browser_type.connect_over_cdp.assert_not_called()
 
     def test_worker_rejects_service_without_persistent_context(self):
@@ -82,8 +112,14 @@ class ChatGPTBrowserServiceWorkerTests(unittest.TestCase):
         browser.contexts = []
         browser_type = Mock()
         browser_type.connect_over_cdp.return_value = browser
+        usage_lease = Mock()
 
         with (
+            patch.object(
+                chatgpt_worker.chatgpt_browser_service,
+                "acquire_browser_service",
+                return_value=usage_lease,
+            ),
             patch.object(
                 chatgpt_worker.chatgpt_browser_service,
                 "get_browser_service_endpoint",
@@ -94,16 +130,24 @@ class ChatGPTBrowserServiceWorkerTests(unittest.TestCase):
             chatgpt_worker.launch_chatgpt_context(
                 browser_type, "profile", wait_timeout=0
             )
+        usage_lease.close.assert_called_once_with()
 
     def test_worker_lease_cannot_close_shared_browser(self):
         context = Mock()
         browser = Mock()
-        lease = chatgpt_worker.SharedBrowserContextLease(context, browser)
+        usage_lease = Mock()
+        lease = chatgpt_worker.SharedBrowserContextLease(
+            context,
+            browser,
+            usage_lease,
+        )
 
+        lease.close()
         lease.close()
 
         context.close.assert_not_called()
         browser.close.assert_not_called()
+        usage_lease.close.assert_called_once_with()
 
     def test_windows_hidden_service_uses_one_offscreen_headed_browser(self):
         options = chatgpt_browser_service.get_browser_service_launch_options(

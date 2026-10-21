@@ -1042,56 +1042,86 @@ async def _flow_worker_session(
     from auto_yt.services import google_flow_browser_service
     from auto_yt.services.google_flow_worker import GoogleFlowWorker
 
-    endpoint = google_flow_browser_service.get_browser_service_endpoint()
-    if not endpoint:
-        google_flow_browser_service.start_browser_service()
-        await asyncio.sleep(5)
-        endpoint = google_flow_browser_service.get_browser_service_endpoint()
-    if not endpoint:
-        raise VideoProductionError("Browser Google Flow chưa khởi động được.")
-
-    async with async_playwright() as playwright:
-        browser = await playwright.chromium.connect_over_cdp(endpoint)
-        if not browser.contexts:
-            raise VideoProductionError("Google Flow browser không có context đang hoạt động.")
-        context = browser.contexts[0]
-        page = next(
-            (
-                candidate for candidate in context.pages
-                if "flow.google.com" in str(candidate.url or "").lower()
-                or "labs.google" in str(candidate.url or "").lower()
-            ),
-            None,
+    try:
+        usage_lease = await asyncio.to_thread(
+            google_flow_browser_service.acquire_browser_service
         )
-        if page is None:
-            page = context.pages[0] if context.pages else await context.new_page()
+    except Exception as exc:
+        raise VideoProductionError(
+            f"Browser Google Flow chưa khởi động được: {exc}"
+        ) from exc
 
-        worker = GoogleFlowWorker(page)
-        worker.video_id = video_id
-        project_record = db.get_flow_project(video_id) or {}
-        reset_requested = bool(project_record.get("reset_requested"))
-        mapped_url = str(project_record.get("project_url") or "").strip()
-        if (
-            mapped_url
-            and not force_new_project
-            and not force_new_flow_project
-            and not reset_requested
-            and re.match(r"^https://(?:flow\.google\.com|labs\.google)/project/", mapped_url)
-        ):
+    try:
+        endpoint = google_flow_browser_service.get_browser_service_endpoint()
+        if not endpoint:
+            raise VideoProductionError("Browser Google Flow chưa kết nối được.")
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.connect_over_cdp(endpoint)
+            if not browser.contexts:
+                raise VideoProductionError(
+                    "Google Flow browser không có context đang hoạt động."
+                )
+            context = browser.contexts[0]
             try:
-                await page.goto(mapped_url, wait_until="domcontentloaded", timeout=30000)
+                await google_flow_browser_service.keep_attached_browser_hidden(
+                    browser,
+                    context,
+                )
             except Exception as exc:
                 logger.warning(
-                    "Could not open mapped Flow project for video %s: %s",
-                    video_id,
+                    "Could not hide Google Flow worker window: %s",
                     security_logging.redact_sensitive(exc),
                 )
-        project_url = await worker.ensure_project(
-            f"auto_yt_{video_id}",
-            force_new=bool(force_new_project or force_new_flow_project or reset_requested),
-        )
-        db.upsert_flow_project(video_id, worker._project_id(), str(project_url or page.url or ""))
-        yield worker
+            page = next(
+                (
+                    candidate for candidate in context.pages
+                    if "flow.google.com" in str(candidate.url or "").lower()
+                    or "labs.google" in str(candidate.url or "").lower()
+                ),
+                None,
+            )
+            if page is None:
+                page = context.pages[0] if context.pages else await context.new_page()
+
+            worker = GoogleFlowWorker(page)
+            worker.video_id = video_id
+            project_record = db.get_flow_project(video_id) or {}
+            reset_requested = bool(project_record.get("reset_requested"))
+            mapped_url = str(project_record.get("project_url") or "").strip()
+            if (
+                mapped_url
+                and not force_new_project
+                and not force_new_flow_project
+                and not reset_requested
+                and re.match(r"^https://(?:flow\.google\.com|labs\.google)/project/", mapped_url)
+            ):
+                try:
+                    await page.goto(
+                        mapped_url,
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Could not open mapped Flow project for video %s: %s",
+                        video_id,
+                        security_logging.redact_sensitive(exc),
+                    )
+            project_url = await worker.ensure_project(
+                f"auto_yt_{video_id}",
+                force_new=bool(
+                    force_new_project or force_new_flow_project or reset_requested
+                ),
+            )
+            db.upsert_flow_project(
+                video_id,
+                worker._project_id(),
+                str(project_url or page.url or ""),
+            )
+            yield worker
+    finally:
+        usage_lease.close()
 
 
 def _log_scene_generation(

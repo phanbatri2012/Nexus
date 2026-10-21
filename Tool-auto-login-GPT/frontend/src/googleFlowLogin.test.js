@@ -33,3 +33,13 @@ test('validates API responses and renders failures as errors', async () => {
   assert.doesNotMatch(source, /disabled=\{!isConnected\}/)
   assert.match(styles, /\.result\.error\s*\{[\s\S]*color: #e74c3c/)
 })
+
+
+test('shows Google Flow on-demand and idle shutdown states', async () => {
+  const source = await readFile(new URL('./GoogleFlowLogin.jsx', import.meta.url), 'utf8')
+
+  assert.match(source, /Chờ tác vụ/)
+  assert.match(source, /Chờ tự tắt/)
+  assert.match(source, /tự tắt sau 5 phút rảnh/)
+  assert.match(source, /browserStatus\?\.in_use \|\| browserStatus\?\.generation_active/)
+})

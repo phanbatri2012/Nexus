@@ -170,6 +170,23 @@ export default function GoogleFlowLogin() {
 
   const isConnected = browserStatus?.connected;
   const isAlive = browserStatus?.process_alive;
+  const isInUse = Boolean(browserStatus?.in_use || browserStatus?.generation_active);
+  const isVisible = Boolean(browserStatus?.window_visible);
+  const isIdlePending = Boolean(browserStatus?.idle_shutdown_at);
+  const browserStateLabel = isVisible
+    ? '👁 Đang hiển thị'
+    : isInUse
+      ? '🟢 Đang dùng'
+      : isConnected && isIdlePending
+        ? '🟡 Chờ tự tắt'
+        : isAlive
+          ? '🟡 Đang khởi động'
+          : '⚪ Chờ tác vụ';
+  const browserStateColors = isVisible || isInUse
+    ? { background: '#1a472a', color: '#4ade80' }
+    : isAlive
+      ? { background: '#4a3800', color: '#facc15' }
+      : { background: '#263247', color: '#cbd5e1' };
 
   return (
     <div className="auto-login-container">
@@ -184,10 +201,9 @@ export default function GoogleFlowLogin() {
         <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
           <span style={{
             padding: '4px 12px', borderRadius: '20px', fontSize: '0.85em', fontWeight: 600,
-            background: isConnected ? '#1a472a' : isAlive ? '#4a3800' : '#3a1a1a',
-            color: isConnected ? '#4ade80' : isAlive ? '#facc15' : '#f87171',
+            ...browserStateColors,
           }}>
-            {isConnected ? '🟢 Đang kết nối' : isAlive ? '🟡 Đang khởi động' : '🔴 Chưa chạy'}
+            {browserStateLabel}
           </span>
           {browserStatus?.cdp_url && (
             <span style={{ fontSize: '0.8em', color: '#888' }}>CDP: {browserStatus.cdp_url}</span>
@@ -206,12 +222,22 @@ export default function GoogleFlowLogin() {
               </button>
             )}
             {isAlive && (
-              <button className="btn-secondary" style={{ width: 'auto', padding: '8px 16px' }} onClick={() => handleBrowser('stop')}>
+              <button
+                className="btn-secondary"
+                style={{ width: 'auto', padding: '8px 16px' }}
+                onClick={() => handleBrowser('stop')}
+                disabled={isInUse}
+                title={isInUse ? 'Đang có tác vụ sử dụng trình duyệt' : ''}
+              >
                 ⏹ Dừng
               </button>
             )}
           </div>
         </div>
+        <p className="help-text" style={{ margin: '12px 0 0', fontSize: '0.82em', color: '#888' }}>
+          Trình duyệt tự mở ở chế độ ẩn khi có tác vụ và tự tắt sau 5 phút rảnh.
+          Cửa sổ được hiện thủ công sẽ không tự tắt cho tới khi bạn ẩn lại.
+        </p>
       </div>
 
       {/* Account Credentials */}

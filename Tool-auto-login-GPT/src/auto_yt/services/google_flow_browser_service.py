@@ -1,9 +1,8 @@
-"""Long-lived local Chromium owner for all Google Flow automation workers.
+"""On-demand local Chromium owner for all Google Flow automation workers.
 
-The backend starts this process once. Individual video/comment workers attach
-through a loopback-only CDP endpoint instead of launching another window. A
-worker must never start this service because doing so could steal focus from a
-fullscreen application at an arbitrary time.
+The first worker lease starts this process and later workers attach through a
+loopback-only CDP endpoint. The shared owner remains hidden and stops after a
+bounded idle interval instead of opening a new browser for every operation.
 """
 
 from __future__ import annotations
@@ -26,6 +25,7 @@ from pathlib import Path
 
 from auto_yt.paths import DATA_DIR, PROJECT_ROOT, google_flow_profile_dir
 from auto_yt.services import account_store, google_flow_account
+from auto_yt.services.on_demand_browser import OnDemandBrowserLifecycle
 from auto_yt.services.secret_store import write_private_text
 
 
@@ -38,6 +38,8 @@ SERVICE_START_TIMEOUT_SECONDS = 30.0
 SERVICE_STOP_TIMEOUT_SECONDS = 15.0
 SERVICE_POLL_SECONDS = 0.25
 SERVICE_HEALTH_CHECK_SECONDS = 5.0
+SERVICE_IDLE_TIMEOUT_SECONDS = 300.0
+SERVICE_IDLE_POLL_SECONDS = 5.0
 SERVICE_RESTART_BACKOFF_SECONDS = (1.0, 2.0, 5.0, 10.0, 30.0)
 SERVICE_HOME_URL = "https://labs.google/fx/flow"
 SERVICE_NAVIGATION_TIMEOUT_MS = 60_000
@@ -184,7 +186,7 @@ def get_browser_service_launch_options(
     }
 
 
-def get_browser_service_status() -> dict:
+def _read_browser_service_status() -> dict:
     """Return process and endpoint health without starting Chromium."""
     state = _read_json(SERVICE_STATE_PATH)
     pid = int(state.get("pid") or 0)
@@ -216,6 +218,36 @@ def get_browser_service_status() -> dict:
         "generation_checked_at": str(state.get("generation_checked_at") or ""),
         "message": message,
     }
+
+
+def get_browser_service_status() -> dict:
+    status = _read_browser_service_status()
+    lifecycle = globals().get("_on_demand_lifecycle")
+    if lifecycle is not None:
+        status.update(lifecycle.snapshot())
+        if status.get("connected") and not status.get("window_visible"):
+            if status.get("in_use") or status.get("generation_active"):
+                status["message"] = (
+                    "Trình duyệt Google Flow đang được tác vụ sử dụng ở chế độ ẩn."
+                )
+            elif status.get("idle_shutdown_at"):
+                status["message"] = (
+                    "Trình duyệt Google Flow đang chờ tự tắt sau 5 phút rảnh."
+                )
+        elif not status.get("process_alive") and not _read_last_error():
+            status["message"] = (
+                "Trình duyệt Google Flow đang chờ và sẽ tự mở khi có tác vụ."
+            )
+    else:
+        status.update(
+            {
+                "in_use": False,
+                "active_lease_count": 0,
+                "idle_shutdown_at": "",
+                "idle_timeout_seconds": int(SERVICE_IDLE_TIMEOUT_SECONDS),
+            }
+        )
+    return status
 
 
 def get_browser_service_endpoint() -> str:
@@ -270,34 +302,47 @@ def _spawn_service_process() -> None:
     )
 
 
+def _arm_idle_after_start(status: dict) -> dict:
+    lifecycle = globals().get("_on_demand_lifecycle")
+    if lifecycle is not None and status.get("connected"):
+        lifecycle.service_started()
+        status.update(lifecycle.snapshot())
+    return status
+
+
 def start_browser_service(
     timeout: float = SERVICE_START_TIMEOUT_SECONDS,
 ) -> dict:
-    """Start the browser owner once; never call this from a worker job."""
+    """Start the shared browser owner once for manual or leased use."""
     with _manager_lock:
-        status = get_browser_service_status()
+        status = _read_browser_service_status()
         if status["connected"]:
-            return status
-        if status["process_alive"]:
-            deadline = time.monotonic() + max(0.0, timeout)
+            result = status
         else:
-            SERVICE_STATE_PATH.unlink(missing_ok=True)
-            SERVICE_STOP_PATH.unlink(missing_ok=True)
-            SERVICE_ERROR_PATH.unlink(missing_ok=True)
-            _spawn_service_process()
-            deadline = time.monotonic() + max(0.0, timeout)
+            if status["process_alive"]:
+                deadline = time.monotonic() + max(0.0, timeout)
+            else:
+                SERVICE_STATE_PATH.unlink(missing_ok=True)
+                SERVICE_STOP_PATH.unlink(missing_ok=True)
+                SERVICE_ERROR_PATH.unlink(missing_ok=True)
+                _spawn_service_process()
+                deadline = time.monotonic() + max(0.0, timeout)
 
-        while time.monotonic() < deadline:
-            status = get_browser_service_status()
-            if status["connected"]:
-                return status
-            if not status["process_alive"] and SERVICE_ERROR_PATH.exists():
-                return status
-            time.sleep(SERVICE_POLL_SECONDS)
-        return get_browser_service_status()
+            result = status
+            while time.monotonic() < deadline:
+                status = _read_browser_service_status()
+                result = status
+                if status["connected"]:
+                    break
+                if not status["process_alive"] and SERVICE_ERROR_PATH.exists():
+                    break
+                time.sleep(SERVICE_POLL_SECONDS)
+            else:
+                result = _read_browser_service_status()
+    return _arm_idle_after_start(result)
 
 
-def stop_browser_service(
+def _stop_browser_service_process(
     timeout: float = SERVICE_STOP_TIMEOUT_SECONDS,
 ) -> dict:
     """Ask the owning process to close its context and persist fresh cookies."""
@@ -308,7 +353,7 @@ def stop_browser_service(
         if not _pid_is_alive(pid):
             SERVICE_STATE_PATH.unlink(missing_ok=True)
             SERVICE_STOP_PATH.unlink(missing_ok=True)
-            return get_browser_service_status()
+            return _read_browser_service_status()
 
         _write_json(
             SERVICE_STOP_PATH,
@@ -319,7 +364,22 @@ def stop_browser_service(
             if not _pid_is_alive(pid):
                 break
             time.sleep(SERVICE_POLL_SECONDS)
-        return get_browser_service_status()
+        return _read_browser_service_status()
+
+
+def stop_browser_service(
+    timeout: float = SERVICE_STOP_TIMEOUT_SECONDS,
+    *,
+    force: bool = False,
+) -> dict:
+    lifecycle = globals().get("_on_demand_lifecycle")
+    if force or lifecycle is None:
+        result = _stop_browser_service_process(timeout)
+    else:
+        result = lifecycle.stop_now(lambda: _stop_browser_service_process(timeout))
+    if lifecycle is not None:
+        result.update(lifecycle.snapshot())
+    return result
 
 
 def _visible_window_bounds() -> dict[str, int]:
@@ -342,65 +402,135 @@ def _visible_window_bounds() -> dict[str, int]:
     }
 
 
-def _set_cdp_window_visibility(endpoint: str, visible: bool) -> None:
-    """Move the existing Chromium window; never launch or replace a browser."""
-    from playwright.sync_api import sync_playwright
+def _set_connected_browser_window_visibility(browser, context, visible: bool) -> None:
+    """Move and hide/show an already attached shared Chromium window."""
     from auto_yt.services.win32_window import set_desktop_window_visibility
 
     browser_pids: set[int] = set()
+    page = context.pages[0] if context.pages else context.new_page()
+
+    try:
+        browser_cdp = browser.new_browser_cdp_session()
+        sys_info = browser_cdp.send("SystemInfo.getProcessInfo")
+        for proc in sys_info.get("processInfo", []):
+            proc_id = proc.get("id")
+            if isinstance(proc_id, int) and proc_id > 0:
+                browser_pids.add(proc_id)
+    except Exception:
+        pass
+
+    session = context.new_cdp_session(page)
+    window_id = session.send("Browser.getWindowForTarget")["windowId"]
+    session.send(
+        "Browser.setWindowBounds",
+        {"windowId": window_id, "bounds": {"windowState": "normal"}},
+    )
+    time.sleep(SERVICE_POLL_SECONDS)
+    if visible:
+        session.send(
+            "Browser.setWindowBounds",
+            {"windowId": window_id, "bounds": _visible_window_bounds()},
+        )
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+    else:
+        session.send(
+            "Browser.setWindowBounds",
+            {
+                "windowId": window_id,
+                "bounds": {
+                    "left": -32000,
+                    "top": -32000,
+                    "width": 1280,
+                    "height": 800,
+                },
+            },
+        )
+        session.send(
+            "Browser.setWindowBounds",
+            {"windowId": window_id, "bounds": {"windowState": "minimized"}},
+        )
+
+    if sys.platform == "win32" and browser_pids:
+        set_desktop_window_visibility(browser_pids, visible)
+
+
+def _set_cdp_window_visibility(endpoint: str, visible: bool) -> None:
+    """Move the existing Chromium window; never launch or replace a browser."""
+    from playwright.sync_api import sync_playwright
+
     with sync_playwright() as playwright:
         browser = playwright.chromium.connect_over_cdp(endpoint)
         if not browser.contexts:
             raise RuntimeError("Browser Service chưa có browser context.")
         context = browser.contexts[0]
-        page = context.pages[0] if context.pages else context.new_page()
+        _set_connected_browser_window_visibility(browser, context, visible)
 
+
+async def _set_async_connected_browser_window_visibility(
+    browser,
+    context,
+    visible: bool,
+) -> None:
+    from auto_yt.services.win32_window import set_desktop_window_visibility
+
+    browser_pids: set[int] = set()
+    page = context.pages[0] if context.pages else await context.new_page()
+    try:
+        browser_cdp = await browser.new_browser_cdp_session()
+        sys_info = await browser_cdp.send("SystemInfo.getProcessInfo")
+        for proc in sys_info.get("processInfo", []):
+            proc_id = proc.get("id")
+            if isinstance(proc_id, int) and proc_id > 0:
+                browser_pids.add(proc_id)
+    except Exception:
+        pass
+
+    session = await context.new_cdp_session(page)
+    window_id = (await session.send("Browser.getWindowForTarget"))["windowId"]
+    await session.send(
+        "Browser.setWindowBounds",
+        {"windowId": window_id, "bounds": {"windowState": "normal"}},
+    )
+    if visible:
+        await session.send(
+            "Browser.setWindowBounds",
+            {"windowId": window_id, "bounds": _visible_window_bounds()},
+        )
         try:
-            browser_cdp = browser.new_browser_cdp_session()
-            sys_info = browser_cdp.send("SystemInfo.getProcessInfo")
-            for proc in sys_info.get("processInfo", []):
-                proc_id = proc.get("id")
-                if isinstance(proc_id, int) and proc_id > 0:
-                    browser_pids.add(proc_id)
+            await page.bring_to_front()
         except Exception:
             pass
-
-        session = context.new_cdp_session(page)
-        window_id = session.send("Browser.getWindowForTarget")["windowId"]
-        session.send(
+    else:
+        await session.send(
             "Browser.setWindowBounds",
-            {"windowId": window_id, "bounds": {"windowState": "normal"}},
-        )
-        time.sleep(SERVICE_POLL_SECONDS)
-        if visible:
-            session.send(
-                "Browser.setWindowBounds",
-                {"windowId": window_id, "bounds": _visible_window_bounds()},
-            )
-            try:
-                page.bring_to_front()
-            except Exception:
-                pass
-        else:
-            session.send(
-                "Browser.setWindowBounds",
-                {
-                    "windowId": window_id,
-                    "bounds": {
-                        "left": -32000,
-                        "top": -32000,
-                        "width": 1280,
-                        "height": 800,
-                    },
+            {
+                "windowId": window_id,
+                "bounds": {
+                    "left": -32000,
+                    "top": -32000,
+                    "width": 1280,
+                    "height": 800,
                 },
-            )
-            session.send(
-                "Browser.setWindowBounds",
-                {"windowId": window_id, "bounds": {"windowState": "minimized"}},
-            )
-
+            },
+        )
+        await session.send(
+            "Browser.setWindowBounds",
+            {"windowId": window_id, "bounds": {"windowState": "minimized"}},
+        )
     if sys.platform == "win32" and browser_pids:
         set_desktop_window_visibility(browser_pids, visible)
+
+
+async def keep_attached_browser_hidden(browser, context) -> None:
+    """Hide a worker-attached window unless the user explicitly showed it."""
+    if bool(_read_json(SERVICE_STATE_PATH).get("window_visible", False)):
+        return
+    await _set_async_connected_browser_window_visibility(browser, context, False)
+    if bool(_read_json(SERVICE_STATE_PATH).get("window_visible", False)):
+        await _set_async_connected_browser_window_visibility(browser, context, True)
 
 
 def set_browser_service_window_visibility(visible: bool) -> dict:
@@ -413,7 +543,7 @@ def set_browser_service_window_visibility(visible: bool) -> dict:
                 return status
 
     with _manager_lock:
-        status = get_browser_service_status()
+        status = _read_browser_service_status()
         if not status.get("connected"):
             return status
         state = _read_json(SERVICE_STATE_PATH)
@@ -422,7 +552,12 @@ def set_browser_service_window_visibility(visible: bool) -> dict:
         state["window_visible"] = bool(visible)
         state["window_visibility_changed_at"] = _utc_now()
         _write_json(SERVICE_STATE_PATH, state)
-        return get_browser_service_status()
+        result = _read_browser_service_status()
+    lifecycle = globals().get("_on_demand_lifecycle")
+    if lifecycle is not None:
+        lifecycle.visibility_changed(bool(visible))
+        result = get_browser_service_status()
+    return result
 
 
 def _restore_saved_google_flow_session(context) -> bool:
@@ -691,6 +826,27 @@ def run_browser_service_with_recovery() -> int:
         )
         if not _wait_before_service_restart(delay, attempt):
             return 0
+
+
+_on_demand_lifecycle = OnDemandBrowserLifecycle(
+    name="Google Flow",
+    start_service=start_browser_service,
+    stop_service=_stop_browser_service_process,
+    status_provider=_read_browser_service_status,
+    external_busy=lambda status: bool(status.get("generation_active")),
+    idle_timeout_seconds=SERVICE_IDLE_TIMEOUT_SECONDS,
+    idle_poll_seconds=SERVICE_IDLE_POLL_SECONDS,
+)
+
+
+def acquire_browser_service():
+    """Acquire one worker lease and lazily start the shared browser."""
+    return _on_demand_lifecycle.acquire()
+
+
+def arm_browser_service_idle_watchdog() -> None:
+    """Adopt a pre-existing hidden owner without starting a new process."""
+    _on_demand_lifecycle.arm_existing_service()
 
 
 def main() -> int:

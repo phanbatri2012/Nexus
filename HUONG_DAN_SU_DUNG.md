@@ -34,8 +34,8 @@ flowchart LR
 | **Backend API** | `http://127.0.0.1:8080` | Bộ não xử lý dữ liệu SQLite, điều phối tiến trình và render video. |
 | **Frontend UI** | `http://localhost:5173` | Giao diện điều khiển Dark Mode trực quan cho người dùng. |
 | **OmniVoice TTS** | `http://127.0.0.1:8011` | Máy chủ sinh giọng đọc tiếng Việt AI, hỗ trợ nhân bản giọng (Voice Cloning) và hội thoại nhiều vai. |
-| **ChatGPT Service** | Profile `PROFILE_GPT_1` | Trình duyệt điều khiển tự động tạo kịch bản, dàn ý, metadata và câu hỏi tương tác. |
-| **Google Flow** | Profile `PROFILE_GOOGLE_FLOW_1` | Trình duyệt tự động sinh ảnh phân cảnh chất lượng cao. |
+| **ChatGPT Service** | Profile `PROFILE_GPT_1` | Tự mở ẩn khi có job tạo kịch bản/metadata và tự tắt sau 5 phút rảnh. |
+| **Google Flow** | Profile `PROFILE_GOOGLE_FLOW_1` | Tự mở ẩn khi cần sinh media và tự tắt sau 5 phút thực sự rảnh. |
 
 ---
 

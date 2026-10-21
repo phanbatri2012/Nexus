@@ -60,6 +60,9 @@ test('AutoLogin manages ChatGPT browser service while Settings focuses on prompt
   assert.match(autoLoginSource, /Hiện trình duyệt/);
   assert.match(autoLoginSource, /Ẩn trình duyệt/);
   assert.match(autoLoginSource, /window_visible/);
+  assert.match(autoLoginSource, /Chờ tác vụ/);
+  assert.match(autoLoginSource, /Chờ tự tắt/);
+  assert.match(autoLoginSource, /tự tắt sau 5 phút rảnh/);
   assert.match(settingsSource, /Prompt Management/);
   assert.doesNotMatch(settingsSource, /\/api\/browser-automation/);
 });

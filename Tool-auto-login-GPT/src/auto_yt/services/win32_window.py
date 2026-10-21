@@ -155,7 +155,7 @@ def set_desktop_window_visibility(
     browser_pids: Collection[int],
     visible: bool,
 ) -> bool:
-    """Find top-level Chromium windows for the given process IDs and restore or minimize."""
+    """Find top-level Chromium windows for the given process IDs and show or hide."""
     if sys.platform != "win32" or not browser_pids:
         return False
 
@@ -202,8 +202,8 @@ def set_desktop_window_visibility(
                 user32.BringWindowToTop(hwnd)
                 user32.SetForegroundWindow(hwnd)
             else:
-                SW_MINIMIZE = 6
-                user32.ShowWindow(hwnd, SW_MINIMIZE)
+                SW_HIDE = 0
+                user32.ShowWindow(hwnd, SW_HIDE)
 
         return len(matching_hwnds) > 0
     except Exception as exc:

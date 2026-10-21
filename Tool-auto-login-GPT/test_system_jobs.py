@@ -100,12 +100,20 @@ class SystemJobTests(unittest.TestCase):
                 main.chatgpt_browser_service,
                 "start_browser_service",
                 return_value={"connected": True},
-            ),
+            ) as start_chatgpt,
             patch.object(
                 main.google_flow_browser_service,
                 "start_browser_service",
                 return_value={"connected": True},
-            ),
+            ) as start_flow,
+            patch.object(
+                main.chatgpt_browser_service,
+                "arm_browser_service_idle_watchdog",
+            ) as arm_chatgpt,
+            patch.object(
+                main.google_flow_browser_service,
+                "arm_browser_service_idle_watchdog",
+            ) as arm_flow,
             patch.object(database, "get_active_audio_tasks", return_value=[]),
             patch.object(database, "recover_interrupted_system_jobs"),
             patch.object(main, "_reconcile_active_comment_draft_job_duplicates"),
@@ -123,6 +131,10 @@ class SystemJobTests(unittest.TestCase):
 
         kick_comment.assert_not_called()
         enqueue_comment_syncs.assert_not_called()
+        start_chatgpt.assert_not_called()
+        start_flow.assert_not_called()
+        arm_chatgpt.assert_called_once_with()
+        arm_flow.assert_called_once_with()
         thread_names = {
             call.kwargs.get("name")
             for call in thread_class.call_args_list
@@ -603,7 +615,10 @@ class SystemJobTests(unittest.TestCase):
         with (
             patch("auto_yt.services.account_store.load_account", return_value=fake_account),
             patch("auto_yt.services.account_store.save_account") as mock_save,
-            patch("auto_yt.services.chatgpt_browser_service.stop_browser_service") as mock_stop,
+            patch(
+                "auto_yt.services.chatgpt_browser_service.stop_browser_service",
+                return_value={"process_alive": False},
+            ) as mock_stop,
             patch("auto_yt.services.chatgpt_browser_service.start_browser_service") as mock_start,
             patch("playwright.async_api.async_playwright", return_value=mock_playwright_cm),
             patch("auto_yt.services.chatgpt_login.login_gpt_auto", return_value=fake_result) as mock_login,
@@ -612,7 +627,7 @@ class SystemJobTests(unittest.TestCase):
 
         self.assertTrue(res.get("success"))
         mock_stop.assert_called_once()
-        mock_start.assert_called_once()
+        mock_start.assert_not_called()
         mock_login.assert_called_once_with(fake_account, mock_page)
         mock_save.assert_called_once()
         self.assertEqual(mock_save.call_args[0][0]["session_cookie"], fake_result["cookies"])

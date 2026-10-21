@@ -151,10 +151,14 @@ class ChatGPTBrowserServiceManagerTests(unittest.TestCase):
             ),
             patch.object(
                 chatgpt_browser_service,
-                "get_browser_service_status",
+                "_read_browser_service_status",
                 side_effect=[stopped, connected],
             ),
             patch.object(chatgpt_browser_service, "_spawn_service_process") as spawn,
+            patch.object(
+                chatgpt_browser_service._on_demand_lifecycle,
+                "service_started",
+            ),
         ):
             result = chatgpt_browser_service.start_browser_service(timeout=1)
 
@@ -210,11 +214,13 @@ class ChatGPTBrowserServiceManagerTests(unittest.TestCase):
                 ),
                 patch.object(
                     chatgpt_browser_service,
-                    "get_browser_service_status",
+                    "_read_browser_service_status",
                     return_value=stopped,
                 ),
             ):
-                result = chatgpt_browser_service.stop_browser_service(timeout=1)
+                result = chatgpt_browser_service._stop_browser_service_process(
+                    timeout=1
+                )
 
             self.assertFalse(result["connected"])
             self.assertIn('"instance_id": "owner-a"', stop_path.read_text())
