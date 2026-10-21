@@ -25,6 +25,23 @@ DOUBLE_CLICK_ENTRYPOINTS = (
         RESTART_SCRIPT,
     ),
 )
+NEXUS_DOUBLE_CLICK_ENTRYPOINTS = (
+    (
+        ROOT_DIR / "run_nexus.bat",
+        Path(__file__).with_name("run_nexus.bat"),
+        STARTUP_SCRIPT,
+    ),
+    (
+        ROOT_DIR / "run_nexus_stop.bat",
+        Path(__file__).with_name("run_nexus_stop.bat"),
+        STOP_SCRIPT,
+    ),
+    (
+        ROOT_DIR / "run_nexus_restart.bat",
+        Path(__file__).with_name("run_nexus_restart.bat"),
+        RESTART_SCRIPT,
+    ),
+)
 MAIN_MODULE = Path(__file__).parent / "src" / "auto_yt" / "main.py"
 OMNIVOICE_CLIENT = (
     Path(__file__).parent / "src" / "auto_yt" / "services" / "omnivoice_client.py"
@@ -65,7 +82,7 @@ class StartupLifecycleTests(unittest.TestCase):
 
     def test_double_click_entrypoints_reach_an_elevating_lifecycle_script(self):
         for root_wrapper_path, canonical_wrapper_path, lifecycle_script_path in (
-            DOUBLE_CLICK_ENTRYPOINTS
+            DOUBLE_CLICK_ENTRYPOINTS + NEXUS_DOUBLE_CLICK_ENTRYPOINTS
         ):
             root_wrapper = root_wrapper_path.read_text(encoding="utf-8")
             canonical_wrapper = canonical_wrapper_path.read_text(encoding="utf-8")

@@ -6,7 +6,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from auto_yt.app import main
+try:
+    from nexus_engine.app import main
+except ImportError:
+    from auto_yt.app import main
 
 if __name__ == "__main__":
     main()

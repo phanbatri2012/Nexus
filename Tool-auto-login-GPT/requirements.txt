@@ -6,6 +6,8 @@ truststore>=0.10
 
 fastapi
 uvicorn
+requests>=2.31,<3
+websocket-client>=1.8,<2
 python-multipart>=0.0.9
 youtube_transcript_api
 yt-dlp>=2025.1.15

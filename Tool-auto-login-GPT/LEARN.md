@@ -1,8 +1,8 @@
-# Auto_YT Engineering Learnings
+# Nexus Studio Engine Engineering Learnings
 
 ## Persistent channel browser rule
 
-Browser profiles used for channel operations are persistent. This applies to GPM-Login and local Chromium browsers such as Cốc Cốc, Chrome, Edge, and Brave when Auto_YT scans channels, opens creator tools, posts comments, uploads media, or changes publication state.
+Browser profiles used for channel operations are persistent. This applies to GPM-Login and local Chromium browsers such as Cốc Cốc, Chrome, Edge, and Brave when Nexus Studio Engine scans channels, opens creator tools, posts comments, uploads media, or changes publication state.
 
 - If the selected browser/profile is closed, start it once with CDP and keep it running after the operation.
 - If it is already running with CDP, reconnect to the same process and create a new task-owned tab.
@@ -10,7 +10,7 @@ Browser profiles used for channel operations are persistent. This applies to GPM
 - On successful completion, close only the task-owned tab. If it is the final tab, navigate it to `about:blank` so Chromium stays alive.
 - Preserve a failed write-operation tab for diagnostics or manual reconciliation.
 - Never call GPM stop, kill a browser process, or force-restart a profile as automatic CDP recovery.
-- If a browser is running without CDP, fail closed for automated operations and tell the user to reopen it manually through Auto_YT when idle.
+- If a browser is running without CDP, fail closed for automated operations and tell the user to reopen it manually through Nexus Studio Engine when idle.
 - If CDP disappears during a write operation, do not reopen and repeat the action. Use checkpoint/reconciliation to avoid duplicate comments, uploads, or posts.
 - Serialize automated operations per profile. A user-requested Stop must return a busy response while the profile has an active or queued browser operation.
 - Manual Open actions always create a new tab and leave it available to the user.
@@ -20,7 +20,7 @@ Browser profiles used for channel operations are persistent. This applies to GPM
 
 Treat browser process existence and automation readiness as separate states:
 
-- `closed`: the exact assigned profile is not running; Auto_YT may start it once with CDP.
+- `closed`: the exact assigned profile is not running; Nexus Studio Engine may start it once with CDP.
 - `running_cdp_ready`: reconnect and open only a new task-owned tab.
 - `running_without_cdp`: preserve the process, pause the job as `waiting_for_browser`, and require the user to close it manually when idle.
 - `cdp_temporarily_unreachable`: preserve the process and use bounded transient retry; never assume the profile is closed.
@@ -31,7 +31,7 @@ A paused `waiting_for_browser` job may resume automatically only while its workf
 
 Facebook browser crossposts follow the same durable-state rule. A missing or unreachable CDP at `CP3_CDP_READY` must keep both the queue item and its system job paused, and may auto-resume only when there is no Meta post ID or upload session/video ID. Checkpoints after CP3 require manual review because a remote write may already have occurred. Retry and resume actions must return the existing system job to the production queue; they must not launch a second worker thread for the same job.
 
-ChatGPT Browser Service and Google Flow Browser Service are service-owned browsers and retain their dedicated lifecycle managed by the unified Auto_YT start/stop/restart scripts. The persistent channel-browser rule must not weaken their shutdown cleanup.
+ChatGPT Browser Service and Google Flow Browser Service are service-owned browsers and retain their dedicated lifecycle managed by the unified Nexus Studio Engine start/stop/restart scripts. The persistent channel-browser rule must not weaken their shutdown cleanup.
 
 ### Required regression checks
 

@@ -1,0 +1,30 @@
+QUY TRÌNH RESTART NEXUS STUDIO ENGINE AN TOÀN SAU KHI SỬA CODE
+================================================================
+
+Phạm vi dự án:
+
+E:\yt\Tool\Nexus_Studio_Engine
+
+Sau khi sửa code, phải áp dụng đúng quy trình dưới đây. Không được restart ngay nếu chưa xác nhận hệ thống đang idle.
+
+
+1. QUY TẮC BẮT BUỘC
+--------------------
+
+1. Không làm gián đoạn job đang render, tạo scene, tạo audio, upload hoặc publish.
+2. Không tự thay đổi trạng thái job trong SQLite để vượt qua kiểm tra idle.
+3. Không dùng taskkill hàng loạt đối với python.exe, node.exe hoặc chrome.exe.
+4. Không đóng Chrome cá nhân của người dùng.
+5. Chỉ dùng entrypoint:
+
+   E:\yt\Tool\Nexus_Studio_Engine\run_nexus_restart.bat
+
+6. Không gọi riêng stop và start nếu wrapper restart vẫn sử dụng được.
+7. Không kết luận thành công chỉ dựa vào exit code hoặc dòng chữ "restarted successfully".
+8. Phải xác minh đủ năm thành phần:
+
+   - Backend API.
+   - Frontend UI.
+   - OmniVoice TTS.
+   - ChatGPT Browser Service.
+   - Google Flow Browser Service.

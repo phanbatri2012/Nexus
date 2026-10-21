@@ -7,7 +7,7 @@ export default function UserGuideModal({ isOpen, onClose }) {
   if (!isOpen) return null
 
   return (
-    <div className="guide-modal-overlay" onClick={onClose} role="dialog" aria-modal="true" aria-label="Hướng dẫn sử dụng Auto_YT">
+    <div className="guide-modal-overlay" onClick={onClose} role="dialog" aria-modal="true" aria-label="Hướng dẫn sử dụng Nexus Studio Engine">
       <div className="guide-modal-container" onClick={(e) => e.stopPropagation()}>
         <div className="guide-modal-header">
           <div className="guide-modal-title">
@@ -60,7 +60,7 @@ export default function UserGuideModal({ isOpen, onClose }) {
                 <div className="guide-step-card">
                   <div className="guide-step-badge">Bước 1</div>
                   <h5>Khởi động hệ thống</h5>
-                  <p>Nhấp đúp file <code>run_autoyt.bat</code> tại thư mục gốc để khởi chạy đủ 5 dịch vụ ngầm (Backend, Frontend, OmniVoice, ChatGPT, Google Flow).</p>
+                  <p>Nhấp đúp file <code>run_nexus.bat</code> (hoặc <code>run_autoyt.bat</code>) tại thư mục gốc để khởi chạy đủ 5 dịch vụ ngầm (Backend, Frontend, OmniVoice, ChatGPT, Google Flow).</p>
                 </div>
                 <div className="guide-step-card">
                   <div className="guide-step-badge">Bước 2</div>
@@ -169,7 +169,7 @@ export default function UserGuideModal({ isOpen, onClose }) {
                 </div>
                 <div className="guide-faq-item">
                   <div className="guide-faq-q">❓ Cần khởi động lại Tool khi đang có video render</div>
-                  <div className="guide-faq-a">👉 Mở <b>Trung tâm Job</b> kiểm tra không còn job nào chạy (`Idle`). Sau đó mới chạy <code>run_autoyt_restart.bat</code>.</div>
+                  <div className="guide-faq-a">👉 Mở <b>Trung tâm Job</b> kiểm tra không còn job nào chạy (`Idle`). Sau đó mới chạy <code>run_nexus_restart.bat</code> (hoặc <code>run_autoyt_restart.bat</code>).</div>
                 </div>
                 <div className="guide-faq-item">
                   <div className="guide-faq-q">❓ Kênh YouTube bị lỗi tải video (Upload error)</div>

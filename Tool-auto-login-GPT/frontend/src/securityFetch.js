@@ -4,7 +4,8 @@ const API_ORIGINS = new Set([
   'http://localhost:8080',
 ])
 const SESSION_ENDPOINT = `${API_BASE_URL}/api/security/session`
-const CSRF_HEADER = 'X-AutoYT-CSRF'
+const CSRF_HEADER = 'X-Nexus-CSRF'
+const LEGACY_CSRF_HEADER = 'X-AutoYT-CSRF'
 
 let csrfToken = ''
 let sessionPromise = null
@@ -55,6 +56,7 @@ function buildProtectedRequest(input, init) {
 
   if (csrfToken) {
     headers.set(CSRF_HEADER, csrfToken)
+    headers.set(LEGACY_CSRF_HEADER, csrfToken)
   }
 
   if (input instanceof Request) {

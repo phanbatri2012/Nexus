@@ -7,7 +7,7 @@ set "AUTOYT_EXIT_CODE=%ERRORLEVEL%"
 
 if not "%AUTOYT_EXIT_CODE%"=="0" (
     echo.
-    echo Auto_YT failed to start. Review the error above and data\logs.
+    echo Nexus Studio Engine failed to start. Review the error above and data\logs.
     if not defined AUTOYT_NO_PAUSE pause
 )
 

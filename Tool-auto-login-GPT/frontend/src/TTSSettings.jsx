@@ -3,7 +3,8 @@ import './TTSSettings.css'
 
 const API = 'http://127.0.0.1:8080/api/tts'
 const OMNIVOICE_PREVIEW_MAX_CHARACTERS = 200
-const OMNIVOICE_PREVIEW_STORAGE_KEY = 'autoyt_omnivoice_preview_id'
+const OMNIVOICE_PREVIEW_STORAGE_KEY = 'nexus_omnivoice_preview_id'
+const LEGACY_OMNIVOICE_PREVIEW_STORAGE_KEY = 'autoyt_omnivoice_preview_id'
 const ACTIVE_PREVIEW_STATUSES = new Set(['queued', 'processing'])
 
 async function api(path, options = {}) {
@@ -106,6 +107,7 @@ export default function TTSSettings() {
     } catch (err) {
       if (err.status === 404) {
         localStorage.removeItem(OMNIVOICE_PREVIEW_STORAGE_KEY)
+        localStorage.removeItem(LEGACY_OMNIVOICE_PREVIEW_STORAGE_KEY)
         setPreview(null)
         return null
       }
@@ -115,7 +117,7 @@ export default function TTSSettings() {
   }, [])
 
   useEffect(() => {
-    const previewId = localStorage.getItem(OMNIVOICE_PREVIEW_STORAGE_KEY)
+    const previewId = localStorage.getItem(OMNIVOICE_PREVIEW_STORAGE_KEY) || localStorage.getItem(LEGACY_OMNIVOICE_PREVIEW_STORAGE_KEY)
     if (previewId) refreshPreview(previewId)
   }, [refreshPreview])
 
@@ -282,6 +284,7 @@ export default function TTSSettings() {
         body: JSON.stringify({ voice_id: previewVoiceId, text }),
       })
       localStorage.setItem(OMNIVOICE_PREVIEW_STORAGE_KEY, result.id)
+      localStorage.setItem(LEGACY_OMNIVOICE_PREVIEW_STORAGE_KEY, result.id)
       setPreview(result)
       setPreviewText(result.text)
       setNotice('Đã đưa bản nghe thử vào hàng đợi OmniVoice.')

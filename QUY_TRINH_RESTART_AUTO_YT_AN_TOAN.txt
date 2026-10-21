@@ -1,9 +1,9 @@
-QUY TRÌNH RESTART AUTO_YT AN TOÀN SAU KHI SỬA CODE
-==================================================
+QUY TRÌNH RESTART NEXUS STUDIO ENGINE AN TOÀN SAU KHI SỬA CODE
+================================================================
 
 Phạm vi dự án:
 
-E:\yt\Tool\Auto_YT
+E:\yt\Tool\Nexus_Studio_Engine
 
 Sau khi sửa code, phải áp dụng đúng quy trình dưới đây. Không được restart ngay nếu chưa xác nhận hệ thống đang idle.
 
@@ -17,7 +17,7 @@ Sau khi sửa code, phải áp dụng đúng quy trình dưới đây. Không đ
 4. Không đóng Chrome cá nhân của người dùng.
 5. Chỉ dùng entrypoint:
 
-   E:\yt\Tool\Auto_YT\run_autoyt_restart.bat
+   E:\yt\Tool\Nexus_Studio_Engine\run_nexus_restart.bat
 
 6. Không gọi riêng stop và start nếu wrapper restart vẫn sử dụng được.
 7. Không kết luận thành công chỉ dựa vào exit code hoặc dòng chữ "restarted successfully".
@@ -46,7 +46,7 @@ Trước khi restart:
 
 Mở PowerShell tại thư mục dự án:
 
-Set-Location 'E:\yt\Tool\Auto_YT'
+Set-Location 'E:\yt\Tool\Nexus_Studio_Engine'
 
 Nếu backend đang chạy, kiểm tra bằng endpoint:
 
@@ -69,7 +69,7 @@ total_blocking_jobs = 0
 
 Nếu backend không phản hồi, chạy maintenance guard trực tiếp:
 
-Set-Location 'E:\yt\Tool\Auto_YT\Tool-auto-login-GPT'
+Set-Location 'E:\yt\Tool\Nexus_Studio_Engine\Tool-auto-login-GPT'
 
 $previousProjectPythonPath = $env:PYTHONPATH
 
@@ -153,7 +153,7 @@ Không kill các process này bằng tay. Thông tin trên chỉ dùng để đ�
 
 Chỉ sau khi maintenance status xác nhận idle:
 
-Set-Location 'E:\yt\Tool\Auto_YT'
+Set-Location 'E:\yt\Tool\Nexus_Studio_Engine'
 
 & '.\run_autoyt_restart.bat'
 $restartExitCode = $LASTEXITCODE
@@ -180,12 +180,12 @@ Nếu $restartExitCode khác 0, không chạy lại restart ngay lập tức.
 Đọc log:
 
 Get-Content `
-    'E:\yt\Tool\Auto_YT\Tool-auto-login-GPT\data\logs\backend.current.stderr.log' `
+    'E:\yt\Tool\Nexus_Studio_Engine\Tool-auto-login-GPT\data\logs\backend.current.stderr.log' `
     -Tail 100 `
     -ErrorAction SilentlyContinue
 
 Get-Content `
-    'E:\yt\Tool\Auto_YT\Tool-auto-login-GPT\data\logs\frontend.current.stderr.log' `
+    'E:\yt\Tool\Nexus_Studio_Engine\Tool-auto-login-GPT\data\logs\frontend.current.stderr.log' `
     -Tail 100 `
     -ErrorAction SilentlyContinue
 
@@ -223,7 +223,7 @@ $frontendResponse = Invoke-WebRequest `
 
 $frontendResponse.StatusCode
 
-Kết quả phải là 200, và nội dung phải là trang Auto_YT/Vite hợp lệ.
+Kết quả phải là 200, và nội dung phải là trang Nexus Studio Engine/Vite hợp lệ.
 
 
 10. XÁC MINH OMNIVOICE
@@ -254,7 +254,7 @@ HTTP 200 là ready. HTTP 401 cũng chứng minh server đang phản hồi, nhưn
 ------------------------------------
 
 $chatgptStatePath = `
-    'E:\yt\Tool\Auto_YT\Tool-auto-login-GPT\data\chatgpt_browser_service.json'
+    'E:\yt\Tool\Nexus_Studio_Engine\Tool-auto-login-GPT\data\chatgpt_browser_service.json'
 
 $chatgptState = Get-Content $chatgptStatePath -Raw | ConvertFrom-Json
 $chatgptState | ConvertTo-Json -Depth 10
@@ -280,7 +280,7 @@ Kết quả phải là True.
 ----------------------------------------
 
 $flowStatePath = `
-    'E:\yt\Tool\Auto_YT\Tool-auto-login-GPT\data\google_flow_browser_service.json'
+    'E:\yt\Tool\Nexus_Studio_Engine\Tool-auto-login-GPT\data\google_flow_browser_service.json'
 
 $flowState = Get-Content $flowStatePath -Raw | ConvertFrom-Json
 $flowState | ConvertTo-Json -Depth 10

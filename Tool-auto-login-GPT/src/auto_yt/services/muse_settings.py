@@ -1,4 +1,4 @@
-"""Global configuration for the on-demand Muse browser integration."""
+"""Global configuration for the on-demand Muse AI Studio integration."""
 
 from __future__ import annotations
 
@@ -10,10 +10,10 @@ from auto_yt.paths import MUSE_SETTINGS_PATH
 from auto_yt.services.secret_store import write_private_text
 
 
+DEFAULT_MUSE_STUDIO_PATH = r"E:\yt\Tool\Muse_AI_Studio"
 DEFAULT_MUSE_SETTINGS = {
-    "gpm_profile_id": "",
+    "muse_studio_path": DEFAULT_MUSE_STUDIO_PATH,
 }
-MUSE_GPM_PROFILE_STORAGE_KEY = "muse_gpm_profile_id"
 
 logger = logging.getLogger(__name__)
 _settings_lock = threading.RLock()
@@ -22,11 +22,9 @@ _settings_lock = threading.RLock()
 def normalize_muse_settings(value: object) -> dict:
     settings = value if isinstance(value, dict) else {}
     return {
-        "gpm_profile_id": str(
-            settings.get(MUSE_GPM_PROFILE_STORAGE_KEY)
-            or settings.get("gpm_profile_id")
-            or ""
-        ).strip()[:120],
+        "muse_studio_path": str(
+            settings.get("muse_studio_path") or DEFAULT_MUSE_STUDIO_PATH
+        ).strip()[:1024],
     }
 
 
@@ -44,12 +42,9 @@ def load_muse_settings() -> dict:
 
 def save_muse_settings(value: object) -> dict:
     normalized = normalize_muse_settings(value)
-    storage_value = {
-        MUSE_GPM_PROFILE_STORAGE_KEY: normalized["gpm_profile_id"],
-    }
     with _settings_lock:
         write_private_text(
             MUSE_SETTINGS_PATH,
-            json.dumps(storage_value, ensure_ascii=False, indent=2) + "\n",
+            json.dumps(normalized, ensure_ascii=False, indent=2) + "\n",
         )
     return normalized

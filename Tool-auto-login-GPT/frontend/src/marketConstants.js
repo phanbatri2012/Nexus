@@ -1,4 +1,4 @@
-// marketConstants.js - Global Target Markets Registry for Auto_YT
+// marketConstants.js - Global Target Markets Registry for Nexus Studio Engine
 // Single source of truth for channel timezone, regional golden hours, and Trust Builder behavior.
 
 export const DEFAULT_MARKET_TIMEZONE = 'Asia/Ho_Chi_Minh'

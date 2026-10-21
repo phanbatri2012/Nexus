@@ -21,11 +21,11 @@ function Invoke-AutoYTElevatedScript {
         "-ExecutionPolicy",
         "Bypass",
         "-File",
-        ('"' + $resolvedScript + '"')
+        $resolvedScript
     ) + $Arguments
 
     try {
-        Write-Host "[Auto_YT] Requesting Administrator permission..." -ForegroundColor Yellow
+        Write-Host "[Nexus Studio Engine] Requesting Administrator permission..." -ForegroundColor Yellow
         $process = Start-Process `
             -FilePath $powershellPath `
             -ArgumentList $processArguments `
@@ -35,7 +35,7 @@ function Invoke-AutoYTElevatedScript {
         return [int]$process.ExitCode
     }
     catch {
-        Write-Host "Auto_YT could not obtain Administrator permission: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "Nexus Studio Engine could not obtain Administrator permission: $($_.Exception.Message)" -ForegroundColor Red
         return 1223
     }
 }

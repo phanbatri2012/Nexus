@@ -230,17 +230,27 @@ def list_fb_crossposter_blockers() -> list[dict[str, Any]]:
 
 
 def list_gpm_restart_blockers() -> list[dict[str, Any]]:
+    import datetime
     from auto_yt.services import drain_mode
     now = db.utc_now()
     drain_active = drain_mode.is_drain_mode_active()
-    allowed_statuses = {"running", "processing"} if drain_active else {"queued", "running", "processing", "retry_wait"}
+    allowed_statuses = {"running", "processing"} if drain_active else {"queued", "running", "processing"}
     blockers = []
     for job in db.list_system_jobs(limit=500, job_type="comment_publish"):
         status = str(job.get("status") or "").strip().lower()
         if status not in allowed_statuses:
             continue
+        # Staleness check: if a task hasn't been updated in 15 minutes, it is not an active task
+        updated_at = str(job.get("updated_at") or "").strip()
+        if updated_at:
+            try:
+                dt = datetime.datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                if (datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds() > 900:
+                    continue
+            except Exception:
+                pass
         next_retry_at = str(job.get("next_retry_at") or "").strip()
-        if status == "retry_wait" and next_retry_at and next_retry_at > now:
+        if status == "retry_wait":
             continue
         channel_id = int((job.get("payload") or {}).get("channel_id") or 0)
         channel = db.get_youtube_channel(channel_id) if channel_id else None

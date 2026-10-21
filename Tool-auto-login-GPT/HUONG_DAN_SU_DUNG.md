@@ -17,7 +17,7 @@
 
 ## 1. TỔNG QUAN HỆ THỐNG
 
-**Auto_YT** (Nexus Studio Engine) là nền tảng tự động hóa toàn diện quy trình sản xuất nội dung YouTube từ khâu lấy ý tưởng, viết kịch bản, tạo giọng đọc lồng tiếng, tạo hình ảnh phân cảnh, ghép video hoàn chỉnh cho đến xuất bản và lên lịch phát hành.
+**Nexus Studio Engine** là nền tảng tự động hóa toàn diện quy trình sản xuất nội dung YouTube từ khâu lấy ý tưởng, viết kịch bản, tạo giọng đọc lồng tiếng, tạo hình ảnh phân cảnh, ghép video hoàn chỉnh cho đến xuất bản và lên lịch phát hành.
 
 ```mermaid
 flowchart LR
@@ -43,7 +43,7 @@ flowchart LR
 
 ### Bước 1: Khởi động hệ sinh thái
 Nhấp đúp vào file thực thi tại thư mục gốc:
-👉 **`run_autoyt.bat`** (hoặc `run_autoyt_restart.bat` nếu muốn khởi động lại mới toàn bộ).
+👉 **`run_nexus.bat`** (hoặc `run_nexus_restart.bat` nếu muốn khởi động lại mới toàn bộ. Hệ thống vẫn hỗ trợ song song các file cũ `run_autoyt*.bat`).
 
 Chờ terminal kiểm tra 5 dịch vụ và tự động mở trình duyệt tại: `http://localhost:5173`.
 
@@ -192,9 +192,9 @@ sequenceDiagram
 2. Hoặc kiểm tra qua API: `http://127.0.0.1:8080/api/system/maintenance-status` (yêu cầu `safe_to_restart: true`).
 
 ### Các lệnh điều khiển hệ thống:
-- **Khởi động**: Chạy file `run_autoyt.bat`
-- **Khởi động lại sạch**: Chạy file `run_autoyt_restart.bat`
-- **Tắt toàn bộ hệ thống**: Chạy file `run_autoyt_stop.bat`
+- **Khởi động**: Chạy file `run_nexus.bat` (hoặc `run_autoyt.bat`)
+- **Khởi động lại sạch**: Chạy file `run_nexus_restart.bat` (hoặc `run_autoyt_restart.bat`)
+- **Tắt toàn bộ hệ thống**: Chạy file `run_nexus_stop.bat` (hoặc `run_autoyt_stop.bat`)
 
 ---
 
@@ -206,7 +206,7 @@ sequenceDiagram
 | **Video bị dừng ở `waiting_for_image_service`** | Google Flow chưa đăng nhập hoặc profile bị ngắt kết nối. | Vào tab **Google Flow** → Kiểm tra trạng thái đăng nhập tài khoản Google. |
 | **Âm thanh đọc bị lỗi dính chữ hoặc sai ngữ điệu** | Văn bản có ký tự lạ hoặc câu văn quá dài không có dấu ngắt. | Mở **Audio Review Panel** → Sửa lại dấu chấm/phẩy trong câu → Nhấn **Tạo lại câu này**. |
 | **Không tải được video lên YouTube (Upload Error)** | Proxy của kênh bị gián đoạn hoặc GPM Profile chưa mở được cổng API. | Mở **Channel Hub** → Kiểm tra lại trạng thái kết nối GPM-Login (Port 19995) và Proxy của kênh đó. |
-| **Giao diện báo `Không thể kết nối Backend`** | Dịch vụ Backend (port 8080) chưa chạy hoặc bị xung đột cổng. | Chạy file `run_autoyt_restart.bat` để làm sạch cổng và khởi động lại toàn bộ dịch vụ. |
+| **Giao diện báo `Không thể kết nối Backend`** | Dịch vụ Backend (port 8080) chưa chạy hoặc bị xung đột cổng. | Chạy file `run_nexus_restart.bat` để làm sạch cổng và khởi động lại toàn bộ dịch vụ. |
 
 ---
 

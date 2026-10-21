@@ -20,12 +20,13 @@ import auto_yt.services.database as db
 from auto_yt.paths import MUSE_ARTIFACTS_DIR
 from auto_yt.services import process_registry, prompt_assets, video_production
 from auto_yt.services.muse_provider import (
+    MUSE_PROVIDER_NAME,
     MuseAmbiguousSubmissionError,
-    MuseBrowserProvider,
     MuseError,
-    MuseProfileBusy,
+    MuseServiceBusy,
     MusePromptBuilder,
     MuseReceipt,
+    MuseStudioApiProvider,
     MuseTransientError,
 )
 
@@ -402,9 +403,9 @@ def _validate_image(path: Path) -> dict:
         with Image.open(path) as image:
             width, height = image.size
     except Exception as exc:
-        raise MuseTransientError("Ảnh Muse bị hỏng hoặc sai định dạng.") from exc
+        raise MuseError("Ảnh Muse bị hỏng hoặc sai định dạng.") from exc
     if width < 640 or height < 360:
-        raise MuseTransientError("Ảnh Muse có độ phân giải quá thấp.")
+        raise MuseError("Ảnh Muse có độ phân giải quá thấp.")
     return {"width": width, "height": height}
 
 
@@ -412,7 +413,7 @@ def _normalize_video(video_id: int, source: Path, target: Path) -> dict:
     try:
         source_details = video_production.probe_scene_video(source)
     except video_production.VideoProductionError as exc:
-        raise MuseTransientError("Video Muse bị hỏng hoặc không đọc được.") from exc
+        raise MuseError("Video Muse bị hỏng hoặc không đọc được.") from exc
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(".mp4.tmp")
@@ -452,14 +453,14 @@ def _normalize_video(video_id: int, source: Path, target: Path) -> dict:
         process_registry.unregister_process(f"video:{video_id}", process)
     if process.returncode != 0:
         temporary.unlink(missing_ok=True)
-        raise MuseTransientError(
+        raise MuseError(
             "Không thể chuẩn hóa video Muse: " + video_production.extract_ffmpeg_error(stderr or "")
         )
     try:
         normalized = video_production.probe_scene_video(temporary)
     except video_production.VideoProductionError as exc:
         temporary.unlink(missing_ok=True)
-        raise MuseTransientError("Video Muse sau chuẩn hóa không hợp lệ.") from exc
+        raise MuseError("Video Muse sau chuẩn hóa không hợp lệ.") from exc
     temporary.replace(target)
     return {
         "duration_seconds": float(normalized["duration_seconds"]),
@@ -487,10 +488,32 @@ async def _generate_request(
     if _valid_cached_artifact(existing, request_hash):
         return existing
     metadata = dict((existing or {}).get("metadata") or {})
+    if existing and existing.get("content_hash") == request_hash:
+        if existing.get("status") == "ready":
+            raise MuseError(
+                f"Artifact Muse scene {int(scene['index']) + 1} sai checksum hoặc bị thiếu; hãy Recreate."
+            )
+        if existing.get("status") == "error" and (
+            metadata.get("terminal_generation") or metadata.get("invalid_media")
+        ):
+            raise MuseError(
+                f"Generation Muse scene {int(scene['index']) + 1} đã fail; hãy Recreate để gửi request mới."
+            )
     if existing and existing.get("content_hash") == request_hash and existing.get("status") == "submitting":
-        thread_url = str(metadata.get("thread_url") or "")
+        if metadata.get("thread_url") or metadata.get("turn_id"):
+            raise MuseAmbiguousSubmissionError(
+                f"Scene {int(scene['index']) + 1} còn receipt Muse browser cũ; hãy Recreate để tạo lại."
+            )
+        provider = str(metadata.get("provider") or "")
+        provider_task_id = str(metadata.get("provider_task_id") or "")
+        endpoint = str(metadata.get("endpoint") or "")
         submitted_at = str(metadata.get("submitted_at") or "")
-        if not thread_url or not submitted_at:
+        if (
+            provider != MUSE_PROVIDER_NAME
+            or not provider_task_id
+            or not endpoint
+            or not submitted_at
+        ):
             raise MuseAmbiguousSubmissionError(
                 f"Scene {int(scene['index']) + 1} có submission không receipt; không tự gửi lại."
             )
@@ -501,8 +524,9 @@ async def _generate_request(
             )
         reconciled = await adapter.reconcile(
             receipt=MuseReceipt(
-                thread_url=thread_url,
-                turn_id=str(metadata.get("turn_id") or ""),
+                provider=provider,
+                provider_task_id=provider_task_id,
+                endpoint=endpoint,
                 submitted_at=submitted_at,
             ),
             destination=destination,
@@ -543,6 +567,7 @@ async def _generate_request(
             "attempt": attempt,
             "scene_index": int(scene["index"]),
             "phase": "videos" if expected == "video" else "images",
+            "provider": MUSE_PROVIDER_NAME,
         }
         _record_request_state(
             video_id,
@@ -560,8 +585,9 @@ async def _generate_request(
                 status="submitting",
                 metadata={
                     **base_metadata,
-                    "thread_url": receipt.thread_url,
-                    "turn_id": receipt.turn_id,
+                    "provider": receipt.provider,
+                    "provider_task_id": receipt.provider_task_id,
+                    "endpoint": receipt.endpoint,
                     "submitted_at": receipt.submitted_at,
                 },
             )
@@ -574,10 +600,11 @@ async def _generate_request(
                 prompt,
                 [Path(item["path"]) for item in references],
                 destination,
+                request_hash=request_hash,
                 on_submitted=on_submitted,
                 cancel_check=cancel_check,
             )
-        except MuseProfileBusy:
+        except MuseServiceBusy:
             raise
         except MuseAmbiguousSubmissionError as exc:
             current = db.get_latest_video_artifact(video_id, artifact_type) or {}
@@ -599,7 +626,9 @@ async def _generate_request(
             current_metadata = dict(current.get("metadata") or {})
             if (
                 current.get("status") == "submitting"
-                and current_metadata.get("thread_url")
+                and current_metadata.get("provider") == MUSE_PROVIDER_NAME
+                and current_metadata.get("provider_task_id")
+                and current_metadata.get("endpoint")
                 and current_metadata.get("submitted_at")
             ):
                 _record_request_state(
@@ -629,6 +658,21 @@ async def _generate_request(
                     str(exc), delay_seconds=RETRY_DELAYS_SECONDS[attempt - 1]
                 ) from exc
             raise
+        except MuseError as exc:
+            current = db.get_latest_video_artifact(video_id, artifact_type) or {}
+            current_metadata = dict(current.get("metadata") or base_metadata)
+            _record_request_state(
+                video_id,
+                artifact_type,
+                request_hash,
+                status="error",
+                metadata={
+                    **current_metadata,
+                    "error_class": type(exc).__name__,
+                    "terminal_generation": True,
+                },
+            )
+            raise
         except Exception as exc:
             if exc.__class__.__name__ == "VideoJobCanceled":
                 current = db.get_latest_video_artifact(video_id, artifact_type) or {}
@@ -644,12 +688,14 @@ async def _generate_request(
                     },
                 )
                 raise
+            current = db.get_latest_video_artifact(video_id, artifact_type) or {}
+            current_metadata = dict(current.get("metadata") or base_metadata)
             _record_request_state(
                 video_id,
                 artifact_type,
                 request_hash,
                 status="error",
-                metadata={**base_metadata, "error_class": type(exc).__name__},
+                metadata={**current_metadata, "error_class": type(exc).__name__},
             )
             raise
 
@@ -665,7 +711,7 @@ async def _generate_request(
             duration = float(details["duration_seconds"])
             if result_path != final_path:
                 result_path.unlink(missing_ok=True)
-    except MuseTransientError as exc:
+    except MuseError as exc:
         current = db.get_latest_video_artifact(video_id, artifact_type) or {}
         current_metadata = dict(current.get("metadata") or {})
         validation_attempt = int(current_metadata.get("attempt") or 1)
@@ -681,10 +727,6 @@ async def _generate_request(
                 "invalid_media": True,
             },
         )
-        if validation_attempt < MAX_REQUEST_ATTEMPTS:
-            raise MuseRetryScheduled(
-                str(exc), delay_seconds=RETRY_DELAYS_SECONDS[validation_attempt - 1]
-            ) from exc
         raise
     checksum = _sha256_file(final_path)
     final_metadata = {
@@ -696,8 +738,9 @@ async def _generate_request(
         "attempt": int((db.get_latest_video_artifact(video_id, artifact_type) or {}).get("metadata", {}).get("attempt") or 1),
         "scene_index": int(scene["index"]),
         "phase": "videos" if expected == "video" else "images",
-        "thread_url": str(result.get("thread_url") or ""),
-        "turn_id": str(result.get("turn_id") or ""),
+        "provider": str(result.get("provider") or MUSE_PROVIDER_NAME),
+        "provider_task_id": str(result.get("provider_task_id") or ""),
+        "endpoint": str(result.get("endpoint") or ""),
         "submitted_at": str(result.get("submitted_at") or ""),
         "checksum": checksum,
         "download_method": str(result.get("download_method") or ""),
@@ -729,7 +772,7 @@ async def _prepare_media_async(
 ) -> list[dict]:
     settings = snapshot.get("image_generation_settings") or {}
     references = plan.get("reference_snapshot") or []
-    provider = MuseBrowserProvider(job_id=job_id, video_id=video_id)
+    provider = MuseStudioApiProvider(job_id=job_id, video_id=video_id)
     scene_results: list[dict] = []
     async with provider.open_session() as adapter:
         total = len(plan["scenes"])

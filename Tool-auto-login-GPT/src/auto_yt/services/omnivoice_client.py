@@ -22,7 +22,9 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8011"
 TOKEN_PATH = DATA_DIR / "omnivoice_internal_token.txt"
 OMNIVOICE_ROOT = Path(
     os.environ.get(
-        "AUTO_YT_OMNIVOICE_ROOT",
+        "NEXUS_OMNIVOICE_ROOT")
+        or os.environ.get(
+            "AUTO_YT_OMNIVOICE_ROOT",
         str(PROJECT_ROOT.parent.parent / "omnivoice"),
     )
 ).resolve()
@@ -47,7 +49,10 @@ class OmniVoiceInvalidResponseError(OmniVoiceClientError):
 
 
 def _get_token() -> str:
-    environment_token = os.environ.get("AUTO_YT_OMNIVOICE_TOKEN", "").strip()
+    environment_token = (
+        os.environ.get("NEXUS_OMNIVOICE_TOKEN")
+        or os.environ.get("AUTO_YT_OMNIVOICE_TOKEN", "")
+    ).strip()
     if environment_token:
         return environment_token
     worker_token_path = OMNIVOICE_ROOT / "data" / "omnivoice_internal_token.txt"

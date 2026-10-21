@@ -20,8 +20,12 @@ if (-not (Test-AutoYTAdministrator)) {
 $projectRoot = [System.IO.Path]::GetFullPath($PSScriptRoot).TrimEnd("\")
 $dataRoot = Join-Path $projectRoot "data"
 $chromeUserDataRoot = Join-Path $dataRoot "chrome_user_data"
+$museServiceStateFile = Join-Path $dataRoot "muse_studio_service.json"
 $servicePorts = @(8080, 5173, 8011)
-$omniVoiceRoot = if ($env:AUTO_YT_OMNIVOICE_ROOT) {
+$omniVoiceRoot = if ($env:NEXUS_OMNIVOICE_ROOT) {
+    [System.IO.Path]::GetFullPath($env:NEXUS_OMNIVOICE_ROOT).TrimEnd("\")
+}
+elseif ($env:AUTO_YT_OMNIVOICE_ROOT) {
     [System.IO.Path]::GetFullPath($env:AUTO_YT_OMNIVOICE_ROOT).TrimEnd("\")
 }
 else {
@@ -32,7 +36,7 @@ else {
 
 function Write-Step {
     param([string]$Message)
-    Write-Host "[Auto_YT] $Message" -ForegroundColor Cyan
+    Write-Host "[Nexus Studio Engine] $Message" -ForegroundColor Cyan
 }
 
 function Get-RestartMaintenanceStatus {
@@ -177,6 +181,42 @@ function Get-ListeningProcessIds {
     }
 }
 
+function Get-OwnedMuseServiceInfo {
+    param([object[]]$Processes)
+
+    if (-not (Test-Path -LiteralPath $museServiceStateFile -PathType Leaf)) {
+        return $null
+    }
+    try {
+        $state = Get-Content -LiteralPath $museServiceStateFile -Raw | ConvertFrom-Json
+        if (-not $state.owned -or [int]$state.pid -le 0 -or [string]::IsNullOrWhiteSpace([string]$state.studio_path)) {
+            return $null
+        }
+        $studioPath = [System.IO.Path]::GetFullPath([string]$state.studio_path).TrimEnd("\")
+        $expectedMain = Join-Path $studioPath "main.py"
+        $process = $Processes | Where-Object { [int]$_.ProcessId -eq [int]$state.pid } | Select-Object -First 1
+        if (-not $process) {
+            return $null
+        }
+        $commandLine = [string]$process.CommandLine
+        if (
+            $commandLine.IndexOf("--muse-service", [System.StringComparison]::OrdinalIgnoreCase) -lt 0 -or
+            $commandLine.IndexOf($expectedMain, [System.StringComparison]::OrdinalIgnoreCase) -lt 0
+        ) {
+            Write-Warning "Muse service marker does not match PID $($state.pid); the process will not be stopped."
+            return $null
+        }
+        return [pscustomobject]@{
+            process_id = [int]$state.pid
+            profile_root = Join-Path $studioPath "chrome_user_data\muse_profiles"
+        }
+    }
+    catch {
+        Write-Warning "Muse service marker is invalid; no external process will be stopped."
+        return $null
+    }
+}
+
 function Request-BrowserServiceStop {
     param([string]$ServiceName)
 
@@ -200,45 +240,23 @@ function Request-BrowserServiceStop {
 $createdNew = $false
 $stopMutex = New-Object System.Threading.Mutex($true, "Local\AutoYTStop", [ref]$createdNew)
 if (-not $createdNew) {
-    Write-Host "Another Auto_YT stop is already in progress." -ForegroundColor Yellow
+    Write-Host "Another Nexus Studio Engine stop is already in progress." -ForegroundColor Yellow
     $stopMutex.Dispose()
     exit 0
 }
 
 try {
-    Write-Step "Analyzing running Auto_YT services and processes..."
+    Write-Step "Analyzing running Nexus Studio Engine services and processes..."
 
-    if ($env:AUTOYT_REQUIRE_GPM_IDLE -eq "1" -or $env:AUTOYT_REQUIRE_IDLE -eq "1") {
-        $maintenanceStatus = Get-RestartMaintenanceStatus
-        if ($maintenanceStatus -and -not $maintenanceStatus.safe_to_restart) {
-            Write-Host "`n[Auto_YT] [CANH BAO AN TOAN] He thong dang co $($maintenanceStatus.total_blocking_jobs) tac vu dang chay:" -ForegroundColor Yellow
-            foreach ($reason in @($maintenanceStatus.reasons)) {
-                Write-Host "  - $reason" -ForegroundColor Red
-            }
-            foreach ($job in @($maintenanceStatus.blocking_jobs) | Select-Object -First 5) {
-                $desc = if ($job.PSObject.Properties['title'] -and $job.title) {
-                    [string]$job.title
-                } elseif ($job.PSObject.Properties['video_title'] -and $job.video_title) {
-                    [string]$job.video_title
-                } elseif ($job.PSObject.Properties['id']) {
-                    "ID: $($job.id)"
-                } else {
-                    "Unknown job"
-                }
-                $type = if ($job.PSObject.Properties['type'] -and $job.type) { [string]$job.type } else { "job" }
-                $statusVal = if ($job.PSObject.Properties['status'] -and $job.status) { [string]$job.status } else { "running" }
-                Write-Host "    * [$type] $($statusVal): $desc" -ForegroundColor Yellow
-            }
-            Write-Host ""
-            throw "Auto_YT restart/stop bi chan an toan vi he thong dang thuc hien tac vu quan trong (render, upload YouTube, dang bai, hoac GPM). Vui long doi cac job tren hoan tat truoc khi restart!"
-        }
-    }
-    
-    Request-BrowserServiceStop "chatgpt_browser_service"
-    Request-BrowserServiceStop "google_flow_browser_service"
 
     $processes = Get-ProcessSnapshot
     $rootIds = New-Object System.Collections.Generic.HashSet[int]
+    $museRootIds = New-Object System.Collections.Generic.HashSet[int]
+    $ownedMuseService = Get-OwnedMuseServiceInfo $processes
+    if ($ownedMuseService) {
+        $null = $rootIds.Add([int]$ownedMuseService.process_id)
+        $null = $museRootIds.Add([int]$ownedMuseService.process_id)
+    }
 
     # 1. Listeners on service ports: 8080 (backend), 5173 (frontend), 8011 (omnivoice)
     foreach ($port in $servicePorts) {
@@ -249,7 +267,7 @@ try {
             }
             else {
                 $proc = $processes | Where-Object { [int]$_.ProcessId -eq [int]$listenerId } | Select-Object -First 1
-                if ($proc -and (Test-AutoYTProcess $proc -or [string]$proc.CommandLine -match "api_server:app" -or [string]$proc.CommandLine -match "auto_yt" -or [string]$proc.CommandLine -match "uvicorn" -or $port -eq 8011)) {
+                if ($proc -and (Test-AutoYTProcess $proc -or [string]$proc.CommandLine -match "api_server:app" -or [string]$proc.CommandLine -match "nexus_engine" -or [string]$proc.CommandLine -match "auto_yt" -or [string]$proc.CommandLine -match "uvicorn" -or $port -eq 8011)) {
                     $null = $rootIds.Add([int]$listenerId)
                 }
                 else {
@@ -282,7 +300,7 @@ try {
         }
     }
 
-    # 3. Dedicated Chrome processes with Auto_YT profiles
+    # 3. Dedicated Chrome processes with Nexus Studio Engine profiles
     foreach ($process in $processes) {
         if (Test-AutoYTChromeProcess $process) {
             $null = $rootIds.Add([int]$process.ProcessId)
@@ -290,18 +308,55 @@ try {
     }
 
     if ($rootIds.Count -eq 0) {
-        Write-Host "Auto_YT is not running." -ForegroundColor Yellow
+        if (Test-Path -LiteralPath $museServiceStateFile -PathType Leaf) {
+            Remove-Item -LiteralPath $museServiceStateFile -Force -ErrorAction SilentlyContinue
+        }
+        Write-Host "Nexus Studio Engine is not running." -ForegroundColor Yellow
         exit 0
     }
 
+    if ($env:NEXUS_REQUIRE_GPM_IDLE -eq "1" -or $env:AUTOYT_REQUIRE_GPM_IDLE -eq "1" -or $env:NEXUS_REQUIRE_IDLE -eq "1" -or $env:AUTOYT_REQUIRE_IDLE -eq "1") {
+        $maintenanceStatus = Get-RestartMaintenanceStatus
+        if ($maintenanceStatus -and -not $maintenanceStatus.safe_to_restart) {
+            Write-Host "`n[Nexus Studio Engine] [CANH BAO AN TOAN] He thong dang co $($maintenanceStatus.total_blocking_jobs) tac vu dang chay:" -ForegroundColor Yellow
+            foreach ($reason in @($maintenanceStatus.reasons)) {
+                Write-Host "  - $reason" -ForegroundColor Red
+            }
+            foreach ($job in @($maintenanceStatus.blocking_jobs) | Select-Object -First 5) {
+                $desc = if ($job.PSObject.Properties['title'] -and $job.title) {
+                    [string]$job.title
+                } elseif ($job.PSObject.Properties['video_title'] -and $job.video_title) {
+                    [string]$job.video_title
+                } elseif ($job.PSObject.Properties['id']) {
+                    "ID: $($job.id)"
+                } else {
+                    "Unknown job"
+                }
+                $type = if ($job.PSObject.Properties['type'] -and $job.type) { [string]$job.type } else { "job" }
+                $statusVal = if ($job.PSObject.Properties['status'] -and $job.status) { [string]$job.status } else { "running" }
+                Write-Host "    * [$type] $($statusVal): $desc" -ForegroundColor Yellow
+            }
+            Write-Host ""
+            throw "Nexus Studio Engine restart/stop bi chan an toan vi he thong dang thuc hien tac vu quan trong (render, upload YouTube, dang bai, hoac GPM). Vui long doi cac job tren hoan tat truoc khi restart!"
+        }
+    }
+    
+    Request-BrowserServiceStop "chatgpt_browser_service"
+    Request-BrowserServiceStop "google_flow_browser_service"
+
+
     $targetIds = New-Object System.Collections.Generic.HashSet[int]
     foreach ($rootId in $rootIds) {
+        $isMuseTree = $museRootIds.Contains([int]$rootId)
         foreach ($processId in Get-ProcessTreeIds $rootId $processes) {
             $proc = $processes | Where-Object { [int]$_.ProcessId -eq $processId } | Select-Object -First 1
             if ($proc) {
                 $procName = [string]$proc.Name
                 if ($procName -in @("chrome.exe", "msedge.exe", "browser.exe", "brave.exe", "firefox.exe", "opera.exe", "explorer.exe")) {
-                    if ($procName -ne "chrome.exe" -or -not (Test-AutoYTChromeProcess $proc)) {
+                    if ($procName -eq "explorer.exe") {
+                        continue
+                    }
+                    if (-not $isMuseTree -and ($procName -ne "chrome.exe" -or -not (Test-AutoYTChromeProcess $proc))) {
                         continue
                     }
                 }
@@ -310,7 +365,7 @@ try {
         }
     }
 
-    Write-Step "Stopping backend + Radar/Trust Builder schedulers (8080), frontend (5173), OmniVoice (8011), ChatGPT & Google Flow browser services ($($targetIds.Count) processes)..."
+    Write-Step "Stopping backend, frontend, OmniVoice, owned Muse2API, and project browser services ($($targetIds.Count) processes)..."
     foreach ($processId in @($targetIds) | Sort-Object -Descending) {
         Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
     }
@@ -336,7 +391,7 @@ try {
         foreach ($port in $servicePorts) {
             foreach ($listenerId in @(Get-ListeningProcessIds $port)) {
                 $proc = $snapshot | Where-Object { [int]$_.ProcessId -eq [int]$listenerId } | Select-Object -First 1
-                if ($proc -and (Test-AutoYTProcess $proc -or [string]$proc.CommandLine -match "api_server:app" -or [string]$proc.CommandLine -match "auto_yt" -or [string]$proc.CommandLine -match "uvicorn" -or $port -eq 8011)) {
+                if ($proc -and (Test-AutoYTProcess $proc -or [string]$proc.CommandLine -match "api_server:app" -or [string]$proc.CommandLine -match "nexus_engine" -or [string]$proc.CommandLine -match "auto_yt" -or [string]$proc.CommandLine -match "uvicorn" -or $port -eq 8011)) {
                     Stop-Process -Id $listenerId -Force -ErrorAction SilentlyContinue
                 }
             }
@@ -349,6 +404,7 @@ try {
         (Join-Path $dataRoot "chatgpt_browser_service.stop.json"),
         (Join-Path $dataRoot "google_flow_browser_service.json"),
         (Join-Path $dataRoot "google_flow_browser_service.stop.json"),
+        $museServiceStateFile,
         (Join-Path $omniVoiceRoot "data\worker.pid")
     )
     foreach ($sf in $stateFiles) {
@@ -368,11 +424,11 @@ try {
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    Write-Host "[Auto_YT] All services, including Radar and Trust Builder schedulers, have stopped cleanly. Ports 8080, 5173, and 8011 are free." -ForegroundColor Green
+    Write-Host "[Nexus Studio Engine] All services, including Radar and Trust Builder schedulers, have stopped cleanly. Ports 8080, 5173, and 8011 are free." -ForegroundColor Green
     exit 0
 }
 catch {
-    Write-Host "Auto_YT stop failed: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Nexus Studio Engine stop failed: $($_.Exception.Message)" -ForegroundColor Red
     exit 1
 }
 finally {

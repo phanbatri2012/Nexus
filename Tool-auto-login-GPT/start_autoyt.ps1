@@ -32,7 +32,10 @@ $backendUrl = "http://127.0.0.1:8080/health"
 $legacyBackendUrl = "http://127.0.0.1:8080/api/chatgpt-status"
 $frontendUrl = "http://127.0.0.1:5173/"
 $omniVoiceUrl = "http://127.0.0.1:8011/health"
-$omniVoiceRoot = if ($env:AUTO_YT_OMNIVOICE_ROOT) {
+$omniVoiceRoot = if ($env:NEXUS_OMNIVOICE_ROOT) {
+    [System.IO.Path]::GetFullPath($env:NEXUS_OMNIVOICE_ROOT).TrimEnd("\")
+}
+elseif ($env:AUTO_YT_OMNIVOICE_ROOT) {
     [System.IO.Path]::GetFullPath($env:AUTO_YT_OMNIVOICE_ROOT).TrimEnd("\")
 }
 else {
@@ -48,14 +51,14 @@ if (Test-Path -LiteralPath $ffmpegDir) {
 
 function Write-Step {
     param([string]$Message)
-    Write-Host "[Auto_YT] $Message" -ForegroundColor Cyan
+    Write-Host "[Nexus Studio Engine] $Message" -ForegroundColor Cyan
 }
 
 function Protect-DataDirectory {
     $resolvedDataRoot = [System.IO.Path]::GetFullPath($dataRoot).TrimEnd("\")
     $requiredPrefix = "$projectRoot\"
     if (-not $resolvedDataRoot.StartsWith($requiredPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "Refusing to change ACL outside the Auto_YT project: $resolvedDataRoot"
+        throw "Refusing to change ACL outside the Nexus Studio Engine project: $resolvedDataRoot"
     }
 
     New-Item -ItemType Directory -Path $resolvedDataRoot -Force | Out-Null
@@ -83,7 +86,7 @@ function Protect-DataDirectory {
         [System.Security.Principal.WindowsBuiltInRole]::Administrator
     )
     if ((Test-Path -LiteralPath $deferredMarker -PathType Leaf) -and -not $isElevated) {
-        Write-Warning "Legacy data ACL migration is pending. Run run_autoyt.bat once as Administrator when Auto_YT Chrome is closed; normal startup will continue."
+        Write-Warning "Legacy data ACL migration is pending. Run run_autoyt.bat once as Administrator when Nexus Studio Engine Chrome is closed; normal startup will continue."
         return
     }
 
@@ -94,7 +97,7 @@ function Protect-DataDirectory {
         } |
         Select-Object -First 1
     if ($profileProcess) {
-        Write-Warning "Data ACL migration is waiting for the Auto_YT Chrome profile to close."
+        Write-Warning "Data ACL migration is waiting for the Nexus Studio Engine Chrome profile to close."
         return
     }
 
@@ -600,10 +603,10 @@ function Ensure-PythonEnvironment {
         $versionPattern = [regex]::Escape($playwrightVersion)
         $currentVersionBlock = @(
             $browserListText -split "Playwright version:\s*" |
-                Where-Object { $_ -match "^$versionPattern(?:\r?\n|$)" }
+                Where-Object { $_ -match "^$versionPattern" }
         ) | Select-Object -First 1
         $chromiumReady = $browserListExitCode -eq 0 -and
-            $currentVersionBlock -match "(?m)^\s+.*[\\/]chromium-\d+\s*$"
+            ($currentVersionBlock -match "(?m)^\s+.*[\\/]chromium-\d+\s*$" -or $browserListText -match "(?m)^\s+.*[\\/]chromium-\d+\s*$")
 
         if (-not $chromiumReady) {
             Write-Step "Installing the Playwright Chromium browser."
@@ -681,7 +684,7 @@ function Start-Backend {
         $env:PYTHONPATH = $srcPath
         $process = Start-Process `
             -FilePath $venvPython `
-            -ArgumentList @("-m", "uvicorn", "auto_yt.main:app", "--host", "127.0.0.1", "--port", "8080") `
+            -ArgumentList @("-m", "uvicorn", "nexus_engine.main:app", "--host", "127.0.0.1", "--port", "8080") `
             -WorkingDirectory $projectRoot `
             -WindowStyle Hidden `
             -RedirectStandardOutput $stdoutLog `
@@ -732,7 +735,7 @@ function Start-Frontend {
 $createdNew = $false
 $startupMutex = New-Object System.Threading.Mutex($true, "Local\AutoYTStartup", [ref]$createdNew)
 if (-not $createdNew) {
-    Write-Host "Another Auto_YT startup is already in progress." -ForegroundColor Yellow
+    Write-Host "Another Nexus Studio Engine startup is already in progress." -ForegroundColor Yellow
     $startupMutex.Dispose()
     exit 0
 }
@@ -882,7 +885,7 @@ try {
             if (-not $omniVoiceReady) { $missingServices += "OmniVoice" }
             if (-not $chatgptReady) { $missingServices += "ChatGPT" }
             if (-not $flowReady) { $missingServices += "Google Flow" }
-            throw "Auto_YT services did not become ready within $ReadyTimeoutSeconds seconds: $($missingServices -join ', ')."
+            throw "Nexus Studio Engine services did not become ready within $ReadyTimeoutSeconds seconds: $($missingServices -join ', ')."
         }
     }
 
@@ -891,12 +894,13 @@ try {
 
     Write-Host ""
     Write-Host "=================================================================" -ForegroundColor Green
-    Write-Host "               AUTO_YT SYSTEM IS READY TO PRODUCE VIDEOS          " -ForegroundColor Green
+    Write-Host "         NEXUS STUDIO ENGINE IS READY TO PRODUCE VIDEOS          " -ForegroundColor Green
     Write-Host "=================================================================" -ForegroundColor Green
     Write-Host " [OK] Backend API Server:     $backendUrl" -ForegroundColor Green
     Write-Host " [OK] Production Coordinator: Ready (render + YouTube publish)" -ForegroundColor Green
     Write-Host " [OK] Competitor Radar:       Ready (delayed scan, no startup GPM launch)" -ForegroundColor Green
     Write-Host " [OK] Trust Builder Scheduler: Ready (delayed first run, no startup GPM launch)" -ForegroundColor Green
+    Write-Host " [i]  Muse2API:               On demand (starts with the first Muse job)" -ForegroundColor Cyan
     Write-Host " [OK] Frontend Web UI:        $frontendUrl" -ForegroundColor Green
     if ($omniVoiceReady) {
         Write-Host " [OK] OmniVoice TTS Server:   $omniVoiceUrl" -ForegroundColor Green
@@ -920,11 +924,11 @@ try {
     if (-not $NoBrowser) {
         Start-Process $frontendUrl
     }
-    Write-Host "Auto_YT interface is open at: $frontendUrl" -ForegroundColor Green
+    Write-Host "Nexus Studio Engine interface is open at: $frontendUrl" -ForegroundColor Green
     exit 0
 }
 catch {
-    Write-Host "Auto_YT startup failed: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Nexus Studio Engine startup failed: $($_.Exception.Message)" -ForegroundColor Red
     exit 1
 }
 finally {

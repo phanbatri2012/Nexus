@@ -10,7 +10,8 @@ import {
 } from './crossPosterCampaign'
 
 const API_BASE = 'http://127.0.0.1:8080'
-const FB_STORAGE_KEY = 'AUTOYT_FACEBOOK_PAGES'
+const FB_STORAGE_KEY = 'NEXUS_FACEBOOK_PAGES'
+const LEGACY_FB_STORAGE_KEY = 'AUTOYT_FACEBOOK_PAGES'
 const META_FAILURE_STATES = new Set(['meta_failed', 'stalled', 'missing'])
 const STATUS_LABELS = {
   pending: 'Chờ tới lượt',
@@ -224,7 +225,7 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
     try {
       // Load Facebook Pages saved from Channel Hub localStorage
       try {
-        const savedFb = localStorage.getItem(FB_STORAGE_KEY)
+        const savedFb = localStorage.getItem(FB_STORAGE_KEY) || localStorage.getItem(LEGACY_FB_STORAGE_KEY)
         if (savedFb) {
           const parsedPages = JSON.parse(savedFb)
           if (Array.isArray(parsedPages)) {

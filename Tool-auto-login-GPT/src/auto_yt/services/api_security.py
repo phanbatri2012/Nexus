@@ -13,8 +13,10 @@ ALLOWED_FRONTEND_ORIGINS = {
     "http://localhost:5173",
 }
 ALLOWED_API_HOSTS = {"127.0.0.1", "localhost", "testserver"}
-SESSION_COOKIE_NAME = "autoyt_session"
-CSRF_HEADER_NAME = "X-AutoYT-CSRF"
+SESSION_COOKIE_NAME = "nexus_session"
+LEGACY_SESSION_COOKIE_NAME = "autoyt_session"
+CSRF_HEADER_NAME = "X-Nexus-CSRF"
+LEGACY_CSRF_HEADER_NAME = "X-AutoYT-CSRF"
 SESSION_PATH = "/api/security/session"
 PUBLIC_API_PATHS = {
     "/api/youtube-comments/oauth/callback",
@@ -91,6 +93,14 @@ async def protect_loopback_api(request: Request, call_next):
             secure=False,
             path="/",
         )
+        response.set_cookie(
+            LEGACY_SESSION_COOKIE_NAME,
+            _SESSION_SECRET,
+            httponly=True,
+            samesite="lax",
+            secure=False,
+            path="/",
+        )
         response.headers["Cache-Control"] = "no-store"
         return _secure_response(response)
 
@@ -100,8 +110,8 @@ async def protect_loopback_api(request: Request, call_next):
     if not _has_allowed_origin(request) or _is_cross_site(request):
         return _error(403, "Cross-site API request blocked")
 
-    session_secret = request.cookies.get(SESSION_COOKIE_NAME, "")
-    csrf_header = request.headers.get(CSRF_HEADER_NAME, "")
+    session_secret = request.cookies.get(SESSION_COOKIE_NAME) or request.cookies.get(LEGACY_SESSION_COOKIE_NAME, "")
+    csrf_header = request.headers.get(CSRF_HEADER_NAME) or request.headers.get(LEGACY_CSRF_HEADER_NAME, "")
     has_valid_cookie = bool(session_secret and secrets.compare_digest(session_secret, _SESSION_SECRET))
     has_valid_token = bool(csrf_header and secrets.compare_digest(csrf_header, _CSRF_TOKEN))
 
@@ -109,7 +119,7 @@ async def protect_loopback_api(request: Request, call_next):
         return _error(401, "Local API session required")
 
     if request.method in UNSAFE_METHODS:
-        csrf_token = request.headers.get(CSRF_HEADER_NAME, "")
+        csrf_token = request.headers.get(CSRF_HEADER_NAME) or request.headers.get(LEGACY_CSRF_HEADER_NAME, "")
         if not csrf_token or not secrets.compare_digest(csrf_token, _CSRF_TOKEN):
             return _error(403, "Invalid API request token")
 

@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFilter
 
-ICONS_DIR = Path("e:/yt/Tool/Auto_YT/Tool-auto-login-GPT/data/animated_icons")
+ICONS_DIR = Path(__file__).resolve().parent.parent / "data" / "animated_icons"
 ICONS_DIR.mkdir(parents=True, exist_ok=True)
 
 N_FRAMES = 24

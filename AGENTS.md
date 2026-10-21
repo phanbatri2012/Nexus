@@ -2,7 +2,7 @@
 
 ## 1. Scope and precedence
 
-- This file is the canonical policy for the entire `Auto_YT` Git repository.
+- This file is the canonical policy for the entire `Nexus Studio Engine` (Auto_YT) Git repository.
 - When project rules conflict, prioritize security and data integrity, then Auto-YT invariants, then workflow preferences.
 - If a required action is unsafe, impossible, or needs authority outside the task, stop only that action, explain the constraint, and continue any safe in-scope work.
 
@@ -29,12 +29,12 @@
 
 - Use Playwright with the authenticated browser session for all ChatGPT prompting and data retrieval. Do not replace this workflow with direct ChatGPT API calls.
 - Implement behavior generically for every video. A video ID, URL, title, conversation, prompt version, or stored record may be used to reproduce a problem but never to special-case the solution.
-- Starting Auto_YT must not directly launch comment jobs, scanners, channel work, or GPM profiles. Such work may start only after readiness or through an explicit user action.
+- Starting Nexus Studio Engine must not directly launch comment jobs, scanners, channel work, or GPM profiles. Such work may start only after readiness or through an explicit user action.
 
 ## 5. Unified service lifecycle
 
 - `Tool-auto-login-GPT/start_autoyt.ps1` and `Tool-auto-login-GPT/stop_autoyt.ps1` are the canonical PowerShell lifecycle implementations.
-- Root `run_autoyt.bat`, `run_autoyt_stop.bat`, and `run_autoyt_restart.bat` are thin delegators to the canonical wrappers in `Tool-auto-login-GPT`. Preserve argument forwarding and exit codes; the two layers are not expected to be byte-identical.
+- Root `run_nexus.bat`, `run_nexus_stop.bat`, and `run_nexus_restart.bat` (along with legacy `run_autoyt*.bat` wrappers) are thin delegators to the canonical wrappers in `Tool-auto-login-GPT`. Preserve argument forwarding and exit codes; the two layers are not expected to be byte-identical.
 - When adding a service, worker, external tool, or daemon, update the canonical start, stop, and restart flow in the same change.
 - Startup must probe every registered service and report ready only after all required services are healthy.
 - Shutdown must release registered ports, terminate only project-owned processes and Chromium profiles, and remove relevant stale locks and state markers. Never terminate the user's personal browser.
@@ -46,12 +46,12 @@
 - Before restarting, check `system_jobs`, background workers, Playwright sessions, and GPM profile activity for active or immediately claimable generation, TTS, rendering, browser, or background work.
 - Treat `processing`, `running`, `queued`, due `retry_wait`, and any work immediately claimable by a worker as busy.
 - Treat an inability to verify idle state as busy.
-- If the system is idle, run `run_autoyt_restart.bat` and verify that every registered service becomes ready.
+- If the system is idle, run `run_nexus_restart.bat` (or `run_autoyt_restart.bat`) and verify that every registered service becomes ready.
 - If the system is busy:
   1. Abort the restart immediately. Do not wait for or interrupt active jobs.
   2. Continue all remaining work and verification that does not require a restart.
   3. Record which runtime verification could not be completed.
-  4. At final handoff, report that restart was skipped and instruct the user to run `run_autoyt_restart.bat` manually after the system becomes idle.
+  4. At final handoff, report that restart was skipped and instruct the user to run `run_nexus_restart.bat` (or `run_autoyt_restart.bat`) manually after the system becomes idle.
 
 ## 7. GPM and channel network isolation
 

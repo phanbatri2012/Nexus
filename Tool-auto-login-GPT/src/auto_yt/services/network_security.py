@@ -68,7 +68,7 @@ def download_bounded(
     )
     request = urllib.request.Request(
         validated_url,
-        headers={"User-Agent": "Auto_YT/1.0", "Accept": ", ".join(allowed_content_types)},
+        headers={"User-Agent": "NexusStudioEngine/1.0", "Accept": ", ".join(allowed_content_types)},
     )
     opener = urllib.request.build_opener(
         _ValidatedRedirectHandler(allowed_hosts, allow_subdomains)

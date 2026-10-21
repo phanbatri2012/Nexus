@@ -1,17 +1,17 @@
 import asyncio
-import json
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, mock_open, patch
 
 from auto_yt import main
 from auto_yt.services import (
-    browser_diagnostics,
     chatgpt_projects,
     muse_pipeline,
     muse_provider,
     muse_settings,
+    muse_studio_service,
 )
 
 
@@ -23,20 +23,22 @@ def _captions(duration: int) -> list[dict]:
 
 
 class TestMuseSettings(unittest.TestCase):
-    def test_global_profile_setting_uses_canonical_storage_key_and_reads_legacy_key(self):
+    def test_global_setting_uses_studio_path_and_drops_legacy_gpm_keys(self):
         self.assertEqual(
             muse_settings.normalize_muse_settings({"gpm_profile_id": " legacy "}),
-            {"gpm_profile_id": "legacy"},
+            {"muse_studio_path": muse_settings.DEFAULT_MUSE_STUDIO_PATH},
         )
         self.assertEqual(
-            muse_settings.normalize_muse_settings({"muse_gpm_profile_id": " canonical "}),
-            {"gpm_profile_id": "canonical"},
+            muse_settings.normalize_muse_settings({"muse_studio_path": " C:\\Muse_AI_Studio "}),
+            {"muse_studio_path": "C:\\Muse_AI_Studio"},
         )
         with patch.object(muse_settings, "write_private_text") as write_private:
-            saved = muse_settings.save_muse_settings({"gpm_profile_id": "profile-1"})
-        self.assertEqual(saved, {"gpm_profile_id": "profile-1"})
+            saved = muse_settings.save_muse_settings(
+                {"muse_studio_path": "C:\\Muse", "gpm_profile_id": "profile-1"}
+            )
+        self.assertEqual(saved, {"muse_studio_path": "C:\\Muse"})
         serialized = write_private.call_args.args[1]
-        self.assertIn('"muse_gpm_profile_id": "profile-1"', serialized)
+        self.assertIn('"muse_studio_path": "C:\\\\Muse"', serialized)
         self.assertNotIn('"gpm_profile_id":', serialized)
 
     def test_normalize_muse_mode_defaults_and_reference_limit(self):
@@ -192,148 +194,112 @@ class TestMuseReferences(unittest.TestCase):
         self.assertIn("16:9", prompt)
 
 
-class TestMuseBrowserAdapter(unittest.TestCase):
-    def test_login_page_fails_capability_probe(self):
-        body = MagicMock()
-        body.inner_text = AsyncMock(return_value="Sign in to continue")
-        page = MagicMock()
-        page.locator.return_value = body
-        adapter = muse_provider.MuseBrowserAdapter(AsyncMock())
-        with self.assertRaises(muse_provider.MuseAuthenticationError):
-            asyncio.run(adapter.capability_probe(page))
-
-    def test_capability_probe_checks_send_and_clears_draft_without_clicking(self):
-        body = MagicMock()
-        body.inner_text = AsyncMock(return_value="Muse workspace")
-        file_input = MagicMock()
-        file_input.first = file_input
-        file_input.count = AsyncMock(return_value=1)
-        textarea = MagicMock()
-        textarea.first = textarea
-        textarea.count = AsyncMock(return_value=1)
-        textarea.is_visible = AsyncMock(return_value=True)
-        textarea.is_enabled = AsyncMock(return_value=True)
-        textarea.fill = AsyncMock()
-        send = MagicMock()
-        send.is_enabled = AsyncMock(return_value=True)
-        send.click = AsyncMock()
-        composer = MagicMock()
-        page = MagicMock()
-        page.url = "https://muse.ai/thread/new"
-        page.locator.side_effect = lambda selector: (
-            body if selector == "body" else textarea if selector == "textarea" else file_input
-        )
-        page.evaluate = AsyncMock(
-            return_value={"result_detection": True, "download_extraction": True}
-        )
-        page.wait_for_timeout = AsyncMock()
-        adapter = muse_provider.MuseBrowserAdapter(AsyncMock())
-
-        with patch.object(
-            muse_provider,
-            "_first_visible",
-            new=AsyncMock(side_effect=[composer, send]),
-        ):
-            result = asyncio.run(adapter.capability_probe(page))
-
-        self.assertTrue(result["send_detection"])
-        self.assertTrue(result["result_detection"])
-        self.assertTrue(result["download_extraction"])
-        self.assertEqual(
-            textarea.fill.await_args_list,
-            [call("Auto_YT capability probe - do not send"), call("")],
-        )
-        send.click.assert_not_awaited()
-
-    def test_profile_without_proxy_fails_closed(self):
-        with patch.object(
-            muse_provider.gpm_service,
-            "get_gpm_profile_detail",
-            return_value={"id": "profile-1", "proxy": "direct"},
-        ):
-            with self.assertRaises(muse_provider.ProxyConfigurationError):
-                muse_provider.MuseBrowserProvider.validate_profile("profile-1")
-
-    def test_reference_upload_uses_playwright_file_input(self):
+class TestMuseStudioApiProvider(unittest.TestCase):
+    def test_image_payload_has_all_references_and_idempotency_key(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            image_path = Path(temp_dir) / "hero.png"
-            image_path.write_bytes(b"reference")
-            file_input = MagicMock()
-            file_input.first = file_input
-            file_input.count = AsyncMock(return_value=1)
-            file_input.set_input_files = AsyncMock()
-            page = MagicMock()
-            page.locator.return_value = file_input
-            page.evaluate = AsyncMock(return_value=True)
-            page.wait_for_timeout = AsyncMock()
-            adapter = muse_provider.MuseBrowserAdapter(AsyncMock())
-            asyncio.run(adapter._upload_references(page, [image_path]))
-            file_input.set_input_files.assert_awaited_once_with([str(image_path.resolve())])
-
-    def test_rate_limit_timeout_refusal_and_cancel_are_classified(self):
-        adapter = muse_provider.MuseBrowserAdapter(AsyncMock())
-        adapter._attachments = AsyncMock(return_value=[])
-
-        body = MagicMock()
-        body.inner_text = AsyncMock(return_value="Too many requests, try again later")
-        page = MagicMock()
-        page.locator.return_value = body
-        page.wait_for_timeout = AsyncMock()
-        page.evaluate = AsyncMock()
-        with self.assertRaises(muse_provider.MuseTransientError):
-            asyncio.run(
-                adapter._wait_for_result(
-                    page,
-                    expected="image",
-                    baseline_sources=set(),
-                    timeout_seconds=10,
-                    cancel_check=None,
-                )
-            )
-
-        with self.assertRaisesRegex(RuntimeError, "canceled"):
-            asyncio.run(
-                adapter._wait_for_result(
-                    page,
-                    expected="image",
-                    baseline_sources=set(),
-                    timeout_seconds=10,
-                    cancel_check=lambda: (_ for _ in ()).throw(RuntimeError("canceled")),
-                )
-            )
-
-        with self.assertRaisesRegex(muse_provider.MuseTransientError, "hết thời gian"):
-            asyncio.run(
-                adapter._wait_for_result(
-                    page,
-                    expected="image",
-                    baseline_sources=set(),
-                    timeout_seconds=-1,
-                    cancel_check=None,
-                )
-            )
-
-        body.inner_text = AsyncMock(return_value="ready")
-        page.evaluate = AsyncMock(return_value="I cannot create this media.")
-        with patch.object(muse_provider, "_first_visible", new=AsyncMock(return_value=None)):
-            with self.assertRaises(muse_provider.MuseRefusalError):
+            references = []
+            for index in range(3):
+                path = Path(temp_dir) / f"ref-{index}.png"
+                path.write_bytes(f"reference-{index}".encode())
+                references.append(path)
+            provider = muse_provider.MuseStudioApiProvider()
+            with (
+                patch.object(provider, "_post_json", return_value={"task_id": "image-1"}) as post,
+                patch.object(provider, "_wait_for_task", new=AsyncMock(return_value={"path": "done"})),
+            ):
                 asyncio.run(
-                    adapter._wait_for_result(
-                        page,
-                        expected="image",
-                        baseline_sources=set(),
-                        timeout_seconds=10,
-                        cancel_check=None,
+                    provider.create_image(
+                        "image prompt",
+                        references,
+                        Path(temp_dir) / "scene",
+                        request_hash="a" * 64,
                     )
                 )
+            endpoint, payload, idempotency_key = post.call_args.args
+            self.assertEqual(endpoint, "/v1/images/tasks")
+            self.assertEqual(payload["reference_image"], [str(path.resolve()) for path in references])
+            self.assertEqual(idempotency_key, "a" * 64)
 
-    def test_wrong_media_type_fails_closed(self):
+    def test_video_payload_keeps_scene_frame_first_and_has_no_idempotency_key(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            image_path = Path(temp_dir) / "result.png"
-            image_path.write_bytes(b"not-a-video")
-            extractor = muse_provider.MuseMediaExtractor()
-            with self.assertRaisesRegex(muse_provider.MuseError, "yêu cầu video"):
-                extractor._validate_result(image_path, "video", "browser_blob", "image/png")
+            references = []
+            for name in ("scene.png", "hero.png", "villain.png"):
+                path = Path(temp_dir) / name
+                path.write_bytes(name.encode())
+                references.append(path)
+            provider = muse_provider.MuseStudioApiProvider()
+            with (
+                patch.object(provider, "_post_json", return_value={"task_id": "video-1"}) as post,
+                patch.object(provider, "_wait_for_task", new=AsyncMock(return_value={"path": "done"})),
+            ):
+                asyncio.run(
+                    provider.create_video("video prompt", references, Path(temp_dir) / "clip")
+                )
+            endpoint, payload, idempotency_key = post.call_args.args
+            self.assertEqual(endpoint, "/v1/videos")
+            self.assertEqual(payload["reference_image"][0], str(references[0].resolve()))
+            self.assertEqual(payload["reference_image"], [str(path.resolve()) for path in references])
+            self.assertEqual(idempotency_key, "")
+
+    def test_image_connection_loss_is_retryable_but_video_is_ambiguous(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            scene = Path(temp_dir) / "scene.png"
+            scene.write_bytes(b"scene")
+            provider = muse_provider.MuseStudioApiProvider()
+            failure = urllib.error.URLError(ConnectionResetError("lost"))
+            with patch.object(provider, "_post_json", side_effect=failure):
+                with self.assertRaises(muse_provider.MuseTransientError):
+                    asyncio.run(provider.create_image("prompt", [], Path(temp_dir) / "image"))
+            with patch.object(provider, "_post_json", side_effect=failure):
+                with self.assertRaises(muse_provider.MuseAmbiguousSubmissionError):
+                    asyncio.run(provider.create_video("prompt", [scene], Path(temp_dir) / "video"))
+
+    def test_admission_429_is_retryable_before_video_submission(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            scene = Path(temp_dir) / "scene.png"
+            scene.write_bytes(b"scene")
+            provider = muse_provider.MuseStudioApiProvider()
+            with patch.object(
+                provider, "_post_json", side_effect=muse_provider.MuseAdmissionRetry("queue full")
+            ):
+                with self.assertRaises(muse_provider.MuseAdmissionRetry):
+                    asyncio.run(provider.create_video("prompt", [scene], Path(temp_dir) / "video"))
+
+    def test_reconcile_polls_existing_task_without_submitting(self):
+        provider = muse_provider.MuseStudioApiProvider()
+        receipt = muse_provider.MuseReceipt(
+            provider_task_id="task-1",
+            endpoint="/v1/videos/task-1",
+            submitted_at="2026-01-01T00:00:00Z",
+        )
+        downloaded = {"path": "clip.mp4", "mime_type": "video/mp4"}
+        with (
+            patch.object(provider, "_get_json", return_value={"status": "completed", "url": "/v1/media/clip.mp4"}) as get,
+            patch.object(provider, "_download_completed_task", return_value=downloaded),
+            patch.object(provider, "_post_json") as post,
+        ):
+            result = asyncio.run(
+                provider.reconcile(receipt=receipt, destination=Path("clip"), expected="video")
+            )
+        get.assert_called_once_with("/v1/videos/task-1")
+        post.assert_not_called()
+        self.assertEqual(result["provider_task_id"], "task-1")
+
+    def test_refusal_and_external_media_url_fail_closed(self):
+        with self.assertRaises(muse_provider.MuseRefusalError):
+            muse_provider.MuseStudioApiProvider._raise_task_failure(
+                {"error": "Generation refused by safety policy"}
+            )
+        provider = muse_provider.MuseStudioApiProvider()
+        with patch.object(
+            muse_provider.muse_studio_service,
+            "api_credentials",
+            return_value=("http://127.0.0.1:18610", "secret"),
+        ):
+            with self.assertRaisesRegex(muse_provider.MuseError, "ngoài localhost"):
+                provider._download_completed_task(
+                    {"url": "https://example.com/video.mp4"}, Path("unused"), "video"
+                )
 
 
 class TestMuseRecovery(unittest.TestCase):
@@ -349,7 +315,31 @@ class TestMuseRecovery(unittest.TestCase):
             }
             self.assertFalse(muse_pipeline._valid_cached_artifact(artifact, "request"))
 
-    def test_invalid_downloaded_media_leaves_submitting_and_retries(self):
+            adapter = AsyncMock()
+
+            async def run():
+                with patch.object(
+                    muse_pipeline.db, "get_latest_video_artifact", return_value=artifact
+                ):
+                    await muse_pipeline._generate_request(
+                        adapter=adapter,
+                        video_id=1,
+                        artifact_type="muse_scene_image:0",
+                        request_hash="request",
+                        prompt="prompt",
+                        references=[],
+                        omitted=[],
+                        destination=Path(temp_dir) / "scene",
+                        expected="image",
+                        scene={"index": 0},
+                        cancel_check=lambda: None,
+                    )
+
+            with self.assertRaisesRegex(muse_provider.MuseError, "Recreate"):
+                asyncio.run(run())
+            adapter.create_image.assert_not_awaited()
+
+    def test_invalid_downloaded_media_is_terminal(self):
         artifact = None
 
         def get_latest(*_args, **_kwargs):
@@ -401,10 +391,9 @@ class TestMuseRecovery(unittest.TestCase):
                         cancel_check=lambda: None,
                     )
 
-            with self.assertRaises(muse_pipeline.MuseRetryScheduled) as caught:
+            with self.assertRaises(muse_provider.MuseError):
                 asyncio.run(run())
 
-        self.assertEqual(caught.exception.delay_seconds, 60.0)
         self.assertEqual(artifact["status"], "error")
         self.assertTrue(artifact["metadata"]["invalid_media"])
 
@@ -457,8 +446,8 @@ class TestMuseRecovery(unittest.TestCase):
             async def create_image(self, *_args, **kwargs):
                 kwargs["on_submitted"](
                     muse_provider.MuseReceipt(
-                        thread_url="https://muse.ai/thread/receipt-1",
-                        turn_id="turn-1",
+                        provider_task_id="image-task-1",
+                        endpoint="/v1/images/tasks/image-task-1",
                         submitted_at="2026-01-01T00:00:00Z",
                     )
                 )
@@ -487,9 +476,8 @@ class TestMuseRecovery(unittest.TestCase):
             asyncio.run(run())
         self.assertFalse(caught.exception.consume_attempt)
         self.assertEqual(artifact["status"], "submitting")
-        self.assertEqual(
-            artifact["metadata"]["thread_url"], "https://muse.ai/thread/receipt-1"
-        )
+        self.assertEqual(artifact["metadata"]["provider"], "muse_studio_api")
+        self.assertEqual(artifact["metadata"]["provider_task_id"], "image-task-1")
 
     def test_ambiguous_submission_remains_fail_closed(self):
         artifact = None
@@ -557,8 +545,8 @@ class TestMuseRecovery(unittest.TestCase):
             async def create_image(self, *_args, **kwargs):
                 kwargs["on_submitted"](
                     muse_provider.MuseReceipt(
-                        thread_url="https://muse.ai/thread/receipt-cancel",
-                        turn_id="turn-cancel",
+                        provider_task_id="image-task-cancel",
+                        endpoint="/v1/images/tasks/image-task-cancel",
                         submitted_at="2026-01-01T00:00:00Z",
                     )
                 )
@@ -586,10 +574,143 @@ class TestMuseRecovery(unittest.TestCase):
         with self.assertRaises(VideoJobCanceled):
             asyncio.run(run())
         self.assertEqual(artifact["status"], "submitting")
-        self.assertEqual(
-            artifact["metadata"]["thread_url"],
-            "https://muse.ai/thread/receipt-cancel",
+        self.assertEqual(artifact["metadata"]["provider_task_id"], "image-task-cancel")
+
+    def test_legacy_browser_receipt_requires_recreate(self):
+        artifact = {
+            "status": "submitting",
+            "content_hash": "request",
+            "path": "",
+            "metadata": {
+                "thread_url": "https://muse.ai/thread/legacy",
+                "turn_id": "legacy-turn",
+                "submitted_at": "2026-01-01T00:00:00Z",
+            },
+        }
+        adapter = AsyncMock()
+
+        async def run():
+            with patch.object(muse_pipeline.db, "get_latest_video_artifact", return_value=artifact):
+                await muse_pipeline._generate_request(
+                    adapter=adapter,
+                    video_id=1,
+                    artifact_type="muse_scene_image:0",
+                    request_hash="request",
+                    prompt="prompt",
+                    references=[],
+                    omitted=[],
+                    destination=Path("unused"),
+                    expected="image",
+                    scene={"index": 0},
+                    cancel_check=lambda: None,
+                )
+
+        with self.assertRaisesRegex(muse_provider.MuseAmbiguousSubmissionError, "Recreate"):
+            asyncio.run(run())
+        adapter.reconcile.assert_not_awaited()
+
+
+class TestMuseStudioServiceLifecycle(unittest.TestCase):
+    def tearDown(self):
+        timer = muse_studio_service._idle_timer
+        if timer is not None:
+            timer.cancel()
+        muse_studio_service._idle_timer = None
+        muse_studio_service._process = None
+        muse_studio_service._api_key = ""
+        muse_studio_service._instance_id = ""
+        muse_studio_service._studio_path = None
+        muse_studio_service._stdout_handle = None
+        muse_studio_service._stderr_handle = None
+
+    def test_validate_path_requires_studio_contract(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with self.assertRaises(muse_studio_service.MuseStudioConfigurationError):
+                muse_studio_service.validate_studio_path(root)
+            (root / "muse2api_backend").mkdir()
+            (root / "main.py").write_text("", encoding="utf-8")
+            (root / "muse2api_backend" / "app.py").write_text("", encoding="utf-8")
+            self.assertEqual(muse_studio_service.validate_studio_path(root), str(root.resolve()))
+
+    def test_source_mode_prefers_legacy_backend_data_like_muse_studio(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runtime_data = root / "muse2api_data"
+            runtime_data.mkdir()
+            self.assertEqual(muse_studio_service._studio_data_dir(root), runtime_data.resolve())
+            legacy_data = root / "muse2api_backend" / "data"
+            legacy_data.mkdir(parents=True)
+            self.assertEqual(muse_studio_service._studio_data_dir(root), legacy_data.resolve())
+
+    def test_foreign_port_is_never_reused_or_killed(self):
+        with (
+            patch.object(muse_studio_service, "_validate_studio_path", return_value=Path("C:/Muse")),
+            patch.object(muse_studio_service, "_port_in_use", return_value=True),
+            patch.object(muse_studio_service.subprocess, "Popen") as popen,
+        ):
+            with self.assertRaises(muse_studio_service.MuseStudioServiceBusy):
+                muse_studio_service.ensure_started()
+        popen.assert_not_called()
+
+    def test_start_keeps_api_key_out_of_command_line_and_state(self):
+        process = MagicMock()
+        process.pid = 4321
+        process.poll.return_value = None
+        status = {
+            "running": True,
+            "owned": True,
+            "api_ready": True,
+            "accounts": 1,
+            "browser_running": True,
+            "api_url": muse_studio_service.MUSE_API_BASE_URL,
+        }
+        with (
+            patch.object(muse_studio_service, "_validate_studio_path", return_value=Path("C:/Muse")),
+            patch.object(muse_studio_service, "_port_in_use", return_value=False),
+            patch.object(muse_studio_service.Path, "is_file", return_value=True),
+            patch.object(muse_studio_service, "open", mock_open()),
+            patch.object(muse_studio_service.subprocess, "Popen", return_value=process) as popen,
+            patch.object(muse_studio_service.process_registry, "register_process"),
+            patch.object(muse_studio_service, "_write_state") as write_state,
+            patch.object(muse_studio_service, "_probe_owned_service", return_value=status),
+        ):
+            self.assertEqual(muse_studio_service.ensure_started(), status)
+        command = popen.call_args.args[0]
+        environment = popen.call_args.kwargs["env"]
+        self.assertEqual(command[-1], "--muse-service")
+        self.assertNotIn(environment["MUSE2API_KEY"], " ".join(command))
+        self.assertEqual(environment["MUSE2API_HOST"], "127.0.0.1")
+        self.assertEqual(environment["MUSE2API_PORT"], "18610")
+        self.assertEqual(environment["MUSE2API_CDP_PORT"], "19210")
+        self.assertEqual(environment["MUSE2API_CONCURRENCY"], "1")
+        write_state.assert_called_once_with(process, Path("C:/Muse"))
+
+    def test_no_account_fails_readiness(self):
+        muse_studio_service._api_key = "in-memory-only"
+        responses = [
+            {"status": "ok"},
+            {"status": "no_account", "accounts": 0, "browser_running": False},
+            {"data": []},
+        ]
+        with patch.object(muse_studio_service, "_request_json", side_effect=responses):
+            with self.assertRaisesRegex(
+                muse_studio_service.MuseStudioConfigurationError, "account"
+            ):
+                muse_studio_service._probe_owned_service()
+
+    def test_release_schedules_sixty_second_idle_close(self):
+        process = MagicMock()
+        process.poll.return_value = None
+        muse_studio_service._process = process
+        timer = MagicMock()
+        with patch.object(muse_studio_service.threading, "Timer", return_value=timer) as timer_cls:
+            muse_studio_service.release()
+        timer_cls.assert_called_once_with(
+            muse_studio_service.MUSE_IDLE_CLOSE_SECONDS,
+            muse_studio_service._idle_close_callback,
         )
+        timer.start.assert_called_once()
 
 
 class TestMuseRouting(unittest.TestCase):
@@ -681,7 +802,7 @@ class TestMuseRouting(unittest.TestCase):
             )
         )
 
-    def test_profile_busy_wait_does_not_consume_session_attempt(self):
+    def test_service_busy_wait_does_not_consume_session_attempt(self):
         job = {
             "id": "muse-profile-busy",
             "job_type": "muse_media_generation",
@@ -696,12 +817,13 @@ class TestMuseRouting(unittest.TestCase):
             patch.object(main.db, "update_system_job"),
             patch.object(main.db, "update_video_production_state"),
         ):
-            main._handle_production_job_error(job, muse_provider.MuseProfileBusy("busy"))
+            main._handle_production_job_error(job, muse_provider.MuseServiceBusy("busy"))
 
         self.assertEqual(schedule.call_args.kwargs["delay_seconds"], 15.0)
         self.assertNotIn("muse_session_attempt", schedule.call_args.kwargs["result_json"])
+        self.assertEqual(schedule.call_args.kwargs["result_json"]["muse_wait_reason"], "service_busy")
 
-    def test_muse_proxy_failure_does_not_enter_youtube_pause_flow(self):
+    def test_muse_auth_failure_does_not_enter_youtube_pause_flow(self):
         job = {
             "id": "muse-no-proxy",
             "job_type": "muse_media_generation",
@@ -716,52 +838,44 @@ class TestMuseRouting(unittest.TestCase):
             patch.object(main.db, "update_video_production_state"),
         ):
             main._handle_production_job_error(
-                job, muse_provider.ProxyConfigurationError("missing proxy")
+                job, muse_provider.MuseAuthenticationError("no account")
             )
 
         pause_youtube.assert_not_called()
         self.assertEqual(update_job.call_args.kwargs["status"], "error")
 
-    def test_provider_source_has_no_direct_http_downloader(self):
+    def test_provider_source_has_no_playwright_or_gpm_fallback(self):
         source = Path(muse_provider.__file__).read_text(encoding="utf-8")
-        self.assertNotIn("requests.get", source)
-        self.assertNotIn("urllib.request", source)
-        self.assertIn("fetch(src", source)
+        self.assertNotIn("playwright", source.lower())
+        self.assertNotIn("gpm_service", source)
+        self.assertIn("/v1/media/", source)
+        self.assertIn("parsed.hostname != muse_studio_service.MUSE_API_HOST", source)
 
-    def test_muse_content_is_masked_in_browser_diagnostic_screenshots(self):
-        selectors = browser_diagnostics.SENSITIVE_SCREENSHOT_SELECTOR
-        self.assertIn("hatch-agent-bubble-bg", selectors)
-        self.assertIn("hatch-chat-attachment-presentation-", selectors)
-
-    def test_muse_profile_response_never_exposes_credentials(self):
-        public = main._public_gpm_profile(
-            {
-                "id": "profile-1",
-                "name": "Muse",
-                "raw_proxy": "host:8080:user:secret",
-                "proxy": "http://other:password@host:8080",
-                "token": "bearer-secret",
-                "cookies": "session-secret",
-                "proxy_username": "user",
-                "proxy_password": "secret",
-                "account": {"session": "nested-secret"},
-                "future_credential_field": "unknown-secret",
-            }
-        )
-        serialized = json.dumps(public)
-        for secret in (
-            "bearer-secret",
-            "session-secret",
-            "password",
-            "user:secret",
-            "nested-secret",
-            "unknown-secret",
+    def test_muse_settings_response_exposes_only_sanitized_service_status(self):
+        safe_status = {
+            "running": True,
+            "owned": True,
+            "api_ready": True,
+            "accounts": 2,
+            "browser_running": True,
+            "api_url": "http://127.0.0.1:18610",
+        }
+        with (
+            patch.object(main.muse_settings, "load_muse_settings", return_value={"muse_studio_path": "C:\\Muse"}),
+            patch.object(main.muse_studio_service, "status", return_value=safe_status),
         ):
-            self.assertNotIn(secret, serialized)
-        self.assertNotIn("raw_proxy", public)
-        self.assertNotIn("proxy", public)
-        self.assertTrue(public["proxy_configured"])
-        self.assertEqual(public["proxy_display"], "host:8080")
+            response = main.get_muse_settings_endpoint()
+        serialized = response.body.decode("utf-8")
+        self.assertIn('"accounts":2', serialized)
+        for secret_field in ("api_key", "cookie", "token", "proxy"):
+            self.assertNotIn(secret_field, serialized.lower())
+
+    def test_legacy_muse_profile_routes_are_removed(self):
+        source = Path(main.__file__).read_text(encoding="utf-8")
+        self.assertNotIn('/api/muse/profile/open', source)
+        self.assertNotIn('/api/muse/profile/verify', source)
+        self.assertIn('/api/muse/studio/open', source)
+        self.assertIn('/api/muse/service/verify', source)
 
     def test_muse_api_responses_disable_caching(self):
         response = main._muse_json_response({"success": True})

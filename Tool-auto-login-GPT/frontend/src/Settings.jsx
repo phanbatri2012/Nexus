@@ -541,8 +541,14 @@ export default function Settings({
   const [loadingAssets, setLoadingAssets] = useState(false);
   const [uploadingAsset, setUploadingAsset] = useState(false);
   const [assetMessage, setAssetMessage] = useState('');
-  const [museGlobalSettings, setMuseGlobalSettings] = useState({ gpm_profile_id: '' });
-  const [museProfiles, setMuseProfiles] = useState([]);
+  const [museGlobalSettings, setMuseGlobalSettings] = useState({ muse_studio_path: 'E:\\yt\\Tool\\Muse_AI_Studio' });
+  const [museService, setMuseService] = useState({
+    configured: false,
+    running: false,
+    api_ready: false,
+    accounts: 0,
+    browser_running: false
+  });
   const [museStatus, setMuseStatus] = useState('');
   const [museBusy, setMuseBusy] = useState(false);
 
@@ -643,23 +649,23 @@ export default function Settings({
 
   const fetchData = async () => {
     try {
-      const [promptsResponse, voicesResponse, channelsResponse, museResponse, gpmResponse] = await Promise.all([
+      const [promptsResponse, voicesResponse, channelsResponse, museResponse] = await Promise.all([
         fetch('http://127.0.0.1:8080/api/prompts'),
         fetch('http://127.0.0.1:8080/api/voices'),
         fetch('http://127.0.0.1:8080/api/youtube-comments/channels'),
-        fetch('http://127.0.0.1:8080/api/muse/settings'),
-        fetch('http://127.0.0.1:8080/api/gpm/profiles?page_size=500')
+        fetch('http://127.0.0.1:8080/api/muse/settings')
       ]);
       const prompts = await promptsResponse.json();
       const voices = await voicesResponse.json();
       const channels = await channelsResponse.json();
       const muse = museResponse.ok ? await museResponse.json() : { settings: {} };
-      const gpm = gpmResponse.ok ? await gpmResponse.json() : { items: [] };
       setPromptsData(prompts);
       setVoicesData(voices);
       setYoutubeChannels(Array.isArray(channels.items) ? channels.items : []);
-      setMuseGlobalSettings({ gpm_profile_id: muse.settings?.gpm_profile_id || '' });
-      setMuseProfiles(Array.isArray(gpm.items) ? gpm.items : []);
+      setMuseGlobalSettings({
+        muse_studio_path: muse.settings?.muse_studio_path || 'E:\\yt\\Tool\\Muse_AI_Studio'
+      });
+      setMuseService(current => ({ ...current, ...(muse.service || {}) }));
       setActiveVersion(prompts.active_version);
     } catch (err) {
       console.error("Lỗi khi lấy prompts:", err);
@@ -859,28 +865,31 @@ export default function Settings({
     });
   };
 
-  const runMuseProfileAction = async (action) => {
+  const runMuseStudioAction = async (action) => {
     setMuseBusy(true);
-    setMuseStatus(action === 'open' ? 'Đang mở profile Muse...' : 'Đang kiểm tra Muse...');
+    setMuseStatus(action === 'open' ? 'Đang mở Muse Studio...' : 'Đang kiểm tra Muse2API...');
     try {
-      if (!museGlobalSettings.gpm_profile_id) throw new Error('Hãy chọn GPM profile Muse.');
+      if (!museGlobalSettings.muse_studio_path) throw new Error('Hãy nhập đường dẫn Muse_AI_Studio.');
       const saveResponse = await fetch('http://127.0.0.1:8080/api/muse/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(museGlobalSettings)
       });
       const saved = await saveResponse.json();
-      if (!saveResponse.ok) throw new Error(saved.detail || 'Không thể lưu GPM profile Muse.');
+      if (!saveResponse.ok) throw new Error(saved.detail || 'Không thể lưu đường dẫn Muse Studio.');
       setMuseGlobalSettings(saved.settings || museGlobalSettings);
-      const response = await fetch(`http://127.0.0.1:8080/api/muse/profile/${action}`, {
+      setMuseService(current => ({ ...current, ...(saved.service || {}) }));
+      const endpoint = action === 'open' ? '/api/muse/studio/open' : '/api/muse/service/verify';
+      const response = await fetch(`http://127.0.0.1:8080${endpoint}`, {
         method: 'POST'
       });
       const data = await response.json();
-      if (!response.ok) throw new Error(data.detail || 'Không thể thao tác profile Muse.');
+      if (!response.ok) throw new Error(data.detail || 'Không thể thao tác Muse Studio.');
+      if (data.service) setMuseService(current => ({ ...current, ...data.service }));
       setMuseStatus(
         action === 'open'
-          ? '✅ Đã mở Muse trong GPM profile.'
-          : '✅ Profile, proxy, login và composer Muse đều sẵn sàng.'
+          ? '✅ Đã mở Muse Studio để quản lý tài khoản.'
+          : `✅ Muse2API sẵn sàng với ${Number(data.service?.accounts || 0)} account.`
       );
     } catch (err) {
       setMuseStatus(`❌ ${err.message}`);
@@ -891,7 +900,7 @@ export default function Settings({
 
   const saveMuseGlobalSettings = async () => {
     setMuseBusy(true);
-    setMuseStatus('Đang lưu GPM profile Muse...');
+    setMuseStatus('Đang lưu đường dẫn Muse Studio...');
     try {
       const response = await fetch('http://127.0.0.1:8080/api/muse/settings', {
         method: 'PUT',
@@ -901,7 +910,8 @@ export default function Settings({
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || 'Không thể lưu cấu hình Muse.');
       setMuseGlobalSettings(data.settings || museGlobalSettings);
-      setMuseStatus('✅ Đã lưu GPM profile Muse; proxy hợp lệ.');
+      setMuseService(current => ({ ...current, ...(data.service || {}) }));
+      setMuseStatus('✅ Đã lưu đường dẫn Muse Studio.');
     } catch (err) {
       setMuseStatus(`❌ ${err.message}`);
     } finally {
@@ -2536,32 +2546,32 @@ export default function Settings({
               </div>
 
               <div style={{ padding: 14, border: '1px solid #334155', borderRadius: 8, marginBottom: 16 }}>
-                <strong>GPM profile Muse toàn hệ thống</strong>
+                <strong>Muse AI Studio toàn hệ thống</strong>
                 <div className="production-settings-grid" style={{ marginTop: 10 }}>
                   <label>
-                    Profile riêng đã đăng nhập Muse
-                    <select
-                      className="version-select"
-                      value={museGlobalSettings.gpm_profile_id}
-                      onChange={event => setMuseGlobalSettings({ gpm_profile_id: event.target.value })}
-                    >
-                      <option value="">-- Chọn GPM profile --</option>
-                      {museProfiles.map(profile => (
-                        <option key={profile.id} value={profile.id}>
-                          {profile.name || profile.id}{profile.proxy_configured ? ' · Proxy OK' : ' · Thiếu proxy'}
-                        </option>
-                      ))}
-                    </select>
+                    Đường dẫn Muse_AI_Studio
+                    <input
+                      className="version-input"
+                      value={museGlobalSettings.muse_studio_path}
+                      onChange={event => setMuseGlobalSettings({ muse_studio_path: event.target.value })}
+                      placeholder="E:\\yt\\Tool\\Muse_AI_Studio"
+                    />
                   </label>
                 </div>
+                <div className="help-text" style={{ marginTop: 10 }}>
+                  API: <strong>{museService.api_ready ? 'Sẵn sàng' : (museService.running ? 'Đang khởi động' : 'Đang tắt')}</strong>
+                  {' · '}Account khả dụng: <strong>{Number(museService.accounts || 0)}</strong>
+                  {' · '}Browser service: <strong>{museService.browser_running ? 'Đang chạy' : 'Đang tắt'}</strong>
+                </div>
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 10 }}>
-                  <button type="button" className="btn-secondary" onClick={saveMuseGlobalSettings} disabled={museBusy}>💾 Lưu profile</button>
-                  <button type="button" className="btn-secondary" onClick={() => runMuseProfileAction('open')} disabled={museBusy || !museGlobalSettings.gpm_profile_id}>🌐 Mở Muse</button>
-                  <button type="button" className="btn-secondary" onClick={() => runMuseProfileAction('verify')} disabled={museBusy || !museGlobalSettings.gpm_profile_id}>✅ Kiểm tra</button>
+                  <button type="button" className="btn-secondary" onClick={saveMuseGlobalSettings} disabled={museBusy}>💾 Lưu đường dẫn</button>
+                  <button type="button" className="btn-secondary" onClick={() => runMuseStudioAction('open')} disabled={museBusy || !museGlobalSettings.muse_studio_path}>🧩 Mở Muse Studio</button>
+                  <button type="button" className="btn-secondary" onClick={() => runMuseStudioAction('verify')} disabled={museBusy || !museGlobalSettings.muse_studio_path}>✅ Kiểm tra kết nối</button>
                 </div>
                 {museStatus && <div className="help-text" style={{ marginTop: 8 }}>{museStatus}</div>}
                 <div className="help-text" style={{ marginTop: 8 }}>
-                  Tool không mở Muse lúc startup. Profile chỉ được gọi khi có job hoặc khi bạn bấm Mở/Kiểm tra.
+                  Nexus Studio Engine không mở Muse lúc startup. Job Muse đầu tiên mới mở Muse2API; service tự đóng sau 60 giây rảnh.
+                  Hãy đóng giao diện Muse Studio trước khi chạy job hoặc kiểm tra kết nối.
                 </div>
               </div>
 

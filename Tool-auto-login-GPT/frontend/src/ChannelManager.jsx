@@ -8,8 +8,10 @@ import PublicationTimePicker from './PublicationTimePicker'
 
 const API_BASE = 'http://127.0.0.1:8080'
 const WEEKDAYS = ['Thứ Hai', 'Thứ Ba', 'Thứ Tư', 'Thứ Năm', 'Thứ Sáu', 'Thứ Bảy', 'Chủ Nhật']
-const FB_STORAGE_KEY = 'AUTOYT_FACEBOOK_PAGES'
-const TT_STORAGE_KEY = 'AUTOYT_TIKTOK_ACCOUNTS'
+const FB_STORAGE_KEY = 'NEXUS_FACEBOOK_PAGES'
+const LEGACY_FB_STORAGE_KEY = 'AUTOYT_FACEBOOK_PAGES'
+const TT_STORAGE_KEY = 'NEXUS_TIKTOK_ACCOUNTS'
+const LEGACY_TT_STORAGE_KEY = 'AUTOYT_TIKTOK_ACCOUNTS'
 const VALID_TABS = ['youtube', 'facebook', 'tiktok', 'gpm']
 
 function withoutFacebookSecrets(page) {
@@ -22,7 +24,7 @@ function withoutFacebookSecrets(page) {
 
 function readFacebookPageStorage() {
   try {
-    const saved = localStorage.getItem(FB_STORAGE_KEY)
+    const saved = localStorage.getItem(FB_STORAGE_KEY) || localStorage.getItem(LEGACY_FB_STORAGE_KEY)
     const parsed = saved ? JSON.parse(saved) : []
     const pages = Array.isArray(parsed) ? parsed : []
     return {
@@ -112,7 +114,7 @@ export default function ChannelManager({
   // TikTok Accounts States
   const [tiktokAccounts, setTiktokAccounts] = useState(() => {
     try {
-      const saved = localStorage.getItem(TT_STORAGE_KEY)
+      const saved = localStorage.getItem(TT_STORAGE_KEY) || localStorage.getItem(LEGACY_TT_STORAGE_KEY)
       return saved ? JSON.parse(saved) : []
     } catch {
       return []

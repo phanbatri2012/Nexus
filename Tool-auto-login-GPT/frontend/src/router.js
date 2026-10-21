@@ -1,12 +1,13 @@
 /**
- * Auto_YT Universal Router Engine
+ * Nexus Studio Engine Universal Router Engine
  * Zero-dependency, modern HTML5 History API router with deep sub-path & parameter support.
  * Designed for Nexus Studio Engine with React 19 compatibility.
  */
 
 import { createElement, useEffect, useState, useCallback, useMemo } from 'react'
 
-export const NAVIGATION_EVENT = 'autoyt-navigation'
+export const NAVIGATION_EVENT = 'nexus-navigation'
+export const LEGACY_NAVIGATION_EVENT = 'autoyt-navigation'
 
 /**
  * Registry of all primary routes, canonical URLs, aliases, and display titles.
@@ -255,6 +256,7 @@ function emitNavigationEvent(routeData) {
   if (typeof window === 'undefined') return
   const event = new CustomEvent(NAVIGATION_EVENT, { detail: routeData })
   window.dispatchEvent(event)
+  window.dispatchEvent(new CustomEvent(LEGACY_NAVIGATION_EVENT, { detail: routeData }))
 }
 
 /**
@@ -317,10 +319,12 @@ export function useAppRouter() {
 
     window.addEventListener('popstate', handleLocationChange)
     window.addEventListener(NAVIGATION_EVENT, handleCustomNav)
+    window.addEventListener(LEGACY_NAVIGATION_EVENT, handleCustomNav)
 
     return () => {
       window.removeEventListener('popstate', handleLocationChange)
       window.removeEventListener(NAVIGATION_EVENT, handleCustomNav)
+      window.removeEventListener(LEGACY_NAVIGATION_EVENT, handleCustomNav)
     }
   }, [])
 

@@ -98,6 +98,7 @@ from auto_yt.services import (
     muse_pipeline,
     muse_provider,
     muse_settings,
+    muse_studio_service,
     source_voice_analyzer,
     video_qc,
     video_production,
@@ -608,7 +609,7 @@ app.add_middleware(
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Accept", "Content-Type", api_security.CSRF_HEADER_NAME],
+    allow_headers=["Accept", "Content-Type", api_security.CSRF_HEADER_NAME, api_security.LEGACY_CSRF_HEADER_NAME],
 )
 
 app.include_router(trust_builder_router.router, prefix="/api/trust-builder")
@@ -636,6 +637,7 @@ def get_health():
         if _muse_media_coordinator is not None
         else {"running": False, "ready": False, "current_job_id": ""}
     )
+    muse_service = muse_studio_service.status(probe=False)
     radar_coord = (
         _radar_coordinator.status()
         if _radar_coordinator is not None
@@ -679,6 +681,7 @@ def get_health():
         "publish_coordinator": publish_coord,
         "flow_media_coordinator": flow_coord,
         "muse_media_coordinator": muse_coord,
+        "muse_studio_service": muse_service,
         "competitor_radar_coordinator": radar_coord,
         "competitor_radar_scheduler": radar_scheduler,
         "competitor_radar_health": radar_health,
@@ -898,7 +901,7 @@ class GpmConfigRequest(BaseModel):
 
 
 class MuseSettingsData(BaseModel):
-    gpm_profile_id: str = Field(default="", max_length=120)
+    muse_studio_path: str = Field(default="", max_length=1024)
 
 
 class GpmProfileStartRequest(BaseModel):
@@ -1430,73 +1433,45 @@ def _muse_http_exception(status_code: int, exc: Exception) -> HTTPException:
 @app.get("/api/muse/settings")
 def get_muse_settings_endpoint():
     settings = muse_settings.load_muse_settings()
-    profile_id = str(settings.get("gpm_profile_id") or "")
-    profile = None
-    if profile_id:
-        try:
-            profile = _public_gpm_profile(gpm_service.get_gpm_profile_detail(profile_id))
-        except Exception as exc:
-            logger.warning(
-                "Không thể đọc GPM profile Muse đã cấu hình: %s",
-                security_logging.redact_sensitive(exc),
-            )
-            profile = {"id": profile_id, "available": False, "proxy_configured": False}
-    return _muse_json_response({"settings": settings, "profile": profile})
+    return _muse_json_response(
+        {"settings": settings, "service": muse_studio_service.status(probe=True)}
+    )
 
 
 @app.put("/api/muse/settings")
 def update_muse_settings_endpoint(request: MuseSettingsData):
     try:
-        profile_id = request.gpm_profile_id.strip()
-        profile = None
-        if profile_id:
-            detail = muse_provider.MuseBrowserProvider.validate_profile(profile_id)
-            profile = _public_gpm_profile(detail)
-        saved = muse_settings.save_muse_settings({"gpm_profile_id": profile_id})
-        return _muse_json_response({"settings": saved, "profile": profile})
-    except (ValueError, ProxyConfigurationError) as exc:
-        raise _muse_http_exception(400, exc) from exc
-    except gpm_service.GpmProfileNotFoundError as exc:
-        raise _muse_http_exception(404, exc) from exc
-    except Exception as exc:
-        raise _muse_http_exception(503, exc) from exc
-
-
-@app.post("/api/muse/profile/open")
-def open_muse_profile_endpoint():
-    try:
-        profile_id = muse_provider.MuseBrowserProvider.configured_profile_id()
-        muse_provider.MuseBrowserProvider.validate_profile(profile_id)
-        launch = gpm_service.start_gpm_profile(
-            profile_id,
-            require_cdp=True,
-            skip_proxy_check=False,
-            manual=True,
-        )
-        muse_provider.mark_profile_user_owned(profile_id)
-        gpm_service.open_tab_in_running_gpm_process(profile_id, muse_provider.MUSE_URL)
+        studio_path = muse_studio_service.validate_studio_path(request.muse_studio_path.strip())
+        saved = muse_settings.save_muse_settings({"muse_studio_path": studio_path})
         return _muse_json_response(
-            {
-                "success": True,
-                "profile_id": profile_id,
-                "already_running": bool(launch.get("already_running")),
-                "url": muse_provider.MUSE_URL,
-            }
+            {"settings": saved, "service": muse_studio_service.status(probe=True)}
         )
-    except (ValueError, ProxyConfigurationError, muse_provider.MuseAuthenticationError) as exc:
+    except (ValueError, muse_studio_service.MuseStudioConfigurationError) as exc:
         raise _muse_http_exception(400, exc) from exc
     except Exception as exc:
         raise _muse_http_exception(503, exc) from exc
 
 
-@app.post("/api/muse/profile/verify")
-async def verify_muse_profile_endpoint():
+@app.post("/api/muse/studio/open")
+def open_muse_studio_endpoint():
     try:
-        result = await muse_provider.MuseBrowserProvider().verify()
-        return _muse_json_response({"success": True, "capabilities": result})
-    except (ValueError, ProxyConfigurationError, muse_provider.MuseAuthenticationError) as exc:
+        return _muse_json_response(muse_studio_service.open_studio())
+    except muse_studio_service.MuseStudioConfigurationError as exc:
         raise _muse_http_exception(400, exc) from exc
-    except muse_provider.MuseProfileBusy as exc:
+    except muse_studio_service.MuseStudioServiceBusy as exc:
+        raise _muse_http_exception(409, exc) from exc
+    except Exception as exc:
+        raise _muse_http_exception(503, exc) from exc
+
+
+@app.post("/api/muse/service/verify")
+async def verify_muse_service_endpoint():
+    try:
+        result = await muse_provider.MuseStudioApiProvider().verify()
+        return _muse_json_response({"success": True, "service": result})
+    except (ValueError, muse_provider.MuseAuthenticationError) as exc:
+        raise _muse_http_exception(400, exc) from exc
+    except muse_provider.MuseServiceBusy as exc:
         raise _muse_http_exception(409, exc) from exc
     except Exception as exc:
         raise _muse_http_exception(503, exc) from exc
@@ -7206,11 +7181,11 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
     ):
         current_job = db.get_system_job(job["id"]) or job
         result = dict(current_job.get("result") or {})
-        is_busy = isinstance(exc, muse_provider.MuseProfileBusy)
+        is_busy = isinstance(exc, muse_provider.MuseServiceBusy)
         is_request_retry = isinstance(exc, muse_pipeline.MuseRetryScheduled)
         if is_busy:
             delay_seconds = 15.0
-            wait_reason = "profile_busy"
+            wait_reason = "service_busy"
         elif is_request_retry:
             delay_seconds = float(exc.delay_seconds)
             wait_reason = "transient_error"
@@ -7245,7 +7220,7 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
                     render_status="retry_wait",
                     current_stage="muse_media_generation",
                     production_progress=(
-                        "GPM profile Muse đang bận; job sẽ tự tiếp tục"
+                        "Muse2API đang bận; job sẽ tự tiếp tục"
                         if is_busy
                         else f"Muse lỗi tạm thời; thử lại sau {delay_seconds:g} giây"
                     ),

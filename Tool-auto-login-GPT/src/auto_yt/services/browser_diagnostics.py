@@ -266,9 +266,7 @@ def _redact_diagnostic_dom(html: str) -> str:
 SENSITIVE_SCREENSHOT_SELECTOR = (
     "input, textarea, [contenteditable='true'], [data-message-author-role], "
     "flow-creative-agent-prompt-box, flow-base-prompt-box, flow-prompt-box, "
-    "flow-creative-agent-message, flow-agent-message, "
-    "[class*='hatch-agent-bubble-bg'], "
-    "[data-testid^='hatch-chat-attachment-presentation-']"
+    "flow-creative-agent-message, flow-agent-message"
 )
 
 

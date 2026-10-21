@@ -1,0 +1,14 @@
+@echo off
+setlocal EnableExtensions
+cd /d "%~dp0"
+
+title Restart Nexus Studio Engine
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0restart_autoyt.ps1" %*
+set "NEXUS_EXIT_CODE=%ERRORLEVEL%"
+
+if not "%NEXUS_EXIT_CODE%"=="0" (
+    echo Nexus Studio Engine restart failed. Review the error above and data\logs.
+    if not defined NEXUS_RESTART_NO_PAUSE if not defined AUTOYT_RESTART_NO_PAUSE pause
+)
+
+exit /b %NEXUS_EXIT_CODE%
