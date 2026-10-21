@@ -2568,13 +2568,30 @@ export default function Settings({
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 10 }}>
                 <div>
                   <strong>Reference sets</strong>
-                  <div className="help-text">Mỗi bộ có aliases và tối đa 6 ảnh từ kho assets của bộ prompt.</div>
+                  <div className="help-text">Mỗi bộ có aliases và 1–6 ảnh từ kho assets của bộ prompt.</div>
                 </div>
-                <div style={{ display: 'flex', gap: 8 }}>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                   <button type="button" className="btn-secondary" onClick={handleOpenAssetsFolder}>📂 Kho ảnh</button>
+                  <label className="btn-secondary" style={{ cursor: activeVersionLocked || uploadingAsset ? 'not-allowed' : 'pointer', margin: 0 }}>
+                    {uploadingAsset ? '⏳ Đang tải...' : '➕ Tải ảnh'}
+                    <input
+                      type="file"
+                      multiple
+                      accept="image/png, image/jpeg, image/webp"
+                      style={{ display: 'none' }}
+                      onChange={handleUploadAsset}
+                      disabled={activeVersionLocked || uploadingAsset}
+                    />
+                  </label>
+                  <button type="button" className="btn-secondary" onClick={() => fetchPromptAssets(activeVersion)}>🔄 Làm mới</button>
                   <button type="button" className="btn-secondary" onClick={addMuseReferenceSet} disabled={activeVersionLocked}>＋ Thêm bộ</button>
                 </div>
               </div>
+              {assetMessage && (
+                <div className="help-text" style={{ color: '#4ce0b3', marginBottom: 10 }}>
+                  {assetMessage}
+                </div>
+              )}
               {(currentImageGeneration.muse_settings.reference_sets || []).map((referenceSet, setIndex) => {
                 const selectedImages = referenceSet.images || [];
                 return (

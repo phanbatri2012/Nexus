@@ -402,14 +402,17 @@ def _validate_image(path: Path) -> dict:
         with Image.open(path) as image:
             width, height = image.size
     except Exception as exc:
-        raise MuseError("Ảnh Muse bị hỏng hoặc sai định dạng.") from exc
+        raise MuseTransientError("Ảnh Muse bị hỏng hoặc sai định dạng.") from exc
     if width < 640 or height < 360:
-        raise MuseError("Ảnh Muse có độ phân giải quá thấp.")
+        raise MuseTransientError("Ảnh Muse có độ phân giải quá thấp.")
     return {"width": width, "height": height}
 
 
 def _normalize_video(video_id: int, source: Path, target: Path) -> dict:
-    source_details = video_production.probe_scene_video(source)
+    try:
+        source_details = video_production.probe_scene_video(source)
+    except video_production.VideoProductionError as exc:
+        raise MuseTransientError("Video Muse bị hỏng hoặc không đọc được.") from exc
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(".mp4.tmp")
@@ -449,10 +452,14 @@ def _normalize_video(video_id: int, source: Path, target: Path) -> dict:
         process_registry.unregister_process(f"video:{video_id}", process)
     if process.returncode != 0:
         temporary.unlink(missing_ok=True)
-        raise MuseError(
+        raise MuseTransientError(
             "Không thể chuẩn hóa video Muse: " + video_production.extract_ffmpeg_error(stderr or "")
         )
-    normalized = video_production.probe_scene_video(temporary)
+    try:
+        normalized = video_production.probe_scene_video(temporary)
+    except video_production.VideoProductionError as exc:
+        temporary.unlink(missing_ok=True)
+        raise MuseTransientError("Video Muse sau chuẩn hóa không hợp lệ.") from exc
     temporary.replace(target)
     return {
         "duration_seconds": float(normalized["duration_seconds"]),
@@ -560,14 +567,13 @@ async def _generate_request(
             )
 
         try:
-            result = await adapter.generate(
-                prompt=prompt,
-                reference_paths=[Path(item["path"]) for item in references],
-                destination=destination,
-                expected=expected,
-                timeout_seconds=(
-                    900 if expected == "video" else 360
-                ),
+            create_media = (
+                adapter.create_video if expected == "video" else adapter.create_image
+            )
+            result = await create_media(
+                prompt,
+                [Path(item["path"]) for item in references],
+                destination,
                 on_submitted=on_submitted,
                 cancel_check=cancel_check,
             )
@@ -648,16 +654,38 @@ async def _generate_request(
             raise
 
     result_path = Path(str(result["path"]))
-    if expected == "image":
-        details = _validate_image(result_path)
-        final_path = result_path
-        duration = None
-    else:
-        final_path = destination.with_suffix(".mp4")
-        details = _normalize_video(video_id, result_path, final_path)
-        duration = float(details["duration_seconds"])
-        if result_path != final_path:
-            result_path.unlink(missing_ok=True)
+    try:
+        if expected == "image":
+            details = _validate_image(result_path)
+            final_path = result_path
+            duration = None
+        else:
+            final_path = destination.with_suffix(".mp4")
+            details = _normalize_video(video_id, result_path, final_path)
+            duration = float(details["duration_seconds"])
+            if result_path != final_path:
+                result_path.unlink(missing_ok=True)
+    except MuseTransientError as exc:
+        current = db.get_latest_video_artifact(video_id, artifact_type) or {}
+        current_metadata = dict(current.get("metadata") or {})
+        validation_attempt = int(current_metadata.get("attempt") or 1)
+        _record_request_state(
+            video_id,
+            artifact_type,
+            request_hash,
+            status="error",
+            metadata={
+                **current_metadata,
+                "attempt": validation_attempt,
+                "error_class": type(exc).__name__,
+                "invalid_media": True,
+            },
+        )
+        if validation_attempt < MAX_REQUEST_ATTEMPTS:
+            raise MuseRetryScheduled(
+                str(exc), delay_seconds=RETRY_DELAYS_SECONDS[validation_attempt - 1]
+            ) from exc
+        raise
     checksum = _sha256_file(final_path)
     final_metadata = {
         **dict((existing or {}).get("metadata") or {}),

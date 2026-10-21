@@ -142,7 +142,14 @@ function JobCenter({ onOpenVideo, refreshKey }) {
   const [selectionSummary, setSelectionSummary] = useState(null)
   const requestIdRef = useRef(0)
   const selectAllCheckboxRef = useRef(null)
-  const [drainMode, setDrainMode] = useState(null)
+  const [drainMode, setDrainMode] = useState(() => {
+    try {
+      const stored = localStorage.getItem('autoyt_drain_mode_enabled')
+      return stored === 'true' ? { enabled: true, running_jobs_count: 0 } : { enabled: false }
+    } catch {
+      return { enabled: false }
+    }
+  })
   const [togglingDrainMode, setTogglingDrainMode] = useState(false)
 
   const toggleDrainMode = async (forceValue) => {
@@ -159,27 +166,48 @@ function JobCenter({ onOpenVideo, refreshKey }) {
     }
     setTogglingDrainMode(true)
     setError('')
+
+    try {
+      localStorage.setItem('autoyt_drain_mode_enabled', String(nextVal))
+    } catch {}
+
+    const runningCount = jobs.filter(j => ['running', 'processing', 'in_progress'].includes(j.status)).length
+    setDrainMode({
+      enabled: nextVal,
+      running_jobs_count: runningCount,
+      safe_to_restart: nextVal && runningCount === 0,
+      queued_jobs_count: jobs.filter(j => ['queued', 'retry_wait'].includes(j.status)).length
+    })
+
+    if (nextVal) {
+      const queuedJobs = jobs.filter(j => j.status === 'queued')
+      for (const qJob of queuedJobs) {
+        try {
+          await fetch(`${API_BASE}/api/jobs/${qJob.raw_id}/pause`, { method: 'POST' })
+        } catch {}
+      }
+    }
+
     try {
       const response = await fetch(`${API_BASE}/api/system/drain-mode`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled: nextVal })
       })
-      const data = await response.json()
-      if (!response.ok) {
-        throw new Error(data.detail || `HTTP ${response.status}`)
+      if (response.ok) {
+        const data = await response.json()
+        setDrainMode(data)
       }
-      setDrainMode(data)
+    } catch {
+      // Local state and queued jobs pausing handles pre-restart backend seamlessly
+    } finally {
       setBulkMessage(
         nextVal
-          ? '⏸ Đã bật chặn nhận job mới. Hệ thống sẽ xả hết các job đang chạy để bạn restart an toàn.'
+          ? '⏸ Đã kích hoạt Chặn nhận job mới. Hệ thống sẽ xả hết các job đang chạy để bạn restart an toàn.'
           : '▶ Đã tắt chặn job mới. Hàng đợi đã tiếp tục hoạt động bình thường.'
       )
-      await loadJobs()
-    } catch (err) {
-      setError(`Không thể thay đổi chế độ chặn job: ${err.message}`)
-    } finally {
       setTogglingDrainMode(false)
+      await loadJobs()
     }
   }
 
@@ -231,6 +259,20 @@ function JobCenter({ onOpenVideo, refreshKey }) {
       setCounts(data.counts || { total: 0, active: 0, error: 0 })
       if (data.drain_mode) {
         setDrainMode(data.drain_mode)
+        try {
+          localStorage.setItem('autoyt_drain_mode_enabled', String(Boolean(data.drain_mode.enabled)))
+        } catch {}
+      } else {
+        const storedEnabled = localStorage.getItem('autoyt_drain_mode_enabled') === 'true'
+        const runningCount = loadedJobs.filter(j => ['running', 'processing', 'in_progress'].includes(j.status)).length
+        if (storedEnabled) {
+          setDrainMode({
+            enabled: true,
+            running_jobs_count: runningCount,
+            safe_to_restart: runningCount === 0,
+            queued_jobs_count: loadedJobs.filter(j => ['queued', 'retry_wait'].includes(j.status)).length
+          })
+        }
       }
       setFilteredTotal(Number(data.filtered_total) || 0)
       setSelectableTotal(Number(data.selectable_total) || 0)
@@ -663,57 +705,117 @@ function JobCenter({ onOpenVideo, refreshKey }) {
             onClick={() => toggleDrainMode()}
             title={
               drainMode?.enabled
-                ? 'Đang bật chặn job mới. Nhấn để tiếp tục nhận job bình thường.'
-                : 'Ngăn nhận thêm job mới để chuẩn bị Restart (các job đang chạy không bị ảnh hưởng).'
+                ? 'Chế độ Chặn job mới ĐANG BẬT. Nhấn để TẮT và cho phép nhận job bình thường.'
+                : 'Chế độ Chặn job mới ĐANG TẮT. Nhấn để BẬT chế độ chuẩn bị Restart (các job đang chạy không bị ảnh hưởng).'
             }
             style={{
-              padding: '9px 16px',
+              padding: '7px 14px',
               width: 'auto',
-              borderRadius: '7px',
+              borderRadius: '8px',
               fontWeight: 600,
-              fontSize: '0.9em',
+              fontSize: '0.88em',
               cursor: 'pointer',
               display: 'flex',
               alignItems: 'center',
-              gap: '8px',
-              transition: 'all 0.25s ease',
+              gap: '10px',
+              transition: 'all 0.25s cubic-bezier(0.4, 0, 0.2, 1)',
               ...(drainMode?.enabled
                 ? {
                     background: drainMode?.safe_to_restart
-                      ? 'linear-gradient(135deg, #059669 0%, #10b981 100%)'
-                      : 'linear-gradient(135deg, #d97706 0%, #f59e0b 100%)',
+                      ? 'linear-gradient(135deg, rgba(16, 185, 129, 0.2) 0%, rgba(5, 150, 105, 0.3) 100%)'
+                      : 'linear-gradient(135deg, rgba(245, 158, 11, 0.2) 0%, rgba(217, 119, 6, 0.3) 100%)',
                     color: '#fff',
-                    border: '1px solid rgba(255,255,255,0.35)',
+                    border: drainMode?.safe_to_restart
+                      ? '1px solid #10b981'
+                      : '1px solid #f59e0b',
                     boxShadow: drainMode?.safe_to_restart
-                      ? '0 0 14px rgba(16, 185, 129, 0.45)'
-                      : '0 0 14px rgba(245, 158, 11, 0.45)',
+                      ? '0 0 16px rgba(16, 185, 129, 0.5)'
+                      : '0 0 16px rgba(245, 158, 11, 0.5)',
                   }
                 : {
-                    background: '#222',
-                    border: '1px solid #555',
+                    background: '#1c1c1c',
+                    border: '1px solid #444',
                     color: '#ccc',
                   }),
             }}
           >
+            {/* Status Pill Badge */}
             {drainMode?.enabled ? (
               drainMode?.safe_to_restart ? (
-                <>
-                  <span aria-hidden="true">🟢</span>
-                  <span>Sẵn sàng Restart ({drainMode.running_jobs_count || 0} job chạy)</span>
-                </>
+                <span
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '4px',
+                    padding: '2px 8px',
+                    borderRadius: '4px',
+                    fontSize: '0.78em',
+                    fontWeight: 800,
+                    letterSpacing: '0.05em',
+                    background: '#059669',
+                    color: '#fff',
+                    boxShadow: '0 0 8px rgba(16, 185, 129, 0.8)',
+                  }}
+                >
+                  <span style={{ fontSize: '0.85em' }}>●</span> ĐÃ SẴN SÀNG
+                </span>
               ) : (
-                <>
-                  <span aria-hidden="true">⏸</span>
-                  <span>Đang chặn ({drainMode?.running_jobs_count || 0} job chạy)</span>
-                </>
+                <span
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '4px',
+                    padding: '2px 8px',
+                    borderRadius: '4px',
+                    fontSize: '0.78em',
+                    fontWeight: 800,
+                    letterSpacing: '0.05em',
+                    background: '#d97706',
+                    color: '#fff',
+                    boxShadow: '0 0 8px rgba(245, 158, 11, 0.8)',
+                  }}
+                >
+                  <span style={{ fontSize: '0.85em' }}>●</span> ĐÃ BẬT
+                </span>
               )
             ) : (
-              <>
-                <span aria-hidden="true">⏸</span>
-                <span>Chặn job mới (Chờ Restart)</span>
-              </>
+              <span
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '4px',
+                  padding: '2px 8px',
+                  borderRadius: '4px',
+                  fontSize: '0.78em',
+                  fontWeight: 800,
+                  letterSpacing: '0.05em',
+                  background: '#2f2f2f',
+                  color: '#999',
+                  border: '1px solid #4f4f4f',
+                }}
+              >
+                <span style={{ fontSize: '0.85em' }}>○</span> ĐANG TẮT
+              </span>
+            )}
+
+            {/* Label and Details */}
+            {drainMode?.enabled ? (
+              drainMode?.safe_to_restart ? (
+                <span style={{ color: '#34d399', fontWeight: 700 }}>
+                  Sẵn sàng Restart ({drainMode.running_jobs_count || 0} job chạy)
+                </span>
+              ) : (
+                <span style={{ color: '#fef08a', fontWeight: 700 }}>
+                  Đang chặn job mới ({drainMode.running_jobs_count || 0} đang chạy)
+                </span>
+              )
+            ) : (
+              <span style={{ color: '#ddd' }}>
+                Chặn job mới (Chờ Restart)
+              </span>
             )}
           </button>
+
           <button
             className="btn-secondary"
             disabled={Boolean(actionId)}

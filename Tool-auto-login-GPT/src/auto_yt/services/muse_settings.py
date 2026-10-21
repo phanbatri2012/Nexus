@@ -13,6 +13,7 @@ from auto_yt.services.secret_store import write_private_text
 DEFAULT_MUSE_SETTINGS = {
     "gpm_profile_id": "",
 }
+MUSE_GPM_PROFILE_STORAGE_KEY = "muse_gpm_profile_id"
 
 logger = logging.getLogger(__name__)
 _settings_lock = threading.RLock()
@@ -21,7 +22,11 @@ _settings_lock = threading.RLock()
 def normalize_muse_settings(value: object) -> dict:
     settings = value if isinstance(value, dict) else {}
     return {
-        "gpm_profile_id": str(settings.get("gpm_profile_id") or "").strip()[:120],
+        "gpm_profile_id": str(
+            settings.get(MUSE_GPM_PROFILE_STORAGE_KEY)
+            or settings.get("gpm_profile_id")
+            or ""
+        ).strip()[:120],
     }
 
 
@@ -39,9 +44,12 @@ def load_muse_settings() -> dict:
 
 def save_muse_settings(value: object) -> dict:
     normalized = normalize_muse_settings(value)
+    storage_value = {
+        MUSE_GPM_PROFILE_STORAGE_KEY: normalized["gpm_profile_id"],
+    }
     with _settings_lock:
         write_private_text(
             MUSE_SETTINGS_PATH,
-            json.dumps(normalized, ensure_ascii=False, indent=2) + "\n",
+            json.dumps(storage_value, ensure_ascii=False, indent=2) + "\n",
         )
     return normalized

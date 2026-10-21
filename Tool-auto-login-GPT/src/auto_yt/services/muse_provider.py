@@ -76,6 +76,7 @@ class MuseProvider(Protocol):
         destination: Path,
         *,
         on_submitted: Callable[[MuseReceipt], None] | None = None,
+        cancel_check: Callable[[], None] | None = None,
     ) -> dict: ...
 
     async def create_video(
@@ -85,7 +86,16 @@ class MuseProvider(Protocol):
         destination: Path,
         *,
         on_submitted: Callable[[MuseReceipt], None] | None = None,
+        cancel_check: Callable[[], None] | None = None,
     ) -> dict: ...
+
+    async def reconcile(
+        self,
+        *,
+        receipt: MuseReceipt,
+        destination: Path,
+        expected: str,
+    ) -> dict | None: ...
 
 
 class MuseSelectorRegistry:
@@ -364,6 +374,44 @@ class MuseBrowserAdapter:
             return await self.capability_probe(page)
         finally:
             await channel_scanner_service.cleanup_owned_page(self.context, page)
+
+    async def create_image(
+        self,
+        prompt: str,
+        reference_paths: list[Path],
+        destination: Path,
+        *,
+        on_submitted: Callable[[MuseReceipt], None] | None = None,
+        cancel_check: Callable[[], None] | None = None,
+    ) -> dict:
+        return await self.generate(
+            prompt=prompt,
+            reference_paths=reference_paths,
+            destination=destination,
+            expected="image",
+            timeout_seconds=MUSE_IMAGE_TIMEOUT_SECONDS,
+            on_submitted=on_submitted,
+            cancel_check=cancel_check,
+        )
+
+    async def create_video(
+        self,
+        prompt: str,
+        reference_paths: list[Path],
+        destination: Path,
+        *,
+        on_submitted: Callable[[MuseReceipt], None] | None = None,
+        cancel_check: Callable[[], None] | None = None,
+    ) -> dict:
+        return await self.generate(
+            prompt=prompt,
+            reference_paths=reference_paths,
+            destination=destination,
+            expected="video",
+            timeout_seconds=MUSE_VIDEO_TIMEOUT_SECONDS,
+            on_submitted=on_submitted,
+            cancel_check=cancel_check,
+        )
 
     async def generate(
         self,
@@ -757,31 +805,56 @@ class MuseBrowserProvider:
     @contextlib.asynccontextmanager
     async def open_session(self) -> AsyncGenerator[MuseBrowserAdapter, None]:
         profile_id = self.configured_profile_id()
-        await asyncio.to_thread(self.validate_profile, profile_id)
+        try:
+            await asyncio.to_thread(self.validate_profile, profile_id)
+        except ProxyConfigurationError:
+            raise
+        except gpm_service.GpmConnectionError as exc:
+            raise MuseTransientError("Không thể kết nối GPM Local API cho Muse.") from exc
+        except gpm_service.GpmError as exc:
+            raise MuseError(f"Không thể đọc GPM profile Muse: {exc}") from exc
         if channel_scanner_service.is_profile_browser_busy(profile_id):
             raise MuseProfileBusy("GPM profile Muse đang được tác vụ browser khác sử dụng.")
         busy, reason = channel_scanner_service.is_profile_busy_or_queued(profile_id)
         if busy:
             raise MuseProfileBusy(reason or "GPM profile Muse đang bận.")
         _cancel_idle_timer(profile_id)
-        preexisting = await asyncio.to_thread(
-            gpm_service.find_running_gpm_profile_coordinates, profile_id
-        )
+        try:
+            preexisting = await asyncio.to_thread(
+                gpm_service.find_running_gpm_profile_coordinates, profile_id
+            )
+        except gpm_service.GpmConnectionError as exc:
+            raise MuseTransientError("Không thể kiểm tra trạng thái GPM profile Muse.") from exc
         async with channel_scanner_service.profile_browser_operation(profile_id):
             try:
-                async with gpm_service.gpm_browser_session(
-                    profile_id,
-                    auto_stop=False,
-                    skip_proxy_check=False,
-                ) as (context, _browser):
-                    if not preexisting:
-                        with _lifecycle_lock:
-                            _owned_profiles.add(profile_id)
-                    yield MuseBrowserAdapter(
-                        context,
-                        job_id=self.job_id,
-                        video_id=self.video_id,
-                    )
+                try:
+                    async with gpm_service.gpm_browser_session(
+                        profile_id,
+                        auto_stop=False,
+                        skip_proxy_check=False,
+                    ) as (context, _browser):
+                        if not preexisting:
+                            with _lifecycle_lock:
+                                _owned_profiles.add(profile_id)
+                        yield MuseBrowserAdapter(
+                            context,
+                            job_id=self.job_id,
+                            video_id=self.video_id,
+                        )
+                except (MuseError, ProxyConfigurationError):
+                    raise
+                except gpm_service.GpmConnectionError as exc:
+                    raise MuseTransientError(
+                        "Kết nối GPM/CDP cho Muse tạm thời không khả dụng."
+                    ) from exc
+                except gpm_service.GpmError as exc:
+                    raise MuseError(f"Không thể mở GPM profile Muse: {exc}") from exc
+                except Exception as exc:
+                    if exc.__class__.__name__ == "VideoJobCanceled":
+                        raise
+                    raise MuseTransientError(
+                        "Phiên Playwright/GPM của Muse gặp lỗi tạm thời."
+                    ) from exc
             finally:
                 _schedule_idle_close(profile_id)
 
@@ -796,15 +869,15 @@ class MuseBrowserProvider:
         destination: Path,
         *,
         on_submitted: Callable[[MuseReceipt], None] | None = None,
+        cancel_check: Callable[[], None] | None = None,
     ) -> dict:
         async with self.open_session() as adapter:
-            return await adapter.generate(
-                prompt=prompt,
-                reference_paths=reference_paths,
-                destination=destination,
-                expected="image",
-                timeout_seconds=MUSE_IMAGE_TIMEOUT_SECONDS,
+            return await adapter.create_image(
+                prompt,
+                reference_paths,
+                destination,
                 on_submitted=on_submitted,
+                cancel_check=cancel_check,
             )
 
     async def create_video(
@@ -814,13 +887,27 @@ class MuseBrowserProvider:
         destination: Path,
         *,
         on_submitted: Callable[[MuseReceipt], None] | None = None,
+        cancel_check: Callable[[], None] | None = None,
     ) -> dict:
         async with self.open_session() as adapter:
-            return await adapter.generate(
-                prompt=prompt,
-                reference_paths=reference_paths,
-                destination=destination,
-                expected="video",
-                timeout_seconds=MUSE_VIDEO_TIMEOUT_SECONDS,
+            return await adapter.create_video(
+                prompt,
+                reference_paths,
+                destination,
                 on_submitted=on_submitted,
+                cancel_check=cancel_check,
+            )
+
+    async def reconcile(
+        self,
+        *,
+        receipt: MuseReceipt,
+        destination: Path,
+        expected: str,
+    ) -> dict | None:
+        async with self.open_session() as adapter:
+            return await adapter.reconcile(
+                receipt=receipt,
+                destination=destination,
+                expected=expected,
             )

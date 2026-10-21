@@ -631,6 +631,11 @@ def get_health():
         if _flow_media_coordinator is not None
         else {"running": False, "ready": False, "current_job_id": ""}
     )
+    muse_coord = (
+        _muse_media_coordinator.status()
+        if _muse_media_coordinator is not None
+        else {"running": False, "ready": False, "current_job_id": ""}
+    )
     radar_coord = (
         _radar_coordinator.status()
         if _radar_coordinator is not None
@@ -673,6 +678,7 @@ def get_health():
         "production_coordinator": coordinator,
         "publish_coordinator": publish_coord,
         "flow_media_coordinator": flow_coord,
+        "muse_media_coordinator": muse_coord,
         "competitor_radar_coordinator": radar_coord,
         "competitor_radar_scheduler": radar_scheduler,
         "competitor_radar_health": radar_health,
@@ -1381,21 +1387,25 @@ def get_gpm_status(api_url: Optional[str] = Query(None)):
 
 
 def _public_gpm_profile(profile: dict) -> dict:
-    public_profile = dict(profile or {})
-    raw_proxy_value = public_profile.pop("raw_proxy", "")
-    proxy_value = public_profile.pop("proxy", "")
+    source = dict(profile or {})
+    raw_proxy_value = source.get("raw_proxy", "")
+    proxy_value = source.get("proxy", "")
     raw_proxy = str(raw_proxy_value or proxy_value or "")
-    for secret_key in (
-        "cookies",
-        "cookie",
-        "token",
-        "access_token",
-        "refresh_token",
-        "password",
-        "proxy_password",
-        "proxy_username",
-    ):
-        public_profile.pop(secret_key, None)
+    public_profile = {
+        key: source[key]
+        for key in (
+            "id",
+            "name",
+            "profile_name",
+            "group_id",
+            "group_name",
+            "browser_type",
+            "browser_version",
+            "status",
+            "available",
+        )
+        if key in source and isinstance(source[key], (str, int, float, bool, type(None)))
+    }
     public_profile["proxy_configured"] = bool(parse_proxy_url(raw_proxy))
     public_profile["proxy_display"] = proxy_display_value(raw_proxy)
     return public_profile
@@ -7191,38 +7201,57 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
     )
 
     if (
-        isinstance(exc, (muse_pipeline.MuseRetryScheduled, muse_provider.MuseProfileBusy))
+        isinstance(exc, muse_provider.MuseTransientError)
         and str(job.get("job_type") or "") == "muse_media_generation"
     ):
         current_job = db.get_system_job(job["id"]) or job
         result = dict(current_job.get("result") or {})
         is_busy = isinstance(exc, muse_provider.MuseProfileBusy)
-        delay_seconds = 15.0 if is_busy else float(exc.delay_seconds)
-        result["muse_wait_reason"] = "profile_busy" if is_busy else "transient_error"
-        payload = dict(current_job.get("payload") or {})
-        if payload.get("force_new_project"):
-            payload["force_new_project"] = False
-            db.update_system_job(job["id"], payload_json=payload)
-        db.schedule_system_job_recovery(
-            job["id"],
-            resume_from_step="muse_media_generation",
-            delay_seconds=delay_seconds,
-            error=safe_error,
-            result_json=result,
-        )
-        if job.get("video_id"):
-            db.update_video_production_state(
-                int(job["video_id"]),
-                render_status="retry_wait",
-                current_stage="muse_media_generation",
-                production_progress=(
-                    "GPM profile Muse đang bận; job sẽ tự tiếp tục"
-                    if is_busy
-                    else f"Muse lỗi tạm thời; thử lại sau {delay_seconds:g} giây"
-                ),
-                blocking_reason="",
+        is_request_retry = isinstance(exc, muse_pipeline.MuseRetryScheduled)
+        if is_busy:
+            delay_seconds = 15.0
+            wait_reason = "profile_busy"
+        elif is_request_retry:
+            delay_seconds = float(exc.delay_seconds)
+            wait_reason = "transient_error"
+        else:
+            session_attempt = int(result.get("muse_session_attempt") or 0) + 1
+            result["muse_session_attempt"] = session_attempt
+            result["muse_session_error_class"] = type(exc).__name__
+            if session_attempt >= muse_pipeline.MAX_REQUEST_ATTEMPTS:
+                wait_reason = "session_retry_exhausted"
+            else:
+                delay_seconds = muse_pipeline.RETRY_DELAYS_SECONDS[session_attempt - 1]
+                wait_reason = "session_transient_error"
+        result["muse_wait_reason"] = wait_reason
+        if wait_reason == "session_retry_exhausted":
+            db.update_system_job(job["id"], result_json=result)
+            # Fall through to the common terminal-error path below.
+        else:
+            payload = dict(current_job.get("payload") or {})
+            if payload.get("force_new_project"):
+                payload["force_new_project"] = False
+                db.update_system_job(job["id"], payload_json=payload)
+            db.schedule_system_job_recovery(
+                job["id"],
+                resume_from_step="muse_media_generation",
+                delay_seconds=delay_seconds,
+                error=safe_error,
+                result_json=result,
             )
-        return
+            if job.get("video_id"):
+                db.update_video_production_state(
+                    int(job["video_id"]),
+                    render_status="retry_wait",
+                    current_stage="muse_media_generation",
+                    production_progress=(
+                        "GPM profile Muse đang bận; job sẽ tự tiếp tục"
+                        if is_busy
+                        else f"Muse lỗi tạm thời; thử lại sau {delay_seconds:g} giây"
+                    ),
+                    blocking_reason="",
+                )
+            return
 
     if (
         isinstance(exc, FlowImageNeedsAttention)
@@ -7409,7 +7438,10 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
             missing_configuration=["public_upload_verified"],
         )
         return
-    if isinstance(exc, ProxyConfigurationError):
+    if (
+        isinstance(exc, ProxyConfigurationError)
+        and str(job.get("job_type") or "") != "muse_media_generation"
+    ):
         _pause_youtube_publish_job(
             job,
             message=safe_error,

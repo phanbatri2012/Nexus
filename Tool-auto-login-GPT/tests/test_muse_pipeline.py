@@ -6,7 +6,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from auto_yt import main
-from auto_yt.services import chatgpt_projects, muse_pipeline, muse_provider
+from auto_yt.services import (
+    browser_diagnostics,
+    chatgpt_projects,
+    muse_pipeline,
+    muse_provider,
+    muse_settings,
+)
 
 
 def _captions(duration: int) -> list[dict]:
@@ -17,6 +23,22 @@ def _captions(duration: int) -> list[dict]:
 
 
 class TestMuseSettings(unittest.TestCase):
+    def test_global_profile_setting_uses_canonical_storage_key_and_reads_legacy_key(self):
+        self.assertEqual(
+            muse_settings.normalize_muse_settings({"gpm_profile_id": " legacy "}),
+            {"gpm_profile_id": "legacy"},
+        )
+        self.assertEqual(
+            muse_settings.normalize_muse_settings({"muse_gpm_profile_id": " canonical "}),
+            {"gpm_profile_id": "canonical"},
+        )
+        with patch.object(muse_settings, "write_private_text") as write_private:
+            saved = muse_settings.save_muse_settings({"gpm_profile_id": "profile-1"})
+        self.assertEqual(saved, {"gpm_profile_id": "profile-1"})
+        serialized = write_private.call_args.args[1]
+        self.assertIn('"muse_gpm_profile_id": "profile-1"', serialized)
+        self.assertNotIn('"gpm_profile_id":', serialized)
+
     def test_normalize_muse_mode_defaults_and_reference_limit(self):
         normalized = chatgpt_projects.normalize_image_generation_settings(
             {
@@ -327,6 +349,65 @@ class TestMuseRecovery(unittest.TestCase):
             }
             self.assertFalse(muse_pipeline._valid_cached_artifact(artifact, "request"))
 
+    def test_invalid_downloaded_media_leaves_submitting_and_retries(self):
+        artifact = None
+
+        def get_latest(*_args, **_kwargs):
+            return artifact
+
+        def upsert(**kwargs):
+            nonlocal artifact
+            artifact = {
+                "status": kwargs["status"],
+                "content_hash": kwargs["content_hash"],
+                "path": kwargs.get("path", ""),
+                "metadata": kwargs["metadata"],
+            }
+            return artifact
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            corrupt = Path(temp_dir) / "result.png"
+            corrupt.write_bytes(b"not-an-image")
+            adapter = AsyncMock()
+            adapter.create_image.return_value = {
+                "path": str(corrupt),
+                "mime_type": "image/png",
+            }
+
+            async def run():
+                with (
+                    patch.object(
+                        muse_pipeline.db,
+                        "get_latest_video_artifact",
+                        side_effect=get_latest,
+                    ),
+                    patch.object(
+                        muse_pipeline.db,
+                        "upsert_video_artifact",
+                        side_effect=upsert,
+                    ),
+                ):
+                    await muse_pipeline._generate_request(
+                        adapter=adapter,
+                        video_id=1,
+                        artifact_type="muse_scene_image:0",
+                        request_hash="request",
+                        prompt="prompt",
+                        references=[],
+                        omitted=[],
+                        destination=Path(temp_dir) / "scene",
+                        expected="image",
+                        scene={"index": 0},
+                        cancel_check=lambda: None,
+                    )
+
+            with self.assertRaises(muse_pipeline.MuseRetryScheduled) as caught:
+                asyncio.run(run())
+
+        self.assertEqual(caught.exception.delay_seconds, 60.0)
+        self.assertEqual(artifact["status"], "error")
+        self.assertTrue(artifact["metadata"]["invalid_media"])
+
     def test_submission_without_receipt_stops_before_resend(self):
         artifact = {
             "status": "submitting",
@@ -354,7 +435,7 @@ class TestMuseRecovery(unittest.TestCase):
 
         with self.assertRaises(muse_provider.MuseAmbiguousSubmissionError):
             asyncio.run(run())
-        adapter.generate.assert_not_awaited()
+        adapter.create_image.assert_not_awaited()
 
     def test_transient_error_after_receipt_is_reconciled_without_resubmit(self):
         artifact = None
@@ -373,7 +454,7 @@ class TestMuseRecovery(unittest.TestCase):
             return artifact
 
         class ReceiptThenTimeoutAdapter:
-            async def generate(self, **kwargs):
+            async def create_image(self, *_args, **kwargs):
                 kwargs["on_submitted"](
                     muse_provider.MuseReceipt(
                         thread_url="https://muse.ai/thread/receipt-1",
@@ -427,7 +508,7 @@ class TestMuseRecovery(unittest.TestCase):
             return artifact
 
         adapter = AsyncMock()
-        adapter.generate.side_effect = muse_provider.MuseAmbiguousSubmissionError("ambiguous")
+        adapter.create_image.side_effect = muse_provider.MuseAmbiguousSubmissionError("ambiguous")
 
         async def run():
             with (
@@ -473,7 +554,7 @@ class TestMuseRecovery(unittest.TestCase):
             return artifact
 
         class ReceiptThenCanceledAdapter:
-            async def generate(self, **kwargs):
+            async def create_image(self, *_args, **kwargs):
                 kwargs["on_submitted"](
                     muse_provider.MuseReceipt(
                         thread_url="https://muse.ai/thread/receipt-cancel",
@@ -544,11 +625,113 @@ class TestMuseRouting(unittest.TestCase):
         self.assertFalse(created)
         kick.assert_called_once_with()
 
+    def test_session_transient_retries_after_sixty_then_three_hundred_seconds(self):
+        for previous_attempt, expected_delay in ((0, 60.0), (1, 300.0)):
+            job = {
+                "id": f"muse-session-{previous_attempt}",
+                "job_type": "muse_media_generation",
+                "video_id": 42,
+                "payload": {},
+                "result": {"muse_session_attempt": previous_attempt},
+            }
+            with (
+                patch.object(main.db, "get_youtube_publish_workflow_by_job", return_value=None),
+                patch.object(main.db, "get_system_job", return_value=job),
+                patch.object(main.db, "schedule_system_job_recovery") as schedule,
+                patch.object(main.db, "update_system_job"),
+                patch.object(main.db, "update_video_production_state"),
+            ):
+                main._handle_production_job_error(
+                    job, muse_provider.MuseTransientError("temporary session failure")
+                )
+
+            self.assertEqual(schedule.call_args.kwargs["delay_seconds"], expected_delay)
+            self.assertEqual(
+                schedule.call_args.kwargs["result_json"]["muse_session_attempt"],
+                previous_attempt + 1,
+            )
+
+    def test_third_session_transient_failure_is_terminal(self):
+        job = {
+            "id": "muse-session-final",
+            "job_type": "muse_media_generation",
+            "video_id": 42,
+            "payload": {},
+            "result": {"muse_session_attempt": 2},
+        }
+        with (
+            patch.object(main.db, "get_youtube_publish_workflow_by_job", return_value=None),
+            patch.object(main.db, "get_system_job", return_value=job),
+            patch.object(main.db, "schedule_system_job_recovery") as schedule,
+            patch.object(main.db, "update_system_job") as update_job,
+            patch.object(main.db, "update_video_production_state"),
+        ):
+            main._handle_production_job_error(
+                job, muse_provider.MuseTransientError("temporary session failure")
+            )
+
+        schedule.assert_not_called()
+        self.assertTrue(
+            any(call_item.kwargs.get("status") == "error" for call_item in update_job.call_args_list)
+        )
+        self.assertTrue(
+            any(
+                call_item.kwargs.get("result_json", {}).get("muse_session_attempt") == 3
+                for call_item in update_job.call_args_list
+            )
+        )
+
+    def test_profile_busy_wait_does_not_consume_session_attempt(self):
+        job = {
+            "id": "muse-profile-busy",
+            "job_type": "muse_media_generation",
+            "video_id": 42,
+            "payload": {},
+            "result": {},
+        }
+        with (
+            patch.object(main.db, "get_youtube_publish_workflow_by_job", return_value=None),
+            patch.object(main.db, "get_system_job", return_value=job),
+            patch.object(main.db, "schedule_system_job_recovery") as schedule,
+            patch.object(main.db, "update_system_job"),
+            patch.object(main.db, "update_video_production_state"),
+        ):
+            main._handle_production_job_error(job, muse_provider.MuseProfileBusy("busy"))
+
+        self.assertEqual(schedule.call_args.kwargs["delay_seconds"], 15.0)
+        self.assertNotIn("muse_session_attempt", schedule.call_args.kwargs["result_json"])
+
+    def test_muse_proxy_failure_does_not_enter_youtube_pause_flow(self):
+        job = {
+            "id": "muse-no-proxy",
+            "job_type": "muse_media_generation",
+            "video_id": 42,
+            "payload": {},
+            "result": {},
+        }
+        with (
+            patch.object(main.db, "get_youtube_publish_workflow_by_job", return_value=None),
+            patch.object(main, "_pause_youtube_publish_job") as pause_youtube,
+            patch.object(main.db, "update_system_job") as update_job,
+            patch.object(main.db, "update_video_production_state"),
+        ):
+            main._handle_production_job_error(
+                job, muse_provider.ProxyConfigurationError("missing proxy")
+            )
+
+        pause_youtube.assert_not_called()
+        self.assertEqual(update_job.call_args.kwargs["status"], "error")
+
     def test_provider_source_has_no_direct_http_downloader(self):
         source = Path(muse_provider.__file__).read_text(encoding="utf-8")
         self.assertNotIn("requests.get", source)
         self.assertNotIn("urllib.request", source)
         self.assertIn("fetch(src", source)
+
+    def test_muse_content_is_masked_in_browser_diagnostic_screenshots(self):
+        selectors = browser_diagnostics.SENSITIVE_SCREENSHOT_SELECTOR
+        self.assertIn("hatch-agent-bubble-bg", selectors)
+        self.assertIn("hatch-chat-attachment-presentation-", selectors)
 
     def test_muse_profile_response_never_exposes_credentials(self):
         public = main._public_gpm_profile(
@@ -561,10 +744,19 @@ class TestMuseRouting(unittest.TestCase):
                 "cookies": "session-secret",
                 "proxy_username": "user",
                 "proxy_password": "secret",
+                "account": {"session": "nested-secret"},
+                "future_credential_field": "unknown-secret",
             }
         )
         serialized = json.dumps(public)
-        for secret in ("bearer-secret", "session-secret", "password", "user:secret"):
+        for secret in (
+            "bearer-secret",
+            "session-secret",
+            "password",
+            "user:secret",
+            "nested-secret",
+            "unknown-secret",
+        ):
             self.assertNotIn(secret, serialized)
         self.assertNotIn("raw_proxy", public)
         self.assertNotIn("proxy", public)
