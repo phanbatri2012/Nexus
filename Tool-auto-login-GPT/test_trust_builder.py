@@ -20,6 +20,7 @@ from auto_yt.services.trust_builder_actions import (
     action_audit_channel_branding,
     action_browse_and_pick_video,
     action_browse_and_read_comments,
+    action_refocus_video_player,
     action_search_and_pick_video,
     action_watch_video,
     action_like_video,
@@ -339,6 +340,59 @@ def test_action_browse_and_read_comments_early_cancel():
                 cancel_check=_check,
             )
         assert res["dwell_seconds"] < 30.0
+
+    asyncio.run(_run())
+
+
+def test_action_refocus_video_player_success():
+    """Verify that action_refocus_video_player calculates player bounds and smoothly moves mouse."""
+    async def _run():
+        mock_page = AsyncMock()
+        mock_page.evaluate.side_effect = [
+            {"left": 120, "top": 50, "width": 854, "height": 480, "scrollY": 0},
+            False,
+        ]
+        with patch("auto_yt.services.trust_builder_actions.asyncio.sleep", new=AsyncMock()):
+            dwell = await action_refocus_video_player(mock_page)
+
+        assert dwell > 0.0
+        assert mock_page.mouse.move.await_count >= 1
+        first_call_args = mock_page.mouse.move.await_args_list[0]
+        x, y = first_call_args.args[0], first_call_args.args[1]
+        assert 120 <= x <= 120 + 854
+        assert 50 <= y <= 50 + 480
+
+    asyncio.run(_run())
+
+
+def test_action_refocus_video_player_missing_player():
+    """Verify that action_refocus_video_player handles missing player gracefully without raising error."""
+    async def _run():
+        mock_page = AsyncMock()
+        mock_page.evaluate.return_value = None
+        with patch("auto_yt.services.trust_builder_actions.asyncio.sleep", new=AsyncMock()):
+            dwell = await action_refocus_video_player(mock_page)
+
+        assert dwell == 0.0
+        assert mock_page.mouse.move.await_count == 0
+
+    asyncio.run(_run())
+
+
+def test_action_refocus_video_player_resumes_paused_playback():
+    """Verify that action_refocus_video_player triggers play if video was paused."""
+    async def _run():
+        mock_page = AsyncMock()
+        mock_page.evaluate.side_effect = [
+            {"left": 100, "top": 40, "width": 640, "height": 360, "scrollY": 0},
+            True,
+            None,
+        ]
+        with patch("auto_yt.services.trust_builder_actions.asyncio.sleep", new=AsyncMock()):
+            dwell = await action_refocus_video_player(mock_page)
+
+        assert dwell > 0.0
+        assert mock_page.evaluate.await_count >= 3
 
     asyncio.run(_run())
 

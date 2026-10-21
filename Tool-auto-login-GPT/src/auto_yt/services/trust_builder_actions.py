@@ -584,6 +584,133 @@ async def action_browse_and_pick_video(
     return selected
 
 
+async def action_refocus_video_player(
+    page: Any,
+    cancel_check: Callable[[], bool] | None = None,
+) -> float:
+    """Refocus visual attention and mouse onto the video player after scrolling back from comments.
+
+    Aligns player into the upper viewport, smoothly glides the mouse cursor into the player container,
+    and pauses naturally so YouTube's player controls overlay (ytp-chrome-bottom) appears and fades out.
+    Returns the time spent in seconds during this refocus behavior.
+    """
+    logger.info("Chuyển tiêu điểm chú ý chuột trở lại khung phát video (Refocus Player)...")
+    time_spent = 0.0
+
+    try:
+        if cancel_check and cancel_check():
+            return 0.0
+
+        # 1. Fetch player bounding rect and ensure it is properly aligned in viewport
+        player_info = await page.evaluate(
+            """() => {
+                const player = document.querySelector('#movie_player, video.html5-main-video, .html5-video-player');
+                if (!player) return null;
+                const rect = player.getBoundingClientRect();
+                return {
+                    left: Math.round(rect.left),
+                    top: Math.round(rect.top),
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height),
+                    scrollY: Math.round(window.scrollY || window.pageYOffset || 0)
+                };
+            }"""
+        )
+
+        if not isinstance(player_info, dict) or player_info.get("width", 0) <= 0:
+            logger.debug("Không xác định được tọa độ player để refocus.")
+            return 0.0
+
+        p_left = float(player_info.get("left", 0))
+        p_top = float(player_info.get("top", 0))
+        p_width = float(player_info.get("width", 0))
+        p_height = float(player_info.get("height", 0))
+        scroll_y = float(player_info.get("scrollY", 0))
+
+        # 2. Check if player top is shifted off-screen or too low; align smoothly if needed
+        if p_top < -30 or p_top > 120 or scroll_y > 200:
+            logger.debug("Video player chưa ở vị trí tối ưu (top=%.1f, scrollY=%.1f). Căn chỉnh lại...", p_top, scroll_y)
+            await page.evaluate("() => window.scrollTo({ top: 0, behavior: 'smooth' })")
+            align_pause = random.uniform(0.4, 0.7)
+            await asyncio.sleep(align_pause)
+            time_spent += align_pause
+            try:
+                new_info = await page.evaluate(
+                    """() => {
+                        const player = document.querySelector('#movie_player, video.html5-main-video, .html5-video-player');
+                        if (!player) return null;
+                        const rect = player.getBoundingClientRect();
+                        return {
+                            left: Math.round(rect.left),
+                            top: Math.round(rect.top),
+                            width: Math.round(rect.width),
+                            height: Math.round(rect.height)
+                        };
+                    }"""
+                )
+                if isinstance(new_info, dict) and new_info.get("width", 0) > 0:
+                    p_left = float(new_info.get("left", p_left))
+                    p_top = float(new_info.get("top", p_top))
+                    p_width = float(new_info.get("width", p_width))
+                    p_height = float(new_info.get("height", p_height))
+            except Exception:
+                pass
+
+        if cancel_check and cancel_check():
+            return time_spent
+
+        # 3. Calculate target hover coordinates inside the player (around center with natural offset)
+        target_x = max(100.0, p_left + p_width * random.uniform(0.35, 0.65))
+        target_y = max(100.0, p_top + p_height * random.uniform(0.40, 0.70))
+
+        # 4. Glide mouse smoothly towards player (steps emulate natural cursor glide)
+        glide_steps = random.randint(5, 9)
+        await page.mouse.move(target_x, target_y, steps=glide_steps)
+        glide_pause = random.uniform(0.1, 0.25)
+        await asyncio.sleep(glide_pause)
+        time_spent += glide_pause
+
+        if cancel_check and cancel_check():
+            return time_spent
+
+        # 5. Natural attention dwell: let player controls pop up (ytp-chrome-bottom) and observe
+        dwell_pause = random.uniform(1.5, 2.6)
+        await asyncio.sleep(dwell_pause)
+        time_spent += dwell_pause
+
+        # 6. Micro-interaction: subtle jitter or glance towards progress bar
+        if random.random() < 0.35 and not (cancel_check and cancel_check()):
+            sub_x = target_x + random.uniform(-40.0, 40.0)
+            sub_y = min(p_top + p_height - 30.0, target_y + random.uniform(20.0, 50.0))
+            await page.mouse.move(sub_x, sub_y, steps=random.randint(3, 5))
+            micro_pause = random.uniform(0.5, 1.0)
+            await asyncio.sleep(micro_pause)
+            time_spent += micro_pause
+
+        # 7. Verify playback is still active; resume if accidentally paused
+        try:
+            is_paused = await page.evaluate(
+                "() => Boolean(document.querySelector('video.html5-main-video, video')?.paused)"
+            )
+            if is_paused:
+                logger.info("Video đang tạm dừng sau khi cuộn lên, tiếp tục phát...")
+                await page.evaluate(
+                    "() => document.querySelector('video.html5-main-video, video')?.play().catch(() => {})"
+                )
+        except Exception:
+            pass
+
+        logger.info("Hoàn tất chuyển tiêu điểm chuột vào player (thời gian tương tác: %.1fs).", time_spent)
+    except Exception as exc:
+        logger.debug(
+            "Lỗi trong quá trình refocus video player: %s",
+            security_logging.redact_sensitive(exc),
+        )
+
+    return round(time_spent, 2)
+
+
+
 async def action_browse_and_read_comments(
     page: Any,
     min_dwell_seconds: float = 15.0,
@@ -681,6 +808,11 @@ async def action_browse_and_read_comments(
                 delta = random.randint(280, 520)
                 await page.mouse.wheel(0, -delta)
                 await asyncio.sleep(random.uniform(0.3, 0.6))
+
+            # Attention Refocus Telemetry: smoothly glide cursor into player and observe
+            if not (cancel_check and cancel_check()):
+                refocus_dwell = await action_refocus_video_player(page, cancel_check=cancel_check)
+                time_spent += refocus_dwell
 
         logger.info(
             "Hoàn tất lướt đọc bình luận: %.1fs dừng đọc thực tế (%d bình luận trích xuất).",
