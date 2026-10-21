@@ -12,6 +12,7 @@ from auto_yt.services import (
     muse_provider,
     muse_settings,
     muse_studio_service,
+    video_production,
 )
 
 
@@ -610,6 +611,61 @@ class TestMuseRecovery(unittest.TestCase):
         adapter.reconcile.assert_not_awaited()
 
 
+class TestMuseRenderContract(unittest.TestCase):
+    def test_video_segments_loop_and_trim_to_each_scene_duration(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            media_paths = []
+            for index in range(2):
+                path = root / f"scene-{index}.mp4"
+                path.write_bytes(b"video")
+                media_paths.append(path)
+            srt_path = root / "captions.srt"
+            srt_path.write_text(
+                "1\n00:00:00,000 --> 00:00:13,500\nTest caption\n",
+                encoding="utf-8",
+            )
+            commands = []
+
+            def fake_popen(command, **_kwargs):
+                commands.append(command)
+                Path(command[-1]).write_bytes(b"segment")
+                process = MagicMock()
+                process.returncode = 0
+                process.communicate.return_value = ("", "")
+                return process
+
+            with (
+                patch.object(video_production, "SEGMENTS_DIR", root / "segments"),
+                patch.object(video_production, "_write_segment_srt", return_value=False),
+                patch.object(video_production.subprocess, "Popen", side_effect=fake_popen),
+                patch.object(video_production.process_registry, "register_process"),
+                patch.object(video_production.process_registry, "unregister_process"),
+            ):
+                results = video_production._render_segments(
+                    ffmpeg_exe="ffmpeg",
+                    encoder="libx264",
+                    video_id=1,
+                    scenes=[
+                        {"index": 0, "start": 0.0, "end": 10.0, "duration": 10.0},
+                        {"index": 1, "start": 10.0, "end": 13.5, "duration": 3.5},
+                    ],
+                    media_paths=media_paths,
+                    srt_path=srt_path,
+                    input_hash="a" * 64,
+                    progress=lambda *_args, **_kwargs: None,
+                    cancel_check=lambda: None,
+                    crop_watermark=False,
+                )
+
+            self.assertEqual(len(results), 2)
+            self.assertEqual(len(commands), 2)
+            for command in commands:
+                self.assertEqual(command[command.index("-stream_loop") + 1], "-1")
+            self.assertEqual(commands[0][commands[0].index("-t") + 1], "10.000")
+            self.assertEqual(commands[1][commands[1].index("-t") + 1], "3.500")
+
+
 class TestMuseStudioServiceLifecycle(unittest.TestCase):
     def tearDown(self):
         timer = muse_studio_service._idle_timer
@@ -686,16 +742,40 @@ class TestMuseStudioServiceLifecycle(unittest.TestCase):
         self.assertEqual(environment["MUSE2API_CONCURRENCY"], "1")
         write_state.assert_called_once_with(process, Path("C:/Muse"))
 
+    def test_state_marker_contains_no_credentials(self):
+        process = MagicMock()
+        process.pid = 4321
+        muse_studio_service._instance_id = "instance-1"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "muse-service.json"
+            with patch.object(muse_studio_service, "MUSE_SERVICE_STATE_PATH", state_path):
+                muse_studio_service._write_state(process, Path("C:/Muse"))
+            serialized = state_path.read_text(encoding="utf-8").lower()
+        for forbidden in ("api_key", "cookie", "token", "proxy", "secret"):
+            self.assertNotIn(forbidden, serialized)
+
     def test_no_account_fails_readiness(self):
         muse_studio_service._api_key = "in-memory-only"
         responses = [
             {"status": "ok"},
             {"status": "no_account", "accounts": 0, "browser_running": False},
-            {"data": []},
         ]
         with patch.object(muse_studio_service, "_request_json", side_effect=responses):
             with self.assertRaisesRegex(
                 muse_studio_service.MuseStudioConfigurationError, "account"
+            ):
+                muse_studio_service._probe_owned_service()
+
+    def test_probe_rejects_incompatible_model_contract(self):
+        muse_studio_service._api_key = "in-memory-only"
+        responses = [
+            {"status": "ok"},
+            {"status": "ready", "accounts": 1, "browser_running": True},
+            {"object": "list", "data": [{"id": "muse-image"}]},
+        ]
+        with patch.object(muse_studio_service, "_request_json", side_effect=responses):
+            with self.assertRaisesRegex(
+                muse_studio_service.MuseStudioConfigurationError, "không tương thích"
             ):
                 muse_studio_service._probe_owned_service()
 
@@ -711,6 +791,28 @@ class TestMuseStudioServiceLifecycle(unittest.TestCase):
             muse_studio_service._idle_close_callback,
         )
         timer.start.assert_called_once()
+
+    def test_shutdown_uses_the_owned_popen_handle_without_process_lookup(self):
+        process = MagicMock()
+        process.poll.return_value = None
+        muse_studio_service._process = process
+        muse_studio_service._api_key = "in-memory-only"
+        muse_studio_service._studio_path = Path("C:/Muse")
+        with (
+            patch.object(muse_studio_service.process_registry, "unregister_process") as unregister,
+            patch.object(muse_studio_service, "_remove_state"),
+            patch.object(muse_studio_service, "_close_log_handles"),
+        ):
+            muse_studio_service.shutdown_owned_service()
+
+        if muse_studio_service.os.name == "nt":
+            process.send_signal.assert_called_once_with(muse_studio_service.signal.CTRL_BREAK_EVENT)
+        else:
+            process.terminate.assert_called_once()
+        process.wait.assert_called_once_with(timeout=10)
+        unregister.assert_called_once_with(muse_studio_service.MUSE_SERVICE_PROCESS_KEY, process)
+        self.assertIsNone(muse_studio_service._process)
+        self.assertEqual(muse_studio_service._api_key, "")
 
 
 class TestMuseRouting(unittest.TestCase):

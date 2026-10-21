@@ -97,44 +97,6 @@ def _port_in_use(port: int) -> bool:
         return sock.connect_ex((MUSE_API_HOST, int(port))) == 0
 
 
-def _process_command_line(pid: int) -> str:
-    if pid <= 0:
-        return ""
-    if os.name == "nt":
-        command = (
-            "$p=Get-CimInstance Win32_Process -Filter \"ProcessId = "
-            + str(int(pid))
-            + "\" -ErrorAction SilentlyContinue; if($p){$p.CommandLine}"
-        )
-        try:
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", command],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            return str(result.stdout or "").strip()
-        except Exception:
-            return ""
-    try:
-        return Path(f"/proc/{int(pid)}/cmdline").read_bytes().replace(b"\0", b" ").decode(
-            "utf-8", errors="replace"
-        )
-    except OSError:
-        return ""
-
-
-def _is_expected_process(pid: int, studio_path: Path) -> bool:
-    command_line = _process_command_line(pid).lower()
-    return bool(
-        command_line
-        and "--muse-service" in command_line
-        and str((studio_path / "main.py").resolve()).lower() in command_line
-    )
-
-
 def _write_state(process: subprocess.Popen[Any], studio_path: Path) -> None:
     payload = {
         "pid": int(process.pid),
@@ -180,15 +142,28 @@ def _probe_owned_service(*, timeout: float = 3.0) -> dict:
     if not key:
         raise MuseStudioServiceUnavailable("Muse2API chưa có phiên do Auto_YT sở hữu.")
     health = _request_json("/healthz", timeout=timeout)
-    ready = _request_json("/readyz", timeout=timeout)
-    models = _request_json("/v1/models", api_key=key, timeout=timeout)
     if health.get("status") != "ok":
         raise MuseStudioServiceUnavailable("Muse2API health check không đạt.")
+    ready = _request_json("/readyz", timeout=timeout)
     if ready.get("status") != "ready" or int(ready.get("accounts") or 0) <= 0:
         raise MuseStudioConfigurationError(
             "Muse_AI_Studio chưa có account khả dụng; hãy mở Muse Studio để đăng nhập trước."
         )
-    if not isinstance(models.get("data"), list):
+    try:
+        models = _request_json("/v1/models", api_key=key, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        if exc.code in {401, 403}:
+            raise MuseStudioConfigurationError(
+                "Muse2API từ chối API key nội bộ; service không tương thích."
+            ) from exc
+        raise
+    model_rows = models.get("data")
+    model_ids = {
+        str(item.get("id") or "").strip()
+        for item in model_rows
+        if isinstance(item, dict)
+    } if isinstance(model_rows, list) else set()
+    if not {"muse-image", "muse-video"}.issubset(model_ids):
         raise MuseStudioConfigurationError("Muse2API không tương thích: /v1/models sai contract.")
     return {
         "running": True,
@@ -383,10 +358,12 @@ def shutdown_owned_service() -> None:
     _cancel_idle_timer()
     with _lock:
         process = _process
-        studio_path = _studio_path
     if process is not None:
         try:
-            if process.poll() is None and studio_path and _is_expected_process(process.pid, studio_path):
+            # `_process` is assigned only from this manager's successful Popen call.
+            # The live handle is stronger ownership evidence than a second CIM lookup,
+            # which can fail and otherwise leave an orphan with an in-memory API key.
+            if process.poll() is None:
                 if os.name == "nt":
                     try:
                         process.send_signal(signal.CTRL_BREAK_EVENT)
@@ -398,8 +375,6 @@ def shutdown_owned_service() -> None:
                     process.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     _terminate_process_tree(process)
-            elif process.poll() is None:
-                logger.error("Từ chối dừng PID Muse vì command line không khớp ownership marker.")
         finally:
             process_registry.unregister_process(MUSE_SERVICE_PROCESS_KEY, process)
     with _lock:
