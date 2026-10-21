@@ -132,6 +132,11 @@ const DEFAULT_IMAGE_GENERATION_SETTINGS = {
     show_waveform: true,
     show_animated_icon: true,
   },
+  muse_settings: {
+    video_coverage_mode: 'intro_only',
+    video_coverage_minutes: 5,
+    reference_sets: [],
+  },
   provider: 'google_flow',
   model: 'nano_banana_2_1',
   aspect_ratio: '16:9',
@@ -536,6 +541,10 @@ export default function Settings({
   const [loadingAssets, setLoadingAssets] = useState(false);
   const [uploadingAsset, setUploadingAsset] = useState(false);
   const [assetMessage, setAssetMessage] = useState('');
+  const [museGlobalSettings, setMuseGlobalSettings] = useState({ gpm_profile_id: '' });
+  const [museProfiles, setMuseProfiles] = useState([]);
+  const [museStatus, setMuseStatus] = useState('');
+  const [museBusy, setMuseBusy] = useState(false);
 
   const fetchPromptAssets = async (version) => {
     if (!version) return;
@@ -634,17 +643,23 @@ export default function Settings({
 
   const fetchData = async () => {
     try {
-      const [promptsResponse, voicesResponse, channelsResponse] = await Promise.all([
+      const [promptsResponse, voicesResponse, channelsResponse, museResponse, gpmResponse] = await Promise.all([
         fetch('http://127.0.0.1:8080/api/prompts'),
         fetch('http://127.0.0.1:8080/api/voices'),
-        fetch('http://127.0.0.1:8080/api/youtube-comments/channels')
+        fetch('http://127.0.0.1:8080/api/youtube-comments/channels'),
+        fetch('http://127.0.0.1:8080/api/muse/settings'),
+        fetch('http://127.0.0.1:8080/api/gpm/profiles?page_size=500')
       ]);
       const prompts = await promptsResponse.json();
       const voices = await voicesResponse.json();
       const channels = await channelsResponse.json();
+      const muse = museResponse.ok ? await museResponse.json() : { settings: {} };
+      const gpm = gpmResponse.ok ? await gpmResponse.json() : { items: [] };
       setPromptsData(prompts);
       setVoicesData(voices);
       setYoutubeChannels(Array.isArray(channels.items) ? channels.items : []);
+      setMuseGlobalSettings({ gpm_profile_id: muse.settings?.gpm_profile_id || '' });
+      setMuseProfiles(Array.isArray(gpm.items) ? gpm.items : []);
       setActiveVersion(prompts.active_version);
     } catch (err) {
       console.error("Lỗi khi lấy prompts:", err);
@@ -798,6 +813,100 @@ export default function Settings({
         }
       };
     });
+  };
+
+  const updateMusePromptSettings = (updates) => {
+    const current = {
+      ...DEFAULT_IMAGE_GENERATION_SETTINGS.muse_settings,
+      ...(promptsData.versions[activeVersion]?.image_generation_settings?.muse_settings || {})
+    };
+    handlePromptSettingChange('image_generation_settings', 'muse_settings', {
+      ...current,
+      ...updates
+    });
+  };
+
+  const updateMuseReferenceSet = (setIndex, updates) => {
+    const current = {
+      ...DEFAULT_IMAGE_GENERATION_SETTINGS.muse_settings,
+      ...(promptsData.versions[activeVersion]?.image_generation_settings?.muse_settings || {})
+    };
+    const referenceSets = [...(current.reference_sets || [])];
+    referenceSets[setIndex] = { ...referenceSets[setIndex], ...updates };
+    updateMusePromptSettings({ reference_sets: referenceSets });
+  };
+
+  const addMuseReferenceSet = () => {
+    const current = {
+      ...DEFAULT_IMAGE_GENERATION_SETTINGS.muse_settings,
+      ...(promptsData.versions[activeVersion]?.image_generation_settings?.muse_settings || {})
+    };
+    updateMusePromptSettings({
+      reference_sets: [
+        ...(current.reference_sets || []),
+        { id: `reference_${Date.now()}`, name: 'Nhân vật mới', aliases: [], images: [] }
+      ]
+    });
+  };
+
+  const removeMuseReferenceSet = (setIndex) => {
+    const current = {
+      ...DEFAULT_IMAGE_GENERATION_SETTINGS.muse_settings,
+      ...(promptsData.versions[activeVersion]?.image_generation_settings?.muse_settings || {})
+    };
+    updateMusePromptSettings({
+      reference_sets: (current.reference_sets || []).filter((_, index) => index !== setIndex)
+    });
+  };
+
+  const runMuseProfileAction = async (action) => {
+    setMuseBusy(true);
+    setMuseStatus(action === 'open' ? 'Đang mở profile Muse...' : 'Đang kiểm tra Muse...');
+    try {
+      if (!museGlobalSettings.gpm_profile_id) throw new Error('Hãy chọn GPM profile Muse.');
+      const saveResponse = await fetch('http://127.0.0.1:8080/api/muse/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(museGlobalSettings)
+      });
+      const saved = await saveResponse.json();
+      if (!saveResponse.ok) throw new Error(saved.detail || 'Không thể lưu GPM profile Muse.');
+      setMuseGlobalSettings(saved.settings || museGlobalSettings);
+      const response = await fetch(`http://127.0.0.1:8080/api/muse/profile/${action}`, {
+        method: 'POST'
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || 'Không thể thao tác profile Muse.');
+      setMuseStatus(
+        action === 'open'
+          ? '✅ Đã mở Muse trong GPM profile.'
+          : '✅ Profile, proxy, login và composer Muse đều sẵn sàng.'
+      );
+    } catch (err) {
+      setMuseStatus(`❌ ${err.message}`);
+    } finally {
+      setMuseBusy(false);
+    }
+  };
+
+  const saveMuseGlobalSettings = async () => {
+    setMuseBusy(true);
+    setMuseStatus('Đang lưu GPM profile Muse...');
+    try {
+      const response = await fetch('http://127.0.0.1:8080/api/muse/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(museGlobalSettings)
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || 'Không thể lưu cấu hình Muse.');
+      setMuseGlobalSettings(data.settings || museGlobalSettings);
+      setMuseStatus('✅ Đã lưu GPM profile Muse; proxy hợp lệ.');
+    } catch (err) {
+      setMuseStatus(`❌ ${err.message}`);
+    } finally {
+      setMuseBusy(false);
+    }
   };
 
   const handleThumbnailVariantChange = (thumbnailVariant) => {
@@ -1346,7 +1455,11 @@ export default function Settings({
       currentVersion.image_generation_settings?.avoid_prompt ??
       currentVersion.image_generation_settings?.negative_prompt ??
       ''
-    )
+    ),
+    muse_settings: {
+      ...DEFAULT_IMAGE_GENERATION_SETTINGS.muse_settings,
+      ...(currentVersion.image_generation_settings?.muse_settings || {})
+    }
   };
   const currentPublishing = {
     ...DEFAULT_PUBLISHING_SETTINGS,
@@ -2208,12 +2321,16 @@ export default function Settings({
               <label>
                 {currentImageGeneration.render_mode === 'stock_video'
                   ? '🎬 Cấu hình Dựng Video từ Kho Nền (Stock / Radio Mode)'
-                  : '🖼️ Cấu hình Media & Video Google Flow (Nano Banana 2 / Omni 1.1 / Veo 3.1)'}
+                  : currentImageGeneration.render_mode === 'muse_ai'
+                    ? '✨ Cấu hình Media & Video Muse AI'
+                    : '🖼️ Cấu hình Media & Video Google Flow (Nano Banana 2 / Omni 1.1 / Veo 3.1)'}
               </label>
               <div className="help-text" style={{ marginTop: 5 }}>
                 {currentImageGeneration.render_mode === 'stock_video'
                   ? 'Ghép file audio MP3 với video nền ngẫu nhiên từ kho, thumbnail 4 góc, box tiêu đề đối xứng, sóng âm thanh & icon động.'
-                  : 'Hệ thống chia phân cảnh theo phụ đề SRT (25–35s), tạo ảnh/video chất lượng cao qua Google Flow và dựng thành video MP4 hoàn chỉnh.'}
+                  : currentImageGeneration.render_mode === 'muse_ai'
+                    ? 'Chia toàn bộ audio thành scene 10 giây, tạo tất cả ảnh trước rồi tạo video Muse theo coverage đã chọn.'
+                    : 'Hệ thống chia phân cảnh theo phụ đề SRT (25–35s), tạo ảnh/video chất lượng cao qua Google Flow và dựng thành video MP4 hoàn chỉnh.'}
               </div>
             </div>
             <button
@@ -2274,6 +2391,29 @@ export default function Settings({
                 </div>
                 <div style={{ fontSize: '0.82rem', color: '#94a3b8', lineHeight: 1.4 }}>
                   Chọn video nền từ kho có sẵn, random Thumbnail 4 góc, Box Tiêu đề đối xứng, Sóng âm Visualizer & Icon động. Render siêu tốc ~1–2 phút.
+                </div>
+              </div>
+
+              {/* Option 3: Muse AI */}
+              <div
+                onClick={() => handlePromptSettingChange('image_generation_settings', 'render_mode', 'muse_ai')}
+                style={{
+                  border: currentImageGeneration.render_mode === 'muse_ai' ? '2px solid #f59e0b' : '1px solid #334155',
+                  background: currentImageGeneration.render_mode === 'muse_ai' ? 'rgba(245, 158, 11, 0.12)' : 'rgba(15, 23, 42, 0.6)',
+                  borderRadius: 8,
+                  padding: 14,
+                  cursor: 'pointer',
+                  transition: 'all 0.2s'
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                  <strong style={{ color: '#fbbf24', fontSize: '0.95rem' }}>🟠 3. Muse AI (10s Scenes)</strong>
+                  {currentImageGeneration.render_mode === 'muse_ai' && (
+                    <span style={{ fontSize: '0.75rem', background: '#f59e0b', color: '#111827', padding: '2px 8px', borderRadius: 12 }}>Đang chọn</span>
+                  )}
+                </div>
+                <div style={{ fontSize: '0.82rem', color: '#94a3b8', lineHeight: 1.4 }}>
+                  Tạo ảnh rồi tạo clip Muse theo coverage; chạy on-demand trong GPM profile riêng và tự đóng khi queue hết.
                 </div>
               </div>
             </div>
@@ -2350,6 +2490,146 @@ export default function Settings({
               <div style={{ fontSize: '0.82rem', color: '#94a3b8', lineHeight: 1.5, background: 'rgba(30, 41, 59, 0.6)', padding: '10px 14px', borderRadius: 6, borderLeft: '3px solid #8b5cf6' }}>
                 💡 <strong>Quy tắc hoạt động:</strong> Sau khi xuất âm thanh MP3, hệ thống sẽ tự động ghép video nền ngẫu nhiên từ kho (tự động loop/nối đủ độ dài audio), thumbnail đặt ở góc được chọn, tiêu đề tự động canh đối xứng, sóng âm nhảy theo giọng đọc và chèn icon động ngẫu nhiên.
               </div>
+            </div>
+          )}
+
+          {currentImageGeneration.render_mode === 'muse_ai' && (
+            <div style={{ background: 'rgba(15, 23, 42, 0.5)', border: '1px solid rgba(245, 158, 11, 0.45)', borderRadius: 8, padding: 16, marginBottom: 16 }}>
+              <h4 style={{ margin: '0 0 12px 0', color: '#fbbf24' }}>✨ Muse AI độc lập</h4>
+              <div className="production-settings-grid" style={{ marginBottom: 14 }}>
+                <label>
+                  Coverage video
+                  <select
+                    className="version-select"
+                    value={currentImageGeneration.muse_settings.video_coverage_mode}
+                    onChange={event => updateMusePromptSettings({ video_coverage_mode: event.target.value })}
+                    disabled={activeVersionLocked}
+                  >
+                    <option value="intro_only">Chỉ phần Intro (mặc định)</option>
+                    <option value="first_n_minutes">N phút đầu</option>
+                    <option value="full">Toàn bộ video</option>
+                  </select>
+                </label>
+                {currentImageGeneration.muse_settings.video_coverage_mode === 'first_n_minutes' && (
+                  <label>
+                    Số phút có video Muse
+                    <input
+                      className="version-input"
+                      type="number"
+                      min="1"
+                      max="90"
+                      value={currentImageGeneration.muse_settings.video_coverage_minutes}
+                      onChange={event => updateMusePromptSettings({ video_coverage_minutes: Number(event.target.value) || 1 })}
+                      disabled={activeVersionLocked}
+                    />
+                  </label>
+                )}
+              </div>
+              <div className="help-text" style={{ marginBottom: 16 }}>
+                Scene cố định 10 giây. Số scene video dự kiến: <strong>
+                  {currentImageGeneration.muse_settings.video_coverage_mode === 'full'
+                    ? 'toàn bộ video (1 scene / 10 giây)'
+                    : currentImageGeneration.muse_settings.video_coverage_mode === 'first_n_minutes'
+                      ? `${Math.max(1, Number(currentImageGeneration.muse_settings.video_coverage_minutes) || 1) * 6} scene tối đa`
+                      : 'từ 1 scene đến hết Intro'}
+                </strong>. Mọi scene ngoài coverage vẫn dùng ảnh tĩnh do Muse tạo.
+              </div>
+
+              <div style={{ padding: 14, border: '1px solid #334155', borderRadius: 8, marginBottom: 16 }}>
+                <strong>GPM profile Muse toàn hệ thống</strong>
+                <div className="production-settings-grid" style={{ marginTop: 10 }}>
+                  <label>
+                    Profile riêng đã đăng nhập Muse
+                    <select
+                      className="version-select"
+                      value={museGlobalSettings.gpm_profile_id}
+                      onChange={event => setMuseGlobalSettings({ gpm_profile_id: event.target.value })}
+                    >
+                      <option value="">-- Chọn GPM profile --</option>
+                      {museProfiles.map(profile => (
+                        <option key={profile.id} value={profile.id}>
+                          {profile.name || profile.id}{profile.proxy_configured ? ' · Proxy OK' : ' · Thiếu proxy'}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 10 }}>
+                  <button type="button" className="btn-secondary" onClick={saveMuseGlobalSettings} disabled={museBusy}>💾 Lưu profile</button>
+                  <button type="button" className="btn-secondary" onClick={() => runMuseProfileAction('open')} disabled={museBusy || !museGlobalSettings.gpm_profile_id}>🌐 Mở Muse</button>
+                  <button type="button" className="btn-secondary" onClick={() => runMuseProfileAction('verify')} disabled={museBusy || !museGlobalSettings.gpm_profile_id}>✅ Kiểm tra</button>
+                </div>
+                {museStatus && <div className="help-text" style={{ marginTop: 8 }}>{museStatus}</div>}
+                <div className="help-text" style={{ marginTop: 8 }}>
+                  Tool không mở Muse lúc startup. Profile chỉ được gọi khi có job hoặc khi bạn bấm Mở/Kiểm tra.
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 10 }}>
+                <div>
+                  <strong>Reference sets</strong>
+                  <div className="help-text">Mỗi bộ có aliases và tối đa 6 ảnh từ kho assets của bộ prompt.</div>
+                </div>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button type="button" className="btn-secondary" onClick={handleOpenAssetsFolder}>📂 Kho ảnh</button>
+                  <button type="button" className="btn-secondary" onClick={addMuseReferenceSet} disabled={activeVersionLocked}>＋ Thêm bộ</button>
+                </div>
+              </div>
+              {(currentImageGeneration.muse_settings.reference_sets || []).map((referenceSet, setIndex) => {
+                const selectedImages = referenceSet.images || [];
+                return (
+                  <div key={referenceSet.id || setIndex} style={{ border: '1px solid #334155', borderRadius: 8, padding: 12, marginBottom: 10 }}>
+                    <div className="production-settings-grid">
+                      <label>
+                        Tên bộ / nhân vật
+                        <input
+                          className="version-input"
+                          value={referenceSet.name || ''}
+                          onChange={event => updateMuseReferenceSet(setIndex, { name: event.target.value })}
+                          disabled={activeVersionLocked}
+                        />
+                      </label>
+                      <label>
+                        Aliases (phân cách dấu phẩy)
+                        <input
+                          className="version-input"
+                          value={(referenceSet.aliases || []).join(', ')}
+                          onChange={event => updateMuseReferenceSet(setIndex, {
+                            aliases: event.target.value.split(',').map(value => value.trim()).filter(Boolean)
+                          })}
+                          disabled={activeVersionLocked}
+                        />
+                      </label>
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))', gap: 6, marginTop: 10 }}>
+                      {promptAssets.map(asset => {
+                        const checked = selectedImages.includes(asset.filename);
+                        const limitReached = !checked && selectedImages.length >= 6;
+                        return (
+                          <label key={asset.filename} style={{ display: 'flex', gap: 7, alignItems: 'center', fontSize: '0.82rem' }}>
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              disabled={activeVersionLocked || limitReached}
+                              onChange={() => updateMuseReferenceSet(setIndex, {
+                                images: checked
+                                  ? selectedImages.filter(filename => filename !== asset.filename)
+                                  : [...selectedImages, asset.filename]
+                              })}
+                            />
+                            {asset.display_name || asset.filename}
+                          </label>
+                        );
+                      })}
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 10 }}>
+                      <span className="help-text">Đã chọn {selectedImages.length}/6 ảnh</span>
+                      <button type="button" className="btn-secondary" onClick={() => removeMuseReferenceSet(setIndex)} disabled={activeVersionLocked}>Xóa bộ</button>
+                    </div>
+                  </div>
+                );
+              })}
+              {loadingAssets && <div className="help-text">Đang tải kho ảnh...</div>}
             </div>
           )}
 

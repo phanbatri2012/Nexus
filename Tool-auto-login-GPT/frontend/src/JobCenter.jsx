@@ -142,6 +142,46 @@ function JobCenter({ onOpenVideo, refreshKey }) {
   const [selectionSummary, setSelectionSummary] = useState(null)
   const requestIdRef = useRef(0)
   const selectAllCheckboxRef = useRef(null)
+  const [drainMode, setDrainMode] = useState(null)
+  const [togglingDrainMode, setTogglingDrainMode] = useState(false)
+
+  const toggleDrainMode = async (forceValue) => {
+    const nextVal = typeof forceValue === 'boolean' ? forceValue : !drainMode?.enabled
+    if (nextVal) {
+      if (!window.confirm(
+        'BẬT CHẾ ĐỘ CHẶN JOB MỚI (CHUẨN BỊ RESTART)?\n\n' +
+        '• Các job đang chạy sẽ tiếp tục chạy cho tới khi hoàn tất 100%.\n' +
+        '• Hàng đợi đóng lại: hệ thống KHÔNG nhận thêm bất kỳ job mới nào.\n' +
+        '• Khi số job đang chạy về 0, bạn có thể chạy "run_autoyt_restart.bat" an toàn.'
+      )) {
+        return
+      }
+    }
+    setTogglingDrainMode(true)
+    setError('')
+    try {
+      const response = await fetch(`${API_BASE}/api/system/drain-mode`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: nextVal })
+      })
+      const data = await response.json()
+      if (!response.ok) {
+        throw new Error(data.detail || `HTTP ${response.status}`)
+      }
+      setDrainMode(data)
+      setBulkMessage(
+        nextVal
+          ? '⏸ Đã bật chặn nhận job mới. Hệ thống sẽ xả hết các job đang chạy để bạn restart an toàn.'
+          : '▶ Đã tắt chặn job mới. Hàng đợi đã tiếp tục hoạt động bình thường.'
+      )
+      await loadJobs()
+    } catch (err) {
+      setError(`Không thể thay đổi chế độ chặn job: ${err.message}`)
+    } finally {
+      setTogglingDrainMode(false)
+    }
+  }
 
   const clearSelection = useCallback(() => {
     setSelectedJobs({})
@@ -189,6 +229,9 @@ function JobCenter({ onOpenVideo, refreshKey }) {
       const loadedJobs = Array.isArray(data.items) ? data.items : []
       setJobs(loadedJobs)
       setCounts(data.counts || { total: 0, active: 0, error: 0 })
+      if (data.drain_mode) {
+        setDrainMode(data.drain_mode)
+      }
       setFilteredTotal(Number(data.filtered_total) || 0)
       setSelectableTotal(Number(data.selectable_total) || 0)
       setServerActionCounts({
@@ -574,6 +617,7 @@ function JobCenter({ onOpenVideo, refreshKey }) {
           <option value="audio">Tạo audio</option>
           <option value="visual_scene_plan">Lập kế hoạch cảnh</option>
           <option value="flow_media_generation">Tạo media Google Flow</option>
+          <option value="muse_media_generation">Tạo media Muse AI</option>
           <option value="video_render">Dựng video MP4</option>
           <option value="video_qc">Kiểm tra chất lượng video</option>
           <option value="youtube_publish">Upload / đặt lịch YouTube</option>
@@ -612,15 +656,136 @@ function JobCenter({ onOpenVideo, refreshKey }) {
           <option value="updated_asc">Cập nhật: Cũ nhất</option>
           <option value="active_first">Đang xử lý lên đầu (Active first)</option>
         </select>
-        <button
-          className="btn-secondary"
-          disabled={Boolean(actionId)}
-          onClick={loadJobs}
-          style={{ padding: '9px 16px', width: 'auto', marginLeft: 'auto' }}
-        >
-          ↻ Làm mới
-        </button>
+        <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+          <button
+            type="button"
+            disabled={Boolean(actionId) || togglingDrainMode}
+            onClick={() => toggleDrainMode()}
+            title={
+              drainMode?.enabled
+                ? 'Đang bật chặn job mới. Nhấn để tiếp tục nhận job bình thường.'
+                : 'Ngăn nhận thêm job mới để chuẩn bị Restart (các job đang chạy không bị ảnh hưởng).'
+            }
+            style={{
+              padding: '9px 16px',
+              width: 'auto',
+              borderRadius: '7px',
+              fontWeight: 600,
+              fontSize: '0.9em',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              transition: 'all 0.25s ease',
+              ...(drainMode?.enabled
+                ? {
+                    background: drainMode?.safe_to_restart
+                      ? 'linear-gradient(135deg, #059669 0%, #10b981 100%)'
+                      : 'linear-gradient(135deg, #d97706 0%, #f59e0b 100%)',
+                    color: '#fff',
+                    border: '1px solid rgba(255,255,255,0.35)',
+                    boxShadow: drainMode?.safe_to_restart
+                      ? '0 0 14px rgba(16, 185, 129, 0.45)'
+                      : '0 0 14px rgba(245, 158, 11, 0.45)',
+                  }
+                : {
+                    background: '#222',
+                    border: '1px solid #555',
+                    color: '#ccc',
+                  }),
+            }}
+          >
+            {drainMode?.enabled ? (
+              drainMode?.safe_to_restart ? (
+                <>
+                  <span aria-hidden="true">🟢</span>
+                  <span>Sẵn sàng Restart ({drainMode.running_jobs_count || 0} job chạy)</span>
+                </>
+              ) : (
+                <>
+                  <span aria-hidden="true">⏸</span>
+                  <span>Đang chặn ({drainMode?.running_jobs_count || 0} job chạy)</span>
+                </>
+              )
+            ) : (
+              <>
+                <span aria-hidden="true">⏸</span>
+                <span>Chặn job mới (Chờ Restart)</span>
+              </>
+            )}
+          </button>
+          <button
+            className="btn-secondary"
+            disabled={Boolean(actionId)}
+            onClick={loadJobs}
+            style={{ padding: '9px 16px', width: 'auto' }}
+          >
+            ↻ Làm mới
+          </button>
+        </div>
       </div>
+
+      {drainMode?.enabled && (
+        <div
+          style={{
+            margin: '0 0 18px 0',
+            padding: '12px 18px',
+            borderRadius: '8px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: '14px',
+            flexWrap: 'wrap',
+            background: drainMode?.safe_to_restart
+              ? 'rgba(16, 185, 129, 0.12)'
+              : 'rgba(245, 158, 11, 0.12)',
+            border: drainMode?.safe_to_restart
+              ? '1px solid rgba(16, 185, 129, 0.4)'
+              : '1px solid rgba(245, 158, 11, 0.4)',
+            boxShadow: '0 4px 16px rgba(0,0,0,0.2)',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', minWidth: '260px', flex: 1 }}>
+            <span style={{ fontSize: '1.4em' }}>
+              {drainMode?.safe_to_restart ? '🟢' : '⏳'}
+            </span>
+            <div>
+              <div
+                style={{
+                  fontWeight: '700',
+                  fontSize: '0.98em',
+                  color: drainMode?.safe_to_restart ? '#34d399' : '#fbbf24',
+                }}
+              >
+                {drainMode?.safe_to_restart
+                  ? 'Hệ thống đã IDLE hoàn toàn — Đã sẵn sàng Restart!'
+                  : `Đang ở chế độ Chờ Restart — Đang đợi ${drainMode?.running_jobs_count || 0} job hoàn tất...`}
+              </div>
+              <div style={{ fontSize: '0.84em', color: '#ccc', marginTop: '3px' }}>
+                {drainMode?.safe_to_restart
+                  ? 'Tất cả job đang chạy đã kết thúc. Hàng đợi đã khóa an toàn. Bạn có thể chạy "run_autoyt_restart.bat" ngay bây giờ.'
+                  : 'Các job đang chạy tiếp tục xử lý bình thường. Các worker đã bị chặn không nhận thêm job mới.'}
+              </div>
+            </div>
+          </div>
+          <button
+            type="button"
+            className="btn-secondary"
+            disabled={togglingDrainMode}
+            onClick={() => toggleDrainMode(false)}
+            style={{
+              padding: '7px 14px',
+              fontSize: '0.86em',
+              width: 'auto',
+              whiteSpace: 'nowrap',
+              background: '#2a2a2a',
+              borderColor: '#666',
+            }}
+          >
+            Hủy chặn & Tiếp tục nhận job
+          </button>
+        </div>
+      )}
 
       <div className="result-panel" style={{ padding: '12px 16px', marginBottom: '16px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>

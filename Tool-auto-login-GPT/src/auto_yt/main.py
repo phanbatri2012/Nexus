@@ -95,6 +95,9 @@ from auto_yt.services import (
     prompt_assets,
     publication_scheduler,
     production_coordinator as production_coordinator_service,
+    muse_pipeline,
+    muse_provider,
+    muse_settings,
     source_voice_analyzer,
     video_qc,
     video_production,
@@ -383,6 +386,7 @@ class PromptPipelineData(BaseModel):
 class PromptImageGenerationData(BaseModel):
     render_mode: Optional[str] = "google_flow"
     stock_video_settings: Optional[dict] = Field(default_factory=dict)
+    muse_settings: Optional[dict] = Field(default_factory=dict)
     provider: str = "google_flow"
     model: str = "nano_banana_pro"
     aspect_ratio: str = "16:9"
@@ -887,6 +891,10 @@ class GpmConfigRequest(BaseModel):
     timeout_seconds: Optional[float] = Field(default=None, ge=2.0, le=120.0)
 
 
+class MuseSettingsData(BaseModel):
+    gpm_profile_id: str = Field(default="", max_length=120)
+
+
 class GpmProfileStartRequest(BaseModel):
     remote_debugging_port: Optional[int] = Field(default=None, ge=1, le=65535)
     window_scale: Optional[float] = Field(default=None, ge=0.1, le=3.0)
@@ -1374,14 +1382,114 @@ def get_gpm_status(api_url: Optional[str] = Query(None)):
 
 def _public_gpm_profile(profile: dict) -> dict:
     public_profile = dict(profile or {})
-    raw_proxy = str(
-        public_profile.pop("raw_proxy", "")
-        or public_profile.pop("proxy", "")
-        or ""
-    )
+    raw_proxy_value = public_profile.pop("raw_proxy", "")
+    proxy_value = public_profile.pop("proxy", "")
+    raw_proxy = str(raw_proxy_value or proxy_value or "")
+    for secret_key in (
+        "cookies",
+        "cookie",
+        "token",
+        "access_token",
+        "refresh_token",
+        "password",
+        "proxy_password",
+        "proxy_username",
+    ):
+        public_profile.pop(secret_key, None)
     public_profile["proxy_configured"] = bool(parse_proxy_url(raw_proxy))
     public_profile["proxy_display"] = proxy_display_value(raw_proxy)
     return public_profile
+
+
+def _muse_json_response(content: dict, status_code: int = 200) -> JSONResponse:
+    return JSONResponse(
+        content=content,
+        status_code=status_code,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+def _muse_http_exception(status_code: int, exc: Exception) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail=security_logging.redact_sensitive(exc),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/muse/settings")
+def get_muse_settings_endpoint():
+    settings = muse_settings.load_muse_settings()
+    profile_id = str(settings.get("gpm_profile_id") or "")
+    profile = None
+    if profile_id:
+        try:
+            profile = _public_gpm_profile(gpm_service.get_gpm_profile_detail(profile_id))
+        except Exception as exc:
+            logger.warning(
+                "Không thể đọc GPM profile Muse đã cấu hình: %s",
+                security_logging.redact_sensitive(exc),
+            )
+            profile = {"id": profile_id, "available": False, "proxy_configured": False}
+    return _muse_json_response({"settings": settings, "profile": profile})
+
+
+@app.put("/api/muse/settings")
+def update_muse_settings_endpoint(request: MuseSettingsData):
+    try:
+        profile_id = request.gpm_profile_id.strip()
+        profile = None
+        if profile_id:
+            detail = muse_provider.MuseBrowserProvider.validate_profile(profile_id)
+            profile = _public_gpm_profile(detail)
+        saved = muse_settings.save_muse_settings({"gpm_profile_id": profile_id})
+        return _muse_json_response({"settings": saved, "profile": profile})
+    except (ValueError, ProxyConfigurationError) as exc:
+        raise _muse_http_exception(400, exc) from exc
+    except gpm_service.GpmProfileNotFoundError as exc:
+        raise _muse_http_exception(404, exc) from exc
+    except Exception as exc:
+        raise _muse_http_exception(503, exc) from exc
+
+
+@app.post("/api/muse/profile/open")
+def open_muse_profile_endpoint():
+    try:
+        profile_id = muse_provider.MuseBrowserProvider.configured_profile_id()
+        muse_provider.MuseBrowserProvider.validate_profile(profile_id)
+        launch = gpm_service.start_gpm_profile(
+            profile_id,
+            require_cdp=True,
+            skip_proxy_check=False,
+            manual=True,
+        )
+        muse_provider.mark_profile_user_owned(profile_id)
+        gpm_service.open_tab_in_running_gpm_process(profile_id, muse_provider.MUSE_URL)
+        return _muse_json_response(
+            {
+                "success": True,
+                "profile_id": profile_id,
+                "already_running": bool(launch.get("already_running")),
+                "url": muse_provider.MUSE_URL,
+            }
+        )
+    except (ValueError, ProxyConfigurationError, muse_provider.MuseAuthenticationError) as exc:
+        raise _muse_http_exception(400, exc) from exc
+    except Exception as exc:
+        raise _muse_http_exception(503, exc) from exc
+
+
+@app.post("/api/muse/profile/verify")
+async def verify_muse_profile_endpoint():
+    try:
+        result = await muse_provider.MuseBrowserProvider().verify()
+        return _muse_json_response({"success": True, "capabilities": result})
+    except (ValueError, ProxyConfigurationError, muse_provider.MuseAuthenticationError) as exc:
+        raise _muse_http_exception(400, exc) from exc
+    except muse_provider.MuseProfileBusy as exc:
+        raise _muse_http_exception(409, exc) from exc
+    except Exception as exc:
+        raise _muse_http_exception(503, exc) from exc
 
 
 @app.get("/api/gpm/profiles")
@@ -4057,6 +4165,10 @@ FLOW_MEDIA_JOB_TYPES = ("flow_media_generation",)
 FLOW_MEDIA_JOB_LABELS = {
     "flow_media_generation": "Tạo media Google Flow",
 }
+MUSE_MEDIA_JOB_TYPES = ("muse_media_generation",)
+MUSE_MEDIA_JOB_LABELS = {
+    "muse_media_generation": "Tạo media Muse AI",
+}
 
 PRODUCTION_JOB_TYPES = (
     "video_render",
@@ -4098,6 +4210,7 @@ ALL_JOB_LABELS = {
     "video_generation": "Tạo video",
     **COMMENT_JOB_LABELS,
     **FLOW_MEDIA_JOB_LABELS,
+    **MUSE_MEDIA_JOB_LABELS,
     **PRODUCTION_JOB_LABELS,
     **PUBLISHING_JOB_LABELS,
     **TRUST_BUILDER_JOB_LABELS,
@@ -5277,6 +5390,9 @@ def _channel_sync_job_exists(channel_db_id: int) -> bool:
 
 
 def _enqueue_due_comment_syncs() -> int:
+    from auto_yt.services import drain_mode
+    if drain_mode.is_drain_mode_active():
+        return 0
     now = datetime.datetime.now(datetime.timezone.utc)
     created = 0
     for channel in db.list_youtube_channels():
@@ -5346,6 +5462,8 @@ def _start_google_flow_browser_safely() -> None:
 
 @app.on_event("startup")
 def resume_background_jobs() -> None:
+    from auto_yt.services import drain_mode
+    drain_mode.reset_drain_mode()
     global _comment_sync_thread, _tts_preview_cleanup_thread, _system_cleanup_thread
     global _competitor_radar_thread
     # Migrate any legacy plaintext credentials before background workers can
@@ -5381,6 +5499,7 @@ def resume_background_jobs() -> None:
         db.recover_interrupted_system_jobs(job_type)
     for prod_job in (
         "flow_media_generation",
+        "muse_media_generation",
         "video_render",
         "video_qc",
         "visual_scene_plan",
@@ -5477,6 +5596,9 @@ def stop_video_queue_wakeup_timer() -> None:
     trust_builder_scheduler.stop_trust_builder_scheduler()
     if _flow_media_coordinator is not None:
         _flow_media_coordinator.stop()
+    if _muse_media_coordinator is not None:
+        _muse_media_coordinator.stop()
+    muse_provider.shutdown_muse_resources()
     if _production_coordinator is not None:
         _production_coordinator.stop()
     if _publish_coordinator is not None:
@@ -6336,6 +6458,73 @@ def _execute_flow_media_generation_job(job: dict) -> None:
     )
 
 
+def _execute_muse_media_generation_job(job: dict) -> None:
+    payload = job.get("payload") or {}
+    video_id = int(job.get("video_id") or payload.get("video_id") or 0)
+    existing_final = db.get_latest_video_artifact(video_id, "final_mp4", status="ready")
+    if existing_final and Path(existing_final.get("path") or "").is_file():
+        db.update_system_job(
+            job["id"],
+            status="completed",
+            progress="Media Muse đã hoàn tất (final_mp4 đã sẵn sàng)",
+            finished_at=db.utc_now(),
+        )
+        return
+    snapshot = payload.get("snapshot") or _get_prompt_production_snapshot(
+        job.get("prompt_version") or ""
+    )
+
+    def update(message: str, stage: str = "", *args, **kwargs) -> None:
+        del args
+        updates = {"progress": message}
+        media_progress = kwargs.get("media_progress")
+        if isinstance(media_progress, dict):
+            current = db.get_system_job(job["id"]) or job
+            result = dict(current.get("result") or {})
+            result["muse_media_progress"] = media_progress
+            updates["result_json"] = result
+        db.update_system_job(job["id"], **updates)
+        db.update_video_production_state(
+            video_id,
+            render_status="media_generation",
+            current_stage=stage or "muse_media_generation",
+            production_progress=message,
+            blocking_reason="",
+        )
+
+    result = muse_pipeline.prepare_muse_media(
+        video_id,
+        snapshot,
+        update,
+        lambda: _raise_if_video_job_canceled(job["id"]),
+        job_id=job["id"],
+        force_new_project=bool(payload.get("force_new_project", False)),
+        reference_snapshot=payload.get("muse_reference_snapshot"),
+    )
+    _raise_if_video_job_canceled(job["id"])
+    render_job, _ = _enqueue_video_render_job(
+        video_id=video_id,
+        snapshot=snapshot,
+        mode=str(payload.get("mode") or "resume"),
+        source_media_job_id=job["id"],
+    )
+    result = {**result, "render_job_id": render_job["id"]}
+    db.update_system_job(
+        job["id"],
+        status="completed",
+        progress="Media Muse đã sẵn sàng; đã chuyển sang hàng đợi MP4",
+        result_json=result,
+        finished_at=db.utc_now(),
+    )
+    db.update_video_production_state(
+        video_id,
+        render_status="queued",
+        current_stage="video_render_queue",
+        production_progress="Media Muse đã sẵn sàng; đang chờ dựng MP4",
+        blocking_reason="",
+    )
+
+
 def _enqueue_video_qc_job(
     *,
     video_id: int,
@@ -6708,13 +6897,21 @@ def _execute_video_render_job(job: dict) -> None:
             blocking_reason="",
         )
 
-    if video_production.get_render_mode(snapshot) == "stock_video":
+    render_mode = video_production.get_render_mode(snapshot)
+    if render_mode == "stock_video":
         result = stock_video_renderer.produce_stock_video(
             video_id=video_id,
             snapshot=snapshot,
             progress=update,
             cancel_check=lambda: _raise_if_video_job_canceled(job["id"]),
             force_new_project=bool(payload.get("force_new_project", False)),
+        )
+    elif render_mode == "muse_ai":
+        result = muse_pipeline.render_prepared_muse_video(
+            video_id,
+            snapshot,
+            update,
+            lambda: _raise_if_video_job_canceled(job["id"]),
         )
     else:
         result = video_production.render_prepared_google_flow_video(
@@ -6952,7 +7149,7 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
         )
         if (
             str(job.get("job_type") or "")
-            in {"flow_media_generation", "video_render"}
+            in {"flow_media_generation", "muse_media_generation", "video_render"}
             and job.get("video_id")
         ):
             db.update_video_production_state(
@@ -6992,6 +7189,40 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
         FlowImageNeedsAttention,
         FlowMediaPending,
     )
+
+    if (
+        isinstance(exc, (muse_pipeline.MuseRetryScheduled, muse_provider.MuseProfileBusy))
+        and str(job.get("job_type") or "") == "muse_media_generation"
+    ):
+        current_job = db.get_system_job(job["id"]) or job
+        result = dict(current_job.get("result") or {})
+        is_busy = isinstance(exc, muse_provider.MuseProfileBusy)
+        delay_seconds = 15.0 if is_busy else float(exc.delay_seconds)
+        result["muse_wait_reason"] = "profile_busy" if is_busy else "transient_error"
+        payload = dict(current_job.get("payload") or {})
+        if payload.get("force_new_project"):
+            payload["force_new_project"] = False
+            db.update_system_job(job["id"], payload_json=payload)
+        db.schedule_system_job_recovery(
+            job["id"],
+            resume_from_step="muse_media_generation",
+            delay_seconds=delay_seconds,
+            error=safe_error,
+            result_json=result,
+        )
+        if job.get("video_id"):
+            db.update_video_production_state(
+                int(job["video_id"]),
+                render_status="retry_wait",
+                current_stage="muse_media_generation",
+                production_progress=(
+                    "GPM profile Muse đang bận; job sẽ tự tiếp tục"
+                    if is_busy
+                    else f"Muse lỗi tạm thời; thử lại sau {delay_seconds:g} giây"
+                ),
+                blocking_reason="",
+            )
+        return
 
     if (
         isinstance(exc, FlowImageNeedsAttention)
@@ -7222,7 +7453,7 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
     )
     if (
         str(job.get("job_type") or "")
-        in {"flow_media_generation", "video_render"}
+        in {"flow_media_generation", "muse_media_generation", "video_render"}
         and job.get("video_id")
     ):
         db.update_video_production_state(
@@ -7909,6 +8140,9 @@ def _handle_competitor_scan_error(job: dict, exc: Exception) -> None:
 
 
 def _enqueue_due_competitor_scans() -> int:
+    from auto_yt.services import drain_mode
+    if drain_mode.is_drain_mode_active():
+        return 0
     created = 0
     for rule in db.list_due_competitor_watch_rules(db.utc_now(), limit=20):
         if _has_active_competitor_scan(int(rule["id"])):
@@ -8434,6 +8668,11 @@ _flow_media_coordinator = production_coordinator_service.ProductionCoordinator(
     error_handler=_handle_production_job_error,
 )
 
+_muse_media_coordinator = production_coordinator_service.ProductionCoordinator(
+    {"muse_media_generation": _execute_muse_media_generation_job},
+    error_handler=_handle_production_job_error,
+)
+
 _radar_coordinator = production_coordinator_service.ProductionCoordinator(
     {"competitor_scan": _execute_competitor_scan_job},
     error_handler=_handle_competitor_scan_error,
@@ -8451,6 +8690,11 @@ def _kick_publish_queue() -> None:
 def _kick_flow_media_queue() -> None:
     if db.has_claimable_system_jobs("flow_media_generation"):
         _flow_media_coordinator.wake()
+
+
+def _kick_muse_media_queue() -> None:
+    if db.has_claimable_system_jobs("muse_media_generation"):
+        _muse_media_coordinator.wake()
 
 
 def _kick_radar_queue() -> None:
@@ -8532,10 +8776,56 @@ def _enqueue_flow_media_job(
         },
         video_id=video_id,
         prompt_version=prompt_version,
-        dedupe_job_types=("flow_media_generation", "video_render"),
+        dedupe_job_types=(
+            "flow_media_generation",
+            "muse_media_generation",
+            "video_render",
+        ),
     )
     if created:
         _kick_flow_media_queue()
+    return job, created
+
+
+def _enqueue_muse_media_job(
+    *,
+    video_id: int,
+    snapshot: dict,
+    mode: str = "resume",
+    force_new_project: bool = False,
+) -> tuple[dict, bool]:
+    prompt_version = str(
+        snapshot.get("prompt_version")
+        or snapshot.get("version")
+        or (db.get_video(video_id) or {}).get("prompt_version")
+        or ""
+    )
+    reference_snapshot = muse_pipeline.snapshot_reference_assets(video_id, snapshot)
+    job, created = db.create_system_job_if_absent(
+        job_id=f"muse-media-{uuid.uuid4().hex}",
+        job_type="muse_media_generation",
+        title=(
+            f"Tạo media Muse AI cho #{video_id}"
+            + (" (Tạo mới)" if force_new_project else "")
+        ),
+        payload={
+            "video_id": video_id,
+            "snapshot": snapshot,
+            "mode": mode,
+            "force_new_project": bool(force_new_project),
+            "muse_reference_snapshot": reference_snapshot,
+        },
+        video_id=video_id,
+        prompt_version=prompt_version,
+        dedupe_job_types=(
+            "flow_media_generation",
+            "muse_media_generation",
+            "video_render",
+        ),
+    )
+    # This function is reached through an explicit render/retry request. Wake an
+    # existing recovered job too; startup recovery deliberately does not call it.
+    _kick_muse_media_queue()
     return job, created
 
 
@@ -8546,7 +8836,8 @@ def _route_video_render_job(
     mode: str = "resume",
     force_new_project: bool = False,
 ) -> tuple[dict, bool, str]:
-    if video_production.get_render_mode(snapshot) == "stock_video":
+    render_mode = video_production.get_render_mode(snapshot)
+    if render_mode == "stock_video":
         job, created = _enqueue_video_render_job(
             video_id=video_id,
             snapshot=snapshot,
@@ -8554,6 +8845,17 @@ def _route_video_render_job(
             force_new_project=force_new_project,
         )
         return job, created, "render"
+    if render_mode == "muse_ai":
+        job, created = _enqueue_muse_media_job(
+            video_id=video_id,
+            snapshot=snapshot,
+            mode=mode,
+            force_new_project=force_new_project,
+        )
+        phase = (
+            "render" if job.get("job_type") == "video_render" else "media_generation"
+        )
+        return job, created, phase
     job, created = _enqueue_flow_media_job(
         video_id=video_id,
         snapshot=snapshot,
@@ -8573,16 +8875,21 @@ def _migrate_legacy_google_flow_render_jobs() -> int:
         if payload.get("media_prepared"):
             continue
         snapshot = payload.get("snapshot") or {}
-        if video_production.get_render_mode(snapshot) == "stock_video":
+        render_mode = video_production.get_render_mode(snapshot)
+        if render_mode == "stock_video":
             continue
         video_id = int(job.get("video_id") or payload.get("video_id") or 0)
         if not video_id:
             continue
-        if db.has_active_system_job_for_video("flow_media_generation", video_id):
+        target_job_type = (
+            "muse_media_generation" if render_mode == "muse_ai" else "flow_media_generation"
+        )
+        target_label = "Muse AI" if render_mode == "muse_ai" else "Google Flow"
+        if db.has_active_system_job_for_video(target_job_type, video_id):
             db.update_system_job(
                 job["id"],
                 status="canceled",
-                progress="Đã thay thế bằng job media Google Flow hiện có",
+                progress=f"Đã thay thế bằng job media {target_label} hiện có",
                 error="",
                 cancel_requested=0,
                 finished_at=db.utc_now(),
@@ -8591,11 +8898,11 @@ def _migrate_legacy_google_flow_render_jobs() -> int:
         updated = db.reclassify_active_system_job(
             job["id"],
             expected_job_type="video_render",
-            new_job_type="flow_media_generation",
-            title=f"Tạo media Google Flow cho #{video_id}",
-            progress="Đã chuyển sang hàng đợi media Google Flow",
+            new_job_type=target_job_type,
+            title=f"Tạo media {target_label} cho #{video_id}",
+            progress=f"Đã chuyển sang hàng đợi media {target_label}",
         )
-        if updated and updated.get("job_type") == "flow_media_generation":
+        if updated and updated.get("job_type") == target_job_type:
             migrated += 1
     return migrated
 
@@ -9317,6 +9624,11 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
             if isinstance(result.get("flow_media_progress"), dict)
             else {}
         ),
+        "muse_media_progress": (
+            result.get("muse_media_progress")
+            if isinstance(result.get("muse_media_progress"), dict)
+            else {}
+        ),
         "recovery_limit": (
             len(YOUTUBE_RECOVERY_DELAYS_SECONDS)
             if job_type in {"youtube_upload", "youtube_publish"}
@@ -9335,11 +9647,11 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
         "can_force_stop": (
             status == "running"
             or bool(job.get("cancel_requested"))
-            or (job_type in {"video_generation", "flow_media_generation", "video_render", "video_qc", "visual_scene_plan", "competitor_scan", "youtube_upload", "youtube_publish"} and status in {"running", "retry_wait"})
+            or (job_type in {"video_generation", "flow_media_generation", "muse_media_generation", "video_render", "video_qc", "visual_scene_plan", "competitor_scan", "youtube_upload", "youtube_publish"} and status in {"running", "retry_wait"})
         ),
         "can_cancel": (
             status in {"queued", "retry_wait", "paused"}
-            or (job_type in {"video_generation", "flow_media_generation", "video_render", "video_qc", "visual_scene_plan", "competitor_scan", "youtube_upload", "youtube_publish", "fb_crosspost", "fb_crosspost_sync", "thumbnail_generation", "tiktok_publish", "trust_builder_session"} and status == "running")
+            or (job_type in {"video_generation", "flow_media_generation", "muse_media_generation", "video_render", "video_qc", "visual_scene_plan", "competitor_scan", "youtube_upload", "youtube_publish", "fb_crosspost", "fb_crosspost_sync", "thumbnail_generation", "tiktok_publish", "trust_builder_session"} and status == "running")
         ),
         "can_retry": (
             status in {"error", "canceled"}
@@ -9668,6 +9980,7 @@ JOB_CENTER_SYSTEM_JOB_TYPES = (
     "video_generation",
     *COMMENT_JOB_TYPES,
     *FLOW_MEDIA_JOB_TYPES,
+    *MUSE_MEDIA_JOB_TYPES,
     *PRODUCTION_JOB_TYPES,
     *PUBLISHING_JOB_TYPES,
     *TRUST_BUILDER_JOB_TYPES,
@@ -9830,6 +10143,40 @@ def _sort_job_center_items(items: list[dict], sort_by: str = "start_desc") -> li
     )
 
 
+
+class DrainModeRequest(BaseModel):
+    enabled: bool
+    reason: Optional[str] = ""
+
+
+@app.get("/api/system/drain-mode")
+def get_drain_mode():
+    from auto_yt.services import drain_mode
+    return drain_mode.get_drain_status()
+
+
+@app.post("/api/system/drain-mode")
+def set_drain_mode_endpoint(req: DrainModeRequest):
+    from auto_yt.services import drain_mode
+    status = drain_mode.set_drain_mode(req.enabled, req.reason or "")
+    if not req.enabled:
+        _kick_job_queues(
+            {
+                "video_generation",
+                "flow_media_generation",
+                "muse_media_generation",
+                "video_render",
+                "video_qc",
+                "youtube_publish",
+                "competitor_scan",
+                "comment_sync",
+                "comment_draft",
+                "comment_publish",
+                "trust_builder_session",
+            }
+        )
+    return status
+
 @app.get("/api/jobs")
 def list_jobs(
     limit: int = 100,
@@ -9839,6 +10186,7 @@ def list_jobs(
     search: Optional[str] = None,
     sort_by: str = "start_desc",
 ):
+    from auto_yt.services import drain_mode
     requested_limit = max(1, min(int(limit), 500))
     requested_offset = max(0, int(offset))
     snapshot_at = db.utc_now()
@@ -9878,6 +10226,7 @@ def list_jobs(
         "selectable_total": sum(_job_is_selectable(item) for item in filtered_items),
         "action_counts": action_counts,
         "snapshot_at": snapshot_at,
+        "drain_mode": drain_mode.get_drain_status(),
     }
 
 
@@ -9896,6 +10245,8 @@ def _kick_job_queues(job_types: set[str]) -> None:
         _kick_comment_queue()
     if any(job_type in FLOW_MEDIA_JOB_TYPES for job_type in job_types):
         _kick_flow_media_queue()
+    if any(job_type in MUSE_MEDIA_JOB_TYPES for job_type in job_types):
+        _kick_muse_media_queue()
     if any(job_type in PRODUCTION_JOB_TYPES for job_type in job_types):
         _kick_production_queue()
     if any(job_type in PUBLISHING_JOB_TYPES for job_type in job_types):
@@ -9927,6 +10278,7 @@ def _run_system_job_center_action(
     if action == "retry":
         if str(job.get("job_type") or "") in {
             "flow_media_generation",
+            "muse_media_generation",
             "video_render",
         }:
             video_id = int(
@@ -9946,7 +10298,7 @@ def _run_system_job_center_action(
                     )
                     == video_id
                     and candidate.get("job_type")
-                    in {"flow_media_generation", "video_render"}
+                    in {"flow_media_generation", "muse_media_generation", "video_render"}
                 ),
                 None,
             )
@@ -11809,7 +12161,7 @@ def cancel_render_video(video_id: int):
     jobs = db.list_system_jobs(video_id=video_id, limit=None)
     active_jobs = [
         j for j in jobs
-        if j.get("job_type") in {"flow_media_generation", "video_render"}
+        if j.get("job_type") in {"flow_media_generation", "muse_media_generation", "video_render"}
         and j.get("status") in {"queued", "running", "retry_wait", "paused"}
     ]
     if not active_jobs:
@@ -11821,7 +12173,11 @@ def cancel_render_video(video_id: int):
         coordinator = (
             _flow_media_coordinator
             if job.get("job_type") == "flow_media_generation"
-            else _production_coordinator
+            else (
+                _muse_media_coordinator
+                if job.get("job_type") == "muse_media_generation"
+                else _production_coordinator
+            )
         )
         coordinator_status = coordinator.status()
         if (
@@ -11930,7 +12286,7 @@ def get_render_status(video_id: int):
     render_jobs = [
         j
         for j in jobs
-        if j.get("job_type") in {"flow_media_generation", "video_render"}
+        if j.get("job_type") in {"flow_media_generation", "muse_media_generation", "video_render"}
     ]
     active_job = next(
         (
@@ -11944,7 +12300,9 @@ def get_render_status(video_id: int):
     render_job = active_job or latest_job
     phase = (
         "media_generation"
-        if render_job and render_job.get("job_type") == "flow_media_generation"
+        if render_job
+        and render_job.get("job_type")
+        in {"flow_media_generation", "muse_media_generation"}
         else "render"
     )
 

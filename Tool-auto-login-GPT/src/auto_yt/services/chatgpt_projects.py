@@ -146,6 +146,11 @@ DEFAULT_IMAGE_GENERATION_SETTINGS = {
         "show_waveform": True,
         "show_animated_icon": True,
     },
+    "muse_settings": {
+        "video_coverage_mode": "intro_only",
+        "video_coverage_minutes": 5,
+        "reference_sets": [],
+    },
     "provider": "google_flow",
     "model": DEFAULT_IMAGE_MODEL,
     "aspect_ratio": "16:9",
@@ -379,7 +384,11 @@ def normalize_image_generation_settings(value: object) -> dict:
         normalized["video_output_count"] = 1
 
     render_mode = str(settings.get("render_mode") or "google_flow").strip().lower()
-    normalized["render_mode"] = render_mode if render_mode in {"google_flow", "stock_video"} else "google_flow"
+    normalized["render_mode"] = (
+        render_mode
+        if render_mode in {"google_flow", "stock_video", "muse_ai"}
+        else "google_flow"
+    )
 
     stock_settings = settings.get("stock_video_settings") or {}
     if not isinstance(stock_settings, dict):
@@ -392,8 +401,64 @@ def normalize_image_generation_settings(value: object) -> dict:
         "show_animated_icon": bool(stock_settings.get("show_animated_icon", True)),
     }
 
+    muse_settings = settings.get("muse_settings") or {}
+    if not isinstance(muse_settings, dict):
+        muse_settings = {}
+    coverage_mode = str(
+        muse_settings.get("video_coverage_mode") or "intro_only"
+    ).strip().lower()
+    if coverage_mode not in {"intro_only", "first_n_minutes", "full"}:
+        coverage_mode = "intro_only"
+    try:
+        coverage_minutes = max(
+            1, min(90, int(muse_settings.get("video_coverage_minutes", 5) or 5))
+        )
+    except (TypeError, ValueError):
+        coverage_minutes = 5
+    reference_sets: list[dict] = []
+    seen_set_ids: set[str] = set()
+    raw_reference_sets = muse_settings.get("reference_sets") or []
+    if isinstance(raw_reference_sets, list):
+        for index, raw_set in enumerate(raw_reference_sets):
+            if not isinstance(raw_set, dict):
+                continue
+            name = str(raw_set.get("name") or f"Reference {index + 1}").strip()[:120]
+            set_id = str(raw_set.get("id") or name or f"reference-{index + 1}").strip()[:120]
+            if not set_id or set_id in seen_set_ids:
+                set_id = f"reference-{index + 1}"
+            seen_set_ids.add(set_id)
+            aliases = []
+            for alias in raw_set.get("aliases") or []:
+                clean_alias = str(alias or "").strip()[:120]
+                if clean_alias and clean_alias.casefold() not in {
+                    item.casefold() for item in aliases
+                }:
+                    aliases.append(clean_alias)
+            images = []
+            for image in raw_set.get("images") or []:
+                filename = str(image or "").strip().replace("\\", "/").rsplit("/", 1)[-1]
+                if filename and filename not in images:
+                    images.append(filename[:255])
+                if len(images) >= 6:
+                    break
+            reference_sets.append(
+                {
+                    "id": set_id,
+                    "name": name or set_id,
+                    "aliases": aliases,
+                    "images": images,
+                }
+            )
+    normalized["muse_settings"] = {
+        "video_coverage_mode": coverage_mode,
+        "video_coverage_minutes": coverage_minutes,
+        "reference_sets": reference_sets,
+    }
+
     provider = str(settings.get("provider") or "").strip()
-    normalized["provider"] = provider if provider else "google_flow"
+    normalized["provider"] = (
+        "muse_ai" if normalized["render_mode"] == "muse_ai" else provider or "google_flow"
+    )
 
     # Both negative_prompt (used by frontend) and avoid_prompt (backend alias) are supported.
     avoid = str(settings.get("avoid_prompt") or "").strip()
@@ -486,6 +551,25 @@ def validate_image_generation_settings(value: object) -> dict:
         raise ValueError("Loại thumbnail upload không được hỗ trợ.")
     if settings.get("scene_0_source", DEFAULT_SCENE_0_SOURCE) not in SCENE_0_SOURCES:
         raise ValueError("Nguồn ảnh Scene 0 không được hỗ trợ.")
+    if str(settings.get("render_mode") or "google_flow").strip().lower() == "muse_ai":
+        raw_muse_settings = settings.get("muse_settings") or {}
+        if not isinstance(raw_muse_settings, dict):
+            raise ValueError("Cấu hình Muse AI không hợp lệ.")
+        raw_reference_sets = raw_muse_settings.get("reference_sets") or []
+        if not isinstance(raw_reference_sets, list):
+            raise ValueError("Danh sách reference sets Muse không hợp lệ.")
+        for index, reference_set in enumerate(raw_reference_sets):
+            if not isinstance(reference_set, dict):
+                raise ValueError(f"Reference set Muse #{index + 1} không hợp lệ.")
+            images = [
+                str(image or "").strip()
+                for image in (reference_set.get("images") or [])
+                if str(image or "").strip()
+            ]
+            if not 1 <= len(images) <= 6:
+                raise ValueError(
+                    f"Reference set Muse #{index + 1} phải có từ 1 đến 6 ảnh."
+                )
     return normalize_image_generation_settings(settings)
 
 

@@ -4651,6 +4651,9 @@ def delete_system_job(job_id: str) -> dict | None:
 
 
 def claim_next_system_job(job_type: str) -> dict | None:
+    from auto_yt.services import drain_mode
+    if drain_mode.is_drain_mode_active():
+        return None
     now = utc_now()
     conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
@@ -4814,6 +4817,9 @@ def schedule_system_job_recovery(
 
 
 def has_claimable_system_jobs(job_type: str) -> bool:
+    from auto_yt.services import drain_mode
+    if drain_mode.is_drain_mode_active():
+        return False
     now = utc_now()
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
@@ -4852,6 +4858,9 @@ def has_claimable_system_jobs(job_type: str) -> bool:
 
 
 def get_next_system_job_retry_delay(job_type: str) -> float | None:
+    from auto_yt.services import drain_mode
+    if drain_mode.is_drain_mode_active():
+        return None
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     c = conn.cursor()

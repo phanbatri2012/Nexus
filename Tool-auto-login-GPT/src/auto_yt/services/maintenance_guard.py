@@ -25,14 +25,17 @@ def list_system_job_blockers() -> list[dict[str, Any]]:
     if not conn:
         return []
     try:
+        from auto_yt.services import drain_mode
+        drain_active = drain_mode.is_drain_mode_active()
+        status_filter = "('running', 'processing', 'in_progress')" if drain_active else "('running', 'processing', 'in_progress', 'queued', 'retry_wait')"
         rows = conn.execute(
-            """
+            f"""
             SELECT system_jobs.id, system_jobs.job_type, system_jobs.status,
                    system_jobs.video_id, system_jobs.progress, system_jobs.started_at,
                    videos.title AS video_title
             FROM system_jobs
             LEFT JOIN videos ON videos.id = system_jobs.video_id
-            WHERE system_jobs.status IN ('running', 'processing', 'in_progress', 'queued', 'retry_wait')
+            WHERE system_jobs.status IN {status_filter}
               AND system_jobs.job_type != 'comment_publish'
               AND (
                   system_jobs.status != 'retry_wait'
@@ -227,11 +230,14 @@ def list_fb_crossposter_blockers() -> list[dict[str, Any]]:
 
 
 def list_gpm_restart_blockers() -> list[dict[str, Any]]:
+    from auto_yt.services import drain_mode
     now = db.utc_now()
+    drain_active = drain_mode.is_drain_mode_active()
+    allowed_statuses = {"running", "processing"} if drain_active else {"queued", "running", "processing", "retry_wait"}
     blockers = []
     for job in db.list_system_jobs(limit=500, job_type="comment_publish"):
         status = str(job.get("status") or "").strip().lower()
-        if status not in {"queued", "running", "processing", "retry_wait"}:
+        if status not in allowed_statuses:
             continue
         next_retry_at = str(job.get("next_retry_at") or "").strip()
         if status == "retry_wait" and next_retry_at and next_retry_at > now:

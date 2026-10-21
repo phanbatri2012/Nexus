@@ -190,6 +190,9 @@ async def _execute_claimed_job(job: dict[str, Any]) -> None:
 
 
 async def _drain_job_queue() -> None:
+    from auto_yt.services import drain_mode
+    if drain_mode.is_drain_mode_active():
+        return
     async with _drain_lock:
         while True:
             job = db.claim_next_system_job(TRUST_JOB_TYPE)
@@ -218,6 +221,9 @@ def _is_plan_due(plan: dict[str, Any], now_utc: datetime.datetime) -> bool:
 
 
 async def _evaluate_active_plans() -> None:
+    from auto_yt.services import drain_mode
+    if drain_mode.is_drain_mode_active():
+        return
     now_utc = _utc_now()
     for plan in db.list_channel_trust_plans():
         if plan.get("status") != "active" or not _is_plan_due(plan, now_utc):

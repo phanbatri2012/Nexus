@@ -1638,7 +1638,9 @@ function App() {
           status: data.status || 'queued',
           job_type: data.job_type || 'video_render',
           title: data.phase === 'media_generation'
-            ? `Tạo media Google Flow cho #${currentVideoId}${mode === 'recreate' ? ' (Tạo mới)' : ''}`
+            ? (data.job_type === 'muse_media_generation'
+              ? `Tạo media Muse AI cho #${currentVideoId}${mode === 'recreate' ? ' (Tạo mới)' : ''}`
+              : `Tạo media Google Flow cho #${currentVideoId}${mode === 'recreate' ? ' (Tạo mới)' : ''}`)
             : `Dựng video MP4 cho #${currentVideoId}${mode === 'recreate' ? ' (Tạo mới)' : ''}`
         }
       }));
@@ -1699,7 +1701,9 @@ function App() {
           status: data.status || 'queued',
           job_type: data.job_type || 'video_render',
           title: data.phase === 'media_generation'
-            ? `Tạo lại media Google Flow từ cảnh ${Number(fromIndex) + 1}`
+            ? (data.job_type === 'muse_media_generation'
+              ? `Tạo lại media Muse AI từ cảnh ${Number(fromIndex) + 1}`
+              : `Tạo lại media Google Flow từ cảnh ${Number(fromIndex) + 1}`)
             : `Dựng video MP4 cho #${currentVideoId} (Tạo lại từ cảnh ${Number(fromIndex) + 1})`
         }
       }));
@@ -3578,7 +3582,7 @@ function App() {
                               }}>
                                 <div>
                                   <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                                    <h4 style={{ color: 'var(--accent)', margin: 0 }}>🎬 Video MP4 ({renderInfo?.render_mode === 'stock_video' ? 'Stock Video & Audio' : 'Google Flow & Subtitles'}):</h4>
+                                    <h4 style={{ color: 'var(--accent)', margin: 0 }}>🎬 Video MP4 ({renderInfo?.render_mode === 'stock_video' ? 'Stock Video & Audio' : renderInfo?.render_mode === 'muse_ai' ? 'Muse AI & Subtitles' : 'Google Flow & Subtitles'}):</h4>
                                     {hasMp4Ready && (
                                       <div className="media-badge-group">
                                         <span className="media-pill-badge">{renderInfo?.mp4_details?.resolution || '1080p FHD'}</span>
@@ -3595,7 +3599,7 @@ function App() {
                                   }}>
                                     {isRenderActive ? (
                                       <span>
-                                        ⏳ {renderInfo?.job?.progress || (renderInfo?.job?.status === 'running' ? 'Đang tạo ảnh Flow & render MP4...' : 'Đang trong hàng đợi render...')}
+                                        ⏳ {renderInfo?.job?.progress || (renderInfo?.job?.status === 'running' ? (renderInfo?.render_mode === 'muse_ai' ? 'Đang tạo media Muse & render MP4...' : 'Đang tạo ảnh Flow & render MP4...') : 'Đang trong hàng đợi render...')}
                                       </span>
                                     ) : isRenderError ? (
                                       <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>

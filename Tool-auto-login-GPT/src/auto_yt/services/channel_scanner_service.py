@@ -227,7 +227,7 @@ def ensure_profile_automation_ready(profile_id: str) -> dict[str, Any]:
 
 
 @asynccontextmanager
-async def _profile_browser_operation(profile_id: str) -> AsyncGenerator[None, None]:
+async def profile_browser_operation(profile_id: str) -> AsyncGenerator[None, None]:
     clean_id = str(profile_id or "").strip()
     lock = _get_profile_operation_lock(clean_id)
     acquired = False
@@ -675,7 +675,7 @@ async def channel_browser_session(
 ) -> AsyncGenerator[Any, None]:
     """Open a serialized CDP session without closing or restarting the browser."""
     parsed = parse_profile_target(profile_id)
-    async with _profile_browser_operation(parsed["id"]):
+    async with profile_browser_operation(parsed["id"]):
         await asyncio.to_thread(ensure_profile_automation_ready, parsed["id"])
         if parsed["type"] == "local":
             async with local_browser_session(
