@@ -6451,6 +6451,32 @@ def _execute_muse_media_generation_job(job: dict) -> None:
             blocking_reason="",
         )
 
+    def build_semantic_plan(request: dict) -> dict:
+        prompt_version = str(request.get("prompt_version") or "")
+        if not _try_start_chatgpt_operation(
+            "muse_semantic_planner",
+            prompt_version,
+            video_id,
+        ):
+            raise muse_pipeline.MusePlannerBusy(
+                "ChatGPT đang bận; semantic planner Muse sẽ tự thử lại.",
+                delay_seconds=30.0,
+                consume_attempt=False,
+            )
+        try:
+            update("Đang lập semantic scene plan qua ChatGPT", "muse_semantic_planner")
+            from auto_yt.services.chatgpt_worker import generate_muse_scene_plan_only
+
+            return generate_muse_scene_plan_only(
+                title=str(request.get("title") or ""),
+                style=str(request.get("style") or ""),
+                windows=list(request.get("windows") or []),
+                chat_url=str(request.get("chat_url") or ""),
+                prompt_version=prompt_version,
+            )
+        finally:
+            _finish_chatgpt_operation()
+
     result = muse_pipeline.prepare_muse_media(
         video_id,
         snapshot,
@@ -6459,6 +6485,7 @@ def _execute_muse_media_generation_job(job: dict) -> None:
         job_id=job["id"],
         force_new_project=bool(payload.get("force_new_project", False)),
         reference_snapshot=payload.get("muse_reference_snapshot"),
+        semantic_plan_builder=build_semantic_plan,
     )
     _raise_if_video_job_canceled(job["id"])
     render_job, _ = _enqueue_video_render_job(
@@ -7150,16 +7177,77 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
     )
 
     if (
+        isinstance(exc, ChatGPTAttentionRequiredError)
+        and str(job.get("job_type") or "") == "muse_media_generation"
+    ):
+        current_job = db.get_system_job(job["id"]) or job
+        result = dict(current_job.get("result") or {})
+        result["attention_required"] = "chatgpt_verification"
+        scheduled = _schedule_automatic_chatgpt_login(job["id"], exc)
+        if scheduled:
+            result["automatic_login"] = "pending"
+        db.update_system_job(
+            job["id"],
+            status="paused",
+            progress="Cần xác minh phiên ChatGPT trước khi lập scene plan Muse",
+            result_json=result,
+            error=safe_error,
+            next_retry_at="",
+            cancel_requested=0,
+            finished_at="",
+        )
+        if job.get("video_id"):
+            db.update_video_production_state(
+                int(job["video_id"]),
+                render_status="paused",
+                current_stage="muse_semantic_planner",
+                production_progress="Cần xác minh phiên ChatGPT trước khi tiếp tục",
+                blocking_reason=safe_error,
+            )
+        return
+
+    if (
+        isinstance(exc, muse_pipeline.MuseSemanticPlanNeedsAttention)
+        and str(job.get("job_type") or "") == "muse_media_generation"
+    ):
+        current_job = db.get_system_job(job["id"]) or job
+        result = dict(current_job.get("result") or {})
+        result["attention_required"] = "muse_semantic_plan"
+        db.update_system_job(
+            job["id"],
+            status="paused",
+            progress="Semantic scene plan Muse không đạt; chưa gửi yêu cầu tạo media",
+            result_json=result,
+            error=safe_error,
+            next_retry_at="",
+            cancel_requested=0,
+            finished_at="",
+        )
+        if job.get("video_id"):
+            db.update_video_production_state(
+                int(job["video_id"]),
+                render_status="paused",
+                current_stage="muse_semantic_plan_needs_attention",
+                production_progress="Semantic scene plan cần kiểm tra; chưa gọi Muse",
+                blocking_reason=safe_error,
+            )
+        return
+
+    if (
         isinstance(exc, muse_provider.MuseTransientError)
         and str(job.get("job_type") or "") == "muse_media_generation"
     ):
         current_job = db.get_system_job(job["id"]) or job
         result = dict(current_job.get("result") or {})
         is_busy = isinstance(exc, muse_provider.MuseServiceBusy)
+        is_planner_busy = isinstance(exc, muse_pipeline.MusePlannerBusy)
         is_request_retry = isinstance(exc, muse_pipeline.MuseRetryScheduled)
         if is_busy:
             delay_seconds = 15.0
             wait_reason = "service_busy"
+        elif is_planner_busy:
+            delay_seconds = float(exc.delay_seconds)
+            wait_reason = "chatgpt_busy"
         elif is_request_retry:
             delay_seconds = float(exc.delay_seconds)
             wait_reason = "transient_error"
@@ -7196,7 +7284,11 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
                     production_progress=(
                         "Muse2API đang bận; job sẽ tự tiếp tục"
                         if is_busy
-                        else f"Muse lỗi tạm thời; thử lại sau {delay_seconds:g} giây"
+                        else (
+                            "ChatGPT đang bận; semantic planner sẽ tự tiếp tục"
+                            if is_planner_busy
+                            else f"Muse lỗi tạm thời; thử lại sau {delay_seconds:g} giây"
+                        )
                     ),
                     blocking_reason="",
                 )

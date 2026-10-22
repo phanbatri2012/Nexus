@@ -57,6 +57,43 @@ class MuseAmbiguousSubmissionError(MuseError):
     """A request may have consumed credit but has no recoverable task id."""
 
 
+_REFUSAL_ERROR_TOKENS = (
+    "refus",
+    "safety",
+    "policy",
+    "blocked",
+    "模型未生成媒体",
+    "仅返回文本",
+    "chưa tạo được",
+    "không thể tạo",
+    "tôi không thể",
+    "mình không thể",
+)
+_REFERENCE_ERROR_TOKENS = (
+    "reference",
+    "attachment",
+    "upload",
+    "ảnh tham chiếu",
+    "ảnh đính kèm",
+    "tệp ảnh",
+    "không đọc được ảnh",
+)
+_AUTH_ERROR_TOKENS = ("auth", "login", "cookie", "session", "account")
+
+
+def classify_muse_failure(message: str) -> type[MuseError]:
+    """Classify provider failures without broad language-specific substrings."""
+
+    lowered = str(message or "").casefold()
+    if any(token in lowered for token in _REFUSAL_ERROR_TOKENS):
+        return MuseRefusalError
+    if any(token in lowered for token in _REFERENCE_ERROR_TOKENS):
+        return MuseReferenceError
+    if any(token in lowered for token in _AUTH_ERROR_TOKENS):
+        return MuseAuthenticationError
+    return MuseError
+
+
 @dataclass(frozen=True)
 class MuseReceipt:
     provider_task_id: str
@@ -266,7 +303,7 @@ class MuseStudioApiProvider:
             destination=destination,
             expected="video",
             timeout_seconds=MUSE_VIDEO_TIMEOUT_SECONDS,
-            idempotency_key="",
+            idempotency_key=request_hash or _idempotency_key(prompt, references),
             on_submitted=on_submitted,
             cancel_check=cancel_check,
         )
@@ -304,6 +341,7 @@ class MuseStudioApiProvider:
             "provider_task_id": receipt.provider_task_id,
             "endpoint": receipt.endpoint,
             "submitted_at": receipt.submitted_at,
+            "provider_elapsed_seconds": task.get("elapsed"),
         }
 
     async def _submit_and_wait(
@@ -331,7 +369,7 @@ class MuseStudioApiProvider:
         except MuseAuthenticationError:
             raise
         except MuseTransientError as exc:
-            if expected == "image":
+            if expected == "image" or idempotency_key:
                 raise
             raise MuseAmbiguousSubmissionError(
                 "POST video Muse2API có thể đã được nhận nhưng không trả task_id; không tự gửi lại."
@@ -339,18 +377,20 @@ class MuseStudioApiProvider:
         except MuseError:
             raise
         except Exception as exc:
-            if expected == "image" or _is_connection_refused(exc):
+            if expected == "image" or idempotency_key or _is_connection_refused(exc):
                 raise MuseTransientError("Không thể kết nối Muse2API trước khi nhận task.") from exc
             raise MuseAmbiguousSubmissionError(
                 "POST video Muse2API mất kết nối trước khi nhận task_id; không tự gửi lại."
             ) from exc
         task_id = str(submitted.get("task_id") or submitted.get("id") or "").strip()
         if not task_id:
-            if expected == "video":
+            if expected == "video" and not idempotency_key:
                 raise MuseAmbiguousSubmissionError(
                     "Muse2API đã nhận POST video nhưng không trả task_id; không tự gửi lại."
                 )
-            raise MuseTransientError("Muse2API không trả task_id cho request ảnh.")
+            raise MuseTransientError(
+                "Muse2API không trả task_id; sẽ retry an toàn bằng Idempotency-Key."
+            )
         receipt = MuseReceipt(
             provider_task_id=task_id,
             endpoint=f"{status_prefix}/{urllib.parse.quote(task_id, safe='')}",
@@ -398,6 +438,7 @@ class MuseStudioApiProvider:
                     "provider_task_id": receipt.provider_task_id,
                     "endpoint": receipt.endpoint,
                     "submitted_at": receipt.submitted_at,
+                    "provider_elapsed_seconds": task.get("elapsed"),
                 }
             if status in {"failed", "error", "cancelled", "canceled"}:
                 self._raise_task_failure(task)
@@ -409,14 +450,12 @@ class MuseStudioApiProvider:
     @staticmethod
     def _raise_task_failure(task: dict) -> None:
         message = str(task.get("error") or "Muse2API generation thất bại.")[:1000]
-        lowered = message.lower()
-        if any(token in lowered for token in ("refus", "safety", "policy", "blocked")):
-            raise MuseRefusalError(message)
-        if any(token in lowered for token in ("reference", "attachment", "upload", "ảnh")):
-            raise MuseReferenceError(message)
-        if any(token in lowered for token in ("auth", "login", "cookie", "session", "account")):
-            raise MuseAuthenticationError(message)
-        raise MuseError(message)
+        error = classify_muse_failure(message)(message)
+        try:
+            error.provider_elapsed_seconds = float(task.get("elapsed") or 0)
+        except (TypeError, ValueError):
+            error.provider_elapsed_seconds = 0.0
+        raise error
 
     @staticmethod
     def _request_json(

@@ -201,12 +201,6 @@ def _recover_orphaned_muse_browser(studio_path: Path) -> bool:
 
     if os.name != "nt" or _port_in_use(MUSE_API_PORT) or not _port_in_use(MUSE_CDP_PORT):
         return False
-    try:
-        if _has_active_muse_jobs():
-            return False
-    except Exception:
-        logger.warning("Không thể xác minh trạng thái job Muse; bỏ qua dọn browser orphan.")
-        return False
     process = _windows_port_process(MUSE_CDP_PORT)
     if not process or process.get("parent_running"):
         return False

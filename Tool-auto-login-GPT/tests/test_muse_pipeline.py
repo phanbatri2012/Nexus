@@ -1,4 +1,5 @@
 import asyncio
+import json
 import tempfile
 import unittest
 import urllib.error
@@ -7,9 +8,11 @@ from unittest.mock import AsyncMock, MagicMock, mock_open, patch
 
 from auto_yt import main
 from auto_yt.services import (
+    chatgpt_worker,
     chatgpt_projects,
     muse_pipeline,
     muse_provider,
+    muse_semantic_planner,
     muse_settings,
     muse_studio_service,
     video_production,
@@ -21,6 +24,34 @@ def _captions(duration: int) -> list[dict]:
         {"start": float(start), "end": float(min(duration, start + 5)), "text": f"line {start}"}
         for start in range(0, duration, 5)
     ]
+
+
+def _semantic_payload(windows: list[dict]) -> dict:
+    return {
+        "story_context": "A coherent documentary story with concrete visual continuity.",
+        "scenes": [
+            {
+                "index": int(window["index"]),
+                "subject": f"documentary subject {window['index']}",
+                "action": f"performs a distinct visible action for scene {window['index']}",
+                "setting": f"specific location {window['index']}",
+                "era": f"period {window['index']}",
+                "visual_anchor": f"unique concrete visual anchor for scene {window['index']}",
+                "safe_visual_anchor": (
+                    f"quiet non-violent documentary moment for scene {window['index']}"
+                ),
+                "must_show": [
+                    f"visible object {window['index']}",
+                    f"location marker {window['index']}",
+                ],
+                "composition": "wide layered documentary framing",
+                "lighting": "soft directional daylight",
+                "color": "muted earth tones",
+                "narrative_role": "setup",
+            }
+            for window in windows
+        ],
+    }
 
 
 class TestMuseSettings(unittest.TestCase):
@@ -112,7 +143,7 @@ class TestMuseSettings(unittest.TestCase):
 
 
 class TestMuseScenePlan(unittest.TestCase):
-    def test_fixed_ten_second_windows_and_short_final_scene(self):
+    def test_caption_aligned_windows_and_short_final_scene(self):
         windows = muse_pipeline.build_fixed_scene_windows(
             _captions(25),
             25,
@@ -141,7 +172,7 @@ class TestMuseScenePlan(unittest.TestCase):
     def test_accepts_video_over_ninety_minutes(self):
         duration = 91 * 60 + 5
         windows = muse_pipeline.build_fixed_scene_windows(
-            _captions(10),
+            _captions(duration),
             duration,
             intro_end_seconds=0,
             coverage_mode="full",
@@ -156,7 +187,7 @@ class TestMuseScenePlan(unittest.TestCase):
     def test_first_n_minutes_coverage_can_extend_beyond_ninety_minutes(self):
         duration = 121 * 60
         windows = muse_pipeline.build_fixed_scene_windows(
-            _captions(10),
+            _captions(duration),
             duration,
             intro_end_seconds=0,
             coverage_mode="first_n_minutes",
@@ -173,6 +204,408 @@ class TestMuseScenePlan(unittest.TestCase):
             {"plan_hash": "base-plan"}, [{"sha256": "reference-b"}]
         )["plan_hash"]
         self.assertNotEqual(first, second)
+
+    def test_caption_windows_match_sentence_boundaries_without_duplication(self):
+        captions = [
+            {"start": 0.08, "end": 5.4, "text": "Đèo Mang Yang mở đầu."},
+            {"start": 5.4, "end": 10.66, "text": "Quốc lộ 19 năm 1954."},
+            {"start": 10.66, "end": 19.3, "text": "Đoàn xe GM100 rời An Khê về Pleiku."},
+            {"start": 19.3, "end": 26.1, "text": "Trung đoàn 96 chuẩn bị phục kích."},
+            {"start": 26.56, "end": 30.22, "text": "Lực lượng giữ vị trí chờ đợi."},
+            {"start": 30.22, "end": 35.22, "text": "Đoàn xe GM100 bị chặn."},
+            {"start": 35.22, "end": 41.96, "text": "Xe thông tin mất liên lạc."},
+            {"start": 41.96, "end": 50.56, "text": "Binh đoàn Pháp bị chia cắt và rút lui."},
+            {"start": 51.02, "end": 56.32, "text": "Mang Yang trở thành nơi tưởng niệm."},
+            {"start": 56.32, "end": 58.82, "text": "Hãy LIKE và đăng ký kênh."},
+        ]
+        windows = muse_pipeline.build_fixed_scene_windows(
+            captions,
+            58.823,
+            intro_end_seconds=0,
+            coverage_mode="full",
+            coverage_minutes=5,
+        )
+        self.assertEqual(
+            [(item["start"], item["end"]) for item in windows],
+            [
+                (0.0, 10.66),
+                (10.66, 19.3),
+                (19.3, 30.22),
+                (30.22, 41.96),
+                (41.96, 50.56),
+                (50.56, 58.823),
+            ],
+        )
+        joined = " || ".join(item["transcript"] for item in windows)
+        for caption in captions:
+            self.assertEqual(joined.count(caption["text"]), 1)
+
+    def test_long_caption_is_split_into_bounded_non_overlapping_windows(self):
+        text = " ".join(f"word{index}" for index in range(36))
+        windows = muse_pipeline.build_fixed_scene_windows(
+            [{"start": 0.0, "end": 25.0, "text": text}],
+            25.0,
+            intro_end_seconds=0,
+            coverage_mode="full",
+            coverage_minutes=5,
+        )
+        self.assertEqual(windows[0]["start"], 0.0)
+        self.assertEqual(windows[-1]["end"], 25.0)
+        self.assertTrue(all(item["duration"] <= 12.0 for item in windows))
+        self.assertEqual(
+            [item["start"] for item in windows[1:]],
+            [item["end"] for item in windows[:-1]],
+        )
+        words = " ".join(item["transcript"] for item in windows).split()
+        self.assertEqual(words, text.split())
+
+    def test_long_leading_and_trailing_silence_stays_bounded(self):
+        windows = muse_pipeline.build_fixed_scene_windows(
+            [{"start": 20.0, "end": 25.0, "text": "one spoken caption"}],
+            50.0,
+            intro_end_seconds=0,
+            coverage_mode="full",
+            coverage_minutes=5,
+        )
+        self.assertEqual(windows[0]["start"], 0.0)
+        self.assertEqual(windows[-1]["end"], 50.0)
+        self.assertTrue(all(item["duration"] <= 12.0 for item in windows))
+        self.assertEqual(
+            [item["start"] for item in windows[1:]],
+            [item["end"] for item in windows[:-1]],
+        )
+        self.assertEqual(
+            sum("one spoken caption" in item["transcript"] for item in windows),
+            1,
+        )
+
+
+class TestMuseSemanticPlanner(unittest.TestCase):
+    def test_historical_regression_fixture_keeps_source_anchors_and_removes_cta(self):
+        windows = muse_pipeline.build_fixed_scene_windows(
+            [
+                {"start": 0.0, "end": 10.66, "text": "Đèo Mang Yang, quốc lộ 19 năm 1954."},
+                {"start": 10.66, "end": 19.3, "text": "Đoàn xe GM100 rời An Khê về Pleiku."},
+                {"start": 19.3, "end": 30.22, "text": "Trung đoàn 96 chuẩn bị phục kích."},
+                {"start": 30.22, "end": 41.96, "text": "Đoàn xe GM100 bị chặn, xe thông tin mất liên lạc."},
+                {"start": 41.96, "end": 50.56, "text": "Binh đoàn Pháp bị chia cắt và rút lui."},
+                {"start": 50.56, "end": 58.82, "text": "Tưởng niệm tại Mang Yang. Hãy LIKE và đăng ký."},
+            ],
+            58.82,
+            intro_end_seconds=0,
+            coverage_mode="full",
+            coverage_minutes=5,
+        )
+        anchors = [
+            ("đèo Mang Yang", "quốc lộ 19", "năm 1954"),
+            ("đoàn xe GM100", "tuyến An Khê đến Pleiku", "năm 1954"),
+            ("Trung đoàn 96", "khu vực Mang Yang", "năm 1954"),
+            ("đoàn xe GM100", "quốc lộ 19 tại Mang Yang", "năm 1954"),
+            ("Binh đoàn Pháp", "đường rút lui gần Mang Yang", "năm 1954"),
+            ("những người được tưởng niệm", "đèo Mang Yang, Việt Nam", "năm 1954"),
+        ]
+        roles = ["opening", "setup", "rising_tension", "turning_point", "aftermath", "memorial"]
+        scenes = []
+        for index, (subject, setting, era) in enumerate(anchors):
+            visual_anchor = (
+                f"{subject} in {setting} with a distinct period vehicle formation for scene {index}"
+            )
+            safe_anchor = (
+                f"{subject} waiting quietly in {setting} beside stationary period vehicles"
+            )
+            scenes.append(
+                {
+                    "index": index,
+                    "subject": subject,
+                    "action": f"moves through a distinct documentary beat for scene {index}",
+                    "setting": setting,
+                    "era": era,
+                    "visual_anchor": visual_anchor,
+                    "safe_visual_anchor": safe_anchor,
+                    "must_show": [subject, setting],
+                    "composition": "wide shot with layered road depth",
+                    "lighting": "humid overcast daylight",
+                    "color": "muted tropical earth tones",
+                    "narrative_role": roles[index],
+                }
+            )
+        payload = {"story_context": "The 1954 GM100 retreat through Mang Yang.", "scenes": scenes}
+        plan = muse_semantic_planner.compile_muse_scene_plan(
+            payload,
+            windows,
+            title="Trận Mang Yang năm 1954",
+            style="historical documentary realism",
+        )
+        serialized = json.dumps(plan, ensure_ascii=False).casefold()
+        for anchor in ("mang yang", "1954", "quốc lộ 19", "gm100", "trung đoàn 96", "việt nam"):
+            self.assertIn(anchor, serialized)
+        self.assertNotIn("contemporary", serialized)
+        final_visual = " ".join(
+            str(plan["scenes"][-1].get(key) or "")
+            for key in ("subject", "action", "visual_anchor", "safe_visual_anchor", "prompt")
+        ).casefold()
+        self.assertNotIn("like", final_visual)
+        self.assertNotIn("đăng ký", final_visual)
+        self.assertEqual(plan["scenes"][-1]["narrative_role"], "memorial")
+
+    def test_modern_technology_plan_preserves_genre_without_historical_bias(self):
+        windows = [
+            {
+                "index": 0,
+                "start": 0.0,
+                "end": 9.0,
+                "duration": 9.0,
+                "transcript": (
+                    "Tại Apple Park tháng 9 năm 2026, nhóm thiết kế giới thiệu iPhone 17."
+                ),
+                "is_video": True,
+                "media_type": "video",
+            }
+        ]
+        payload = {
+            "story_context": "A present-day technology product launch focused on industrial design.",
+            "scenes": [
+                {
+                    "index": 0,
+                    "subject": "Apple product designers and iPhone 17",
+                    "action": "The team demonstrates the phone's camera controls at a worktable.",
+                    "setting": "a product design studio inside Apple Park, California",
+                    "era": "September 2026 during the product launch",
+                    "visual_anchor": "A close product demonstration with the campus visible beyond glass walls.",
+                    "safe_visual_anchor": "Designers calmly inspect the phone at a clean studio worktable.",
+                    "must_show": ["iPhone 17 prototype", "Apple Park studio"],
+                    "composition": "clean medium-wide product framing",
+                    "lighting": "soft daylight through glass walls",
+                    "color": "silver, white, and natural green",
+                    "narrative_role": "demonstration",
+                }
+            ],
+        }
+        plan = muse_semantic_planner.compile_muse_scene_plan(
+            payload,
+            windows,
+            title="Inside the iPhone 17 design process",
+            style="clean contemporary technology product photography",
+        )
+        scene = plan["scenes"][0]
+        self.assertEqual(plan["planner_version"], "semantic_v2")
+        self.assertEqual(scene["narrative_role"], "demonstration")
+        self.assertEqual(scene["style"], "clean contemporary technology product photography")
+        self.assertIn("Apple Park", scene["prompt"])
+        self.assertIn("iPhone 17", scene["prompt"])
+        self.assertNotIn("historical", scene["prompt"].casefold())
+        self.assertNotIn("documentary", scene["prompt"].casefold())
+
+    def test_lifestyle_plan_without_named_entities_is_valid(self):
+        windows = [
+            {
+                "index": 0,
+                "start": 0.0,
+                "end": 8.0,
+                "duration": 8.0,
+                "transcript": "trộn bột với nước rồi để hỗn hợp nghỉ trong mười phút",
+                "is_video": False,
+                "media_type": "image",
+            }
+        ]
+        payload = {
+            "story_context": "A calm step-by-step home cooking demonstration.",
+            "scenes": [
+                {
+                    "index": 0,
+                    "subject": "a home cook and a ceramic mixing bowl",
+                    "action": "The cook folds water into flour with a wooden spoon.",
+                    "setting": "a bright compact home kitchen beside a window",
+                    "era": "present-day morning during the recipe preparation",
+                    "visual_anchor": "Hands mixing a smooth dough in a ceramic bowl on a wooden counter.",
+                    "safe_visual_anchor": "Hands calmly mixing dough in a ceramic bowl on a wooden counter.",
+                    "must_show": ["ceramic mixing bowl", "wooden spoon"],
+                    "composition": "overhead close-up with ingredients at the edge",
+                    "lighting": "soft morning window light",
+                    "color": "warm cream and natural wood",
+                    "narrative_role": "demonstration",
+                }
+            ],
+        }
+        plan = muse_semantic_planner.compile_muse_scene_plan(
+            payload, windows, title="Baking at home", style="warm lifestyle photography"
+        )
+        self.assertEqual(plan["anchor_coverage"]["ratio"], 1.0)
+        self.assertIn("warm lifestyle photography", plan["scenes"][0]["prompt"])
+        self.assertNotIn("historical", plan["scenes"][0]["prompt"].casefold())
+
+    def test_parser_accepts_fenced_json_and_validator_rejects_generic_plan(self):
+        windows = [
+            {
+                "index": 0,
+                "start": 0.0,
+                "end": 8.0,
+                "duration": 8.0,
+                "transcript": "a quiet lower-case transcript",
+                "is_video": True,
+                "media_type": "video",
+            }
+        ]
+        payload = _semantic_payload(windows)
+        parsed = muse_semantic_planner.parse_planner_response(
+            "```json\n" + json.dumps(payload) + "\n```"
+        )
+        self.assertEqual(
+            muse_semantic_planner.validate_semantic_plan(parsed, windows)["scenes"][0]["index"],
+            0,
+        )
+        payload["scenes"][0]["setting"] = "cinematic scene"
+        with self.assertRaises(muse_semantic_planner.SemanticPlanValidationError):
+            muse_semantic_planner.validate_semantic_plan(payload, windows)
+
+    def test_image_refusal_fallback_keeps_semantic_anchors(self):
+        prompt, references = muse_pipeline._build_refusal_fallback(
+            {
+                "index": 0,
+                "setting": "Mang Yang pass on Route 19, Vietnam",
+                "era": "1954",
+                "safe_visual_anchor": "A halted GM100 convoy waits beside the mountain road.",
+                "must_show": ["Mang Yang pass", "Route 19 marker", "GM100 vehicles"],
+                "composition": "wide road perspective",
+                "lighting": "overcast daylight",
+                "color": "muted tropical colors",
+            },
+            "image",
+            [{"path": "reference.png", "sha256": "reference"}],
+        )
+        self.assertEqual(references, [])
+        self.assertIn("Mang Yang pass", prompt)
+        self.assertIn("1954", prompt)
+        self.assertIn("GM100", prompt)
+        self.assertNotIn("empty landscape or interior", prompt)
+
+    def test_manifest_generation_metadata_uses_allowlist(self):
+        filtered = muse_pipeline._manifest_generation_metadata(
+            {
+                "_muse_cache_hit": True,
+                "metadata": {
+                    "prompt_policy_version": "balanced_v2",
+                    "prompt_strategy": "risk_rewritten",
+                    "refusal_count": 1,
+                    "fallback_count": 1,
+                    "generation_elapsed_seconds": 12.5,
+                    "raw_prompt": "must not leak",
+                    "api_key": "must not leak",
+                    "selected_references": [{"path": "secret-path"}],
+                },
+            }
+        )
+        self.assertEqual(filtered["prompt_policy_version"], "balanced_v2")
+        self.assertEqual(filtered["refusal_count"], 1)
+        self.assertTrue(filtered["cache_hit"])
+        serialized = json.dumps(filtered)
+        for forbidden in ("raw_prompt", "api_key", "secret-path", "must not leak"):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_plan_cache_skips_builder_and_missing_builder_fails_closed(self):
+        windows = [
+            {
+                "index": 0,
+                "start": 0.0,
+                "end": 8.0,
+                "duration": 8.0,
+                "transcript": "a quiet lower-case transcript",
+                "is_video": True,
+                "media_type": "video",
+            }
+        ]
+        payload = _semantic_payload(windows)
+        compiled = muse_semantic_planner.compile_muse_scene_plan(
+            payload, windows, title="Title", style="documentary"
+        )
+        compiled.update(
+            {
+                "planner_source": "chatgpt_playwright_batch",
+                "planner_cache_hit": False,
+                "planner_elapsed_seconds": 12.0,
+            }
+        )
+        prepared = {
+            "plan_hash": "plan-hash",
+            "base_plan_hash": "base-hash",
+            "windows": windows,
+            "video": {"generated_title": "Title"},
+        }
+        snapshot = {"image_generation_settings": {"style_prompt": "documentary"}}
+        builder = MagicMock()
+        with patch.object(
+            muse_pipeline,
+            "_load_json_artifact",
+            return_value=({"content_hash": "plan-hash"}, compiled),
+        ):
+            cached = muse_pipeline._load_or_build_plan(
+                42,
+                snapshot,
+                prepared,
+                [],
+                force_new_project=False,
+                semantic_plan_builder=builder,
+            )
+        builder.assert_not_called()
+        self.assertTrue(cached["planner_cache_hit"])
+
+        with patch.object(
+            muse_pipeline,
+            "_load_json_artifact",
+            side_effect=video_production.VideoProductionError("missing"),
+        ):
+            with self.assertRaises(muse_pipeline.MuseSemanticPlanNeedsAttention):
+                muse_pipeline._load_or_build_plan(
+                    42,
+                    snapshot,
+                    prepared,
+                    [],
+                    force_new_project=False,
+                    semantic_plan_builder=None,
+                )
+
+    def test_chatgpt_planner_repairs_invalid_json_once(self):
+        windows = [
+            {
+                "index": 0,
+                "start": 0.0,
+                "end": 8.0,
+                "duration": 8.0,
+                "transcript": "a quiet lower-case transcript",
+                "is_video": True,
+                "media_type": "video",
+            }
+        ]
+        valid_response = json.dumps(_semantic_payload(windows))
+        page = MagicMock()
+        page.url = "https://chatgpt.com/c/planner-test"
+        context = MagicMock()
+        context.pages = [page]
+        playwright = MagicMock()
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(chatgpt_worker, "gpt_profile_dir", return_value=Path(temp_dir)),
+            patch.object(chatgpt_worker, "sync_playwright") as sync_playwright,
+            patch.object(chatgpt_worker, "launch_chatgpt_context", return_value=context),
+            patch.object(chatgpt_worker, "get_chatgpt_project_url", return_value="https://chatgpt.com/g/project"),
+            patch.object(chatgpt_worker, "navigate_to_chatgpt_project"),
+            patch.object(
+                chatgpt_worker,
+                "is_chatgpt_conversation_url",
+                side_effect=lambda value: "/c/" in str(value),
+            ),
+            patch.object(chatgpt_worker, "send_prompt", side_effect=["{}", valid_response]) as send,
+        ):
+            sync_playwright.return_value.__enter__.return_value = playwright
+            result = chatgpt_worker.generate_muse_scene_plan_only(
+                title="Title",
+                style="documentary",
+                windows=windows,
+                prompt_version="default",
+            )
+        self.assertEqual(send.call_count, 2)
+        self.assertEqual(result["semantic_plan"]["scenes"][0]["index"], 0)
+        context.close.assert_called_once()
 
 
 class TestMuseReferences(unittest.TestCase):
@@ -212,6 +645,92 @@ class TestMuseReferences(unittest.TestCase):
         self.assertIn("16:9", prompt)
 
 
+class TestMuseBalancedPromptPolicy(unittest.TestCase):
+    def test_risk_classifier_is_bilingual_and_avoids_broad_terms(self):
+        for action in (
+            "Súng máy nổ vang và xe thông tin bị phá hủy.",
+            "The machine gun attack caused an explosion.",
+            "Những mất mát và hy sinh được tưởng niệm.",
+        ):
+            with self.subTest(action=action):
+                result = muse_pipeline.classify_scene_risk({"action": action})
+                self.assertEqual(result["risk_level"], "high")
+
+        result = muse_pipeline.classify_scene_risk(
+            {"action": "Đội ngũ đánh giá ảnh tư liệu trong một căn phòng yên tĩnh."}
+        )
+        self.assertEqual(result["risk_level"], "low")
+
+    def test_high_risk_image_is_rewritten_and_keeps_references(self):
+        references = [{"path": "hero.png", "sha256": "hero"}]
+        prompt, selected, metadata = muse_pipeline._prepare_balanced_submission(
+            {
+                "action": "Súng máy nổ vang và đoàn xe bị phá hủy.",
+                "composition": "wide shot",
+                "lighting": "natural light",
+                "color": "muted colors",
+                "setting": "Mang Yang pass",
+                "era": "1954",
+                "safe_visual_anchor": (
+                    "The GM100 convoy halted on Route 19 at Mang Yang pass while radio crews "
+                    "checked period equipment."
+                ),
+                "must_show": ["Mang Yang pass", "GM100 convoy", "Route 19 marker"],
+            },
+            "image",
+            "original prompt",
+            references,
+        )
+        self.assertEqual(selected, references)
+        self.assertEqual(metadata["prompt_strategy"], "risk_rewritten")
+        self.assertEqual(metadata["prompt_policy_version"], "balanced_v2")
+        self.assertIn("Mang Yang pass", prompt)
+        self.assertNotIn("Súng máy", prompt)
+        self.assertNotIn("phá hủy", prompt)
+
+    def test_high_risk_video_uses_only_first_frame(self):
+        references = [
+            {"path": "scene.png", "sha256": "scene"},
+            {"path": "hero.png", "sha256": "hero"},
+        ]
+        prompt, selected, metadata = muse_pipeline._prepare_balanced_submission(
+            {"action": "Súng máy nổ vang và đoàn xe bị phá hủy.", "duration": 10},
+            "video",
+            "original prompt",
+            references,
+        )
+        self.assertEqual(selected, references[:1])
+        self.assertEqual(metadata["prompt_strategy"], "risk_rewritten")
+        self.assertIn("subtle cinematic motion", prompt)
+        self.assertNotIn("đoàn xe bị phá hủy", prompt)
+
+    def test_modern_high_risk_rewrite_preserves_requested_genre(self):
+        prompt, selected, metadata = muse_pipeline._prepare_balanced_submission(
+            {
+                "action": "A laboratory explosion caused injuries near the robot.",
+                "setting": "a robotics laboratory in Tokyo",
+                "era": "March 2026 during a daytime safety review",
+                "safe_visual_anchor": (
+                    "Engineers inspect a powered-down robot from behind a transparent safety barrier."
+                ),
+                "must_show": ["powered-down robot", "transparent safety barrier"],
+                "composition": "orderly medium-wide laboratory view",
+                "lighting": "clean overhead laboratory light",
+                "color": "white, graphite, and safety yellow",
+                "style": "clean contemporary technology news photography",
+            },
+            "image",
+            "original prompt",
+            [{"path": "robot.png", "sha256": "robot"}],
+        )
+        self.assertEqual(metadata["prompt_strategy"], "risk_rewritten")
+        self.assertEqual(len(selected), 1)
+        self.assertIn("clean contemporary technology news photography", prompt)
+        self.assertIn("robotics laboratory in Tokyo", prompt)
+        self.assertNotIn("historical", prompt.casefold())
+        self.assertNotIn("documentary", prompt.casefold())
+
+
 class TestMuseStudioApiProvider(unittest.TestCase):
     def test_image_payload_has_all_references_and_idempotency_key(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -238,7 +757,7 @@ class TestMuseStudioApiProvider(unittest.TestCase):
             self.assertEqual(payload["reference_image"], [str(path.resolve()) for path in references])
             self.assertEqual(idempotency_key, "a" * 64)
 
-    def test_video_payload_keeps_scene_frame_first_and_has_no_idempotency_key(self):
+    def test_video_payload_keeps_scene_frame_first_and_has_idempotency_key(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             references = []
             for name in ("scene.png", "hero.png", "villain.png"):
@@ -251,15 +770,20 @@ class TestMuseStudioApiProvider(unittest.TestCase):
                 patch.object(provider, "_wait_for_task", new=AsyncMock(return_value={"path": "done"})),
             ):
                 asyncio.run(
-                    provider.create_video("video prompt", references, Path(temp_dir) / "clip")
+                    provider.create_video(
+                        "video prompt",
+                        references,
+                        Path(temp_dir) / "clip",
+                        request_hash="b" * 64,
+                    )
                 )
             endpoint, payload, idempotency_key = post.call_args.args
             self.assertEqual(endpoint, "/v1/videos")
             self.assertEqual(payload["reference_image"][0], str(references[0].resolve()))
             self.assertEqual(payload["reference_image"], [str(path.resolve()) for path in references])
-            self.assertEqual(idempotency_key, "")
+            self.assertEqual(idempotency_key, "b" * 64)
 
-    def test_image_connection_loss_is_retryable_but_video_is_ambiguous(self):
+    def test_image_and_idempotent_video_connection_loss_are_retryable(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             scene = Path(temp_dir) / "scene.png"
             scene.write_bytes(b"scene")
@@ -269,7 +793,7 @@ class TestMuseStudioApiProvider(unittest.TestCase):
                 with self.assertRaises(muse_provider.MuseTransientError):
                     asyncio.run(provider.create_image("prompt", [], Path(temp_dir) / "image"))
             with patch.object(provider, "_post_json", side_effect=failure):
-                with self.assertRaises(muse_provider.MuseAmbiguousSubmissionError):
+                with self.assertRaises(muse_provider.MuseTransientError):
                     asyncio.run(provider.create_video("prompt", [scene], Path(temp_dir) / "video"))
 
     def test_admission_429_is_retryable_before_video_submission(self):
@@ -282,6 +806,22 @@ class TestMuseStudioApiProvider(unittest.TestCase):
             ):
                 with self.assertRaises(muse_provider.MuseAdmissionRetry):
                     asyncio.run(provider.create_video("prompt", [scene], Path(temp_dir) / "video"))
+
+    def test_idempotent_video_missing_task_id_is_retryable(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            scene = Path(temp_dir) / "scene.png"
+            scene.write_bytes(b"scene")
+            provider = muse_provider.MuseStudioApiProvider()
+            with patch.object(provider, "_post_json", return_value={}):
+                with self.assertRaises(muse_provider.MuseTransientError):
+                    asyncio.run(
+                        provider.create_video(
+                            "prompt",
+                            [scene],
+                            Path(temp_dir) / "video",
+                            request_hash="c" * 64,
+                        )
+                    )
 
     def test_reconcile_polls_existing_task_without_submitting(self):
         provider = muse_provider.MuseStudioApiProvider()
@@ -304,10 +844,23 @@ class TestMuseStudioApiProvider(unittest.TestCase):
         self.assertEqual(result["provider_task_id"], "task-1")
 
     def test_refusal_and_external_media_url_fail_closed(self):
-        with self.assertRaises(muse_provider.MuseRefusalError):
-            muse_provider.MuseStudioApiProvider._raise_task_failure(
-                {"error": "Generation refused by safety policy"}
-            )
+        for message in (
+            "Generation refused by safety policy",
+            "模型未生成媒体，仅返回文本: Ảnh theo brief này mình chưa tạo được.",
+        ):
+            with self.subTest(message=message):
+                with self.assertRaises(muse_provider.MuseRefusalError):
+                    muse_provider.MuseStudioApiProvider._raise_task_failure(
+                        {"error": message}
+                    )
+        self.assertIs(
+            muse_provider.classify_muse_failure("Ảnh được tạo thành công."),
+            muse_provider.MuseError,
+        )
+        self.assertIs(
+            muse_provider.classify_muse_failure("Không đọc được ảnh tham chiếu."),
+            muse_provider.MuseReferenceError,
+        )
         provider = muse_provider.MuseStudioApiProvider()
         with patch.object(
             muse_provider.muse_studio_service,
@@ -321,6 +874,404 @@ class TestMuseStudioApiProvider(unittest.TestCase):
 
 
 class TestMuseRecovery(unittest.TestCase):
+    def test_refused_image_retries_once_with_non_graphic_fallback(self):
+        artifact = None
+
+        def get_latest(*_args, **_kwargs):
+            return artifact
+
+        def upsert(**kwargs):
+            nonlocal artifact
+            artifact = {
+                "status": kwargs["status"],
+                "content_hash": kwargs["content_hash"],
+                "path": kwargs.get("path", ""),
+                "metadata": kwargs["metadata"],
+            }
+            return artifact
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.png"
+            reference.write_bytes(b"reference")
+            generated = root / "generated.png"
+            generated.write_bytes(b"generated")
+            calls = []
+
+            class RefusalThenSuccessAdapter:
+                async def create_image(self, prompt, reference_paths, _destination, **kwargs):
+                    calls.append((prompt, list(reference_paths), kwargs["request_hash"]))
+                    receipt_number = len(calls)
+                    kwargs["on_submitted"](
+                        muse_provider.MuseReceipt(
+                            provider_task_id=f"image-task-{receipt_number}",
+                            endpoint=f"/v1/images/tasks/image-task-{receipt_number}",
+                            submitted_at="2026-01-01T00:00:00Z",
+                        )
+                    )
+                    if receipt_number == 1:
+                        raise muse_provider.MuseRefusalError(
+                            "模型未生成媒体，仅返回文本: Ảnh theo brief này mình chưa tạo được."
+                        )
+                    return {
+                        "path": str(generated),
+                        "mime_type": "image/png",
+                        "provider": muse_provider.MUSE_PROVIDER_NAME,
+                        "provider_task_id": "image-task-2",
+                        "endpoint": "/v1/images/tasks/image-task-2",
+                        "submitted_at": "2026-01-01T00:00:00Z",
+                    }
+
+            async def run():
+                with (
+                    patch.object(muse_pipeline.db, "get_latest_video_artifact", side_effect=get_latest),
+                    patch.object(muse_pipeline.db, "upsert_video_artifact", side_effect=upsert),
+                    patch.object(
+                        muse_pipeline,
+                        "_validate_image",
+                        return_value={"width": 1920, "height": 1080},
+                    ),
+                ):
+                    return await muse_pipeline._generate_request(
+                        adapter=RefusalThenSuccessAdapter(),
+                        video_id=1,
+                        artifact_type="muse_scene_image:0",
+                        request_hash="request",
+                        prompt="original sensitive prompt",
+                        references=[
+                            {
+                                "path": str(reference),
+                                "sha256": "reference-hash",
+                            }
+                        ],
+                        omitted=[],
+                        destination=root / "scene",
+                        expected="image",
+                        scene={
+                            "index": 0,
+                            "setting": "Mang Yang pass on Route 19, Vietnam",
+                            "era": "1954",
+                            "safe_visual_anchor": (
+                                "A halted GM100 convoy waits beside the mountain road."
+                            ),
+                            "must_show": [
+                                "Mang Yang pass",
+                                "Route 19 marker",
+                                "GM100 vehicles",
+                            ],
+                            "composition": "wide shot",
+                            "lighting": "natural light",
+                            "color": "natural tones",
+                        },
+                        cancel_check=lambda: None,
+                    )
+
+            result = asyncio.run(run())
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][1], [reference])
+        self.assertEqual(calls[1][1], [])
+        self.assertNotEqual(calls[0][2], calls[1][2])
+        self.assertIn("non-graphic", calls[1][0])
+        self.assertEqual(result["status"], "ready")
+        self.assertTrue(result["metadata"]["refusal_fallback"])
+        self.assertEqual(result["metadata"]["provider_task_id"], "image-task-2")
+
+    def test_safe_video_refusal_degrades_to_existing_scene_image(self):
+        artifact = None
+
+        def get_latest(*_args, **_kwargs):
+            return artifact
+
+        def upsert(**kwargs):
+            nonlocal artifact
+            artifact = {
+                "status": kwargs["status"],
+                "content_hash": kwargs["content_hash"],
+                "path": kwargs.get("path", ""),
+                "metadata": kwargs["metadata"],
+            }
+            return artifact
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first_frame = root / "scene.png"
+            first_frame.write_bytes(b"scene")
+            calls = []
+
+            class AlwaysRefuseAdapter:
+                async def create_video(self, prompt, reference_paths, _destination, **kwargs):
+                    calls.append((prompt, list(reference_paths), kwargs["request_hash"]))
+                    kwargs["on_submitted"](
+                        muse_provider.MuseReceipt(
+                            provider_task_id="video-task-1",
+                            endpoint="/v1/videos/video-task-1",
+                            submitted_at="2026-01-01T00:00:00Z",
+                        )
+                    )
+                    error = muse_provider.MuseRefusalError("Generation refused by safety policy")
+                    error.provider_elapsed_seconds = 12.5
+                    raise error
+
+            async def run():
+                with (
+                    patch.object(muse_pipeline.db, "get_latest_video_artifact", side_effect=get_latest),
+                    patch.object(muse_pipeline.db, "upsert_video_artifact", side_effect=upsert),
+                ):
+                    return await muse_pipeline._generate_request(
+                        adapter=AlwaysRefuseAdapter(),
+                        video_id=1,
+                        artifact_type="muse_scene_video:0",
+                        request_hash="request",
+                        prompt="safe motion prompt",
+                        references=[{"path": str(first_frame), "sha256": "scene-hash"}],
+                        omitted=[],
+                        destination=root / "clip",
+                        expected="video",
+                        scene={"index": 0, "duration": 10},
+                        cancel_check=lambda: None,
+                        policy_metadata={
+                            "prompt_policy_version": "balanced_v2",
+                            "prompt_strategy": "risk_rewritten",
+                            "risk_level": "high",
+                            "risk_categories": ["weapons", "attack"],
+                            "risk_match_count": 2,
+                        },
+                    )
+
+            result = asyncio.run(run())
+
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(result["degraded_to_image"])
+        self.assertEqual(result["status"], "degraded")
+        self.assertEqual(result["metadata"]["refusal_count"], 1)
+        self.assertEqual(result["metadata"]["fallback_count"], 0)
+        self.assertEqual(result["metadata"]["refusal_elapsed_seconds"], 12.5)
+
+    def test_original_video_refusal_uses_one_fallback_then_degrades(self):
+        artifact = None
+
+        def get_latest(*_args, **_kwargs):
+            return artifact
+
+        def upsert(**kwargs):
+            nonlocal artifact
+            artifact = {
+                "status": kwargs["status"],
+                "content_hash": kwargs["content_hash"],
+                "path": kwargs.get("path", ""),
+                "metadata": kwargs["metadata"],
+            }
+            return artifact
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first_frame = root / "scene.png"
+            extra_reference = root / "hero.png"
+            first_frame.write_bytes(b"scene")
+            extra_reference.write_bytes(b"hero")
+            calls = []
+
+            class AlwaysRefuseAdapter:
+                async def create_video(self, prompt, reference_paths, _destination, **kwargs):
+                    calls.append((prompt, list(reference_paths), kwargs["request_hash"]))
+                    number = len(calls)
+                    kwargs["on_submitted"](
+                        muse_provider.MuseReceipt(
+                            provider_task_id=f"video-task-{number}",
+                            endpoint=f"/v1/videos/video-task-{number}",
+                            submitted_at="2026-01-01T00:00:00Z",
+                        )
+                    )
+                    error = muse_provider.MuseRefusalError("Generation refused by safety policy")
+                    error.provider_elapsed_seconds = 5
+                    raise error
+
+            async def run():
+                with (
+                    patch.object(muse_pipeline.db, "get_latest_video_artifact", side_effect=get_latest),
+                    patch.object(muse_pipeline.db, "upsert_video_artifact", side_effect=upsert),
+                ):
+                    return await muse_pipeline._generate_request(
+                        adapter=AlwaysRefuseAdapter(),
+                        video_id=1,
+                        artifact_type="muse_scene_video:0",
+                        request_hash="request",
+                        prompt="ordinary camera motion",
+                        references=[
+                            {"path": str(first_frame), "sha256": "scene-hash"},
+                            {"path": str(extra_reference), "sha256": "hero-hash"},
+                        ],
+                        omitted=[],
+                        destination=root / "clip",
+                        expected="video",
+                        scene={"index": 0, "duration": 10},
+                        cancel_check=lambda: None,
+                        policy_metadata={
+                            "prompt_policy_version": "balanced_v2",
+                            "prompt_strategy": "original",
+                            "risk_level": "low",
+                            "risk_categories": [],
+                            "risk_match_count": 0,
+                        },
+                    )
+
+            result = asyncio.run(run())
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][1], [first_frame, extra_reference])
+        self.assertEqual(calls[1][1], [first_frame])
+        self.assertTrue(result["degraded_to_image"])
+        self.assertEqual(result["metadata"]["refusal_count"], 2)
+        self.assertEqual(result["metadata"]["fallback_count"], 1)
+        self.assertEqual(result["metadata"]["refusal_elapsed_seconds"], 10)
+
+    def test_submission_without_receipt_resumes_with_same_idempotency_key(self):
+        artifact = {
+            "status": "submitting",
+            "content_hash": "request",
+            "path": "",
+            "metadata": {
+                "attempt": 1,
+                "provider": muse_provider.MUSE_PROVIDER_NAME,
+                "submission_hash": "request",
+                "submission_variant": "original",
+                "idempotent_submission": True,
+                "prompt_strategy": "original",
+            },
+        }
+
+        def get_latest(*_args, **_kwargs):
+            return artifact
+
+        def upsert(**kwargs):
+            nonlocal artifact
+            artifact = {
+                "status": kwargs["status"],
+                "content_hash": kwargs["content_hash"],
+                "path": kwargs.get("path", ""),
+                "metadata": kwargs["metadata"],
+            }
+            return artifact
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            generated = root / "generated.png"
+            generated.write_bytes(b"generated")
+            submitted_hashes = []
+
+            class SuccessAdapter:
+                async def create_image(self, _prompt, _references, _destination, **kwargs):
+                    submitted_hashes.append(kwargs["request_hash"])
+                    kwargs["on_submitted"](
+                        muse_provider.MuseReceipt(
+                            provider_task_id="image-task-1",
+                            endpoint="/v1/images/tasks/image-task-1",
+                            submitted_at="2026-01-01T00:00:00Z",
+                        )
+                    )
+                    return {
+                        "path": str(generated),
+                        "mime_type": "image/png",
+                        "provider": muse_provider.MUSE_PROVIDER_NAME,
+                        "provider_task_id": "image-task-1",
+                        "endpoint": "/v1/images/tasks/image-task-1",
+                        "submitted_at": "2026-01-01T00:00:00Z",
+                    }
+
+            async def run():
+                with (
+                    patch.object(muse_pipeline.db, "get_latest_video_artifact", side_effect=get_latest),
+                    patch.object(muse_pipeline.db, "upsert_video_artifact", side_effect=upsert),
+                    patch.object(
+                        muse_pipeline,
+                        "_validate_image",
+                        return_value={"width": 1920, "height": 1080},
+                    ),
+                ):
+                    return await muse_pipeline._generate_request(
+                        adapter=SuccessAdapter(),
+                        video_id=1,
+                        artifact_type="muse_scene_image:0",
+                        request_hash="request",
+                        prompt="safe prompt",
+                        references=[],
+                        omitted=[],
+                        destination=root / "scene",
+                        expected="image",
+                        scene={"index": 0},
+                        cancel_check=lambda: None,
+                        policy_metadata={"prompt_strategy": "original"},
+                    )
+
+            result = asyncio.run(run())
+
+        self.assertEqual(submitted_hashes, ["request"])
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["metadata"]["attempt"], 1)
+
+    def test_renderer_accepts_video_scene_resolved_as_image(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = root / "audio.wav"
+            captions = root / "captions.srt"
+            image = root / "scene.png"
+            audio.write_bytes(b"audio")
+            captions.write_text("captions", encoding="utf-8")
+            image.write_bytes(b"image")
+            scene = {"index": 0, "is_video": True, "duration": 10}
+            plan_artifact = {
+                "content_hash": "bound-plan",
+                "metadata": {"base_plan_hash": "base-plan"},
+            }
+            plan = {"scenes": [scene], "visual_bible": {}}
+            manifest = {
+                "plan_hash": "bound-plan",
+                "caption_hash": "caption-hash",
+                "media": [
+                    {
+                        "scene_index": 0,
+                        "path": str(image),
+                        "sha256": muse_pipeline._sha256_file(image),
+                        "requested_media_type": "video",
+                        "resolved_media_type": "image",
+                        "degraded_to_image": True,
+                    }
+                ],
+            }
+            render_result = {"id": 1, "path": str(root / "final.mp4")}
+            with (
+                patch.object(
+                    muse_pipeline,
+                    "_prepare_inputs",
+                    return_value={
+                        "plan_hash": "base-plan",
+                        "caption_hash": "caption-hash",
+                        "audio_path": audio,
+                        "srt_path": captions,
+                    },
+                ),
+                patch.object(
+                    muse_pipeline,
+                    "_load_json_artifact",
+                    side_effect=[(plan_artifact, plan), ({}, manifest)],
+                ),
+                patch.object(
+                    muse_pipeline.video_production,
+                    "render_video",
+                    return_value=render_result,
+                ) as render_video,
+            ):
+                result = muse_pipeline.render_prepared_muse_video(
+                    1,
+                    {},
+                    lambda *_args, **_kwargs: None,
+                    lambda: None,
+                )
+
+        self.assertEqual(result["artifact"], render_result)
+        self.assertEqual(render_video.call_args.kwargs["media_paths"], [image])
+
     def test_corrupt_cached_artifact_is_not_reused(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "scene.png"
@@ -799,7 +1750,6 @@ class TestMuseStudioServiceLifecycle(unittest.TestCase):
                     "_port_in_use",
                     side_effect=[False, True, False],
                 ),
-                patch.object(muse_studio_service, "_has_active_muse_jobs", return_value=False),
                 patch.object(
                     muse_studio_service,
                     "_windows_port_process",
@@ -831,7 +1781,6 @@ class TestMuseStudioServiceLifecycle(unittest.TestCase):
         }
         with (
             patch.object(muse_studio_service, "_port_in_use", side_effect=[False, True]),
-            patch.object(muse_studio_service, "_has_active_muse_jobs", return_value=False),
             patch.object(muse_studio_service, "_windows_port_process", return_value=process),
             patch.object(muse_studio_service.subprocess, "run") as run,
         ):
@@ -854,7 +1803,6 @@ class TestMuseStudioServiceLifecycle(unittest.TestCase):
         }
         with (
             patch.object(muse_studio_service, "_port_in_use", side_effect=[False, True]),
-            patch.object(muse_studio_service, "_has_active_muse_jobs", return_value=False),
             patch.object(muse_studio_service, "_windows_port_process", return_value=process),
             patch.object(muse_studio_service, "_cdp_is_muse_browser") as cdp_probe,
             patch.object(muse_studio_service.subprocess, "run") as run,
@@ -866,18 +1814,34 @@ class TestMuseStudioServiceLifecycle(unittest.TestCase):
         run.assert_not_called()
 
     @unittest.skipUnless(muse_studio_service.os.name == "nt", "Windows-only recovery")
-    def test_recovery_refuses_browser_while_muse_job_is_active(self):
+    def test_recovery_removes_verified_orphan_while_muse_job_is_active(self):
+        profile_dir = Path("C:/Muse/chrome_user_data/muse_profiles/generate")
+        process = {
+            "process_id": 4321,
+            "parent_process_id": 9876,
+            "parent_running": False,
+            "name": "chrome.exe",
+            "command_line": (
+                "chrome.exe --headless=new --remote-debugging-port=19210 "
+                f'--user-data-dir="{profile_dir}" about:blank'
+            ),
+        }
+        completed = MagicMock(returncode=0)
         with (
-            patch.object(muse_studio_service, "_port_in_use", side_effect=[False, True]),
+            patch.object(
+                muse_studio_service,
+                "_port_in_use",
+                side_effect=[False, True, False],
+            ),
             patch.object(muse_studio_service, "_has_active_muse_jobs", return_value=True),
-            patch.object(muse_studio_service, "_windows_port_process") as port_process,
-            patch.object(muse_studio_service.subprocess, "run") as run,
+            patch.object(muse_studio_service, "_windows_port_process", return_value=process),
+            patch.object(muse_studio_service, "_cdp_is_muse_browser", return_value=True),
+            patch.object(muse_studio_service.subprocess, "run", return_value=completed) as run,
         ):
             recovered = muse_studio_service._recover_orphaned_muse_browser(Path("C:/Muse"))
 
-        self.assertFalse(recovered)
-        port_process.assert_not_called()
-        run.assert_not_called()
+        self.assertTrue(recovered)
+        run.assert_called_once()
 
     def test_processing_muse_job_blocks_idle_cleanup(self):
         with patch.object(
@@ -1113,6 +2077,89 @@ class TestMuseRouting(unittest.TestCase):
         self.assertEqual(schedule.call_args.kwargs["delay_seconds"], 15.0)
         self.assertNotIn("muse_session_attempt", schedule.call_args.kwargs["result_json"])
         self.assertEqual(schedule.call_args.kwargs["result_json"]["muse_wait_reason"], "service_busy")
+
+    def test_chatgpt_planner_busy_wait_does_not_consume_muse_attempt(self):
+        job = {
+            "id": "muse-planner-busy",
+            "job_type": "muse_media_generation",
+            "video_id": 42,
+            "payload": {},
+            "result": {},
+        }
+        with (
+            patch.object(main.db, "get_youtube_publish_workflow_by_job", return_value=None),
+            patch.object(main.db, "get_system_job", return_value=job),
+            patch.object(main.db, "schedule_system_job_recovery") as schedule,
+            patch.object(main.db, "update_system_job"),
+            patch.object(main.db, "update_video_production_state"),
+        ):
+            main._handle_production_job_error(
+                job,
+                muse_pipeline.MusePlannerBusy(
+                    "busy", delay_seconds=30.0, consume_attempt=False
+                ),
+            )
+        result = schedule.call_args.kwargs["result_json"]
+        self.assertEqual(schedule.call_args.kwargs["delay_seconds"], 30.0)
+        self.assertEqual(result["muse_wait_reason"], "chatgpt_busy")
+        self.assertNotIn("muse_session_attempt", result)
+
+    def test_invalid_semantic_plan_pauses_before_muse(self):
+        job = {
+            "id": "muse-plan-invalid",
+            "job_type": "muse_media_generation",
+            "video_id": 42,
+            "payload": {},
+            "result": {},
+        }
+        with (
+            patch.object(main.db, "get_youtube_publish_workflow_by_job", return_value=None),
+            patch.object(main.db, "get_system_job", return_value=job),
+            patch.object(main.db, "update_system_job") as update_job,
+            patch.object(main.db, "update_video_production_state") as update_video,
+        ):
+            main._handle_production_job_error(
+                job,
+                muse_pipeline.MuseSemanticPlanNeedsAttention("invalid anchors"),
+            )
+        self.assertEqual(update_job.call_args.kwargs["status"], "paused")
+        self.assertEqual(
+            update_job.call_args.kwargs["result_json"]["attention_required"],
+            "muse_semantic_plan",
+        )
+        self.assertEqual(
+            update_video.call_args.kwargs["current_stage"],
+            "muse_semantic_plan_needs_attention",
+        )
+
+    def test_chatgpt_attention_pauses_muse_planner(self):
+        job = {
+            "id": "muse-plan-login",
+            "job_type": "muse_media_generation",
+            "video_id": 42,
+            "payload": {},
+            "result": {},
+        }
+        with (
+            patch.object(main.db, "get_youtube_publish_workflow_by_job", return_value=None),
+            patch.object(main.db, "get_system_job", return_value=job),
+            patch.object(main, "_schedule_automatic_chatgpt_login", return_value=True),
+            patch.object(main.db, "update_system_job") as update_job,
+            patch.object(main.db, "update_video_production_state"),
+        ):
+            main._handle_production_job_error(
+                job,
+                main.ChatGPTAttentionRequiredError("verify login"),
+            )
+        self.assertEqual(update_job.call_args.kwargs["status"], "paused")
+        self.assertEqual(
+            update_job.call_args.kwargs["result_json"]["attention_required"],
+            "chatgpt_verification",
+        )
+        self.assertEqual(
+            update_job.call_args.kwargs["result_json"]["automatic_login"],
+            "pending",
+        )
 
     def test_muse_auth_failure_does_not_enter_youtube_pause_flow(self):
         job = {

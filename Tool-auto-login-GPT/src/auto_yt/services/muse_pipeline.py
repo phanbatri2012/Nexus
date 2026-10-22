@@ -6,10 +6,13 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
 import subprocess
+import time
+import unicodedata
 from pathlib import Path
 from typing import Callable
 
@@ -18,11 +21,17 @@ from PIL import Image
 
 import auto_yt.services.database as db
 from auto_yt.paths import MUSE_ARTIFACTS_DIR
-from auto_yt.services import process_registry, prompt_assets, video_production
+from auto_yt.services import (
+    muse_semantic_planner,
+    process_registry,
+    prompt_assets,
+    video_production,
+)
 from auto_yt.services.muse_provider import (
     MUSE_PROVIDER_NAME,
     MuseAmbiguousSubmissionError,
     MuseError,
+    MuseRefusalError,
     MuseServiceBusy,
     MusePromptBuilder,
     MuseReceipt,
@@ -35,6 +44,155 @@ logger = logging.getLogger(__name__)
 SCENE_SECONDS = 10.0
 MAX_REQUEST_ATTEMPTS = 3
 RETRY_DELAYS_SECONDS = (60.0, 300.0)
+MUSE_PROMPT_POLICY_VERSION = "balanced_v2"
+
+_SEVERE_RISK_TERMS = (
+    "đẫm máu",
+    "máu",
+    "thi thể",
+    "xác chết",
+    "vết thương",
+    "thương vong",
+    "tổn thất nặng",
+    "chết",
+    "giết",
+    "hy sinh",
+    "tử vong",
+    "blood",
+    "bloody",
+    "gore",
+    "corpse",
+    "corpses",
+    "wound",
+    "wounds",
+    "injury",
+    "injuries",
+    "casualty",
+    "casualties",
+    "death",
+    "deaths",
+    "dead",
+    "kill",
+    "killed",
+    "killing",
+)
+_ACTION_RISK_GROUPS = {
+    "weapons": (
+        "súng máy",
+        "súng",
+        "vũ khí",
+        "bom",
+        "đạn",
+        "tên lửa",
+        "chống tăng",
+        "machine gun",
+        "gun",
+        "rifle",
+        "weapon",
+        "bomb",
+        "ammunition",
+        "missile",
+        "anti-tank",
+    ),
+    "attack": (
+        "bắn",
+        "tấn công",
+        "giao tranh",
+        "chiến đấu",
+        "đánh tan",
+        "đánh đập",
+        "shoot",
+        "attack",
+        "combat",
+        "battle",
+        "assault",
+    ),
+    "explosion": (
+        "nổ vang",
+        "phát nổ",
+        "vụ nổ",
+        "explosion",
+        "blast",
+        "detonation",
+    ),
+    "destruction": (
+        "phá hủy",
+        "hủy diệt",
+        "destroy",
+        "destroyed",
+        "destruction",
+        "ruins",
+    ),
+}
+_RISK_REPLACEMENTS = (
+    ("tổn thất nặng nề", "một giai đoạn lịch sử đầy khó khăn"),
+    ("tổn thất nặng", "khó khăn lịch sử"),
+    ("thương vong", "mất mát lịch sử"),
+    ("vết thương", "dấu vết thời gian"),
+    ("thi thể", "dấu tích lịch sử"),
+    ("xác chết", "dấu tích lịch sử"),
+    ("hy sinh", "được tưởng niệm"),
+    ("tử vong", "mất mát"),
+    ("đẫm máu", "căng thẳng"),
+    ("máu", "bùn đất"),
+    ("chết", "mất mát"),
+    ("giết", "áp đảo"),
+    ("súng máy", "thiết bị thời kỳ"),
+    ("chống tăng", "thiết bị phòng thủ thời kỳ"),
+    ("tên lửa", "thiết bị thời kỳ"),
+    ("vũ khí", "thiết bị thời kỳ"),
+    ("súng", "thiết bị thời kỳ"),
+    ("bom", "thiết bị thời kỳ"),
+    ("đạn", "vật tư thời kỳ"),
+    ("giao tranh", "thời khắc căng thẳng"),
+    ("chiến đấu", "di chuyển chiến thuật"),
+    ("tấn công", "tiếp cận"),
+    ("đánh tan", "làm thay đổi cục diện"),
+    ("đánh đập", "đối đầu"),
+    ("bắn", "phản ứng"),
+    ("phá hủy", "bị thời gian bào mòn"),
+    ("hủy diệt", "thay đổi hoàn toàn"),
+    ("nổ vang", "vang động"),
+    ("phát nổ", "biến động"),
+    ("vụ nổ", "biến động"),
+    ("casualties", "somber context"),
+    ("casualty", "somber context"),
+    ("killing", "overcoming"),
+    ("killed", "overcome"),
+    ("kill", "overcome"),
+    ("death", "somber absence"),
+    ("deaths", "somber absence"),
+    ("dead", "somber absence"),
+    ("bloody", "tense"),
+    ("blood", "mud"),
+    ("gore", "weathered detail"),
+    ("corpse", "weathered trace"),
+    ("corpses", "weathered traces"),
+    ("wound", "weathered detail"),
+    ("wounds", "weathered details"),
+    ("injury", "visible hardship"),
+    ("injuries", "visible hardship"),
+    ("machine gun", "period equipment"),
+    ("anti-tank", "period defensive equipment"),
+    ("ammunition", "period supplies"),
+    ("missile", "period equipment"),
+    ("weapon", "period equipment"),
+    ("rifle", "period equipment"),
+    ("gun", "period equipment"),
+    ("bomb", "period equipment"),
+    ("combat", "tense movement"),
+    ("battle", "tense turning point"),
+    ("assault", "approach"),
+    ("attack", "approach"),
+    ("shoot", "react"),
+    ("detonation", "atmospheric disturbance"),
+    ("explosion", "atmospheric disturbance"),
+    ("blast", "atmospheric disturbance"),
+    ("destroyed", "weathered"),
+    ("destruction", "weathering"),
+    ("destroy", "weather"),
+    ("ruins", "aged surroundings"),
+)
 
 
 class MuseRetryScheduled(MuseTransientError):
@@ -42,6 +200,14 @@ class MuseRetryScheduled(MuseTransientError):
         super().__init__(message)
         self.delay_seconds = max(1.0, float(delay_seconds))
         self.consume_attempt = consume_attempt
+
+
+class MusePlannerBusy(MuseRetryScheduled):
+    """ChatGPT profile is busy; retry without consuming a Muse attempt."""
+
+
+class MuseSemanticPlanNeedsAttention(video_production.VideoProductionError):
+    """Semantic planning failed closed before any Muse submission."""
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -60,6 +226,268 @@ def _json_hash(value: object) -> str:
     return _sha256_bytes(
         json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")
     )
+
+
+def _normalize_policy_text(value: object) -> tuple[str, str]:
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    folded = "".join(
+        char
+        for char in unicodedata.normalize("NFKD", normalized)
+        if not unicodedata.combining(char)
+    )
+    return normalized, folded
+
+
+def _contains_policy_term(normalized: str, folded: str, term: str) -> bool:
+    clean_term, folded_term = _normalize_policy_text(term)
+    pattern = rf"(?<!\w){re.escape(clean_term)}(?!\w)"
+    if re.search(pattern, normalized):
+        return True
+    if len(folded_term) < 4 or folded_term in {"anh", "dan", "bom", "sung"}:
+        return False
+    return bool(re.search(rf"(?<!\w){re.escape(folded_term)}(?!\w)", folded))
+
+
+def classify_scene_risk(scene: dict) -> dict:
+    """Return deterministic bilingual risk metadata for one visual scene."""
+
+    source = " ".join(
+        str(scene.get(key) or "")
+        for key in ("subject", "action", "visual_anchor", "transcript", "prompt")
+    )
+    normalized, folded = _normalize_policy_text(source)
+    severe = sorted(
+        {
+            term
+            for term in _SEVERE_RISK_TERMS
+            if _contains_policy_term(normalized, folded, term)
+        }
+    )
+    action_groups = sorted(
+        group
+        for group, terms in _ACTION_RISK_GROUPS.items()
+        if any(_contains_policy_term(normalized, folded, term) for term in terms)
+    )
+    categories = (["direct_harm"] if severe else []) + action_groups
+    return {
+        "risk_level": "high" if severe or len(action_groups) >= 2 else "low",
+        "risk_categories": categories,
+        "risk_match_count": len(severe) + len(action_groups),
+    }
+
+
+def _replace_policy_phrase(value: str, source: str, replacement: str) -> str:
+    normalized_source = unicodedata.normalize("NFKC", source)
+    return re.sub(
+        rf"(?<!\w){re.escape(normalized_source)}(?!\w)",
+        replacement,
+        value,
+        flags=re.IGNORECASE,
+    )
+
+
+def _safe_scene_context(scene: dict) -> str:
+    context = str(
+        scene.get("safe_visual_anchor")
+        or scene.get("visual_anchor")
+        or scene.get("transcript")
+        or ""
+    ).strip()
+    for source, replacement in _RISK_REPLACEMENTS:
+        context = _replace_policy_phrase(context, source, replacement)
+    context = re.sub(r"\s+", " ", context).strip(" .,:;-–—")
+    if len(context) > 320:
+        shortened = context[:320]
+        sentence_end = max(shortened.rfind("."), shortened.rfind("!"), shortened.rfind("?"))
+        context = (
+            shortened[: sentence_end + 1]
+            if sentence_end >= 160
+            else shortened.rsplit(" ", 1)[0].rstrip(" ,;:-") + "."
+        )
+    if classify_scene_risk({"action": context})["risk_level"] == "high":
+        raise MuseSemanticPlanNeedsAttention(
+            f"Scene {int(scene.get('index') or 0) + 1} không có safe_visual_anchor hợp lệ."
+        )
+    if not context:
+        raise MuseSemanticPlanNeedsAttention(
+            f"Scene {int(scene.get('index') or 0) + 1} thiếu semantic anchor."
+        )
+    return context
+
+
+def _required_semantic_anchors(scene: dict) -> tuple[str, str, str, list[str]]:
+    setting = str(scene.get("setting") or "").strip()
+    era = str(scene.get("era") or "").strip()
+    safe_context = _safe_scene_context(scene)
+    must_show = [
+        re.sub(r"\s+", " ", str(item or "")).strip()
+        for item in (scene.get("must_show") or [])
+        if str(item or "").strip()
+    ]
+    generic = {"cinematic scene", "contemporary", "historical documentary setting"}
+    if not setting or setting.casefold() in generic or not era or era.casefold() in generic:
+        raise MuseSemanticPlanNeedsAttention(
+            f"Scene {int(scene.get('index') or 0) + 1} thiếu setting/era cụ thể."
+        )
+    if len(must_show) < 2:
+        raise MuseSemanticPlanNeedsAttention(
+            f"Scene {int(scene.get('index') or 0) + 1} thiếu must_show anchors."
+        )
+    return setting, era, safe_context, must_show
+
+
+def _prepare_balanced_submission(
+    scene: dict,
+    expected: str,
+    prompt: str,
+    references: list[dict],
+) -> tuple[str, list[dict], dict]:
+    risk = classify_scene_risk(scene)
+    metadata = {
+        "prompt_policy_version": MUSE_PROMPT_POLICY_VERSION,
+        **risk,
+        "prompt_strategy": "original",
+    }
+    if risk["risk_level"] != "high":
+        return prompt, references, metadata
+
+    metadata["prompt_strategy"] = "risk_rewritten"
+    if expected == "video":
+        safe_prompt, safe_references = _build_refusal_fallback(scene, expected, references)
+        return safe_prompt, safe_references, metadata
+
+    composition = str(scene.get("composition") or "wide 16:9 cinematic framing").strip()
+    lighting = str(scene.get("lighting") or "natural atmospheric light").strip()
+    color = str(scene.get("color") or "natural tones").strip()
+    style = str(scene.get("style") or "cinematic photorealism").strip()
+    setting, era, safe_context, must_show = _required_semantic_anchors(scene)
+    safe_prompt = MusePromptBuilder.image(
+        (
+            f"Create a non-graphic visual scene in {setting}, during {era}, matching the source "
+            "context and requested genre. "
+            f"Scene context: {safe_context}. Required visible anchors: {', '.join(must_show)}. "
+            "Focus on preparation, restrained tension, environmental storytelling, or quiet "
+            "aftermath. Do not show "
+            "active combat, weapons being used, explosions, visible injuries, death, blood, "
+            "gore, or suffering. "
+            f"Visual treatment: {composition}; {lighting}; {color}; style: {style}."
+        ),
+        has_references=bool(references),
+    )
+    return safe_prompt, references, metadata
+
+
+def _build_refusal_fallback(
+    scene: dict,
+    expected: str,
+    references: list[dict],
+) -> tuple[str, list[dict]]:
+    """Build one deterministic, non-graphic fallback after a terminal refusal."""
+
+    if expected == "video":
+        if not references:
+            raise MuseRefusalError("Video Muse bị từ chối và không có first frame để fallback.")
+        prompt = MusePromptBuilder.video(
+            (
+                "Animate @Image1 with subtle cinematic motion only: a slow camera push-in, "
+                "gentle parallax, and natural atmospheric movement. Preserve the existing "
+                "image content, subject, setting, era, and visual style. Do not introduce new "
+                "people, objects, actions, violence, injuries, graphic content, text, or logos."
+            ),
+            reference_count=1,
+            duration_seconds=float(scene.get("duration") or SCENE_SECONDS),
+        )
+        return prompt, [references[0]]
+
+    composition = str(scene.get("composition") or "wide 16:9 cinematic framing").strip()
+    lighting = str(scene.get("lighting") or "natural atmospheric light").strip()
+    color = str(scene.get("color") or "natural tones").strip()
+    style = str(scene.get("style") or "cinematic photorealism").strip()
+    setting, era, safe_context, must_show = _required_semantic_anchors(scene)
+    prompt = MusePromptBuilder.image(
+        (
+            f"Create a neutral, non-graphic visual scene in {setting}, during {era}, matching "
+            "the source context and requested genre. "
+            f"Scene context: {safe_context}. Required visible anchors: {', '.join(must_show)}. "
+            "Use environmental storytelling and restrained, non-violent human activity while "
+            "preserving the named place, time context, subject, and context-specific objects. "
+            "Do not depict "
+            "active combat, weapons being used, explosions, injuries, death, blood, gore, text, "
+            "or logos. "
+            f"Visual treatment: {composition}; {lighting}; {color}; style: {style}."
+        ),
+        has_references=False,
+    )
+    return prompt, []
+
+
+def _split_long_captions(
+    captions: list[dict],
+    *,
+    maximum_seconds: float,
+) -> list[dict]:
+    """Split overlong captions proportionally so no spoken unit crosses scene ownership."""
+
+    normalized: list[dict] = []
+    for caption in sorted(captions, key=lambda item: float(item.get("start") or 0.0)):
+        start = max(0.0, float(caption.get("start") or 0.0))
+        end = max(start + 0.001, float(caption.get("end") or start))
+        text = re.sub(r"\s+", " ", str(caption.get("text") or "")).strip()
+        duration = end - start
+        if duration <= maximum_seconds:
+            normalized.append({"start": start, "end": end, "text": text})
+            continue
+        chunk_count = max(2, int(math.ceil(duration / maximum_seconds)))
+        words = text.split()
+        for chunk_index in range(chunk_count):
+            word_start = round(chunk_index * len(words) / chunk_count)
+            word_end = round((chunk_index + 1) * len(words) / chunk_count)
+            chunk_start = start + duration * chunk_index / chunk_count
+            chunk_end = start + duration * (chunk_index + 1) / chunk_count
+            normalized.append(
+                {
+                    "start": chunk_start,
+                    "end": chunk_end,
+                    "text": " ".join(words[word_start:word_end]).strip(),
+                }
+            )
+    return normalized
+
+
+def _add_long_silence_segments(
+    captions: list[dict],
+    *,
+    duration_seconds: float,
+    maximum_seconds: float,
+) -> list[dict]:
+    """Represent long silence as bounded planning units without duplicating captions."""
+
+    if not captions:
+        captions = []
+    timeline: list[dict] = []
+    cursor = 0.0
+    for caption in captions:
+        start = max(cursor, float(caption["start"]))
+        caption_duration = max(0.0, float(caption["end"]) - float(caption["start"]))
+        allowed_gap = max(0.0, maximum_seconds - caption_duration)
+        while start - cursor > allowed_gap + 0.001:
+            required_chunk = (start - cursor) - allowed_gap
+            silence_end = min(
+                start,
+                cursor + min(SCENE_SECONDS, maximum_seconds, required_chunk),
+            )
+            timeline.append({"start": cursor, "end": silence_end, "text": ""})
+            cursor = silence_end
+        timeline.append(dict(caption))
+        cursor = max(cursor, float(caption["end"]))
+    duration = float(duration_seconds)
+    while duration - cursor > 0.05:
+        silence_end = min(duration, cursor + min(SCENE_SECONDS, maximum_seconds))
+        timeline.append({"start": cursor, "end": silence_end, "text": ""})
+        cursor = silence_end
+    if not timeline:
+        timeline.append({"start": cursor, "end": duration, "text": ""})
+    return timeline
 
 
 def build_fixed_scene_windows(
@@ -82,37 +510,44 @@ def build_fixed_scene_windows(
         if coverage_minute_count >= duration / 60.0
         else coverage_minute_count * 60.0
     )
-    windows: list[dict] = []
-    start = 0.0
-    while start < duration:
-        end = min(duration, start + SCENE_SECONDS)
-        transcript = " ".join(
-            str(item.get("text") or "").strip()
-            for item in captions
-            if float(item.get("end") or 0) > start
-            and float(item.get("start") or 0) < end
-            and str(item.get("text") or "").strip()
-        )
+    split_captions = _split_long_captions(captions, maximum_seconds=12.0)
+    split_captions = _add_long_silence_segments(
+        split_captions,
+        duration_seconds=duration,
+        maximum_seconds=12.0,
+    )
+    windows = video_production.build_scene_windows(
+        split_captions,
+        duration,
+        minimum_seconds=6.0,
+        target_seconds=10.0,
+        maximum_seconds=12.0,
+        intro_end_seconds=0.0,
+        enable_intro_video=False,
+    )
+    if not windows:
+        raise video_production.VideoProductionError("Không thể tạo scene windows từ audio/SRT.")
+    for index, window in enumerate(windows):
+        start = float(window["start"])
         if mode == "full":
             is_video = True
         elif mode == "first_n_minutes":
             is_video = start < coverage_limit
         else:
             is_video = start < max(0.0, float(intro_end_seconds or 0.0))
-        if not windows:
+        if index == 0:
             is_video = True
-        windows.append(
+        window.update(
             {
-                "index": len(windows),
-                "start": round(start, 3),
-                "end": round(end, 3),
-                "duration": round(end - start, 3),
-                "transcript": re.sub(r"\s+", " ", transcript).strip(),
+                "index": index,
+                "start": round(float(window["start"]), 3),
+                "end": round(float(window["end"]), 3),
+                "duration": round(float(window["end"]) - float(window["start"]), 3),
+                "transcript": re.sub(r"\s+", " ", str(window.get("transcript") or "")).strip(),
                 "is_video": is_video,
                 "media_type": "video" if is_video else "image",
             }
         )
-        start = end
     return windows
 
 
@@ -236,12 +671,19 @@ def _prepare_inputs(video_id: int, snapshot: dict, progress) -> dict:
         coverage_minutes=int(muse_config.get("video_coverage_minutes") or 5),
     )
     prepared["windows"] = windows
+    video = prepared["video"]
+    settings = snapshot.get("image_generation_settings") or {}
     prepared["plan_hash"] = _json_hash(
         {
-            "version": 1,
+            "version": 2,
+            "planner_version": muse_semantic_planner.PLANNER_VERSION,
+            "prompt_policy_version": MUSE_PROMPT_POLICY_VERSION,
             "caption_hash": prepared["caption_hash"],
             "windows": windows,
-            "style": (snapshot.get("image_generation_settings") or {}).get("style_prompt") or "",
+            "title": video.get("generated_title") or video.get("title") or "",
+            "style": settings.get("style_prompt") or "",
+            "scene_0_prompt_template": settings.get("scene_0_prompt_template") or "",
+            "scene_body_prompt_template": settings.get("scene_body_prompt_template") or "",
             "muse_settings": muse_config,
         }
     )
@@ -318,27 +760,60 @@ def _load_or_build_plan(
     reference_snapshot: list[dict],
     *,
     force_new_project: bool,
+    semantic_plan_builder: Callable[[dict], dict] | None,
 ) -> dict:
     if not force_new_project:
         try:
             artifact, payload = _load_json_artifact(video_id, "muse_scene_plan")
-            if artifact.get("content_hash") == prepared["plan_hash"]:
-                return payload
+            if (
+                artifact.get("content_hash") == prepared["plan_hash"]
+                and payload.get("planner_version") == muse_semantic_planner.PLANNER_VERSION
+            ):
+                cached = dict(payload)
+                cached["planner_cache_hit"] = True
+                cached["planner_elapsed_seconds"] = 0.0
+                return cached
         except video_production.VideoProductionError:
             pass
     settings = snapshot.get("image_generation_settings") or {}
     video = prepared["video"]
-    plan = video_production.build_default_visual_scene_plan(
-        prepared["windows"],
-        video.get("generated_title") or video.get("title") or "",
-        style_prompt=str(settings.get("style_prompt") or ""),
-        prompt_version=str(snapshot.get("prompt_version") or snapshot.get("version") or ""),
-        generated_script=str(video.get("generated_script") or ""),
-        scene_0_source="from_intro_transcript",
-        scene_0_prompt_template=str(settings.get("scene_0_prompt_template") or ""),
-        scene_body_prompt_template=str(settings.get("scene_body_prompt_template") or ""),
+    if semantic_plan_builder is None:
+        raise MuseSemanticPlanNeedsAttention(
+            "Không có semantic planner; dừng trước khi gửi request tới Muse."
+        )
+    title = str(video.get("generated_title") or video.get("title") or "").strip()
+    style = str(settings.get("style_prompt") or "").strip()
+    planner_request = {
+        "planner_version": muse_semantic_planner.PLANNER_VERSION,
+        "title": title,
+        "style": style,
+        "windows": prepared["windows"],
+        "chat_url": str(video.get("chat_url") or ""),
+        "prompt_version": str(snapshot.get("prompt_version") or snapshot.get("version") or ""),
+    }
+    try:
+        planner_result = semantic_plan_builder(planner_request)
+        if not isinstance(planner_result, dict):
+            raise muse_semantic_planner.SemanticPlanValidationError(
+                ["Semantic planner không trả về object."]
+            )
+        semantic_payload = planner_result.get("semantic_plan") or planner_result
+        plan = muse_semantic_planner.compile_muse_scene_plan(
+            semantic_payload,
+            prepared["windows"],
+            title=title,
+            style=style,
+        )
+    except muse_semantic_planner.SemanticPlanValidationError as exc:
+        raise MuseSemanticPlanNeedsAttention(str(exc)) from exc
+    plan["planner_source"] = str(
+        planner_result.get("planner_source") or "chatgpt_playwright_batch"
     )
-    plan = video_production.validate_visual_scene_plan(plan, prepared["windows"])
+    plan["planner_cache_hit"] = False
+    plan["planner_elapsed_seconds"] = round(
+        max(0.0, float(planner_result.get("planner_elapsed_seconds") or 0.0)),
+        3,
+    )
     plan["reference_snapshot"] = reference_snapshot
     _save_json_artifact(
         video_id,
@@ -353,6 +828,10 @@ def _load_or_build_plan(
             ],
             "scene_count": len(plan["scenes"]),
             "reference_count": len(reference_snapshot),
+            "planner_version": muse_semantic_planner.PLANNER_VERSION,
+            "planner_source": plan["planner_source"],
+            "planner_elapsed_seconds": plan["planner_elapsed_seconds"],
+            "anchor_coverage": plan.get("anchor_coverage") or {},
         },
     )
     return plan
@@ -483,11 +962,20 @@ async def _generate_request(
     expected: str,
     scene: dict,
     cancel_check: Callable[[], None],
+    policy_metadata: dict | None = None,
 ) -> dict:
+    generation_started = time.monotonic()
     existing = db.get_latest_video_artifact(video_id, artifact_type)
     if _valid_cached_artifact(existing, request_hash):
-        return existing
+        return {**existing, "_muse_cache_hit": True}
     metadata = dict((existing or {}).get("metadata") or {})
+    if (
+        existing
+        and existing.get("content_hash") == request_hash
+        and existing.get("status") == "degraded"
+        and metadata.get("degraded_to_image")
+    ):
+        return {**existing, "degraded_to_image": True, "_muse_cache_hit": True}
     if existing and existing.get("content_hash") == request_hash:
         if existing.get("status") == "ready":
             raise MuseError(
@@ -499,6 +987,8 @@ async def _generate_request(
             raise MuseError(
                 f"Generation Muse scene {int(scene['index']) + 1} đã fail; hãy Recreate để gửi request mới."
             )
+    needs_submission = True
+    resume_without_receipt = False
     if existing and existing.get("content_hash") == request_hash and existing.get("status") == "submitting":
         if metadata.get("thread_url") or metadata.get("turn_id"):
             raise MuseAmbiguousSubmissionError(
@@ -514,52 +1004,62 @@ async def _generate_request(
             or not endpoint
             or not submitted_at
         ):
-            raise MuseAmbiguousSubmissionError(
-                f"Scene {int(scene['index']) + 1} có submission không receipt; không tự gửi lại."
-            )
-        reconcile_count = int(metadata.get("reconcile_count") or 0)
-        if reconcile_count >= 10:
-            raise MuseAmbiguousSubmissionError(
-                f"Không thể đối soát submission Muse của scene {int(scene['index']) + 1}."
-            )
-        reconciled = await adapter.reconcile(
-            receipt=MuseReceipt(
-                provider=provider,
-                provider_task_id=provider_task_id,
-                endpoint=endpoint,
-                submitted_at=submitted_at,
-            ),
-            destination=destination,
-            expected=expected,
-        )
-        if reconciled:
-            result = reconciled
+            if metadata.get("idempotent_submission") and metadata.get("submission_hash"):
+                resume_without_receipt = True
+            else:
+                raise MuseAmbiguousSubmissionError(
+                    f"Scene {int(scene['index']) + 1} có submission không receipt; không tự gửi lại."
+                )
         else:
-            metadata["reconcile_count"] = reconcile_count + 1
-            _record_request_state(
-                video_id,
-                artifact_type,
-                request_hash,
-                status="submitting",
-                metadata=metadata,
+            reconcile_count = int(metadata.get("reconcile_count") or 0)
+            if reconcile_count >= 10:
+                raise MuseAmbiguousSubmissionError(
+                    f"Không thể đối soát submission Muse của scene {int(scene['index']) + 1}."
+                )
+            reconciled = await adapter.reconcile(
+                receipt=MuseReceipt(
+                    provider=provider,
+                    provider_task_id=provider_task_id,
+                    endpoint=endpoint,
+                    submitted_at=submitted_at,
+                ),
+                destination=destination,
+                expected=expected,
             )
-            raise MuseRetryScheduled(
-                "Submission Muse đang xử lý; sẽ đối soát lại trước khi gửi mới.",
-                delay_seconds=60,
-                consume_attempt=False,
-            )
-    else:
+            if reconciled:
+                result = reconciled
+                needs_submission = False
+            else:
+                metadata["reconcile_count"] = reconcile_count + 1
+                _record_request_state(
+                    video_id,
+                    artifact_type,
+                    request_hash,
+                    status="submitting",
+                    metadata=metadata,
+                )
+                raise MuseRetryScheduled(
+                    "Submission Muse đang xử lý; sẽ đối soát lại trước khi gửi mới.",
+                    delay_seconds=60,
+                    consume_attempt=False,
+                )
+    if needs_submission:
         previous_attempt = (
             int(metadata.get("attempt") or 0)
             if existing and existing.get("content_hash") == request_hash
             else 0
         )
-        attempt = previous_attempt + 1
+        attempt = (
+            previous_attempt
+            if resume_without_receipt and previous_attempt
+            else previous_attempt + 1
+        )
         if attempt > MAX_REQUEST_ATTEMPTS:
             raise MuseError(
                 f"Scene {int(scene['index']) + 1} đã hết {MAX_REQUEST_ATTEMPTS} lần thử Muse."
             )
         base_metadata = {
+            **(metadata if resume_without_receipt else {}),
             "request_hash": request_hash,
             "reference_hashes": [item["sha256"] for item in references],
             "selected_references": references,
@@ -568,7 +1068,26 @@ async def _generate_request(
             "scene_index": int(scene["index"]),
             "phase": "videos" if expected == "video" else "images",
             "provider": MUSE_PROVIDER_NAME,
+            "submission_hash": request_hash,
+            "submission_variant": str(
+                (policy_metadata or {}).get("prompt_strategy") or "original"
+            ),
+            "idempotent_submission": True,
+            "refusal_count": int(metadata.get("refusal_count") or 0),
+            "refusal_elapsed_seconds": float(
+                metadata.get("refusal_elapsed_seconds") or 0
+            ),
+            "fallback_count": int(metadata.get("fallback_count") or 0),
+            **dict(policy_metadata or {}),
         }
+        if resume_without_receipt:
+            base_metadata["submission_hash"] = str(
+                metadata.get("submission_hash") or request_hash
+            )
+            base_metadata["submission_variant"] = str(
+                metadata.get("submission_variant")
+                or base_metadata["submission_variant"]
+            )
         _record_request_state(
             video_id,
             artifact_type,
@@ -596,14 +1115,121 @@ async def _generate_request(
             create_media = (
                 adapter.create_video if expected == "video" else adapter.create_image
             )
-            result = await create_media(
-                prompt,
-                [Path(item["path"]) for item in references],
-                destination,
-                request_hash=request_hash,
-                on_submitted=on_submitted,
-                cancel_check=cancel_check,
-            )
+            submission_prompt = prompt
+            submission_references = references
+            submission_hash = request_hash
+            refusal_fallback_used = False
+            if resume_without_receipt and metadata.get("submission_variant") == "refusal_fallback":
+                submission_prompt, submission_references = _build_refusal_fallback(
+                    scene,
+                    expected,
+                    references,
+                )
+                submission_hash = str(metadata.get("submission_hash") or "")
+                expected_fallback_hash = _json_hash(
+                    {
+                        "request_hash": request_hash,
+                        "variant": "non_graphic_refusal_fallback_v1",
+                        "prompt": submission_prompt,
+                        "references": [item["sha256"] for item in submission_references],
+                    }
+                )
+                if submission_hash != expected_fallback_hash:
+                    raise MuseAmbiguousSubmissionError(
+                        "Checkpoint fallback Muse không khớp request hiện tại."
+                    )
+                refusal_fallback_used = True
+            while True:
+                try:
+                    result = await create_media(
+                        submission_prompt,
+                        [Path(item["path"]) for item in submission_references],
+                        destination,
+                        request_hash=submission_hash,
+                        on_submitted=on_submitted,
+                        cancel_check=cancel_check,
+                    )
+                    break
+                except MuseRefusalError as exc:
+                    current = db.get_latest_video_artifact(video_id, artifact_type) or {}
+                    current_metadata = dict(current.get("metadata") or base_metadata)
+                    refused_task_id = str(current_metadata.get("provider_task_id") or "")
+                    refusal_count = int(base_metadata.get("refusal_count") or 0) + 1
+                    refusal_elapsed = float(
+                        base_metadata.get("refusal_elapsed_seconds") or 0
+                    ) + float(getattr(exc, "provider_elapsed_seconds", 0) or 0)
+                    base_metadata = {
+                        **base_metadata,
+                        "refusal_count": refusal_count,
+                        "refusal_elapsed_seconds": round(refusal_elapsed, 3),
+                        "last_refused_task_id": refused_task_id,
+                        "original_error_class": type(exc).__name__,
+                    }
+                    strategy = str(base_metadata.get("prompt_strategy") or "original")
+                    if expected == "video" and (
+                        strategy == "risk_rewritten" or refusal_fallback_used
+                    ):
+                        degraded_metadata = {
+                            **current_metadata,
+                            **base_metadata,
+                            "degraded_to_image": True,
+                            "degrade_reason": "muse_refusal",
+                            "generation_elapsed_seconds": round(
+                                time.monotonic() - generation_started, 3
+                            ),
+                        }
+                        degraded = _record_request_state(
+                            video_id,
+                            artifact_type,
+                            request_hash,
+                            status="degraded",
+                            metadata=degraded_metadata,
+                        )
+                        return {
+                            **degraded,
+                            "degraded_to_image": True,
+                            "_muse_cache_hit": False,
+                        }
+                    if refusal_fallback_used:
+                        raise
+                    refusal_fallback_used = True
+                    submission_prompt, submission_references = _build_refusal_fallback(
+                        scene,
+                        expected,
+                        references,
+                    )
+                    submission_hash = _json_hash(
+                        {
+                            "request_hash": request_hash,
+                            "variant": "non_graphic_refusal_fallback_v1",
+                            "prompt": submission_prompt,
+                            "references": [
+                                item["sha256"] for item in submission_references
+                            ],
+                        }
+                    )
+                    base_metadata = {
+                        **base_metadata,
+                        "refusal_fallback": True,
+                        "fallback_count": int(base_metadata.get("fallback_count") or 0) + 1,
+                        "fallback_prompt_hash": _sha256_bytes(
+                            submission_prompt.encode("utf-8")
+                        ),
+                        "fallback_reference_hashes": [
+                            item["sha256"] for item in submission_references
+                        ],
+                        "submission_hash": submission_hash,
+                        "submission_variant": "refusal_fallback",
+                    }
+                    for receipt_key in ("provider_task_id", "endpoint", "submitted_at"):
+                        base_metadata.pop(receipt_key, None)
+                    _record_request_state(
+                        video_id,
+                        artifact_type,
+                        request_hash,
+                        status="submitting",
+                        metadata=base_metadata,
+                    )
         except MuseServiceBusy:
             raise
         except MuseAmbiguousSubmissionError as exc:
@@ -729,8 +1355,9 @@ async def _generate_request(
         )
         raise
     checksum = _sha256_file(final_path)
+    current_artifact = db.get_latest_video_artifact(video_id, artifact_type) or existing or {}
     final_metadata = {
-        **dict((existing or {}).get("metadata") or {}),
+        **dict(current_artifact.get("metadata") or {}),
         "request_hash": request_hash,
         "reference_hashes": [item["sha256"] for item in references],
         "selected_references": references,
@@ -744,8 +1371,10 @@ async def _generate_request(
         "submitted_at": str(result.get("submitted_at") or ""),
         "checksum": checksum,
         "download_method": str(result.get("download_method") or ""),
+        "provider_elapsed_seconds": result.get("provider_elapsed_seconds"),
+        "generation_elapsed_seconds": round(time.monotonic() - generation_started, 3),
     }
-    return _record_request_state(
+    ready = _record_request_state(
         video_id,
         artifact_type,
         request_hash,
@@ -758,6 +1387,7 @@ async def _generate_request(
         height=int(details.get("height") or result.get("height") or 0),
         metadata=final_metadata,
     )
+    return {**ready, "_muse_cache_hit": False}
 
 
 async def _prepare_media_async(
@@ -769,26 +1399,42 @@ async def _prepare_media_async(
     progress,
     cancel_check,
     job_id: str,
-) -> list[dict]:
+) -> dict:
+    pipeline_started = time.monotonic()
     settings = snapshot.get("image_generation_settings") or {}
     references = plan.get("reference_snapshot") or []
     provider = MuseStudioApiProvider(job_id=job_id, video_id=video_id)
     scene_results: list[dict] = []
     async with provider.open_session() as adapter:
         total = len(plan["scenes"])
+        image_phase_started = time.monotonic()
         for scene in plan["scenes"]:
             cancel_check()
             index = int(scene["index"])
             selected, omitted = select_scene_references(scene, references, limit=6)
-            prompt = MusePromptBuilder.image(
+            original_prompt = MusePromptBuilder.image(
                 str(scene["prompt"]), has_references=bool(selected)
             )
+            prompt, submission_references, policy_metadata = _prepare_balanced_submission(
+                scene,
+                "image",
+                original_prompt,
+                selected,
+            )
+            submitted_hashes = {item["sha256"] for item in submission_references}
+            policy_omitted = [
+                {**item, "omission_reason": "balanced_policy"}
+                for item in selected
+                if item["sha256"] not in submitted_hashes
+            ]
             request_hash = _json_hash(
                 {
                     "kind": "image",
                     "scene": scene,
+                    "prompt_policy_version": MUSE_PROMPT_POLICY_VERSION,
+                    "prompt_strategy": policy_metadata["prompt_strategy"],
                     "prompt": prompt,
-                    "references": [item["sha256"] for item in selected],
+                    "references": [item["sha256"] for item in submission_references],
                     "aspect_ratio": "16:9",
                 }
             )
@@ -803,16 +1449,19 @@ async def _prepare_media_async(
                 artifact_type=f"muse_scene_image:{index}",
                 request_hash=request_hash,
                 prompt=prompt,
-                references=selected,
-                omitted=omitted,
+                references=submission_references,
+                omitted=[*omitted, *policy_omitted],
                 destination=MUSE_ARTIFACTS_DIR / str(video_id) / "images" / f"scene_{index:04d}",
                 expected="image",
                 scene=scene,
                 cancel_check=cancel_check,
+                policy_metadata=policy_metadata,
             )
             scene_results.append({"scene": scene, "image_artifact": image_artifact})
 
+        image_phase_seconds = round(time.monotonic() - image_phase_started, 3)
         requested_videos = [item for item in scene_results if item["scene"].get("is_video")]
+        video_phase_started = time.monotonic()
         for video_number, item in enumerate(requested_videos, 1):
             cancel_check()
             scene = item["scene"]
@@ -831,17 +1480,33 @@ async def _prepare_media_async(
                 "primary": True,
             }
             video_references = [first_frame, *selected]
-            prompt = MusePromptBuilder.video(
+            original_prompt = MusePromptBuilder.video(
                 str(scene.get("action") or scene.get("prompt") or ""),
                 reference_count=len(video_references),
                 duration_seconds=float(scene["duration"]),
             )
+            prompt, submission_references, policy_metadata = _prepare_balanced_submission(
+                scene,
+                "video",
+                original_prompt,
+                video_references,
+            )
+            submitted_hashes = {item["sha256"] for item in submission_references}
+            policy_omitted = [
+                {**reference, "omission_reason": "balanced_policy"}
+                for reference in video_references
+                if reference["sha256"] not in submitted_hashes
+            ]
             request_hash = _json_hash(
                 {
                     "kind": "video",
                     "scene": scene,
+                    "prompt_policy_version": MUSE_PROMPT_POLICY_VERSION,
+                    "prompt_strategy": policy_metadata["prompt_strategy"],
                     "prompt": prompt,
-                    "references": [reference["sha256"] for reference in video_references],
+                    "references": [
+                        reference["sha256"] for reference in submission_references
+                    ],
                     "aspect_ratio": "16:9",
                 }
             )
@@ -854,20 +1519,92 @@ async def _prepare_media_async(
                     "total": len(requested_videos),
                 },
             )
-            item["video_artifact"] = await _generate_request(
+            video_result = await _generate_request(
                 adapter=adapter,
                 video_id=video_id,
                 artifact_type=f"muse_scene_video:{index}",
                 request_hash=request_hash,
                 prompt=prompt,
-                references=video_references,
-                omitted=omitted,
+                references=submission_references,
+                omitted=[*omitted, *policy_omitted],
                 destination=MUSE_ARTIFACTS_DIR / str(video_id) / "videos" / f"scene_{index:04d}",
                 expected="video",
                 scene=scene,
                 cancel_check=cancel_check,
+                policy_metadata=policy_metadata,
             )
-    return scene_results
+            if video_result.get("degraded_to_image"):
+                item["video_degradation"] = video_result
+            else:
+                item["video_artifact"] = video_result
+
+    video_phase_seconds = round(time.monotonic() - video_phase_started, 3)
+    outcomes = []
+    for item in scene_results:
+        outcomes.append(item["image_artifact"])
+        if item["scene"].get("is_video"):
+            outcomes.append(item.get("video_artifact") or item.get("video_degradation") or {})
+    outcome_metadata = [dict(item.get("metadata") or {}) for item in outcomes]
+    summary = {
+        "prompt_policy_version": MUSE_PROMPT_POLICY_VERSION,
+        "planned_media_count": len(outcomes),
+        "original_count": sum(
+            meta.get("prompt_strategy") == "original" for meta in outcome_metadata
+        ),
+        "risk_rewritten_count": sum(
+            meta.get("prompt_strategy") == "risk_rewritten" for meta in outcome_metadata
+        ),
+        "refusal_count": sum(
+            int(meta.get("refusal_count") or 0) for meta in outcome_metadata
+        ),
+        "refusal_elapsed_seconds": round(
+            sum(
+                float(meta.get("refusal_elapsed_seconds") or 0)
+                for meta in outcome_metadata
+            ),
+            3,
+        ),
+        "fallback_count": sum(
+            int(meta.get("fallback_count") or 0) for meta in outcome_metadata
+        ),
+        "degraded_to_image_count": sum(
+            bool(meta.get("degraded_to_image")) for meta in outcome_metadata
+        ),
+        "cache_hit_count": sum(bool(item.get("_muse_cache_hit")) for item in outcomes),
+        "image_phase_seconds": image_phase_seconds,
+        "video_phase_seconds": video_phase_seconds,
+        "total_seconds": round(time.monotonic() - pipeline_started, 3),
+    }
+    return {"scene_results": scene_results, "generation_summary": summary}
+
+
+_MANIFEST_GENERATION_METADATA_KEYS = (
+    "prompt_policy_version",
+    "prompt_strategy",
+    "risk_level",
+    "risk_categories",
+    "risk_match_count",
+    "refusal_count",
+    "refusal_elapsed_seconds",
+    "fallback_count",
+    "degraded_to_image",
+    "degrade_reason",
+    "provider_elapsed_seconds",
+    "generation_elapsed_seconds",
+)
+
+
+def _manifest_generation_metadata(artifact: dict | None) -> dict:
+    if not artifact:
+        return {}
+    metadata = dict(artifact.get("metadata") or {})
+    filtered = {
+        key: metadata[key]
+        for key in _MANIFEST_GENERATION_METADATA_KEYS
+        if key in metadata
+    }
+    filtered["cache_hit"] = bool(artifact.get("_muse_cache_hit"))
+    return filtered
 
 
 def purge_muse_artifacts(video_id: int) -> int:
@@ -899,6 +1636,7 @@ def prepare_muse_media(
     job_id: str,
     force_new_project: bool = False,
     reference_snapshot: list[dict] | None = None,
+    semantic_plan_builder: Callable[[dict], dict] | None = None,
 ) -> dict:
     if force_new_project:
         purge_muse_artifacts(video_id)
@@ -915,8 +1653,9 @@ def prepare_muse_media(
         prepared,
         frozen_references,
         force_new_project=force_new_project,
+        semantic_plan_builder=semantic_plan_builder,
     )
-    results = asyncio.run(
+    prepared_media = asyncio.run(
         _prepare_media_async(
             video_id=video_id,
             snapshot=snapshot,
@@ -927,11 +1666,18 @@ def prepare_muse_media(
             job_id=job_id,
         )
     )
+    results = prepared_media["scene_results"]
+    generation_summary = prepared_media["generation_summary"]
     media = []
     for item in results:
         scene = item["scene"]
         artifact = item.get("video_artifact") or item["image_artifact"]
-        if scene.get("is_video") and not item.get("video_artifact"):
+        video_outcome = item.get("video_artifact") or item.get("video_degradation")
+        if (
+            scene.get("is_video")
+            and not item.get("video_artifact")
+            and not item.get("video_degradation")
+        ):
             raise MuseError(
                 f"Cảnh {int(scene['index']) + 1} yêu cầu video nhưng không có artifact video."
             )
@@ -942,16 +1688,31 @@ def prepare_muse_media(
                 "sha256": (artifact.get("metadata") or {}).get("checksum"),
                 "requested_media_type": "video" if scene.get("is_video") else "image",
                 "resolved_media_type": "video" if item.get("video_artifact") else "image",
+                "degraded_to_image": bool(item.get("video_degradation")),
+                "generation": {
+                    "image": _manifest_generation_metadata(item.get("image_artifact")),
+                    "video": _manifest_generation_metadata(video_outcome),
+                },
             }
         )
+    planner_summary = {
+        "planner_version": str(plan.get("planner_version") or ""),
+        "planner_source": str(plan.get("planner_source") or ""),
+        "planner_cache_hit": bool(plan.get("planner_cache_hit")),
+        "planner_elapsed_seconds": float(plan.get("planner_elapsed_seconds") or 0.0),
+        "anchor_coverage": plan.get("anchor_coverage") or {},
+    }
+    generation_summary.update(planner_summary)
     manifest = {
-        "version": 1,
+        "version": 2,
         "video_id": video_id,
         "plan_hash": prepared["plan_hash"],
         "caption_hash": prepared["caption_hash"],
         "visual_bible": plan["visual_bible"],
         "scenes": plan["scenes"],
         "media": media,
+        "planner_summary": planner_summary,
+        "generation_summary": generation_summary,
     }
     artifact = _save_json_artifact(
         video_id,
@@ -962,14 +1723,24 @@ def prepare_muse_media(
             "plan_hash": prepared["plan_hash"],
             "scene_count": len(media),
             "video_scene_count": sum(entry["resolved_media_type"] == "video" for entry in media),
+            "generation_summary": generation_summary,
         },
     )
-    progress("Media Muse đã sẵn sàng để dựng MP4", "muse_media_ready")
+    degraded_count = int(generation_summary.get("degraded_to_image_count") or 0)
+    progress(
+        (
+            f"Media Muse đã sẵn sàng để dựng MP4; {degraded_count} cảnh video dùng ảnh tĩnh"
+            if degraded_count
+            else "Media Muse đã sẵn sàng để dựng MP4"
+        ),
+        "muse_media_ready",
+    )
     return {
         "manifest_artifact": artifact,
         "plan_hash": prepared["plan_hash"],
         "scene_count": len(media),
         "video_scene_count": sum(entry["resolved_media_type"] == "video" for entry in media),
+        "generation_summary": generation_summary,
     }
 
 
@@ -1003,10 +1774,6 @@ def render_prepared_muse_video(
         index = int(scene["index"])
         if int(entry.get("scene_index", -1)) != index:
             raise video_production.VideoProductionError("Manifest Muse sai thứ tự cảnh.")
-        if scene.get("is_video") and entry.get("resolved_media_type") != "video":
-            raise video_production.VideoProductionError(
-                f"Cảnh {index + 1} yêu cầu video; không được fallback sang ảnh."
-            )
         path = Path(str(entry.get("path") or ""))
         if not path.is_file() or _sha256_file(path) != str(entry.get("sha256") or ""):
             raise video_production.VideoProductionError(

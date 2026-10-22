@@ -6135,6 +6135,76 @@ def run(transcript: str) -> dict:
         }
 
 
+def generate_muse_scene_plan_only(
+    *,
+    title: str,
+    style: str,
+    windows: list[dict],
+    chat_url: str = "",
+    prompt_version: str = "",
+) -> dict:
+    """Build one validated semantic scene plan through the authenticated browser."""
+
+    from auto_yt.services import muse_semantic_planner
+
+    profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
+    if not profile_dir.exists():
+        raise ChatGPTAttentionRequiredError(
+            "Chưa có profile ChatGPT. Hãy chạy Auto Login trước khi lập scene plan Muse."
+        )
+    started = time.monotonic()
+    planner_prompt = muse_semantic_planner.build_planner_prompt(
+        title=title,
+        style=style,
+        windows=windows,
+    )
+    with sync_playwright() as p:
+        context = launch_chatgpt_context(p.chromium, profile_dir)
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            is_original_chat = is_chatgpt_conversation_url(chat_url)
+            target_url = (
+                chat_url if is_original_chat else get_chatgpt_project_url(prompt_version)
+            )
+            if is_original_chat:
+                page.goto(
+                    target_url,
+                    wait_until="domcontentloaded",
+                    timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+                )
+                check_chatgpt_page_attention(page)
+                ensure_expected_conversation_page(page.url, target_url)
+                wait_for_conversation_history(page)
+            else:
+                navigate_to_chatgpt_project(page, target_url)
+
+            response = send_prompt(page, planner_prompt).strip()
+            try:
+                payload = muse_semantic_planner.parse_planner_response(response)
+                semantic_plan = muse_semantic_planner.validate_semantic_plan(payload, windows)
+            except muse_semantic_planner.SemanticPlanValidationError as first_error:
+                repair_prompt = muse_semantic_planner.build_repair_prompt(
+                    first_error.errors,
+                    scene_count=len(windows),
+                )
+                repaired_response = send_prompt(page, repair_prompt).strip()
+                repaired_payload = muse_semantic_planner.parse_planner_response(
+                    repaired_response
+                )
+                semantic_plan = muse_semantic_planner.validate_semantic_plan(
+                    repaired_payload,
+                    windows,
+                )
+            return {
+                "semantic_plan": semantic_plan,
+                "planner_source": "chatgpt_playwright_batch",
+                "planner_elapsed_seconds": round(time.monotonic() - started, 3),
+                "chat_url": page.url if is_chatgpt_conversation_url(page.url) else "",
+            }
+        finally:
+            context.close()
+
+
 def generate_chapters_only(
     script_text: str,
     chat_url: str = "",
