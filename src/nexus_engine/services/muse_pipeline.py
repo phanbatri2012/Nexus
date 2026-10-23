@@ -37,6 +37,7 @@ from nexus_engine.services.muse_provider import (
     MuseReceipt,
     MuseStudioApiProvider,
     MuseTaskTransientFailure,
+    MuseTaskWaitLimitExceeded,
     MuseTransientError,
 )
 
@@ -901,13 +902,18 @@ def _checkpoint_terminal_transient_failure(
     scene: dict,
     metadata: dict,
     error: MuseTaskTransientFailure,
-) -> None:
+    expected: str,
+    generation_started: float,
+) -> dict | None:
     attempt = max(1, int(metadata.get("attempt") or 1))
+    provider_retry_exhausted = isinstance(error, MuseTaskWaitLimitExceeded)
+    retryable_generation = attempt < MAX_REQUEST_ATTEMPTS and not provider_retry_exhausted
     checkpoint = {
         **metadata,
         "last_error_class": type(error).__name__,
         "terminal_provider_task": True,
-        "retryable_generation": attempt < MAX_REQUEST_ATTEMPTS,
+        "provider_retry_exhausted": provider_retry_exhausted,
+        "retryable_generation": retryable_generation,
     }
     receipt_fields = {
         "provider_task_id": "last_provider_task_id",
@@ -919,7 +925,35 @@ def _checkpoint_terminal_transient_failure(
         if value:
             checkpoint[history_key] = value
 
-    if attempt >= MAX_REQUEST_ATTEMPTS:
+    if expected == "video" and not retryable_generation:
+        checkpoint.update(
+            {
+                "degraded_to_image": True,
+                "degrade_reason": (
+                    "muse_provider_wait_exhausted"
+                    if provider_retry_exhausted
+                    else "muse_transient_exhausted"
+                ),
+                "generation_elapsed_seconds": round(
+                    time.monotonic() - generation_started,
+                    3,
+                ),
+            }
+        )
+        degraded = _record_request_state(
+            video_id,
+            artifact_type,
+            request_hash,
+            status="degraded",
+            metadata=checkpoint,
+        )
+        return {
+            **degraded,
+            "degraded_to_image": True,
+            "_muse_cache_hit": False,
+        }
+
+    if not retryable_generation:
         checkpoint["terminal_generation"] = True
         _record_request_state(
             video_id,
@@ -929,7 +963,11 @@ def _checkpoint_terminal_transient_failure(
             metadata=checkpoint,
         )
         raise MuseError(
-            f"Scene {int(scene['index']) + 1} đã hết {MAX_REQUEST_ATTEMPTS} lần thử Muse."
+            (
+                f"Muse đã hết tổng thời gian chờ cho scene {int(scene['index']) + 1}."
+                if provider_retry_exhausted
+                else f"Scene {int(scene['index']) + 1} đã hết {MAX_REQUEST_ATTEMPTS} lần thử Muse."
+            )
         ) from error
 
     _record_request_state(
@@ -1099,14 +1137,18 @@ async def _generate_request(
                     expected=expected,
                 )
             except MuseTaskTransientFailure as exc:
-                _checkpoint_terminal_transient_failure(
+                degraded = _checkpoint_terminal_transient_failure(
                     video_id=video_id,
                     artifact_type=artifact_type,
                     request_hash=request_hash,
                     scene=scene,
                     metadata=metadata,
                     error=exc,
+                    expected=expected,
+                    generation_started=generation_started,
                 )
+                if degraded:
+                    return degraded
             except MuseTransientError:
                 # The task may still be alive. Preserve the receipt and reconcile later.
                 raise
@@ -1355,14 +1397,18 @@ async def _generate_request(
         except MuseTaskTransientFailure as exc:
             current = db.get_latest_video_artifact(video_id, artifact_type) or {}
             current_metadata = dict(current.get("metadata") or base_metadata)
-            _checkpoint_terminal_transient_failure(
+            degraded = _checkpoint_terminal_transient_failure(
                 video_id=video_id,
                 artifact_type=artifact_type,
                 request_hash=request_hash,
                 scene=scene,
                 metadata=current_metadata,
                 error=exc,
+                expected=expected,
+                generation_started=generation_started,
             )
+            if degraded:
+                return degraded
         except MuseAmbiguousSubmissionError as exc:
             current = db.get_latest_video_artifact(video_id, artifact_type) or {}
             current_metadata = dict(current.get("metadata") or base_metadata)
@@ -1720,6 +1766,7 @@ _MANIFEST_GENERATION_METADATA_KEYS = (
     "fallback_count",
     "degraded_to_image",
     "degrade_reason",
+    "provider_retry_exhausted",
     "provider_elapsed_seconds",
     "generation_elapsed_seconds",
 )

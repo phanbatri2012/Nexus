@@ -773,7 +773,10 @@ def init_db():
     _backup_database_before_nullable_publication_channel()
     _migrate_nullable_publication_channel()
     _backup_database_before_video_production()
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA synchronous = NORMAL")
     c = conn.cursor()
     c.execute('''
         CREATE TABLE IF NOT EXISTS videos (
@@ -2202,7 +2205,10 @@ def save_video(
     voice_snapshot_json: str = '{}',
     production_snapshot_json: str = '{}',
 ) -> int:
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA synchronous = NORMAL")
     c = conn.cursor()
     generated_title = extract_generated_video_title(generated_script)
     c.execute('''
@@ -2417,7 +2423,10 @@ def set_video_status(video_id: int, video_status: str) -> dict | None:
         conn.close()
 
 def toggle_published(video_id: int, is_published: int) -> bool:
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA synchronous = NORMAL")
     c = conn.cursor()
     status_row = c.execute(
         "SELECT video_status FROM videos WHERE id = ?",
@@ -3622,7 +3631,10 @@ def is_managed_media_filename_referenced(filename: str) -> bool:
         conn.close()
 
 def update_script(video_id: int, new_script: str) -> bool:
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA synchronous = NORMAL")
     c = conn.cursor()
     c.execute('SELECT url, title FROM videos WHERE id = ?', (video_id,))
     row = c.fetchone()
@@ -3652,7 +3664,10 @@ def update_video_generation(
     generated_script: str,
     chat_url: str,
 ) -> bool:
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA synchronous = NORMAL")
     c = conn.cursor()
     c.execute('SELECT url, title FROM videos WHERE id = ?', (video_id,))
     row = c.fetchone()
@@ -3698,7 +3713,10 @@ def update_video_production_snapshot(video_id: int, snapshot: dict) -> bool:
 
 
 def update_audio_duration(video_id: int, duration_seconds: float | None) -> bool:
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA synchronous = NORMAL")
     c = conn.cursor()
     c.execute(
         'UPDATE videos SET audio_duration_seconds = ? WHERE id = ?',
@@ -3718,7 +3736,10 @@ def update_video_voice(
     voice_revision: int = 1,
     voice_snapshot_json: str = "{}",
 ) -> bool:
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA synchronous = NORMAL")
     c = conn.cursor()
     c.execute(
         '''
@@ -3777,7 +3798,10 @@ def upsert_audio_review(
     reviewed_at: str = "",
 ) -> dict:
     now = utc_now()
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA synchronous = NORMAL")
     c = conn.cursor()
     c.execute(
         '''
@@ -3869,7 +3893,10 @@ def upsert_metadata_review(
     reviewed_at: str = "",
 ) -> dict:
     now = utc_now()
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA synchronous = NORMAL")
     c = conn.cursor()
     c.execute(
         '''
@@ -3987,7 +4014,10 @@ def upsert_audio_task(
     voice_snapshot_json: str = '{}',
 ) -> dict:
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA synchronous = NORMAL")
     c = conn.cursor()
     c.execute(
         '''
@@ -5031,7 +5061,10 @@ def get_system_job_queue_position(job_id: str) -> int | None:
     job = get_system_job(job_id)
     if not job or job["status"] != "queued":
         return None
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA synchronous = NORMAL")
     c = conn.cursor()
     c.execute(
         '''

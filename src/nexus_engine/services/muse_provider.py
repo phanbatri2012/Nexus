@@ -37,6 +37,10 @@ class MuseTaskTransientFailure(MuseTransientError):
     """Muse confirmed that a task ended for a retryable provider-side reason."""
 
 
+class MuseTaskWaitLimitExceeded(MuseTaskTransientFailure):
+    """Muse exhausted its provider-side retry/wait budget for the task."""
+
+
 class MuseAdmissionRetry(MuseTransientError):
     """Muse2API rejected the request before accepting a generation task."""
 
@@ -83,6 +87,14 @@ _REFERENCE_ERROR_TOKENS = (
     "không đọc được ảnh",
 )
 _AUTH_ERROR_TOKENS = ("auth", "login", "cookie", "session", "account")
+_TASK_WAIT_LIMIT_ERROR_TOKENS = (
+    "total task wait limit reached",
+    "total wait limit reached",
+    "任务总等待时限已到",
+    "总等待时限已到",
+    "đã hết tổng thời gian chờ",
+    "đạt giới hạn tổng thời gian chờ",
+)
 _TRANSIENT_TASK_ERROR_TOKENS = (
     "timeout",
     "timed out",
@@ -113,6 +125,8 @@ def classify_muse_failure(message: str) -> type[MuseError]:
         return MuseRefusalError
     if any(token in lowered for token in _REFERENCE_ERROR_TOKENS):
         return MuseReferenceError
+    if any(token in lowered for token in _TASK_WAIT_LIMIT_ERROR_TOKENS):
+        return MuseTaskWaitLimitExceeded
     if any(token in lowered for token in _TRANSIENT_TASK_ERROR_TOKENS):
         return MuseTaskTransientFailure
     if any(token in lowered for token in _AUTH_ERROR_TOKENS):

@@ -2,6 +2,7 @@ import asyncio
 import json
 import subprocess
 import tempfile
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -845,18 +846,25 @@ class TestMuseStudioApiProvider(unittest.TestCase):
         self.assertEqual(result["provider_task_id"], "task-1")
 
     def test_terminal_provider_timeouts_are_classified_as_retryable(self):
-        messages = (
-            "Waiting for generation timed out; no new result appeared",
-            "Hết thời gian chờ tạo ảnh",
-            "等待生成超时，未出现新的生成结果",
+        cases = (
+            (
+                "Waiting for generation timed out; no new result appeared",
+                muse_provider.MuseTaskTransientFailure,
+            ),
+            ("Hết thời gian chờ tạo ảnh", muse_provider.MuseTaskTransientFailure),
+            ("等待生成超时，未出现新的生成结果", muse_provider.MuseTaskTransientFailure),
+            (
+                "任务总等待时限已到，停止重试",
+                muse_provider.MuseTaskWaitLimitExceeded,
+            ),
         )
-        for message in messages:
+        for message, expected_error in cases:
             with self.subTest(message=message):
                 self.assertIs(
                     muse_provider.classify_muse_failure(message),
-                    muse_provider.MuseTaskTransientFailure,
+                    expected_error,
                 )
-                with self.assertRaises(muse_provider.MuseTaskTransientFailure):
+                with self.assertRaises(expected_error):
                     muse_provider.MuseStudioApiProvider._raise_task_failure(
                         {"error": message, "elapsed": 360.9}
                     )
@@ -1065,6 +1073,152 @@ class TestMuseRecovery(unittest.TestCase):
         self.assertEqual(result["metadata"]["refusal_count"], 1)
         self.assertEqual(result["metadata"]["fallback_count"], 0)
         self.assertEqual(result["metadata"]["refusal_elapsed_seconds"], 12.5)
+
+    def test_provider_wait_limit_degrades_video_without_nexus_resubmission(self):
+        artifact = None
+
+        def get_latest(*_args, **_kwargs):
+            return artifact
+
+        def upsert(**kwargs):
+            nonlocal artifact
+            artifact = {
+                "status": kwargs["status"],
+                "content_hash": kwargs["content_hash"],
+                "path": kwargs.get("path", ""),
+                "metadata": kwargs["metadata"],
+            }
+            return artifact
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first_frame = root / "scene.png"
+            first_frame.write_bytes(b"scene")
+            calls = []
+
+            class WaitLimitAdapter:
+                async def create_video(self, _prompt, _reference_paths, _destination, **kwargs):
+                    calls.append(kwargs["request_hash"])
+                    kwargs["on_submitted"](
+                        muse_provider.MuseReceipt(
+                            provider_task_id="video-task-wait-limit",
+                            endpoint="/v1/videos/video-task-wait-limit",
+                            submitted_at="2026-01-01T00:00:00Z",
+                        )
+                    )
+                    raise muse_provider.MuseTaskWaitLimitExceeded(
+                        "任务总等待时限已到，停止重试"
+                    )
+
+            async def run():
+                with (
+                    patch.object(muse_pipeline.db, "get_latest_video_artifact", side_effect=get_latest),
+                    patch.object(muse_pipeline.db, "upsert_video_artifact", side_effect=upsert),
+                ):
+                    return await muse_pipeline._generate_request(
+                        adapter=WaitLimitAdapter(),
+                        video_id=1,
+                        artifact_type="muse_scene_video:0",
+                        request_hash="request",
+                        prompt="subtle camera motion",
+                        references=[{"path": str(first_frame), "sha256": "scene-hash"}],
+                        omitted=[],
+                        destination=root / "clip",
+                        expected="video",
+                        scene={"index": 0, "duration": 10},
+                        cancel_check=lambda: None,
+                        policy_metadata={"prompt_strategy": "original"},
+                    )
+
+            result = asyncio.run(run())
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result["status"], "degraded")
+        self.assertTrue(result["degraded_to_image"])
+        self.assertEqual(result["metadata"]["degrade_reason"], "muse_provider_wait_exhausted")
+        self.assertTrue(result["metadata"]["provider_retry_exhausted"])
+        self.assertFalse(result["metadata"]["retryable_generation"])
+        self.assertEqual(result["metadata"]["last_provider_task_id"], "video-task-wait-limit")
+        self.assertNotIn("provider_task_id", result["metadata"])
+
+    def test_provider_wait_limit_remains_terminal_for_image(self):
+        artifact = None
+
+        def upsert(**kwargs):
+            nonlocal artifact
+            artifact = {
+                "status": kwargs["status"],
+                "content_hash": kwargs["content_hash"],
+                "path": kwargs.get("path", ""),
+                "metadata": kwargs["metadata"],
+            }
+            return artifact
+
+        error = muse_provider.MuseTaskWaitLimitExceeded(
+            "任务总等待时限已到，停止重试"
+        )
+        with (
+            patch.object(muse_pipeline.db, "upsert_video_artifact", side_effect=upsert),
+            self.assertRaises(muse_provider.MuseError),
+        ):
+            muse_pipeline._checkpoint_terminal_transient_failure(
+                video_id=1,
+                artifact_type="muse_scene_image:0",
+                request_hash="request",
+                scene={"index": 0},
+                metadata={"attempt": 1},
+                error=error,
+                expected="image",
+                generation_started=time.monotonic(),
+            )
+
+        self.assertEqual(artifact["status"], "error")
+        self.assertTrue(artifact["metadata"]["terminal_generation"])
+        self.assertFalse(artifact["metadata"]["retryable_generation"])
+        self.assertTrue(artifact["metadata"]["provider_retry_exhausted"])
+
+    def test_video_transient_failure_at_attempt_limit_degrades_to_image(self):
+        artifact = None
+
+        def upsert(**kwargs):
+            nonlocal artifact
+            artifact = {
+                "status": kwargs["status"],
+                "content_hash": kwargs["content_hash"],
+                "path": kwargs.get("path", ""),
+                "metadata": kwargs["metadata"],
+            }
+            return artifact
+
+        with patch.object(
+            muse_pipeline.db,
+            "upsert_video_artifact",
+            side_effect=upsert,
+        ):
+            result = muse_pipeline._checkpoint_terminal_transient_failure(
+                video_id=1,
+                artifact_type="muse_scene_video:0",
+                request_hash="request",
+                scene={"index": 0},
+                metadata={
+                    "attempt": muse_pipeline.MAX_REQUEST_ATTEMPTS,
+                    "provider_task_id": "video-task-third-timeout",
+                    "endpoint": "/v1/videos/video-task-third-timeout",
+                    "submitted_at": "2026-01-01T00:00:00Z",
+                },
+                error=muse_provider.MuseTaskTransientFailure("generation timeout"),
+                expected="video",
+                generation_started=time.monotonic(),
+            )
+
+        self.assertEqual(result["status"], "degraded")
+        self.assertEqual(result["metadata"]["degrade_reason"], "muse_transient_exhausted")
+        self.assertFalse(result["metadata"]["provider_retry_exhausted"])
+        self.assertFalse(result["metadata"]["retryable_generation"])
+        self.assertEqual(
+            result["metadata"]["last_provider_task_id"],
+            "video-task-third-timeout",
+        )
 
     def test_original_video_refusal_uses_one_fallback_then_degrades(self):
         artifact = None

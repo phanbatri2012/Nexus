@@ -145,7 +145,7 @@ function JobCenter({ onOpenVideo, refreshKey }) {
     retry: 0, pause: 0, resume: 0, cancel: 0, force_stop: 0
   })
   const [listSnapshotAt, setListSnapshotAt] = useState('')
-  const [filter, setFilter] = useState('all')
+  const [filter, setFilter] = useState('active')
   const [typeFilter, setTypeFilter] = useState('all')
   const [sortOrder, setSortOrder] = useState('start_desc')
   const [searchQuery, setSearchQuery] = useState('')
