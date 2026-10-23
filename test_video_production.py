@@ -1301,6 +1301,13 @@ class VideoProductionServiceTests(unittest.TestCase):
             raise FlowImagePending("queued", receipt=receipt)
 
         generate_image = AsyncMock(side_effect=queue_image)
+        progress_payloads = []
+
+        def capture_progress(_message, _stage, *args, **kwargs):
+            del args
+            if isinstance(kwargs.get("media_progress"), dict):
+                progress_payloads.append(kwargs["media_progress"])
+
         scenes = [
             {"index": index, "prompt": f"scene {index}"}
             for index in range(5)
@@ -1319,12 +1326,156 @@ class VideoProductionServiceTests(unittest.TestCase):
                     video_id=video_id,
                     scenes=scenes,
                     settings={"flow_image_max_in_flight": 2},
-                    progress=lambda message, stage: None,
+                    progress=capture_progress,
                     cancel_check=lambda: None,
                 )
 
         self.assertEqual(generate_image.await_count, 2)
         self.assertEqual(raised.exception.pending_image_scene_indices, [0, 1, 2, 3, 4])
+        self.assertEqual(progress_payloads[-1]["phase"], "images")
+        self.assertEqual(progress_payloads[-1]["images_in_flight"], 2)
+        self.assertEqual(progress_payloads[-1]["videos_pending"], 0)
+
+    def test_scene_media_blocks_video_until_every_image_is_complete(self):
+        from nexus_engine.services.google_flow_worker import FlowImagePending
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-image-phase-barrier",
+            "Flow image phase barrier",
+            "Transcript",
+            "Script",
+        )
+        worker = MagicMock()
+        image_paths = []
+        for index in range(2):
+            image_path = Path(self.temporary_directory.name) / f"barrier-{index}.png"
+            Image.new("RGB", (1376, 768), color=(30 + index, 50, 70)).save(image_path)
+            image_paths.append(image_path)
+        clip_path = Path(self.temporary_directory.name) / "barrier-video.mp4"
+        clip_path.write_bytes(b"v" * 2048)
+        missing_image_path = (
+            Path(self.temporary_directory.name) / "barrier-missing.png"
+        )
+
+        @asynccontextmanager
+        async def fake_session(_video_id, *, force_new_project=False):
+            yield worker
+
+        generate_image = AsyncMock(
+            side_effect=[
+                image_paths[0],
+                image_paths[1],
+                missing_image_path,
+            ]
+        )
+        generate_video = AsyncMock(return_value=clip_path)
+        progress_payloads = []
+
+        def capture_progress(_message, _stage, *args, **kwargs):
+            del args
+            if isinstance(kwargs.get("media_progress"), dict):
+                progress_payloads.append(kwargs["media_progress"])
+
+        scenes = [
+            {"index": 0, "prompt": "scene 0", "is_video": True},
+            {"index": 1, "prompt": "scene 1"},
+            {"index": 2, "prompt": "scene 2"},
+        ]
+        with (
+            patch.object(video_production, "_flow_worker_session", fake_session),
+            patch.object(
+                video_production,
+                "_generate_scene_image_async",
+                generate_image,
+            ),
+            patch.object(
+                video_production,
+                "_generate_scene_video_async",
+                generate_video,
+            ),
+            patch.object(video_production, "cleanup_duplicate_scene_artifacts"),
+        ):
+            with self.assertRaises(FlowImagePending) as raised:
+                video_production.generate_scene_media(
+                    video_id=video_id,
+                    scenes=scenes,
+                    settings={"flow_image_max_in_flight": 4},
+                    progress=capture_progress,
+                    cancel_check=lambda: None,
+                )
+
+        generate_video.assert_not_awaited()
+        self.assertEqual(raised.exception.pending_image_scene_indices, [2])
+        self.assertEqual(raised.exception.pending_video_scene_indices, [])
+        self.assertEqual(progress_payloads[-1]["phase"], "images")
+        self.assertEqual(progress_payloads[-1]["images_completed"], 2)
+        self.assertEqual(progress_payloads[-1]["videos_pending"], 0)
+
+    def test_scene_media_honors_four_image_in_flight_limit(self):
+        from nexus_engine.services.google_flow_worker import FlowImagePending
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-image-limit-four",
+            "Flow image limit four",
+            "Transcript",
+            "Script",
+        )
+        worker = MagicMock()
+
+        @asynccontextmanager
+        async def fake_session(_video_id, *, force_new_project=False):
+            yield worker
+
+        async def queue_image(**kwargs):
+            scene_index = int(kwargs["scene"]["index"])
+            submitted_at = dt.datetime.now(dt.timezone.utc)
+            receipt = {
+                "request_key": f"image-four-{scene_index}",
+                "media_type": "image",
+                "scene_index": scene_index,
+                "project_id": "project-test",
+                "prompt_hash": f"prompt-{scene_index}",
+                "frame_hashes": [],
+                "submitted_at": submitted_at.isoformat(),
+                "deadline_at": (submitted_at + dt.timedelta(minutes=10)).isoformat(),
+                "identity_keys": [f"request:image-four-{scene_index}"],
+                "attempt": 1,
+            }
+            database.upsert_video_artifact(
+                video_id=video_id,
+                artifact_type=f"scene:{scene_index}",
+                path=str(Path(self.temporary_directory.name) / f"scene-{scene_index}.png"),
+                content_hash=f"image-hash-{scene_index}",
+                status="queued",
+                mime_type="image/png",
+                metadata={"flow_receipt": receipt},
+            )
+            raise FlowImagePending("queued", receipt=receipt)
+
+        generate_image = AsyncMock(side_effect=queue_image)
+        scenes = [
+            {"index": index, "prompt": f"scene {index}"}
+            for index in range(6)
+        ]
+        with (
+            patch.object(video_production, "_flow_worker_session", fake_session),
+            patch.object(
+                video_production,
+                "_generate_scene_image_async",
+                generate_image,
+            ),
+            patch.object(video_production, "cleanup_duplicate_scene_artifacts"),
+        ):
+            with self.assertRaises(FlowImagePending):
+                video_production.generate_scene_media(
+                    video_id=video_id,
+                    scenes=scenes,
+                    settings={"flow_image_max_in_flight": 4},
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                )
+
+        self.assertEqual(generate_image.await_count, 4)
 
     def test_scene_media_submits_at_most_four_videos_per_pass(self):
         from nexus_engine.services.google_flow_worker import FlowVideoPending
@@ -2719,6 +2870,117 @@ class VideoProductionServiceTests(unittest.TestCase):
             if item["job_type"] == "video_render"
         ]
         self.assertEqual(render_jobs, [])
+
+    def test_pending_flow_image_job_resumes_image_reconciliation(self):
+        from nexus_engine.services.google_flow_worker import (
+            FlowImagePending,
+            FlowVideoPending,
+        )
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-pending-image-job",
+            "Pending Flow image job",
+            "Transcript",
+            "Script",
+        )
+        job = database.create_system_job(
+            job_id="flow-image-pending",
+            job_type="flow_media_generation",
+            title="Tạo media",
+            payload={"video_id": video_id},
+            video_id=video_id,
+        )
+        database.update_system_job(job["id"], status="running")
+        pending_since = (
+            dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=2)
+        ).isoformat()
+
+        main._handle_production_job_error(
+            database.get_system_job(job["id"]),
+            FlowImagePending(
+                "Flow is still processing images",
+                queued_since=pending_since,
+                pending_image_scene_indices=[2, 4],
+                reconciliation_poll_count=3,
+                retry_delay_seconds=30.0,
+            ),
+        )
+
+        waiting = database.get_system_job(job["id"])
+        self.assertEqual(waiting["status"], "retry_wait")
+        self.assertEqual(waiting["resume_from_step"], "flow_image_reconcile")
+        self.assertEqual(
+            waiting["result"]["pending_image_scene_indices"],
+            [2, 4],
+        )
+        self.assertEqual(waiting["result"]["pending_video_scene_indices"], [])
+        self.assertEqual(waiting["result"]["reconcile_pending_count"], 2)
+        self.assertNotIn("flow_video_pending_since", waiting["result"])
+        video = database.get_video(video_id)
+        self.assertEqual(video["current_stage"], "flow_image_reconcile")
+
+        video_pending_since = dt.datetime.now(dt.timezone.utc).isoformat()
+        main._handle_production_job_error(
+            waiting,
+            FlowVideoPending(
+                "Flow is now processing video",
+                queued_since=video_pending_since,
+                pending_scene_indices=[0],
+                pending_video_scene_indices=[0],
+                reconciliation_poll_count=1,
+                retry_delay_seconds=30.0,
+            ),
+        )
+
+        video_waiting = database.get_system_job(job["id"])
+        self.assertEqual(video_waiting["resume_from_step"], "flow_video_reconcile")
+        self.assertEqual(
+            video_waiting["result"]["flow_video_pending_since"],
+            video_pending_since,
+        )
+
+    def test_legacy_mixed_flow_pending_prioritizes_image_reconciliation(self):
+        from nexus_engine.services.google_flow_worker import FlowMediaPending
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-legacy-mixed-pending",
+            "Legacy mixed Flow pending",
+            "Transcript",
+            "Script",
+        )
+        job = database.create_system_job(
+            job_id="flow-legacy-mixed-pending",
+            job_type="flow_media_generation",
+            title="Tạo media",
+            payload={"video_id": video_id},
+            video_id=video_id,
+        )
+        database.update_system_job(job["id"], status="running")
+        queued_since = dt.datetime.now(dt.timezone.utc).isoformat()
+
+        main._handle_production_job_error(
+            database.get_system_job(job["id"]),
+            FlowMediaPending(
+                "Legacy mixed pending",
+                queued_since=queued_since,
+                pending_scene_indices=[0],
+                pending_image_scene_indices=[3],
+                pending_video_scene_indices=[0],
+                reconciliation_poll_count=2,
+                retry_delay_seconds=30.0,
+            ),
+        )
+
+        waiting = database.get_system_job(job["id"])
+        self.assertEqual(waiting["resume_from_step"], "flow_image_reconcile")
+        self.assertEqual(waiting["result"]["pending_image_scene_indices"], [3])
+        self.assertEqual(waiting["result"]["pending_video_scene_indices"], [0])
+        self.assertEqual(
+            waiting["result"]["flow_video_pending_since"],
+            queued_since,
+        )
+        video = database.get_video(video_id)
+        self.assertEqual(video["current_stage"], "flow_image_reconcile")
 
     def test_flow_image_attention_pauses_media_job(self):
         from nexus_engine.services.google_flow_worker import FlowImageNeedsAttention

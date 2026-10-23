@@ -6357,6 +6357,18 @@ def _execute_flow_media_generation_job(job: dict) -> None:
             current_job = db.get_system_job(job["id"]) or job
             current_result = dict(current_job.get("result") or {})
             current_result["flow_media_progress"] = media_progress
+            phase = str(media_progress.get("phase") or "")
+            if phase == "images":
+                current_result["reconcile_pending_count"] = max(
+                    0, int(media_progress.get("images_pending") or 0)
+                )
+                current_result["pending_scene_indices"] = []
+                current_result["pending_video_scene_indices"] = []
+            elif phase == "videos":
+                current_result["reconcile_pending_count"] = max(
+                    0, int(media_progress.get("videos_pending") or 0)
+                )
+                current_result["pending_image_scene_indices"] = []
             job_updates["result_json"] = current_result
         db.update_system_job(job["id"], **job_updates)
         db.update_video_production_state(
@@ -6376,7 +6388,6 @@ def _execute_flow_media_generation_job(job: dict) -> None:
         force_new_flow_project=bool(payload.get("force_new_flow_project", False)),
         flow_video_pending_since=str(
             ((job.get("result") or {}).get("flow_video_pending_since"))
-            or ((job.get("result") or {}).get("flow_media_pending_since"))
             or ""
         ),
     )
@@ -7172,6 +7183,7 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
         db.update_video_production_state(video_id, render_status="error")
         return
     from nexus_engine.services.google_flow_worker import (
+        FlowImagePending,
         FlowImageNeedsAttention,
         FlowMediaPending,
     )
@@ -7384,6 +7396,12 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
         pending_count = (
             len(pending_image_scene_indices) + len(pending_video_scene_indices) or 1
         )
+        is_image_phase = bool(
+            isinstance(exc, FlowImagePending) or pending_image_scene_indices
+        )
+        resume_from_step = (
+            "flow_image_reconcile" if is_image_phase else "flow_video_reconcile"
+        )
         reconciliation_poll_count = max(
             0, int(getattr(exc, "reconciliation_poll_count", 0) or 0)
         )
@@ -7394,10 +7412,14 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
             recovery_result["flow_media_pending_since"] = str(
                 getattr(exc, "queued_since", "") or db.utc_now()
             )
-        if not recovery_result.get("flow_video_pending_since"):
-            recovery_result["flow_video_pending_since"] = recovery_result[
-                "flow_media_pending_since"
-            ]
+        if pending_video_scene_indices and not recovery_result.get(
+            "flow_video_pending_since"
+        ):
+            recovery_result["flow_video_pending_since"] = str(
+                getattr(exc, "queued_since", "") or db.utc_now()
+            )
+        elif is_image_phase and not pending_video_scene_indices:
+            recovery_result.pop("flow_video_pending_since", None)
         recovery_result.update(
             {
                 "pending_scene_indices": pending_scene_indices,
@@ -7405,11 +7427,17 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
                 "pending_video_scene_indices": pending_video_scene_indices,
                 "reconcile_pending_count": pending_count,
                 "reconcile_poll_count": reconciliation_poll_count,
-                "flow_video_next_retry_at": str(
+                "flow_media_next_retry_at": str(
                     getattr(exc, "next_retry_at", "") or ""
                 ),
             }
         )
+        if is_image_phase:
+            recovery_result.pop("flow_video_next_retry_at", None)
+        else:
+            recovery_result["flow_video_next_retry_at"] = recovery_result[
+                "flow_media_next_retry_at"
+            ]
         current_payload = dict(current_job.get("payload") or {})
         if current_payload.get("force_new_project") or current_payload.get(
             "force_new_flow_project"
@@ -7419,7 +7447,7 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
             db.update_system_job(job["id"], payload_json=current_payload)
         db.schedule_system_job_recovery(
             job["id"],
-            resume_from_step="flow_video_reconcile",
+            resume_from_step=resume_from_step,
             delay_seconds=retry_delay_seconds,
             error=safe_error,
             result_json=recovery_result,
@@ -7428,11 +7456,17 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
             db.update_video_production_state(
                 int(job["video_id"]),
                 render_status="processing",
-                current_stage="flow_video_reconcile",
+                current_stage=resume_from_step,
                 production_progress=(
-                    f"Google Flow còn {len(pending_image_scene_indices)} ảnh và "
-                    f"{len(pending_video_scene_indices)} video đang xử lý; "
-                    "hệ thống sẽ tự đối soát lại"
+                    (
+                        f"Google Flow còn {len(pending_image_scene_indices)} ảnh đang xử lý; "
+                        "video sẽ bắt đầu sau khi toàn bộ ảnh hoàn tất"
+                    )
+                    if is_image_phase
+                    else (
+                        f"Google Flow còn {len(pending_video_scene_indices)} video đang xử lý; "
+                        "hệ thống sẽ tự đối soát lại"
+                    )
                 ),
                 blocking_reason="",
             )

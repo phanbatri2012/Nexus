@@ -1285,7 +1285,7 @@ async def _generate_scene_image_async(
     
     started_at = time.monotonic()
     progress(
-        f"Đang tạo ảnh {scene['index'] + 1}/{scene_count} bằng Google Flow",
+        f"Đang xử lý ảnh cho scene {scene['index'] + 1}/{scene_count} bằng Google Flow",
         f"generating_flow_image {scene['index'] + 1}/{scene_count}",
     )
 
@@ -2467,21 +2467,32 @@ def generate_scene_media(
             image_pending: list[dict[str, object]],
             video_pending: list[dict[str, object]],
             fallback_count: int,
+            *,
+            phase: str,
         ) -> None:
+            image_in_flight, video_in_flight = remote_counts()
             payload = {
+                "phase": phase,
                 "images_total": len(scenes),
                 "images_completed": sum(path is not None for path in image_paths),
                 "images_pending": len({int(item["scene_index"]) for item in image_pending}),
+                "images_in_flight": image_in_flight,
                 "videos_total": len(requested_positions),
                 "videos_completed": len(video_paths),
                 "videos_pending": len({int(item["scene_index"]) for item in video_pending}),
+                "videos_in_flight": video_in_flight,
                 "videos_fallback": fallback_count,
             }
-            message = (
-                f"Flow: ảnh {payload['images_completed']}/{payload['images_total']}; "
-                f"video intro {payload['videos_completed']}/{payload['videos_total']}; "
-                f"đang chờ {payload['images_pending']} ảnh, {payload['videos_pending']} video"
-            )
+            if phase == "images":
+                message = (
+                    f"Flow phase ảnh: {payload['images_completed']}/{payload['images_total']}; "
+                    f"đang chờ {payload['images_pending']} ảnh"
+                )
+            else:
+                message = (
+                    f"Flow phase video intro: {payload['videos_completed']}/{payload['videos_total']}; "
+                    f"đang chờ {payload['videos_pending']} video"
+                )
             try:
                 progress(message, "flow_media_generation", media_progress=payload)
             except TypeError:
@@ -2560,14 +2571,103 @@ def generate_scene_media(
                 except FlowImagePending as exc:
                     append_pending(pending_images, exc, scene_index)
                     continue
-                image_hash = _sha256_file(image_path)
-                image_fingerprint = _image_perceptual_fingerprint(image_path)
+                try:
+                    if not image_path.is_file() or image_path.stat().st_size <= 0:
+                        raise OSError(f"Scene image is missing or empty: {image_path}")
+                    image_hash = _sha256_file(image_path)
+                    image_fingerprint = _image_perceptual_fingerprint(image_path)
+                except OSError as exc:
+                    logger.warning(
+                        "Scene image unavailable before phase barrier for video=%s scene=%s: %s",
+                        video_id,
+                        scene_index,
+                        security_logging.redact_sensitive(exc),
+                    )
+                    pending_images.append({"scene_index": scene_index})
+                    continue
                 image_hashes.add(image_hash)
                 image_perceptual_hashes.append(image_fingerprint)
                 base_image_paths[position] = image_path
                 if reference_id and reference_id not in references:
                     references[reference_id] = image_path
 
+            pending_image_indices = {
+                int(item["scene_index"])
+                for item in pending_images
+            }
+            for position, image_path in enumerate(base_image_paths):
+                try:
+                    image_is_valid = bool(
+                        image_path is not None
+                        and image_path.is_file()
+                        and image_path.stat().st_size > 0
+                    )
+                except OSError:
+                    image_is_valid = False
+                if image_is_valid:
+                    continue
+                base_image_paths[position] = None
+                scene_index = int(scenes[position].get("index", position))
+                if scene_index not in pending_image_indices:
+                    pending_images.append({"scene_index": scene_index})
+                    pending_image_indices.add(scene_index)
+
+            emit_progress(
+                base_image_paths,
+                video_paths,
+                pending_images,
+                [],
+                summary["fallback_count"],
+                phase="images",
+            )
+            if pending_images:
+                queued_values = [
+                    str(item["queued_since"])
+                    for item in pending_images
+                    if item.get("queued_since")
+                ]
+                retry_values = [
+                    str(item["next_retry_at"])
+                    for item in pending_images
+                    if item.get("next_retry_at")
+                ]
+                retry_delays = [
+                    float(item["retry_delay_seconds"])
+                    for item in pending_images
+                    if item.get("retry_delay_seconds") is not None
+                ]
+                pending_image_indices = sorted(
+                    {int(item["scene_index"]) for item in pending_images}
+                )
+                raise FlowImagePending(
+                    "Google Flow còn "
+                    f"{len(pending_image_indices)} ảnh đang chờ; "
+                    "sẽ đối soát lại mà không gửi trùng prompt.",
+                    reason_code="flow_image_batch_pending",
+                    queued_since=min(queued_values) if queued_values else "",
+                    pending_image_scene_indices=pending_image_indices,
+                    pending_video_scene_indices=[],
+                    next_retry_at=min(retry_values) if retry_values else "",
+                    reconciliation_poll_count=max(
+                        [
+                            int(item.get("reconciliation_poll_count") or 0)
+                            for item in pending_images
+                        ]
+                        or [0]
+                    ),
+                    retry_delay_seconds=min(retry_delays)
+                    if retry_delays
+                    else FLOW_MEDIA_RECONCILIATION_POLL_SECONDS,
+                )
+
+            emit_progress(
+                base_image_paths,
+                video_paths,
+                [],
+                [],
+                summary["fallback_count"],
+                phase="videos",
+            )
             for index, scene in enumerate(scenes):
                 cancel_check()
                 is_video_requested = bool(
@@ -2719,6 +2819,7 @@ def generate_scene_media(
                 pending_images,
                 pending_videos,
                 summary["fallback_count"],
+                phase="videos",
             )
             if pending_images or pending_videos:
                 pending_records = pending_images + pending_videos

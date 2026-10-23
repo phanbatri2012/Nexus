@@ -1094,7 +1094,11 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                     )}
                     {job.type === 'flow_media_generation' && job.reconcile_pending_count > 0 && (
                       <div style={{ color: '#4dd0e1', marginTop: '6px', fontSize: '0.8em' }}>
-                        Đối soát Flow: {(job.pending_image_scene_indices || []).length} ảnh, {(job.pending_video_scene_indices || job.pending_scene_indices || []).length} video đang chờ · {job.reconcile_poll_count || 0} lượt kiểm tra
+                        {job.flow_media_progress?.phase === 'images'
+                          ? `Đối soát ảnh Flow: ${(job.pending_image_scene_indices || []).length} ảnh đang chờ · ${job.reconcile_poll_count || 0} lượt kiểm tra`
+                          : job.flow_media_progress?.phase === 'videos'
+                            ? `Đối soát video Flow: ${(job.pending_video_scene_indices || job.pending_scene_indices || []).length} video đang chờ · ${job.reconcile_poll_count || 0} lượt kiểm tra`
+                            : `Đối soát Flow: ${(job.pending_image_scene_indices || []).length} ảnh, ${(job.pending_video_scene_indices || job.pending_scene_indices || []).length} video đang chờ · ${job.reconcile_poll_count || 0} lượt kiểm tra`}
                       </div>
                     )}
                     {job.type !== 'flow_media_generation' && job.recovery_count > 0 && !(job.processing_poll_count > 0 && job.publish_stage === 'processing') && (
