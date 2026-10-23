@@ -1847,6 +1847,7 @@ async def _generate_scene_video_async(
     video_count: int | None = None,
 ) -> Path:
     from nexus_engine.services.google_flow_worker import (
+        FlowCreditExhausted,
         FlowFrameAttachmentError,
         FlowGenerationError,
         FlowVideoPending,
@@ -1882,6 +1883,7 @@ async def _generate_scene_video_async(
         "known_frame_missing",
     }
     terminal_reason_codes = {
+        "flow_credit_exhausted",
         "flow_generation_error",
         "flow_video_wait_expired",
     }
@@ -1973,6 +1975,10 @@ async def _generate_scene_video_async(
         )
     ):
         cached_error = str(existing_metadata.get("error") or "").strip()
+        if terminal_reason == "flow_credit_exhausted":
+            raise FlowCreditExhausted(
+                cached_error or "Google Flow đã xác nhận hết hạn mức video."
+            )
         if terminal_reason == "flow_video_wait_expired":
             raise FlowVideoWaitExpired(
                 cached_error or "Google Flow đã hết thời hạn đối soát video."
@@ -2675,6 +2681,37 @@ def generate_scene_media(
                             **failure_details,
                         }
                     )
+            if flow_video_credit_exhausted or flow_video_unsupported:
+                for item in list(pending_videos):
+                    s_idx = int(item["scene_index"])
+                    if not any(f.get("scene_index") == s_idx for f in summary["fallback_scenes"]):
+                        summary["fallback_scenes"].append(
+                            {
+                                "scene_index": s_idx,
+                                "failure_stage": "credit_exhausted" if flow_video_credit_exhausted else "video_capability",
+                                "reason_code": "flow_credit_exhausted" if flow_video_credit_exhausted else "flow_video_unsupported",
+                            }
+                        )
+                pending_videos.clear()
+
+                for item in scenes:
+                    s_idx = int(item.get("index", 0))
+                    video_art = db.get_latest_video_artifact(video_id, f"scene_video:{s_idx}")
+                    if video_art and video_art.get("status") in {"queued", "retry_wait", "processing"}:
+                        db.upsert_video_artifact(
+                            video_id=video_id,
+                            artifact_type=f"scene_video:{s_idx}",
+                            path=str(video_art.get("path") or ""),
+                            content_hash=str(video_art.get("content_hash") or ""),
+                            status="failed",
+                            mime_type="video/mp4",
+                            metadata={
+                                **(video_art.get("metadata") or {}),
+                                "failure_stage": "credit_exhausted" if flow_video_credit_exhausted else "video_capability",
+                                "reason_code": "flow_credit_exhausted" if flow_video_credit_exhausted else "flow_video_unsupported",
+                                "terminal": True,
+                            },
+                        )
             summary["fallback_count"] = len(summary["fallback_scenes"])
             emit_progress(
                 base_image_paths,

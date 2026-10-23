@@ -11,6 +11,7 @@ from nexus_engine.services.google_flow_worker import (
     REFERENCE_RESULT_ATTACHED,
     REFERENCE_RESULT_NOT_FOUND,
     _upgrade_google_cdn_image_url,
+    _is_flow_credit_exhausted_error,
 )
 
 
@@ -321,6 +322,19 @@ class TestGoogleFlowWorkerUpload(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(receipt["attempt"], 2)
         self.assertEqual(len(receipt["prompt_hash"]), 64)
         self.assertNotIn("url", " ".join(receipt))
+
+    def test_is_flow_credit_exhausted_error_daily_quota(self):
+        # Actual Google Flow error strings
+        en_err = "The video generation failed because your daily quota for this model has been reached. You will not be charged any credits for this failed generation."
+        vn_err = "Không thành công Bạn đã đạt đến hạn mức sử dụng. Vui lòng thử lại sau."
+        self.assertTrue(_is_flow_credit_exhausted_error(en_err))
+        self.assertTrue(_is_flow_credit_exhausted_error(vn_err))
+        self.assertTrue(_is_flow_credit_exhausted_error(f"{vn_err} {en_err}"))
+
+        # Non-quota error
+        normal_err = "Policy violation: prompt contains prohibited terms."
+        self.assertFalse(_is_flow_credit_exhausted_error(normal_err))
+        self.assertFalse(_is_flow_credit_exhausted_error(""))
 
     async def test_ensure_agent_video_frame_falls_back_to_upload_on_picker_error(self):
         import tempfile

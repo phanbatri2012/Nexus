@@ -313,6 +313,14 @@ def _is_flow_credit_exhausted_error(text: str) -> bool:
         "khong du tin dung",
         "da dat han muc tin dung",
         "vuot qua han muc tin dung",
+        "daily quota for this model has been reached",
+        "daily quota has been reached",
+        "your daily quota",
+        "daily quota",
+        "quota for this model",
+        "da dat den han muc su dung",
+        "dat den han muc su dung",
+        "han muc su dung",
     )
     return any(phrase in normalized for phrase in explicit_phrases)
 
@@ -2663,9 +2671,13 @@ class GoogleFlowWorker:
         matched_state = str(matched.get("state") or "")
         if matched_state == "failed":
             self._record_video_timing("error_seen")
+            error_message = f"{matched.get('error') or 'Thao tác không thành công'}"
+            if _is_flow_credit_exhausted_error(error_message):
+                raise FlowCreditExhausted(
+                    f"Google Flow đã xác nhận hết credit khi tạo video: {error_message}"
+                )
             raise FlowGenerationError(
-                "Google Flow báo lỗi khi tạo video: "
-                f"{matched.get('error') or 'Thao tác không thành công'}"
+                f"Google Flow báo lỗi khi tạo video: {error_message}"
             )
         if include_existing_canvas_errors and matched.get("is_latest_prompt"):
             if video_tile_count_before_submit is not None:
@@ -2683,9 +2695,13 @@ class GoogleFlowWorker:
                 active_errors = await self._get_existing_error_texts()
             if active_errors:
                 self._record_video_timing("error_seen")
+                err_text = next(iter(active_errors))
+                if _is_flow_credit_exhausted_error(err_text):
+                    raise FlowCreditExhausted(
+                        f"Google Flow đã xác nhận hết credit khi tạo video: {err_text}"
+                    )
                 raise FlowGenerationError(
-                    "Google Flow báo lỗi khi tạo video: "
-                    f"{next(iter(active_errors))}"
+                    f"Google Flow báo lỗi khi tạo video: {err_text}"
                 )
         elif include_existing_canvas_errors and matched_state == "missing":
             if video_tile_count_before_submit is not None:
@@ -2702,9 +2718,13 @@ class GoogleFlowWorker:
                 )
             if video_errors and has_new_video_error:
                 self._record_video_timing("error_seen")
+                err_text = next(iter(video_errors))
+                if _is_flow_credit_exhausted_error(err_text):
+                    raise FlowCreditExhausted(
+                        f"Google Flow đã xác nhận hết credit khi tạo video: {err_text}"
+                    )
                 raise FlowGenerationError(
-                    "Google Flow báo lỗi khi tạo video: "
-                    f"{next(iter(video_errors))}"
+                    f"Google Flow báo lỗi khi tạo video: {err_text}"
                 )
         return matched
 
