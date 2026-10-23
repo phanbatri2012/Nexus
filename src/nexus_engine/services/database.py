@@ -4619,13 +4619,18 @@ def get_system_jobs_summary_counts(
             error += int(row[2] or 0)
 
     if include_audio:
-        c.execute('''
+        c.execute(
+            '''
             SELECT 
                 COUNT(1) AS total,
-                SUM(CASE WHEN status IN ('queued', 'pending', 'processing') THEN 1 ELSE 0 END) AS active,
-                SUM(CASE WHEN status IN ('failed', 'interrupted') THEN 1 ELSE 0 END) AS error
+                SUM(CASE WHEN audio_tasks.status IN ('queued', 'pending', 'processing') THEN 1 ELSE 0 END) AS active,
+                SUM(CASE WHEN audio_tasks.status IN ('failed', 'interrupted') THEN 1 ELSE 0 END) AS error
             FROM audio_tasks
-        ''')
+            JOIN videos ON videos.id = audio_tasks.video_id
+            WHERE videos.video_status = ?
+            ''',
+            (VIDEO_STATUS_ACTIVE,),
+        )
         row = c.fetchone()
         if row:
             total += int(row[0] or 0)
@@ -4633,13 +4638,18 @@ def get_system_jobs_summary_counts(
             error += int(row[2] or 0)
 
     if include_audio_review:
-        c.execute('''
+        c.execute(
+            '''
             SELECT 
                 COUNT(1) AS total,
-                SUM(CASE WHEN status IN ('queued', 'pending', 'processing') THEN 1 ELSE 0 END) AS active,
-                SUM(CASE WHEN status IN ('failed', 'rejected') THEN 1 ELSE 0 END) AS error
+                SUM(CASE WHEN audio_reviews.status IN ('queued', 'pending', 'processing') THEN 1 ELSE 0 END) AS active,
+                SUM(CASE WHEN audio_reviews.status IN ('failed', 'rejected') THEN 1 ELSE 0 END) AS error
             FROM audio_reviews
-        ''')
+            JOIN videos ON videos.id = audio_reviews.video_id
+            WHERE videos.video_status = ?
+            ''',
+            (VIDEO_STATUS_ACTIVE,),
+        )
         row = c.fetchone()
         if row:
             total += int(row[0] or 0)
