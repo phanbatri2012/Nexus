@@ -1,10 +1,8 @@
-<#
-.SYNOPSIS
-    Nexus Studio Engine Canonical Stop Wrapper
-#>
 [CmdletBinding()]
-param()
+param(
+    [ValidateRange(5, 120)]
+    [int]$TimeoutSeconds = 25
+)
 
-$target = Join-Path $PSScriptRoot "stop_autoyt.ps1"
-& $target @args
+& (Join-Path $PSScriptRoot "..\stop_nexus.ps1") @PSBoundParameters
 exit $LASTEXITCODE

@@ -1,5 +1,5 @@
 @echo off
 setlocal EnableExtensions
-cd /d "%~dp0Tool-auto-login-GPT"
-call run_autoyt.bat %*
+>&2 echo [DEPRECATED] run_autoyt.bat is deprecated; use run_nexus.bat.
+call "%~dp0run_nexus.bat" %*
 exit /b %ERRORLEVEL%

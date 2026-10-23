@@ -1,4 +1,4 @@
-# HƯỚNG DẪN SỬ DỤNG HỆ THỐNG AUTO_YT (NEXUS STUDIO ENGINE)
+# HƯỚNG DẪN SỬ DỤNG NEXUS STUDIO ENGINE
 > **Tài liệu hướng dẫn vận hành chuẩn dành cho thành viên mới (Onboarding & Operator Manual)**  
 > *Phiên bản hệ thống: Nexus Studio Engine v2.0*
 
@@ -28,14 +28,14 @@ flowchart LR
     E --> F["6. Xuất bản & Lên lịch\n(GPM Profile + Proxy An Toàn)"]
 ```
 
-### 5 Dịch vụ trụ cột chạy ngầm
+### 3 dịch vụ lõi và 2 dịch vụ on-demand
 | Dịch vụ | Địa chỉ / Profile | Nhiệm vụ chính |
 | :--- | :--- | :--- |
 | **Backend API** | `http://127.0.0.1:8080` | Bộ não xử lý dữ liệu SQLite, điều phối tiến trình và render video. |
 | **Frontend UI** | `http://localhost:5173` | Giao diện điều khiển Dark Mode trực quan cho người dùng. |
 | **OmniVoice TTS** | `http://127.0.0.1:8011` | Máy chủ sinh giọng đọc tiếng Việt AI, hỗ trợ nhân bản giọng (Voice Cloning) và hội thoại nhiều vai. |
-| **ChatGPT Service** | Profile `PROFILE_GPT_1` | Tự mở ẩn khi có job tạo kịch bản/metadata và tự tắt sau 5 phút rảnh. |
-| **Google Flow** | Profile `PROFILE_GOOGLE_FLOW_1` | Tự mở ẩn khi cần sinh media và tự tắt sau 5 phút thực sự rảnh. |
+| **ChatGPT Service (on-demand)** | Profile `PROFILE_GPT_1` | Chỉ mở khi người dùng hoặc job hợp lệ yêu cầu tạo kịch bản/metadata; không được startup tự mở. |
+| **Google Flow (on-demand)** | Profile `PROFILE_GOOGLE_FLOW_1` | Chỉ mở khi người dùng hoặc job hợp lệ yêu cầu sinh media; không được startup tự mở. |
 
 ---
 
@@ -43,9 +43,9 @@ flowchart LR
 
 ### Bước 1: Khởi động hệ sinh thái
 Nhấp đúp vào file thực thi tại thư mục gốc:
-👉 **`run_nexus.bat`** (hoặc `run_nexus_restart.bat` nếu muốn khởi động lại mới toàn bộ. Hệ thống vẫn hỗ trợ song song các file cũ `run_autoyt*.bat`).
+👉 **`run_nexus.bat`** (hoặc `run_nexus_restart.bat` khi cần khởi động lại an toàn toàn bộ hệ thống).
 
-Chờ terminal kiểm tra 5 dịch vụ và tự động mở trình duyệt tại: `http://localhost:5173`.
+Chờ terminal xác nhận Backend, Frontend và OmniVoice đã sẵn sàng, sau đó mở: `http://localhost:5173`.
 
 ---
 
@@ -192,9 +192,9 @@ sequenceDiagram
 2. Hoặc kiểm tra qua API: `http://127.0.0.1:8080/api/system/maintenance-status` (yêu cầu `safe_to_restart: true`).
 
 ### Các lệnh điều khiển hệ thống:
-- **Khởi động**: Chạy file `run_nexus.bat` (hoặc `run_autoyt.bat`)
-- **Khởi động lại sạch**: Chạy file `run_nexus_restart.bat` (hoặc `run_autoyt_restart.bat`)
-- **Tắt toàn bộ hệ thống**: Chạy file `run_nexus_stop.bat` (hoặc `run_autoyt_stop.bat`)
+- **Khởi động**: Chạy file `run_nexus.bat`
+- **Khởi động lại an toàn**: Chạy file `run_nexus_restart.bat`
+- **Tắt toàn bộ hệ thống**: Chạy file `run_nexus_stop.bat`
 
 ---
 

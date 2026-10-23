@@ -1,14 +1,4 @@
 @echo off
-setlocal EnableExtensions
-cd /d "%~dp0"
-
-title Restart Nexus Studio Engine
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0restart_autoyt.ps1" %*
-set "AUTOYT_EXIT_CODE=%ERRORLEVEL%"
-
-if not "%AUTOYT_EXIT_CODE%"=="0" (
-    echo Nexus Studio Engine restart failed. Review the error above and data\logs.
-    if not defined AUTOYT_RESTART_NO_PAUSE pause
-)
-
-exit /b %AUTOYT_EXIT_CODE%
+>&2 echo [DEPRECATED] Tool-auto-login-GPT\run_autoyt_restart.bat forwards to root run_nexus_restart.bat.
+call "%~dp0..\run_nexus_restart.bat" %*
+exit /b %ERRORLEVEL%

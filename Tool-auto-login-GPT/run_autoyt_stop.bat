@@ -1,14 +1,4 @@
 @echo off
-setlocal EnableExtensions
-cd /d "%~dp0"
-
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0stop_autoyt.ps1" %*
-set "AUTOYT_EXIT_CODE=%ERRORLEVEL%"
-
-if not "%AUTOYT_EXIT_CODE%"=="0" (
-    echo.
-    echo Nexus Studio Engine failed to stop. Review the error above.
-    if not defined AUTOYT_NO_PAUSE pause
-)
-
-exit /b %AUTOYT_EXIT_CODE%
+>&2 echo [DEPRECATED] Tool-auto-login-GPT\run_autoyt_stop.bat forwards to root run_nexus_stop.bat.
+call "%~dp0..\run_nexus_stop.bat" %*
+exit /b %ERRORLEVEL%

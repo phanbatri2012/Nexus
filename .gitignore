@@ -12,7 +12,9 @@
 *.db
 *.sqlite
 *.log
+/data/
 /Tool-auto-login-GPT/data/
+/.nexus-quarantine/
 /temp_*
 /debug_*
 

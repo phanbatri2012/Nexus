@@ -1,10 +1,9 @@
-<#
-.SYNOPSIS
-    Nexus Studio Engine Canonical Startup Wrapper
-#>
 [CmdletBinding()]
-param()
+param(
+    [switch]$NoBrowser,
+    [ValidateRange(10, 300)]
+    [int]$ReadyTimeoutSeconds = 60
+)
 
-$target = Join-Path $PSScriptRoot "start_autoyt.ps1"
-& $target @args
+& (Join-Path $PSScriptRoot "..\start_nexus.ps1") @PSBoundParameters
 exit $LASTEXITCODE

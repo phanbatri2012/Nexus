@@ -1,10 +1,9 @@
-<#
-.SYNOPSIS
-    Nexus Studio Engine Canonical Restart Wrapper
-#>
 [CmdletBinding()]
-param()
+param(
+    [switch]$NoBrowser,
+    [ValidateRange(10, 300)]
+    [int]$ReadyTimeoutSeconds = 60
+)
 
-$target = Join-Path $PSScriptRoot "restart_autoyt.ps1"
-& $target @args
+& (Join-Path $PSScriptRoot "..\restart_nexus.ps1") @PSBoundParameters
 exit $LASTEXITCODE

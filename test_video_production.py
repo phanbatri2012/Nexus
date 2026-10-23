@@ -1,0 +1,2919 @@
+import asyncio
+import datetime as dt
+import io
+import json
+import sys
+import tempfile
+import unittest
+import urllib.error
+import urllib.request
+from contextlib import asynccontextmanager
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from PIL import Image
+
+from nexus_engine import main
+from nexus_engine.services import database
+from nexus_engine.services import publication_scheduler
+from nexus_engine.services import video_production
+from nexus_engine.services import youtube_publisher
+from nexus_engine.services import youtube_publish_workflow
+
+
+class VideoProductionServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.database_patch = patch.object(
+            database,
+            "DB_PATH",
+            Path(self.temporary_directory.name) / "database.db",
+        )
+        self.database_patch.start()
+        database.init_db()
+
+    def tearDown(self):
+        self.database_patch.stop()
+        try:
+            self.temporary_directory.cleanup()
+        except Exception:
+            pass
+
+    def test_build_scene_windows_splits_by_duration(self):
+        captions = [{"start": i, "end": i + 1, "text": f"word {i}"} for i in range(120)]
+        windows = video_production.build_scene_windows(
+            captions,
+            duration_seconds=120.0,
+            minimum_seconds=25.0,
+            target_seconds=30.0,
+            maximum_seconds=35.0
+        )
+        self.assertTrue(len(windows) > 0)
+        self.assertTrue(all(w["duration"] >= 20.0 for w in windows))
+
+    def test_extract_intro_boundary_multi_tier_matching(self):
+        # Test long intro matching with slight transcription differences
+        script = (
+            "### [INTRO]\n"
+            "Một câu hỏi đã ám ảnh lịch sử suốt hơn bốn thập kỷ: tháng 3 năm 1979 khi quân Trung Quốc tiến vào Lạng Sơn vì sao không tiến xuống Hà Nội?\n"
+            "Và nếu quân Trung Quốc thực sự vượt khỏi Lạng Sơn để tiến về Hà Nội, cục diện năm 1979 có thể đã diễn biến ra sao?\n\n"
+            "### [BODY]\n"
+            "Ngày 17 tháng 2 năm 1979 quân Trung Quốc đồng loạt tiến công trên toàn tuyến biên giới phía Bắc Việt Nam."
+        )
+        captions = [
+            {"start": 0.0, "end": 10.3, "text": "Một câu hỏi đã ám ảnh lịch sử suốt hơn bốn thập kỷ."},
+            {"start": 10.3, "end": 29.6, "text": "tháng 3 năm 1979 khi quân Trung Quốc tiến vào Lạng Sơn vì sao không tiến xuống Hà Nội?"},
+            {"start": 29.6, "end": 55.0, "text": "Và nếu quân Trung Quốc thực sự vượt khỏi lạng sơn để tiến về Hà Nội, cuộc diện năm 1979 có thể đã diễn biến ra sao?"},
+            {"start": 55.0, "end": 75.0, "text": "Ngày 17 tháng 2 năm 1979 quân Trung Quốc đồng loạt tiến công trên toàn tuyến biên giới phía Bắc."},
+        ]
+        boundary = video_production.extract_intro_boundary(script, captions, 200.0)
+        self.assertAlmostEqual(boundary, 55.0, delta=0.1)
+
+        windows = video_production.build_scene_windows(
+            captions,
+            duration_seconds=200.0,
+            intro_end_seconds=boundary,
+            intro_target_seconds=8.0,
+            enable_intro_video=True,
+        )
+        video_windows = [w for w in windows if w["is_video"]]
+        self.assertEqual(len(video_windows), 3)
+        self.assertTrue(all(w["is_video"] for w in video_windows))
+        self.assertFalse(windows[3]["is_video"])
+
+    def test_media_validation_uses_pyav_when_ffprobe_is_missing(self):
+        probe_result = {
+            "duration_seconds": 4.0,
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "codec_name": "h264",
+                    "width": 1920,
+                    "height": 1080,
+                },
+                {
+                    "codec_type": "audio",
+                    "codec_name": "aac",
+                    "width": 0,
+                    "height": 0,
+                },
+            ],
+        }
+        with (
+            patch.object(video_production, "_find_ffprobe", return_value=None),
+            patch.object(
+                video_production,
+                "_probe_media_with_av",
+                return_value=probe_result,
+            ),
+        ):
+            duration = video_production.probe_media_duration(Path("audio.wav"))
+            details = video_production.validate_render(
+                Path("video.mp4"), 4.0, "ffmpeg.exe"
+            )
+
+        self.assertEqual(duration, 4.0)
+        self.assertEqual(details["video_codec"], "h264")
+        self.assertEqual(details["audio_codec"], "aac")
+
+    def test_scene_video_probe_rejects_payload_without_video_stream(self):
+        with (
+            patch.object(video_production, "_find_ffprobe", return_value=None),
+            patch.object(
+                video_production,
+                "_probe_media_with_av",
+                return_value={
+                    "duration_seconds": 8.0,
+                    "streams": [{"codec_type": "audio", "codec_name": "aac"}],
+                },
+            ),
+        ):
+            with self.assertRaisesRegex(
+                video_production.VideoProductionError,
+                "không có video stream",
+            ):
+                video_production.probe_scene_video(Path("not-a-video.mp4"))
+
+    def test_whisper_falls_back_to_cpu_when_cuda_fails_during_transcription(self):
+        audio_path = Path(self.temporary_directory.name) / "audio.wav"
+        captions_dir = Path(self.temporary_directory.name) / "captions"
+        audio_path.write_bytes(b"audio")
+        devices = []
+        progress_messages = []
+
+        class FakeWhisperModel:
+            def __init__(self, _model_name, *, device, compute_type):
+                self.device = device
+                devices.append((device, compute_type))
+
+            def transcribe(self, *_args, **_kwargs):
+                if self.device == "cuda":
+                    def failing_segments():
+                        raise RuntimeError("missing CUDA runtime")
+                        yield
+
+                    return failing_segments(), {}
+                return iter(
+                    [SimpleNamespace(start=0.0, end=1.0, text=" Xin chào ")]
+                ), {}
+
+        with (
+            patch.dict(
+                sys.modules,
+                {"faster_whisper": SimpleNamespace(WhisperModel=FakeWhisperModel)},
+            ),
+            patch.object(video_production, "CAPTIONS_DIR", captions_dir),
+            patch.object(video_production, "_WHISPER_MODEL", None),
+            patch.object(video_production, "_WHISPER_DEVICE", ""),
+            patch.object(database, "get_latest_video_artifact", return_value=None),
+            patch.object(database, "upsert_video_artifact"),
+        ):
+            caption_path, _ = video_production.create_srt(
+                audio_path,
+                1,
+                lambda message, stage: progress_messages.append((stage, message)),
+            )
+
+        self.assertEqual(devices, [("cuda", "float16"), ("cpu", "int8")])
+        self.assertIn("Xin chào", caption_path.read_text(encoding="utf-8"))
+        self.assertTrue(any("CPU int8" in message for _, message in progress_messages))
+
+    
+
+    
+
+    def test_schedule_respects_timezone_lead_daily_limit_and_existing_slots(self):
+        now = dt.datetime(2026, 9, 14, 1, 0, tzinfo=dt.timezone.utc)
+        result = publication_scheduler.find_next_publication_slot(
+            timezone_name="Asia/Ho_Chi_Minh",
+            slots=[{"day": 0, "time": "09:00"}, {"day": 1, "time": "09:00"}],
+            daily_limit=1,
+            lead_minutes=120,
+            occupied_utc=["2026-09-14T02:00:00+00:00"],
+            now_utc=now,
+        )
+
+        self.assertEqual(result, "2026-09-15T02:00:00+00:00")
+
+    def test_schedule_skips_nonexistent_dst_time(self):
+        result = publication_scheduler.find_next_publication_slot(
+            timezone_name="America/New_York",
+            slots=[{"day": 6, "time": "02:30"}],
+            daily_limit=1,
+            lead_minutes=120,
+            occupied_utc=[],
+            now_utc=dt.datetime(2026, 3, 7, 12, 0, tzinfo=dt.timezone.utc),
+        )
+
+        self.assertEqual(result, "2026-03-15T06:30:00+00:00")
+
+    def test_publish_workflow_reservation_is_idempotent_for_video_and_channel(self):
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=source123",
+            "Source",
+            "Transcript",
+            "### [METADATA & QUIZ]\nTiêu đề: Output",
+        )
+        channel = database.save_youtube_channel(
+            channel_id="UC-production-test",
+            title="Production test",
+        )
+        artifact_path = Path(self.temporary_directory.name) / "video.mp4"
+        artifact_path.write_bytes(b"video")
+        artifact = database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="final_mp4",
+            path=str(artifact_path),
+            content_hash="same-artifact",
+            status="ready",
+            mime_type="video/mp4",
+        )
+
+        first, first_created = database.reserve_youtube_publish_workflow(
+            workflow_id="workflow-first",
+            video_id=video_id,
+            youtube_channel_id=channel["id"],
+            artifact_id=artifact["id"],
+            snapshot={"pipeline": {"youtube_upload": True}},
+        )
+        second, second_created = database.reserve_youtube_publish_workflow(
+            workflow_id="workflow-second",
+            video_id=video_id,
+            youtube_channel_id=channel["id"],
+            artifact_id=artifact["id"],
+            snapshot={"pipeline": {"youtube_upload": True}},
+        )
+
+        self.assertTrue(first_created)
+        self.assertFalse(second_created)
+        self.assertEqual(second["id"], first["id"])
+
+    def test_production_schema_defaults_do_not_enqueue_old_videos(self):
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=legacy123",
+            "Legacy",
+            "Transcript",
+            "Script",
+        )
+
+        video = database.get_video(video_id)
+        self.assertEqual(video["production_snapshot_json"], "{}")
+        self.assertEqual(
+            database.list_completed_audio_video_ids_with_production_snapshot(),
+            [],
+        )
+        self.assertEqual(database.list_system_jobs(limit=None), [])
+
+    def test_save_video_persists_production_snapshot_json(self):
+        snapshot_payload = {
+            "prompt_version": "v_test",
+            "image_generation_settings": {"provider": "google_flow"},
+        }
+        video_id = database.save_video(
+            url="https://www.youtube.com/watch?v=new_snapshot_123",
+            title="Snapshot Title",
+            transcript="Transcript text",
+            generated_script="Generated script content",
+            prompt_version="v_test",
+            voice_id="voice_123",
+            voice_name="test_voice",
+            tts_provider_id="omnivoice",
+            voice_revision=2,
+            voice_snapshot_json='{"voice_id": "voice_123"}',
+            production_snapshot_json=json.dumps(snapshot_payload),
+        )
+
+        video = database.get_video(video_id)
+        self.assertEqual(
+            json.loads(video["production_snapshot_json"]),
+            snapshot_payload,
+        )
+        self.assertEqual(video["tts_provider_id"], "omnivoice")
+        self.assertEqual(video["voice_revision"], 2)
+
+    def test_forbidden_privacy_setting_is_classified_as_audit_restriction(self):
+        payload = {
+            "error": {
+                "message": "The request attempts to set an invalid privacy setting.",
+                "errors": [{"reason": "forbiddenPrivacySetting"}],
+            }
+        }
+        error = urllib.error.HTTPError(
+            "https://www.googleapis.com/youtube/v3/videos",
+            403,
+            "Forbidden",
+            {},
+            io.BytesIO(json.dumps(payload).encode("utf-8")),
+        )
+
+        classified = youtube_publisher._publish_error_from_http(error)
+
+        self.assertIsInstance(
+            classified,
+            youtube_publisher.YouTubePublicUploadRestricted,
+        )
+
+    def test_youtube_publish_transport_runs_end_to_end_without_network(self):
+        class FakeResponse:
+            def __init__(self, payload=None, headers=None):
+                self.payload = payload or {}
+                self.headers = headers or {}
+
+            def read(self, _limit=-1):
+                return json.dumps(self.payload).encode("utf-8") if self.payload else b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        video_path = Path(self.temporary_directory.name) / "video.mp4"
+        thumbnail_path = Path(self.temporary_directory.name) / "thumbnail.png"
+        caption_path = Path(self.temporary_directory.name) / "caption.srt"
+        video_path.write_bytes(b"0123456789")
+        thumbnail_path.write_bytes(b"png")
+        caption_path.write_text(
+            "1\n00:00:00,000 --> 00:00:01,000\nAcceptance\n",
+            encoding="utf-8",
+        )
+        session_url = "https://www.googleapis.com/upload/session-safe-test"
+        calls = []
+
+        def fake_urlopen(request: urllib.request.Request, timeout=0):
+            url = request.full_url
+            method = request.get_method()
+            calls.append((method, url, timeout))
+            if url.startswith(f"{youtube_publisher.YOUTUBE_UPLOAD_BASE}/videos?"):
+                return FakeResponse(headers={"Location": session_url})
+            if url == session_url:
+                content_range = request.get_header("Content-range") or ""
+                end = int(
+                    content_range.split(" ", 1)[1]
+                    .split("-", 1)[1]
+                    .split("/", 1)[0]
+                )
+                if end < video_path.stat().st_size - 1:
+                    raise urllib.error.HTTPError(
+                        url,
+                        308,
+                        "Resume Incomplete",
+                        {"Range": f"bytes=0-{end}"},
+                        io.BytesIO(),
+                    )
+                return FakeResponse({"id": "youtube-safe-test"})
+            if "/thumbnails/set?" in url:
+                return FakeResponse({"items": [{"default": {}}]})
+            if url.startswith(f"{youtube_publisher.YOUTUBE_API_BASE}/captions?"):
+                return FakeResponse({"items": []})
+            if url.startswith(f"{youtube_publisher.YOUTUBE_UPLOAD_BASE}/captions?"):
+                return FakeResponse({"id": "caption-safe-test"})
+            if url.startswith(f"{youtube_publisher.YOUTUBE_API_BASE}/videos?"):
+                if method == "PUT":
+                    request_payload = json.loads(request.data.decode("utf-8"))
+                    return FakeResponse(
+                        {
+                            "id": "youtube-safe-test",
+                            "status": request_payload["status"],
+                        }
+                    )
+                return FakeResponse(
+                    {
+                        "items": [
+                            {
+                                "status": {
+                                    "privacyStatus": "private",
+                                    "uploadStatus": "processed",
+                                },
+                                "processingDetails": {
+                                    "processingStatus": "succeeded"
+                                },
+                                "snippet": {},
+                            }
+                        ]
+                    }
+                )
+            raise AssertionError(f"Unexpected external request: {method} {url}")
+
+        class FakeOpener:
+            def open(self, req, timeout=0):
+                return fake_urlopen(req, timeout=timeout)
+
+        progress = []
+        with (
+            patch.object(
+                youtube_publisher.urllib.request,
+                "urlopen",
+                side_effect=fake_urlopen,
+            ),
+            patch.object(
+                youtube_publisher,
+                "create_proxy_opener",
+                return_value=FakeOpener(),
+            ),
+            patch.object(youtube_publisher, "UPLOAD_CHUNK_SIZE", 4),
+        ):
+            created_session = youtube_publisher.start_resumable_upload(
+                token="fake-token",
+                video_path=video_path,
+                metadata={
+                    "snippet": {"title": "Acceptance"},
+                    "status": {"privacyStatus": "private"},
+                },
+                notify_subscribers=False,
+            )
+            uploaded = youtube_publisher.upload_video_resumable(
+                session_url=created_session,
+                video_path=video_path,
+                token_provider=lambda: "fake-token",
+                start_offset=0,
+                persist_progress=progress.append,
+                cancel_check=lambda: None,
+            )
+            youtube_publisher.upload_thumbnail(
+                "fake-token", uploaded["id"], thumbnail_path
+            )
+            youtube_publisher.upload_caption(
+                "fake-token", uploaded["id"], caption_path
+            )
+            processing = youtube_publisher.require_processing_succeeded(
+                "fake-token", uploaded["id"]
+            )
+            youtube_publisher.schedule_video(
+                "fake-token",
+                uploaded["id"],
+                "2099-09-20T02:00:00+00:00",
+            )
+
+        self.assertEqual(created_session, session_url)
+        self.assertEqual(uploaded["id"], "youtube-safe-test")
+        self.assertEqual(progress, [4, 8, 10])
+        self.assertEqual(processing["status"]["privacyStatus"], "private")
+        self.assertEqual(len(calls), 9)
+        self.assertTrue(
+            all(url.startswith("https://www.googleapis.com/") for _, url, _ in calls)
+        )
+
+    
+
+    def _make_publish_job(self, *, schedule: bool) -> tuple[dict, dict, int]:
+        thumbnail_url = "http://127.0.0.1:8080/api/thumbnails/upload.png"
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=source-upload",
+            "Source upload",
+            "Transcript",
+            "### [METADATA & QUIZ]\nTIÊU ĐỀ: A complete generated upload title\n"
+            "MÔ TẢ VIDEO: This generated description is deliberately long enough to pass the metadata quality gate in publish tests.\n"
+            f"### [THUMBNAIL KHÔNG CHỮ]\n{thumbnail_url}",
+        )
+        channel = database.save_youtube_channel(
+            channel_id=f"UC-upload-{int(schedule)}",
+            title="Upload channel",
+            access_token_encrypted="encrypted-access",
+            gpm_profile_id="gpm-profile",
+            gpm_proxy_info="127.0.0.1:8899:user:password",
+        )
+        channel = database.update_youtube_channel(
+            channel["id"], public_upload_verified=int(schedule)
+        )
+        artifact_path = Path(self.temporary_directory.name) / "final.mp4"
+        artifact_path.write_bytes(b"video")
+        artifact = database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="final_mp4",
+            path=str(artifact_path),
+            content_hash="final-hash",
+            status="ready",
+            mime_type="video/mp4",
+            size_bytes=5,
+        )
+        captions_path = Path(self.temporary_directory.name) / "captions.srt"
+        captions_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nTest", encoding="utf-8")
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="captions",
+            path=str(captions_path),
+            content_hash="captions-hash",
+            status="ready",
+            mime_type="application/x-subrip",
+        )
+        snapshot = {
+            "pipeline": {
+                "youtube_upload": True,
+                "youtube_schedule": schedule,
+            },
+            "image_generation_settings": {
+                "thumbnail_variant": "without_text",
+            },
+            "publishing_settings": {
+                "upload_method": "api",
+                "category_id": "22",
+                "language": "vi",
+                "made_for_kids": False,
+                "notify_subscribers": False,
+            },
+        }
+        workflow, _ = database.reserve_youtube_publish_workflow(
+            workflow_id=f"publish-test-{int(schedule)}",
+            video_id=video_id,
+            youtube_channel_id=channel["id"],
+            artifact_id=artifact["id"],
+            snapshot=snapshot,
+        )
+        job = database.create_system_job(
+            job_id=f"publish-job-{int(schedule)}",
+            job_type="youtube_publish",
+            title="Upload",
+            payload={"workflow_id": workflow["id"]},
+        )
+        database.update_system_job(job["id"], video_id=video_id)
+        database.update_youtube_publish_workflow(
+            workflow["id"], system_job_id=job["id"]
+        )
+        return database.get_system_job(job["id"]), channel, video_id
+
+    def test_upload_without_schedule_stops_at_private(self):
+        job, channel, video_id = self._make_publish_job(schedule=False)
+        thumbnail_directory = Path(self.temporary_directory.name) / "thumbnails"
+        thumbnail_directory.mkdir()
+        (thumbnail_directory / "upload.png").write_bytes(b"thumbnail")
+
+        from nexus_engine.services import youtube_publisher
+        with (
+            patch.object(main, "THUMBNAILS_DIR", thumbnail_directory),
+            patch.object(
+                youtube_publish_workflow.youtube_comments,
+                "access_token_for_channel",
+                return_value="token",
+            ),
+            patch.object(
+                youtube_publish_workflow.secret_store,
+                "encrypt_secret",
+                side_effect=lambda value: f"encrypted:{value}",
+            ),
+            patch.object(
+                youtube_publisher,
+                "start_resumable_upload",
+                return_value="https://www.googleapis.com/upload/session",
+            ),
+            patch.object(
+                youtube_publisher,
+                "upload_video_resumable",
+                return_value={"id": "youtube-private", "snippet": {}},
+            ),
+            patch.object(youtube_publisher, "upload_thumbnail"),
+            patch.object(youtube_publisher, "find_caption_track", return_value=""),
+            patch.object(
+                youtube_publisher,
+                "upload_caption",
+                return_value={"id": "caption-private"},
+            ),
+            patch.object(youtube_publisher, "require_processing_succeeded"),
+            patch.object(youtube_publisher, "schedule_video") as schedule_video,
+        ):
+            main._execute_youtube_publish_job(job)
+
+        workflow = database.get_youtube_publish_workflow("publish-test-0")
+        publication = database.get_video_publication_by_youtube_id("youtube-private")
+        self.assertEqual(workflow["status"], "uploaded_private")
+        self.assertEqual(publication["privacy_status"], "private")
+        self.assertEqual(database.get_video(video_id)["publish_status"], "uploaded_private")
+        schedule_video.assert_not_called()
+
+    def test_build_default_visual_scene_plan_meets_quality_spec(self):
+        windows = [
+            {"index": 0, "start": 0.0, "end": 30.0, "duration": 30.0, "transcript": "Mở đầu bài học về hôn nhân gia đình."},
+            {"index": 1, "start": 30.0, "end": 60.0, "duration": 30.0, "transcript": "Phần tiếp theo làm rõ các dấu hiệu nhận biết."},
+        ]
+        plan = video_production.build_default_visual_scene_plan(windows, "Học Cách Thấu Hiểu", "Realistic cinematic")
+        self.assertIn("scenes", plan)
+        self.assertEqual(len(plan["scenes"]), 2)
+        validated = video_production.validate_visual_scene_plan(plan, windows)
+        self.assertEqual(len(validated["scenes"]), 2)
+        for s in validated["scenes"]:
+            self.assertGreaterEqual(len(s["prompt"]), 80)
+
+    def test_default_scene_plan_is_transcript_grounded_for_unrelated_topics(self):
+        transcripts = [
+            "Kính thiên văn ghi lại ánh sáng của một thiên hà cách Trái Đất hàng tỷ năm.",
+            "Người thợ làm bánh nhào bột mì trên bàn gỗ trước khi đưa bánh vào lò.",
+            "Các kỹ sư kiểm tra tua-bin gió ngoài khơi trong điều kiện biển động.",
+            "Bác sĩ giải thích hình ảnh chụp cộng hưởng từ cho bệnh nhân trong phòng khám.",
+            "Nông dân thu hoạch cà phê chín đỏ trên sườn đồi vào sáng sớm.",
+            "Nhà khảo cổ làm sạch một bình gốm vừa được tìm thấy dưới lớp đất cổ.",
+        ]
+        windows = [
+            {
+                "index": index,
+                "start": float(index * 30),
+                "end": float((index + 1) * 30),
+                "duration": 30.0,
+                "transcript": transcript,
+            }
+            for index, transcript in enumerate(transcripts)
+        ]
+
+        plan = video_production.build_default_visual_scene_plan(
+            windows,
+            "Một video tổng hợp nhiều chủ đề",
+            "Photorealistic documentary",
+        )
+        actions = [scene["action"] for scene in plan["scenes"]]
+
+        self.assertEqual(len(actions), len(set(actions)))
+        for transcript, action in zip(transcripts, actions):
+            anchor = " ".join(transcript.split()[:4])
+            self.assertIn(anchor, action)
+        video_production.validate_visual_scene_plan(plan, windows)
+
+    def test_scene_plan_rejects_prompts_that_only_differ_by_scene_number(self):
+        windows = [
+            {"index": 0, "start": 0.0, "end": 30.0, "duration": 30.0, "transcript": "Đoạn một"},
+            {"index": 1, "start": 30.0, "end": 60.0, "duration": 30.0, "transcript": "Đoạn hai"},
+        ]
+        repeated_action = (
+            "A researcher examines the same glass instrument on the same desk "
+            "from the same camera angle"
+        )
+        payload = {
+            "visual_bible": {"style": "Documentary"},
+            "scenes": [
+                {
+                    "index": index,
+                    "action": repeated_action,
+                    "prompt": (
+                        f"A documentary still, scene {index + 1}. {repeated_action}. "
+                        "Natural lighting, realistic detail, clean visual without text."
+                    ),
+                }
+                for index in range(2)
+            ],
+        }
+
+        with self.assertRaises(video_production.VideoProductionError):
+            video_production.validate_visual_scene_plan(payload, windows)
+
+    def test_trigger_render_video_api_endpoints(self):
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=render123",
+            "Test Render Video",
+            "Transcript",
+            "Script",
+        )
+        database.upsert_audio_task(
+            video_id=video_id,
+            request_hash="hash-123456",
+            task_id="task-123",
+            status="completed",
+            audio_url="http://127.0.0.1:8080/api/audio/sample.mp3",
+            error="",
+            segments_json="[]",
+            voice_id="sample-voice",
+            voice_name="Sample Voice",
+        )
+        with (
+            patch.object(main, "_kick_production_queue"),
+            patch.object(main, "_kick_flow_media_queue"),
+        ):
+            res = main.trigger_render_video(video_id)
+            self.assertTrue(res["success"])
+            self.assertEqual(res["status"], "queued")
+            self.assertEqual(res["job_type"], "flow_media_generation")
+            self.assertEqual(res["phase"], "media_generation")
+
+            status = main.get_render_status(video_id)
+            self.assertEqual(status["video_id"], video_id)
+            self.assertIsNotNone(status["job"])
+            self.assertEqual(status["job"]["job_type"], "flow_media_generation")
+            self.assertEqual(status["phase"], "media_generation")
+
+    def test_trigger_render_video_routes_stock_directly_to_mp4_queue(self):
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=stock-route",
+            "Stock Route Video",
+            "Transcript",
+            "Script",
+        )
+        database.upsert_audio_task(
+            video_id=video_id,
+            request_hash="hash-stock-route",
+            task_id="task-stock-route",
+            status="completed",
+            audio_url="http://127.0.0.1:8080/api/audio/stock-route.mp3",
+            error="",
+            segments_json="[]",
+            voice_id="sample-voice",
+            voice_name="Sample Voice",
+        )
+        snapshot = {
+            "render_mode": "stock_video",
+            "pipeline": {"video_render": True, "render_mode": "stock_video"},
+        }
+        with (
+            patch.object(main, "_get_prompt_production_snapshot", return_value=snapshot),
+            patch.object(main, "_kick_production_queue") as kick_render,
+            patch.object(main, "_kick_flow_media_queue") as kick_flow,
+        ):
+            result = main.trigger_render_video(video_id)
+
+        self.assertEqual(result["job_type"], "video_render")
+        self.assertEqual(result["phase"], "render")
+        self.assertFalse(result["duplicate"])
+        kick_render.assert_called_once_with()
+        kick_flow.assert_not_called()
+
+    def test_flow_media_handoff_creates_exactly_one_render_job(self):
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-handoff",
+            "Flow Handoff Video",
+            "Transcript",
+            "Script",
+        )
+        snapshot = {"render_mode": "google_flow", "pipeline": {"video_render": True}}
+        job = database.create_system_job(
+            job_id="flow-media-handoff",
+            job_type="flow_media_generation",
+            title="Tạo media",
+            payload={"video_id": video_id, "snapshot": snapshot, "mode": "resume"},
+            video_id=video_id,
+        )
+        pending_since = "2026-10-15T20:00:00+00:00"
+        database.update_system_job(
+            job["id"],
+            status="running",
+            result_json={"flow_video_pending_since": pending_since},
+        )
+        prepared_result = {
+            "manifest_artifact": {"id": 1},
+            "plan_hash": "plan-hash",
+            "scene_count": 3,
+        }
+
+        with (
+            patch.object(
+                video_production,
+                "prepare_google_flow_media",
+                return_value=prepared_result,
+            ) as prepare_media,
+            patch.object(main, "_kick_production_queue") as kick_render,
+        ):
+            main._execute_flow_media_generation_job(database.get_system_job(job["id"]))
+            main._execute_flow_media_generation_job(database.get_system_job(job["id"]))
+
+        render_jobs = [
+            item
+            for item in database.list_system_jobs(video_id=video_id, limit=None)
+            if item["job_type"] == "video_render"
+        ]
+        self.assertEqual(len(render_jobs), 1)
+        self.assertEqual(
+            prepare_media.call_args_list[0].kwargs["flow_video_pending_since"],
+            pending_since,
+        )
+        self.assertTrue(render_jobs[0]["payload"]["media_prepared"])
+        self.assertEqual(
+            render_jobs[0]["payload"]["source_media_job_id"],
+            job["id"],
+        )
+        self.assertEqual(
+            database.get_system_job(job["id"])["status"],
+            "completed",
+        )
+        kick_render.assert_called_once_with()
+
+    def test_flow_media_manifest_rejects_tampering(self):
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-manifest-tamper",
+            "Flow Manifest Tamper",
+            "Transcript",
+            "Script",
+        )
+        media_path = Path(self.temporary_directory.name) / "scene_0.png"
+        media_path.write_bytes(b"stable-scene-media")
+
+        with patch.object(
+            video_production,
+            "VISUAL_PLANS_DIR",
+            Path(self.temporary_directory.name) / "visual-plans",
+        ):
+            saved = video_production.save_flow_media_manifest(
+                video_id,
+                plan_hash="plan-hash",
+                caption_hash="caption-hash",
+                scenes=[{"index": 0}],
+                visual_bible={"style": "documentary"},
+                media_paths=[media_path],
+            )
+            manifest_path = Path(saved["artifact"]["path"])
+            manifest_path.write_bytes(manifest_path.read_bytes() + b"\n")
+
+            with self.assertRaisesRegex(
+                video_production.VideoProductionError,
+                "đã bị thay đổi",
+            ):
+                video_production.load_flow_media_manifest(video_id)
+
+    def test_produce_video_flow_without_comfyui(self):
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-test",
+            "Flow Test Video",
+            "Transcript",
+            "Script",
+        )
+        fake_audio = Path(self.temporary_directory.name) / "audio.mp3"
+        fake_audio.write_bytes(b"dummy audio content")
+        fake_srt = Path(self.temporary_directory.name) / "captions.srt"
+        fake_srt.write_text("1\n00:00:00,000 --> 00:00:30,000\nXin chào các bạn.\n", encoding="utf-8")
+        fake_img = Path(self.temporary_directory.name) / "scene_0.png"
+        fake_img.write_bytes(b"dummy image")
+
+        prepared = {
+            "video": database.get_video(video_id),
+            "audio_path": fake_audio,
+            "srt_path": fake_srt,
+            "caption_hash": "dummy_caption_hash",
+            "plan_hash": "dummy_plan_hash",
+            "windows": [
+                {"index": 0, "start": 0.0, "end": 30.0, "duration": 30.0, "transcript": "Xin chào các bạn."}
+            ],
+        }
+
+        with (
+            patch.object(video_production, "prepare_visual_plan_inputs", return_value=prepared),
+            patch.object(
+                video_production,
+                "generate_scene_media",
+                return_value={
+                    "media_paths": [fake_img],
+                    "intro_video_summary": video_production._empty_intro_video_summary(
+                        enabled=True
+                    ),
+                },
+            ),
+            patch.object(
+                video_production,
+                "render_video",
+                return_value={"id": 1, "video_id": video_id, "artifact_type": "final_mp4", "status": "ready"}
+            ) as mock_render,
+        ):
+            res = video_production.produce_video(
+                video_id=video_id,
+                snapshot={"image_generation_settings": {"style_prompt": "Cinematic"}},
+                progress=lambda msg, stage: None,
+                cancel_check=lambda: None,
+            )
+
+            self.assertIn("artifact", res)
+            self.assertEqual(res["artifact"]["status"], "ready")
+            self.assertEqual(len(res["scenes"]), 1)
+            mock_render.assert_called_once()
+
+    def test_trigger_render_video_recreate_vs_resume_mode(self):
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=sample-mode-test",
+            "Sample Mode Video",
+            "Transcript",
+            "Script",
+        )
+        database.upsert_audio_task(
+            video_id=video_id,
+            request_hash="hash-mode-test",
+            task_id="task-mode-123",
+            status="completed",
+            audio_url="http://127.0.0.1:8080/api/audio/sample_mode.mp3",
+            error="",
+            segments_json="[]",
+            voice_id="sample-voice",
+            voice_name="Sample Voice",
+        )
+        with (
+            patch.object(main, "_kick_production_queue"),
+            patch.object(main, "_kick_flow_media_queue"),
+        ):
+            # 1. Resume mode (default)
+            res_resume = main.trigger_render_video(video_id, mode="resume")
+            self.assertTrue(res_resume["success"])
+            job_resume = database.get_system_job(res_resume["job_id"])
+            self.assertFalse(job_resume["payload"]["force_new_project"])
+            self.assertEqual(job_resume["payload"]["mode"], "resume")
+
+            # 2. Recreate mode
+            res_recreate = main.trigger_render_video(video_id, mode="recreate")
+            self.assertTrue(res_recreate["success"])
+            job_recreate = database.get_system_job(res_recreate["job_id"])
+            self.assertTrue(job_recreate["payload"]["force_new_project"])
+            self.assertEqual(job_recreate["payload"]["mode"], "recreate")
+            self.assertIn("Tạo mới", job_recreate["title"])
+
+    def test_produce_video_propagates_force_new_project(self):
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-force-new",
+            "Force New Video",
+            "Transcript",
+            "Script",
+        )
+        fake_audio = Path(self.temporary_directory.name) / "audio2.mp3"
+        fake_audio.write_bytes(b"dummy audio")
+        fake_srt = Path(self.temporary_directory.name) / "captions2.srt"
+        fake_srt.write_text("1\n00:00:00,000 --> 00:00:30,000\nHello.\n", encoding="utf-8")
+        fake_img = Path(self.temporary_directory.name) / "scene_new.png"
+        fake_img.write_bytes(b"dummy image")
+
+        prepared = {
+            "video": database.get_video(video_id),
+            "audio_path": fake_audio,
+            "srt_path": fake_srt,
+            "caption_hash": "cap_hash",
+            "plan_hash": "plan_hash",
+            "windows": [{"index": 0, "start": 0.0, "end": 30.0, "duration": 30.0, "transcript": "Hello."}],
+        }
+
+        with (
+            patch.object(video_production, "prepare_visual_plan_inputs", return_value=prepared),
+            patch.object(
+                video_production,
+                "generate_scene_media",
+                return_value={
+                    "media_paths": [fake_img],
+                    "intro_video_summary": video_production._empty_intro_video_summary(
+                        enabled=True
+                    ),
+                },
+            ) as mock_gen,
+            patch.object(
+                video_production,
+                "render_video",
+                return_value={"id": 2, "video_id": video_id, "artifact_type": "final_mp4", "status": "ready"},
+            ),
+        ):
+            video_production.produce_video(
+                video_id=video_id,
+                snapshot={"image_generation_settings": {"style_prompt": "Cinematic"}},
+                progress=lambda msg, stage: None,
+                cancel_check=lambda: None,
+                force_new_project=True,
+            )
+
+            mock_gen.assert_called_once()
+            _, kwargs = mock_gen.call_args
+            self.assertTrue(kwargs.get("force_new_project"))
+
+
+    def test_segment_filter_5way_camera_motion(self):
+        scene_30s = {"duration": 30.0, "start": 0.0, "end": 30.0}
+
+        # Mode 0: Zoom In Center
+        f0, l0 = video_production._segment_filter(scene=scene_30s, scene_index=0, subtitle_path=None)
+        self.assertEqual(l0, "current")
+        self.assertIn("d=900", f0)
+        self.assertIn("zoompan=z='1.0+0.18*(on/900)'", f0)
+        self.assertIn("x='(iw-iw/zoom)/2'", f0)
+        self.assertIn("y='(ih-ih/zoom)/2'", f0)
+
+        # Mode 1: Pan Left -> Right
+        f1, _ = video_production._segment_filter(scene=scene_30s, scene_index=1, subtitle_path=None)
+        self.assertIn("zoompan=z='1.0+0.144*(on/900)'", f1)
+        self.assertIn("x='(iw-iw/zoom)*(on/900)'", f1)
+        self.assertIn("y='(ih-ih/zoom)/2'", f1)
+
+        # Mode 2: Zoom Out Center
+        f2, _ = video_production._segment_filter(scene=scene_30s, scene_index=2, subtitle_path=None)
+        self.assertIn("zoompan=z='1.18-0.18*(on/900)'", f2)
+        self.assertIn("x='(iw-iw/zoom)/2'", f2)
+
+        # Mode 3: Pan Right -> Left
+        f3, _ = video_production._segment_filter(scene=scene_30s, scene_index=3, subtitle_path=None)
+        self.assertIn("zoompan=z='1.0+0.144*(on/900)'", f3)
+        self.assertIn("x='(iw-iw/zoom)*(1.0-on/900)'", f3)
+
+        # Mode 4: Diagonal Pan
+        f4, _ = video_production._segment_filter(scene=scene_30s, scene_index=4, subtitle_path=None)
+        self.assertIn("zoompan=z='1.0+0.144*(on/900)'", f4)
+        self.assertIn("x='(iw-iw/zoom)*(on/900)'", f4)
+        self.assertIn("y='(ih-ih/zoom)*(on/900)'", f4)
+
+
+    def test_scene_0_source_variants(self):
+        windows = [{"index": 0, "start": 0.0, "end": 8.0, "duration": 8.0, "transcript": "Mở đầu câu chuyện hấp dẫn"}]
+        script = (
+            "### [THUMBNAIL KHÔNG CHỮ]\n"
+            "Mô tả visual thumbnail không chữ cực đẹp [IMAGE_URL:/api/thumbnails/clean.png]\n\n"
+            "### [THUMBNAIL CÓ CHỮ]\n"
+            "Mô tả visual thumbnail có chữ giật gân [IMAGE_URL:/api/thumbnails/text.png]\n"
+        )
+        plan_clean = video_production.build_default_visual_scene_plan(
+            windows, "Tiêu đề", scene_0_source="from_thumbnail_without_text", generated_script=script
+        )
+        self.assertIn("Mô tả visual không chữ cực đẹp", plan_clean["scenes"][0]["prompt"])
+
+        plan_text = video_production.build_default_visual_scene_plan(
+            windows, "Tiêu đề", scene_0_source="from_thumbnail_with_text", generated_script=script
+        )
+        self.assertIn("Mô tả visual giật gân", plan_text["scenes"][0]["prompt"])
+
+        plan_intro = video_production.build_default_visual_scene_plan(
+            windows, "Tiêu đề", scene_0_source="from_intro_transcript", generated_script=script
+        )
+        self.assertNotIn("không chữ cực đẹp", plan_intro["scenes"][0]["prompt"])
+        self.assertTrue(len(plan_intro["scenes"][0]["action"]) > 10)
+
+
+    def test_sanitize_scene_prompt_context_lowercases_headline_and_strips_punctuation(self):
+        raw_headline = "18 SƯ ĐOÀN VIỆT NAM TỔNG PHẢN CÔNG, KHMER ĐỎ SỤP ĐỔ RA SAO?"
+        cleaned = video_production._sanitize_scene_prompt_context(raw_headline)
+        self.assertNotIn("?", cleaned)
+        self.assertTrue(cleaned.islower())
+        self.assertIn("18 sư đoàn việt nam", cleaned)
+
+    def test_build_default_visual_scene_plan_decouples_subject_from_title(self):
+        windows = [
+            {"index": 0, "start": 0.0, "end": 8.0, "duration": 8.0, "transcript": "Khởi đầu trận chiến"},
+            {"index": 1, "start": 8.0, "end": 38.0, "duration": 30.0, "transcript": "Các đoàn xe tăng tiến về phía trước"},
+        ]
+        title = "18 SƯ ĐOÀN VIỆT NAM TỔNG PHẢN CÔNG, KHMER ĐỎ SỤP ĐỔ RA SAO?"
+        plan = video_production.build_default_visual_scene_plan(windows, title)
+        scene1 = plan["scenes"][1]
+        self.assertNotEqual(scene1["subject"], title)
+        self.assertIn("xe tăng", scene1["action"].lower())
+        self.assertIn("clean visual without text", scene1["prompt"])
+
+    def test_purge_scene_artifacts_from_index(self):
+        video_id = 999
+        temp_dir = Path(self.temporary_directory.name)
+        paths = []
+        for i in range(4):
+            f = temp_dir / f"scene_{i}.png"
+            f.write_text(f"mock image {i}")
+            paths.append(f)
+            database.upsert_video_artifact(
+                video_id=video_id,
+                artifact_type=f"scene:{i}",
+                path=str(f),
+                content_hash=f"hash_{i}",
+                status="completed",
+            )
+        mp4_path = temp_dir / "final.mp4"
+        mp4_path.write_text("mock mp4")
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="final_mp4",
+            path=str(mp4_path),
+            content_hash="mp4_hash",
+            status="ready",
+        )
+
+        removed = video_production.purge_scene_artifacts_from_index(video_id, from_index=2)
+        self.assertEqual(removed, 2)
+
+        self.assertTrue(paths[0].exists())
+        self.assertTrue(paths[1].exists())
+        self.assertFalse(paths[2].exists())
+        self.assertFalse(paths[3].exists())
+        self.assertFalse(mp4_path.exists())
+
+        art0 = database.get_latest_video_artifact(video_id, "scene:0")
+        art1 = database.get_latest_video_artifact(video_id, "scene:1")
+        art2 = database.get_latest_video_artifact(video_id, "scene:2")
+        self.assertIsNotNone(art0)
+        self.assertIsNotNone(art1)
+        self.assertIsNone(art2)
+
+    def test_sanitize_scene_prompt_for_generation_removes_title_across_all_niches(self):
+        # 1. Finance Niche
+        finance_title = "CUỘC KHỦNG HOẢNG NGÂN HÀNG TOÀN CẦU 2026 SẼ DIỄN RA NHƯ THẾ NÀO?"
+        legacy_prompt = (
+            "A cinematic still photograph: Moody finance style. "
+            "Cinematic visual illustrating: Cuộc khủng hoảng ngân hàng toàn cầu 2026 sẽ diễn ra như thế nào?. "
+            "Narrative scene: Ngân hàng trung ương họp khẩn cấp. "
+            "16:9 widescreen, clean visual without text."
+        )
+        cleaned = video_production._sanitize_scene_prompt_for_generation(
+            legacy_prompt,
+            video_title=finance_title,
+            scene_action="Ngân hàng trung ương họp khẩn cấp",
+            style_prompt="Moody finance style",
+        )
+        self.assertNotIn("khủng hoảng ngân hàng", cleaned.lower())
+        self.assertNotIn("cinematic visual illustrating", cleaned.lower())
+        self.assertIn("ngân hàng trung ương họp khẩn cấp", cleaned.lower())
+        self.assertIn("clean visual without text", cleaned.lower())
+
+        # 2. Space Science Niche
+        science_title = "BÍ ẨN HỐ ĐEN SIÊU KHỐI VỪA ĐƯỢC KÍNH JAMES WEBB PHÁT HIỆN"
+        legacy_prompt2 = (
+            "A cinematic photograph: Sci-fi 8k. "
+            "Story theme: Bí ẩn hố đen siêu khối vừa được kính James Webb phát hiện. "
+            "Narrative scene: Kính viễn vọng quan sát thiên hà cổ đại. "
+            "16:9 widescreen."
+        )
+        cleaned2 = video_production._sanitize_scene_prompt_for_generation(
+            legacy_prompt2,
+            video_title=science_title,
+            scene_action="Kính viễn vọng quan sát thiên hà cổ đại",
+            style_prompt="Sci-fi 8k",
+        )
+        self.assertNotIn("hố đen siêu khối", cleaned2.lower())
+        self.assertNotIn("story theme", cleaned2.lower())
+        self.assertIn("kính viễn vọng quan sát thiên hà cổ đại", cleaned2.lower())
+        self.assertIn("clean visual without text", cleaned2.lower())
+
+    def test_build_default_visual_scene_plan_scene0_has_no_title_hook(self):
+        windows = [
+            {"index": 0, "start": 0.0, "end": 8.0, "duration": 8.0, "transcript": "Khởi đầu phân tích tài chính"},
+        ]
+        title = "DỰ BÁO KINH TẾ NĂM 2026"
+        plan = video_production.build_default_visual_scene_plan(windows, title)
+        scene0 = plan["scenes"][0]
+        self.assertNotIn("Story theme:", scene0["prompt"])
+        self.assertNotIn("dramatic opening scene hook for", scene0["prompt"])
+        self.assertIn("clean visual without text", scene0["prompt"])
+
+    def test_video_prompt_explicitly_requests_one_video_with_two_frames(self):
+        prompt = video_production._format_scene_video_prompt(
+            "scene",
+            scene_action="camera moves forward",
+            has_start_frame=True,
+            has_end_frame=True,
+        )
+        self.assertTrue(prompt.startswith("Generate exactly one 16:9 video"))
+        self.assertIn("first attached image", prompt)
+        self.assertIn("second attached image", prompt)
+        self.assertIn("not a still image", prompt)
+
+    def test_scene_media_reuses_one_flow_worker_session_for_images_and_video(self):
+        shared_worker = MagicMock()
+        session_entries = []
+        image_paths = [
+            Path(self.temporary_directory.name) / "scene-0.png",
+            Path(self.temporary_directory.name) / "scene-1.png",
+        ]
+        for index, image_path in enumerate(image_paths):
+            Image.new("RGB", (1376, 768), color=(30 + index, 40, 50)).save(image_path)
+        video_path = Path(self.temporary_directory.name) / "scene-0.mp4"
+        video_path.write_bytes(b"video" * 512)
+
+        @asynccontextmanager
+        async def fake_session(video_id, *, force_new_project=False):
+            session_entries.append((video_id, force_new_project))
+            yield shared_worker
+
+        scenes = [
+            {"index": 0, "prompt": "scene zero", "is_video": True},
+            {"index": 1, "prompt": "scene one", "is_video": False},
+        ]
+        with (
+            patch.object(video_production, "_flow_worker_session", fake_session),
+            patch.object(
+                video_production,
+                "_generate_scene_image_async",
+                AsyncMock(side_effect=image_paths),
+            ) as generate_images,
+            patch.object(
+                video_production,
+                "_generate_scene_video_async",
+                AsyncMock(return_value=video_path),
+            ) as generate_video,
+            patch.object(video_production, "cleanup_duplicate_scene_artifacts"),
+        ):
+            result = video_production.generate_scene_media(
+                video_id=42,
+                scenes=scenes,
+                settings={"enable_intro_video": True},
+                progress=lambda message, stage: None,
+                cancel_check=lambda: None,
+            )
+
+        self.assertEqual(session_entries, [(42, False)])
+        self.assertIs(generate_images.await_args.kwargs["worker"], shared_worker)
+        self.assertIs(generate_video.await_args.kwargs["worker"], shared_worker)
+        self.assertEqual(result["media_paths"], [video_path, image_paths[1]])
+        self.assertEqual(result["intro_video_summary"]["generated_count"], 1)
+
+    def test_scene_media_stops_video_generation_after_confirmed_credit_exhaustion(self):
+        from nexus_engine.services.google_flow_worker import FlowCreditExhausted
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-credit-limit",
+            "Flow credit limit",
+            "Transcript",
+            "Script",
+        )
+        shared_worker = MagicMock()
+        image_paths = []
+        for index in range(3):
+            image_path = Path(self.temporary_directory.name) / f"credit-{index}.png"
+            Image.new("RGB", (1376, 768), color=(30 + index, 40, 50)).save(image_path)
+            image_paths.append(image_path)
+        progress_updates = []
+
+        @asynccontextmanager
+        async def fake_session(_video_id, *, force_new_project=False):
+            yield shared_worker
+
+        scenes = [
+            {"index": 0, "prompt": "scene zero", "is_video": True},
+            {"index": 1, "prompt": "scene one", "is_video": True},
+            {"index": 2, "prompt": "scene two", "is_video": False},
+        ]
+        with (
+            patch.object(video_production, "_flow_worker_session", fake_session),
+            patch.object(
+                video_production,
+                "_generate_scene_image_async",
+                AsyncMock(side_effect=image_paths),
+            ),
+            patch.object(
+                video_production,
+                "_generate_scene_video_async",
+                AsyncMock(
+                    side_effect=FlowCreditExhausted(
+                        "Google Flow reached your credit quota"
+                    )
+                ),
+            ) as generate_video,
+            patch.object(video_production, "cleanup_duplicate_scene_artifacts"),
+        ):
+            result = video_production.generate_scene_media(
+                video_id=video_id,
+                scenes=scenes,
+                settings={"enable_intro_video": True},
+                progress=lambda message, stage: progress_updates.append(
+                    (message, stage)
+                ),
+                cancel_check=lambda: None,
+            )
+
+        generate_video.assert_awaited_once()
+        self.assertEqual(result["media_paths"], image_paths)
+        self.assertEqual(result["intro_video_summary"]["fallback_count"], 2)
+        self.assertEqual(
+            {
+                item["reason_code"]
+                for item in result["intro_video_summary"]["fallback_scenes"]
+            },
+            {"flow_credit_exhausted"},
+        )
+        self.assertIn(
+            "flow_video_credit_exhausted",
+            [stage for _, stage in progress_updates],
+        )
+
+    def test_scene_media_submits_at_most_two_images_per_pass(self):
+        from nexus_engine.services.google_flow_worker import FlowImagePending
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-image-limit",
+            "Flow image limit",
+            "Transcript",
+            "Script",
+        )
+        worker = MagicMock()
+
+        @asynccontextmanager
+        async def fake_session(_video_id, *, force_new_project=False):
+            yield worker
+
+        async def queue_image(**kwargs):
+            scene_index = int(kwargs["scene"]["index"])
+            submitted_at = dt.datetime.now(dt.timezone.utc)
+            receipt = {
+                "request_key": f"image-{scene_index}",
+                "media_type": "image",
+                "scene_index": scene_index,
+                "project_id": "project-test",
+                "prompt_hash": f"prompt-{scene_index}",
+                "frame_hashes": [],
+                "submitted_at": submitted_at.isoformat(),
+                "deadline_at": (submitted_at + dt.timedelta(minutes=10)).isoformat(),
+                "identity_keys": [f"request:image-{scene_index}"],
+                "attempt": 1,
+            }
+            database.upsert_video_artifact(
+                video_id=video_id,
+                artifact_type=f"scene:{scene_index}",
+                path=str(Path(self.temporary_directory.name) / f"scene-{scene_index}.png"),
+                content_hash=f"image-hash-{scene_index}",
+                status="queued",
+                mime_type="image/png",
+                metadata={"flow_receipt": receipt},
+            )
+            raise FlowImagePending("queued", receipt=receipt)
+
+        generate_image = AsyncMock(side_effect=queue_image)
+        scenes = [
+            {"index": index, "prompt": f"scene {index}"}
+            for index in range(5)
+        ]
+        with (
+            patch.object(video_production, "_flow_worker_session", fake_session),
+            patch.object(
+                video_production,
+                "_generate_scene_image_async",
+                generate_image,
+            ),
+            patch.object(video_production, "cleanup_duplicate_scene_artifacts"),
+        ):
+            with self.assertRaises(FlowImagePending) as raised:
+                video_production.generate_scene_media(
+                    video_id=video_id,
+                    scenes=scenes,
+                    settings={"flow_image_max_in_flight": 2},
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                )
+
+        self.assertEqual(generate_image.await_count, 2)
+        self.assertEqual(raised.exception.pending_image_scene_indices, [0, 1, 2, 3, 4])
+
+    def test_scene_media_submits_at_most_four_videos_per_pass(self):
+        from nexus_engine.services.google_flow_worker import FlowVideoPending
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-video-limit",
+            "Flow video limit",
+            "Transcript",
+            "Script",
+        )
+        worker = MagicMock()
+        image_paths = []
+        for index in range(7):
+            image_path = Path(self.temporary_directory.name) / f"limit-{index}.png"
+            Image.new("RGB", (1376, 768), color=(20 + index * 10, 40, 60)).save(
+                image_path
+            )
+            image_paths.append(image_path)
+
+        @asynccontextmanager
+        async def fake_session(_video_id, *, force_new_project=False):
+            yield worker
+
+        async def queue_video(**kwargs):
+            scene_index = int(kwargs["scene"]["index"])
+            submitted_at = dt.datetime.now(dt.timezone.utc)
+            receipt = {
+                "request_key": f"video-{scene_index}",
+                "media_type": "video",
+                "scene_index": scene_index,
+                "project_id": "project-test",
+                "prompt_hash": f"prompt-{scene_index}",
+                "frame_hashes": [],
+                "submitted_at": submitted_at.isoformat(),
+                "deadline_at": (submitted_at + dt.timedelta(minutes=15)).isoformat(),
+                "identity_keys": [f"request:video-{scene_index}"],
+                "attempt": 1,
+            }
+            database.upsert_video_artifact(
+                video_id=video_id,
+                artifact_type=f"scene_video:{scene_index}",
+                path=str(Path(self.temporary_directory.name) / f"clip-{scene_index}.mp4"),
+                content_hash=f"video-hash-{scene_index}",
+                status="queued",
+                mime_type="video/mp4",
+                metadata={"flow_receipt": receipt},
+            )
+            raise FlowVideoPending("queued", receipt=receipt)
+
+        generate_video = AsyncMock(side_effect=queue_video)
+        scenes = [
+            {
+                "index": index,
+                "prompt": f"scene {index}",
+                "is_video": index < 6,
+            }
+            for index in range(7)
+        ]
+        with (
+            patch.object(video_production, "_flow_worker_session", fake_session),
+            patch.object(
+                video_production,
+                "_generate_scene_image_async",
+                AsyncMock(side_effect=image_paths),
+            ),
+            patch.object(
+                video_production,
+                "_generate_scene_video_async",
+                generate_video,
+            ),
+            patch.object(video_production, "cleanup_duplicate_scene_artifacts"),
+        ):
+            with self.assertRaises(FlowVideoPending) as raised:
+                video_production.generate_scene_media(
+                    video_id=video_id,
+                    scenes=scenes,
+                    settings={"intro_video_max_in_flight": 4},
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                )
+
+        self.assertEqual(generate_video.await_count, 4)
+        self.assertEqual(raised.exception.pending_video_scene_indices, [0, 1, 2, 3, 4, 5])
+
+    def test_scene_media_falls_back_when_veo_is_unsupported(self):
+        from nexus_engine.services.google_flow_worker import FlowModeError
+
+        shared_worker = MagicMock()
+        image_paths = [Path(self.temporary_directory.name) / "scene-0.png"]
+        Image.new("RGB", (1376, 768), color=(30, 40, 50)).save(image_paths[0])
+
+        @asynccontextmanager
+        async def fake_session(video_id, *, force_new_project=False):
+            yield shared_worker
+
+        with (
+            patch.object(video_production, "_flow_worker_session", fake_session),
+            patch.object(
+                video_production,
+                "_generate_scene_image_async",
+                AsyncMock(side_effect=image_paths),
+            ),
+            patch.object(
+                video_production,
+                "_generate_scene_video_async",
+                AsyncMock(side_effect=FlowModeError("video mode unavailable")),
+            ) as generate_video,
+            patch.object(video_production, "cleanup_duplicate_scene_artifacts"),
+        ):
+            result = video_production.generate_scene_media(
+                video_id=42,
+                scenes=[{"index": 0, "prompt": "scene", "is_video": True}],
+                settings={"enable_intro_video": True},
+                progress=lambda message, stage: None,
+                cancel_check=lambda: None,
+            )
+
+        generate_video.assert_awaited_once()
+        self.assertEqual(result["media_paths"], image_paths)
+        self.assertEqual(result["intro_video_summary"]["fallback_count"], 1)
+
+    def test_scene_media_propagates_pending_video_without_image_fallback(self):
+        from nexus_engine.services.google_flow_worker import FlowVideoPending
+
+        shared_worker = MagicMock()
+        image_paths = [
+            Path(self.temporary_directory.name) / f"scene-{index}.png"
+            for index in range(3)
+        ]
+        for index, image_path in enumerate(image_paths):
+            Image.new("RGB", (1376, 768), color=(30 + index, 40, 50)).save(image_path)
+
+        @asynccontextmanager
+        async def fake_session(video_id, *, force_new_project=False):
+            yield shared_worker
+
+        with (
+            patch.object(video_production, "_flow_worker_session", fake_session),
+            patch.object(
+                video_production,
+                "_generate_scene_image_async",
+                AsyncMock(side_effect=image_paths),
+            ),
+            patch.object(
+                video_production,
+                "_generate_scene_video_async",
+                AsyncMock(
+                    side_effect=[
+                        FlowVideoPending(
+                            "Flow is still processing scene 0",
+                            queued_since="2026-10-18T01:00:00+00:00",
+                            next_retry_at="2026-10-18T01:01:00+00:00",
+                        ),
+                        FlowVideoPending(
+                            "Flow is still processing scene 1",
+                            queued_since="2026-10-18T01:00:05+00:00",
+                            next_retry_at="2026-10-18T01:01:05+00:00",
+                        ),
+                    ]
+                ),
+            ) as generate_video,
+            patch.object(video_production, "cleanup_duplicate_scene_artifacts"),
+        ):
+            with self.assertRaises(FlowVideoPending) as raised:
+                video_production.generate_scene_media(
+                    video_id=42,
+                    scenes=[
+                        {"index": 0, "prompt": "scene zero", "is_video": True},
+                        {"index": 1, "prompt": "scene one", "is_video": True},
+                        {"index": 2, "prompt": "scene two", "is_video": False},
+                    ],
+                    settings={"enable_intro_video": True},
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                )
+
+        self.assertEqual(generate_video.await_count, 2)
+        self.assertEqual(raised.exception.pending_scene_indices, [0, 1])
+        self.assertEqual(
+            raised.exception.queued_since,
+            "2026-10-18T01:00:00+00:00",
+        )
+
+    def test_scene_media_separates_policy_failure_from_pending_scene(self):
+        from nexus_engine.services.google_flow_worker import (
+            FlowGenerationError,
+            FlowVideoPending,
+        )
+
+        shared_worker = MagicMock()
+        image_paths = [
+            Path(self.temporary_directory.name) / f"scene-{index}.png"
+            for index in range(3)
+        ]
+        for index, image_path in enumerate(image_paths):
+            Image.new("RGB", (1376, 768), color=(30 + index, 40, 50)).save(image_path)
+
+        @asynccontextmanager
+        async def fake_session(video_id, *, force_new_project=False):
+            yield shared_worker
+
+        generate_video = AsyncMock(
+            side_effect=[
+                FlowGenerationError("Policy rejected scene 0"),
+                FlowVideoPending(
+                    "Scene 1 is still processing",
+                    queued_since="2026-10-18T02:00:00+00:00",
+                    next_retry_at="2026-10-18T02:01:00+00:00",
+                ),
+            ]
+        )
+        with (
+            patch.object(video_production, "_flow_worker_session", fake_session),
+            patch.object(
+                video_production,
+                "_generate_scene_image_async",
+                AsyncMock(side_effect=image_paths),
+            ),
+            patch.object(
+                video_production,
+                "_generate_scene_video_async",
+                generate_video,
+            ),
+            patch.object(video_production, "cleanup_duplicate_scene_artifacts"),
+        ):
+            with self.assertRaises(FlowVideoPending) as raised:
+                video_production.generate_scene_media(
+                    video_id=42,
+                    scenes=[
+                        {"index": 0, "prompt": "policy", "is_video": True},
+                        {"index": 1, "prompt": "slow", "is_video": True},
+                        {"index": 2, "prompt": "still", "is_video": False},
+                    ],
+                    settings={"enable_intro_video": True},
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                )
+
+        self.assertEqual(generate_video.await_count, 2)
+        self.assertEqual(raised.exception.pending_scene_indices, [1])
+
+    def test_scene_media_reuses_terminal_video_fallback_without_resubmit(self):
+        from PIL import Image
+        from nexus_engine.services.google_flow_worker import FlowModeError
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-video-checkpoint",
+            "Flow checkpoint",
+            "Transcript",
+            "Script",
+        )
+        image_paths = []
+        for index in range(3):
+            image_path = Path(self.temporary_directory.name) / f"scene-{index}.png"
+            Image.new("RGB", (1376, 768), color=(30 + index, 40, 50)).save(image_path)
+            image_paths.append(image_path)
+
+        scenes = [
+            {"index": 0, "prompt": "scene zero", "is_video": True},
+            {"index": 1, "prompt": "scene one", "is_video": True},
+            {"index": 2, "prompt": "scene two", "is_video": False},
+        ]
+        first_video = Path(self.temporary_directory.name) / "scene-0.mp4"
+        first_video.write_bytes(b"v" * 2048)
+        start_hash = video_production._sha256_file(image_paths[0])
+        end_hash = video_production._sha256_file(image_paths[1])
+        first_hash = video_production._scene_hash(
+            video_id,
+            scenes[0],
+            {},
+            "",
+            f"{start_hash}:{end_hash}",
+        )
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene_video:0",
+            path=str(first_video),
+            content_hash=first_hash,
+            status="completed",
+            mime_type="video/mp4",
+            metadata={"generation_attempt": 1},
+        )
+
+        worker = MagicMock()
+        worker.generate_scene_video = AsyncMock(
+            side_effect=FlowModeError("temporary Veo failure")
+        )
+        worker.download_video = AsyncMock()
+
+        @asynccontextmanager
+        async def fake_session(video_id, *, force_new_project=False):
+            yield worker
+
+        common_patches = (
+            patch.object(video_production, "_flow_worker_session", fake_session),
+            patch.object(
+                video_production,
+                "_generate_scene_image_async",
+                AsyncMock(side_effect=image_paths),
+            ),
+            patch.object(video_production, "cleanup_duplicate_scene_artifacts"),
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        )
+        with common_patches[0], common_patches[1], common_patches[2], common_patches[3], common_patches[4]:
+            first_result = video_production.generate_scene_media(
+                video_id=video_id,
+                scenes=scenes,
+                settings={"enable_intro_video": True},
+                progress=lambda message, stage: None,
+                cancel_check=lambda: None,
+            )
+
+        self.assertEqual(worker.generate_scene_video.await_count, 1)
+        self.assertEqual(
+            database.get_latest_video_artifact(video_id, "scene_video:0")["status"],
+            "completed",
+        )
+        self.assertEqual(
+            database.get_latest_video_artifact(video_id, "scene_video:1")["status"],
+            "failed",
+        )
+        self.assertTrue(
+            database.get_latest_video_artifact(video_id, "scene_video:1")["metadata"][
+                "terminal"
+            ]
+        )
+        self.assertEqual(first_result["media_paths"], [first_video, image_paths[1], image_paths[2]])
+
+        worker.generate_scene_video.reset_mock()
+        worker.generate_scene_video.side_effect = None
+        worker.generate_scene_video.return_value = "https://flow/video/scene-one"
+
+        async def save_video(_url, save_path):
+            Path(save_path).write_bytes(b"v" * 2048)
+
+        worker.download_video.side_effect = save_video
+        with (
+            patch.object(video_production, "_flow_worker_session", fake_session),
+            patch.object(
+                video_production,
+                "_generate_scene_image_async",
+                AsyncMock(side_effect=image_paths),
+            ),
+            patch.object(video_production, "cleanup_duplicate_scene_artifacts"),
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            result = video_production.generate_scene_media(
+                video_id=video_id,
+                scenes=scenes,
+                settings={"enable_intro_video": True},
+                progress=lambda message, stage: None,
+                cancel_check=lambda: None,
+            )
+
+        worker.generate_scene_video.assert_not_awaited()
+        self.assertEqual(result["media_paths"][0], first_video)
+        self.assertEqual(result["media_paths"][1], image_paths[1])
+        self.assertEqual(result["media_paths"][2], image_paths[2])
+
+    def test_scene_image_retries_once_only_for_explicit_flow_error(self):
+        from PIL import Image
+        from nexus_engine.services.google_flow_worker import FlowGenerationError
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-explicit-retry",
+            "Explicit retry",
+            "Transcript",
+            "Script",
+        )
+        worker = MagicMock()
+        worker.generate_scene = AsyncMock(
+            side_effect=[FlowGenerationError("rejected"), "https://flow/image/new"]
+        )
+
+        async def write_image(asset_url, save_path):
+            Image.new("RGB", (1376, 768), color=(10, 20, 30)).save(save_path)
+
+        worker.download_image = AsyncMock(side_effect=write_image)
+        scene = {"index": 0, "prompt": "scene", "action": "action"}
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            result = asyncio.run(
+                video_production._generate_scene_image_async(
+                    video_id=video_id,
+                    scene=scene,
+                    scene_count=1,
+                    profile={},
+                    settings={},
+                    reference_path=None,
+                    reference_id="",
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                    worker=worker,
+                    existing_hashes=set(),
+                )
+            )
+
+        self.assertTrue(result.is_file())
+        self.assertEqual(worker.generate_scene.await_count, 2)
+        for call in worker.generate_scene.await_args_list:
+            self.assertEqual(call.kwargs["scene_index"], 0)
+            self.assertEqual(call.kwargs["scene_count"], 1)
+
+    def test_scene_image_does_not_reuse_cache_from_a_different_plan(self):
+        from PIL import Image, ImageDraw
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=stale-image-cache",
+            "Stale image cache",
+            "Transcript",
+            "Script",
+        )
+        stale_path = Path(self.temporary_directory.name) / "stale-scene.png"
+        Image.new("RGB", (1376, 768), color=(20, 20, 20)).save(stale_path)
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene:0",
+            path=str(stale_path),
+            content_hash="hash-from-an-older-plan",
+            status="completed",
+            mime_type="image/png",
+        )
+        worker = MagicMock()
+        worker.generate_scene = AsyncMock(return_value="https://flow/image/fresh")
+
+        async def write_fresh_image(_asset_url, save_path):
+            image = Image.new("RGB", (1376, 768), color=(235, 235, 235))
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((100, 100, 600, 600), fill=(20, 80, 160))
+            image.save(save_path)
+
+        worker.download_image = AsyncMock(side_effect=write_fresh_image)
+        scene = {
+            "index": 0,
+            "prompt": "A new scene plan with a blue machine inside a bright workshop.",
+            "action": "A technician inspects a blue machine inside a bright workshop",
+        }
+
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            result = asyncio.run(
+                video_production._generate_scene_image_async(
+                    video_id=video_id,
+                    scene=scene,
+                    scene_count=1,
+                    profile={},
+                    settings={},
+                    reference_path=None,
+                    reference_id="",
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                    worker=worker,
+                    existing_hashes=set(),
+                )
+            )
+
+        self.assertNotEqual(result, stale_path)
+        worker.generate_scene.assert_awaited_once()
+        expected_hash = video_production._scene_hash(video_id, scene, {}, "", "")
+        self.assertEqual(
+            database.get_latest_video_artifact(video_id, "scene:0")["content_hash"],
+            expected_hash,
+        )
+
+    def test_scene_image_retries_when_output_is_perceptually_duplicate(self):
+        from PIL import Image, ImageDraw
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=perceptual-duplicate",
+            "Perceptual duplicate",
+            "Transcript",
+            "Script",
+        )
+        previous_path = Path(self.temporary_directory.name) / "previous-scene.png"
+        previous = Image.new("RGB", (1376, 768), color=(230, 230, 230))
+        previous_draw = ImageDraw.Draw(previous)
+        previous_draw.rectangle((0, 0, 688, 768), fill=(25, 25, 25))
+        previous.save(previous_path)
+
+        worker = MagicMock()
+        worker.generate_scene = AsyncMock(
+            side_effect=[
+                "https://flow/image/duplicate",
+                "https://flow/image/unique",
+            ]
+        )
+        download_count = 0
+
+        async def write_generated_image(_asset_url, save_path):
+            nonlocal download_count
+            download_count += 1
+            if download_count == 1:
+                Image.open(previous_path).save(save_path)
+                return
+            image = Image.new("RGB", (1376, 768), color=(30, 70, 130))
+            draw = ImageDraw.Draw(image)
+            draw.ellipse((380, 80, 1000, 700), fill=(245, 200, 40))
+            image.save(save_path)
+
+        worker.download_image = AsyncMock(side_effect=write_generated_image)
+        scene = {
+            "index": 1,
+            "prompt": "A distinct documentary scene inside a laboratory.",
+            "action": "A laboratory team examines a circular instrument",
+        }
+        previous_fingerprint = video_production._image_perceptual_fingerprint(
+            previous_path
+        )
+
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            result = asyncio.run(
+                video_production._generate_scene_image_async(
+                    video_id=video_id,
+                    scene=scene,
+                    scene_count=2,
+                    profile={},
+                    settings={},
+                    reference_path=None,
+                    reference_id="",
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                    worker=worker,
+                    existing_hashes={video_production._sha256_file(previous_path)},
+                    existing_perceptual_hashes=[previous_fingerprint],
+                )
+            )
+
+        self.assertEqual(worker.generate_scene.await_count, 2)
+        self.assertFalse(
+            video_production._perceptual_fingerprints_match(
+                previous_fingerprint,
+                video_production._image_perceptual_fingerprint(result),
+            )
+        )
+
+    def test_reconciled_duplicate_image_submits_a_new_request(self):
+        from PIL import Image, ImageDraw
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=reconciled-image-duplicate",
+            "Reconciled image duplicate",
+            "Transcript",
+            "Script",
+        )
+        scene = {
+            "index": 1,
+            "prompt": "A distinct documentary scene inside a laboratory.",
+            "action": "A laboratory team examines a circular instrument",
+        }
+        content_hash = video_production._scene_hash(video_id, scene, {}, "", "")
+        target = Path(self.temporary_directory.name) / "queued-scene.png"
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene:1",
+            path=str(target),
+            content_hash=content_hash,
+            status="queued",
+            mime_type="image/png",
+            metadata={
+                "generation_attempt": 1,
+                "flow_receipt": {
+                    "request_key": "original-request",
+                    "deadline_at": (
+                        dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)
+                    ).isoformat(),
+                },
+            },
+        )
+        previous_path = Path(self.temporary_directory.name) / "queued-previous.png"
+        previous = Image.new("RGB", (1376, 768), color=(230, 230, 230))
+        ImageDraw.Draw(previous).rectangle((0, 0, 688, 768), fill=(25, 25, 25))
+        previous.save(previous_path)
+        previous_fingerprint = video_production._image_perceptual_fingerprint(
+            previous_path
+        )
+
+        worker = MagicMock()
+        worker.generate_scene = AsyncMock(
+            side_effect=[
+                "https://flow/image/reconciled-duplicate",
+                "https://flow/image/new-composition",
+            ]
+        )
+        download_count = 0
+
+        async def write_generated_image(_asset_url, save_path):
+            nonlocal download_count
+            download_count += 1
+            if download_count == 1:
+                Image.open(previous_path).save(save_path)
+                return
+            image = Image.new("RGB", (1376, 768), color=(30, 70, 130))
+            ImageDraw.Draw(image).ellipse(
+                (380, 80, 1000, 700), fill=(245, 200, 40)
+            )
+            image.save(save_path)
+
+        worker.download_image = AsyncMock(side_effect=write_generated_image)
+
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            asyncio.run(
+                video_production._generate_scene_image_async(
+                    video_id=video_id,
+                    scene=scene,
+                    scene_count=2,
+                    profile={},
+                    settings={},
+                    reference_path=None,
+                    reference_id="",
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                    worker=worker,
+                    existing_hashes={video_production._sha256_file(previous_path)},
+                    existing_perceptual_hashes=[previous_fingerprint],
+                )
+            )
+
+        first_call, second_call = worker.generate_scene.await_args_list
+        self.assertTrue(first_call.kwargs["reconcile_only"])
+        self.assertFalse(second_call.kwargs["reconcile_only"])
+        self.assertNotEqual(
+            first_call.kwargs["request_key"],
+            second_call.kwargs["request_key"],
+        )
+
+    def test_scene_image_timeout_is_scheduled_for_bounded_retry(self):
+        from nexus_engine.services.google_flow_worker import FlowGenerationTimeout, FlowImagePending
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-no-timeout-retry",
+            "No timeout retry",
+            "Transcript",
+            "Script",
+        )
+        worker = MagicMock()
+        worker.generate_scene = AsyncMock(side_effect=FlowGenerationTimeout("timeout"))
+        worker.download_image = AsyncMock()
+        scene = {"index": 0, "prompt": "scene", "action": "action"}
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            with self.assertRaises(FlowImagePending):
+                asyncio.run(
+                    video_production._generate_scene_image_async(
+                        video_id=video_id,
+                        scene=scene,
+                        scene_count=1,
+                        profile={},
+                        settings={},
+                        reference_path=None,
+                        reference_id="",
+                        progress=lambda message, stage: None,
+                        cancel_check=lambda: None,
+                        worker=worker,
+                        existing_hashes=set(),
+                    )
+                )
+
+        self.assertEqual(worker.generate_scene.await_count, 1)
+        artifact = database.get_latest_video_artifact(video_id, "scene:0")
+        self.assertEqual(artifact["status"], "retry_wait")
+        self.assertEqual(artifact["metadata"]["transient_retry_count"], 1)
+        self.assertEqual(artifact["metadata"]["failure_stage"], "generation_timeout")
+
+    def test_scene_image_submission_failure_is_scheduled_for_bounded_retry(self):
+        from nexus_engine.services.google_flow_worker import FlowImagePending, FlowSubmissionError
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-no-submit-retry",
+            "No submission retry",
+            "Transcript",
+            "Script",
+        )
+        worker = MagicMock()
+        worker.generate_scene = AsyncMock(
+            side_effect=FlowSubmissionError("prompt not acknowledged")
+        )
+        worker.download_image = AsyncMock()
+        scene = {"index": 0, "prompt": "scene", "action": "action"}
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            with self.assertRaises(FlowImagePending):
+                asyncio.run(
+                    video_production._generate_scene_image_async(
+                        video_id=video_id,
+                        scene=scene,
+                        scene_count=1,
+                        profile={},
+                        settings={},
+                        reference_path=None,
+                        reference_id="",
+                        progress=lambda message, stage: None,
+                        cancel_check=lambda: None,
+                        worker=worker,
+                        existing_hashes=set(),
+                    )
+                )
+
+        self.assertEqual(worker.generate_scene.await_count, 1)
+        worker.download_image.assert_not_awaited()
+        artifact = database.get_latest_video_artifact(video_id, "scene:0")
+        self.assertEqual(artifact["status"], "retry_wait")
+        self.assertEqual(artifact["metadata"]["transient_retry_count"], 1)
+        self.assertIn("not acknowledged", artifact["metadata"]["error"])
+        self.assertEqual(artifact["metadata"]["failure_stage"], "submit")
+
+    def test_scene_image_pauses_after_three_transient_retries(self):
+        from nexus_engine.services.google_flow_worker import (
+            FlowGenerationTimeout,
+            FlowImageNeedsAttention,
+        )
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-image-retry-exhausted",
+            "Image retry exhausted",
+            "Transcript",
+            "Script",
+        )
+        scene = {"index": 0, "prompt": "scene", "action": "action"}
+        content_hash = video_production._scene_hash(video_id, scene, {}, "", "")
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene:0",
+            path=str(Path(self.temporary_directory.name) / "retry-exhausted.png"),
+            content_hash=content_hash,
+            status="retry_wait",
+            mime_type="image/png",
+            metadata={
+                "generation_attempt": 3,
+                "transient_retry_count": 3,
+                "next_retry_at": (
+                    dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=1)
+                ).isoformat(),
+            },
+        )
+        worker = MagicMock()
+        worker.generate_scene = AsyncMock(side_effect=FlowGenerationTimeout("timeout"))
+        worker.download_image = AsyncMock()
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            with self.assertRaises(FlowImageNeedsAttention):
+                asyncio.run(
+                    video_production._generate_scene_image_async(
+                        video_id=video_id,
+                        scene=scene,
+                        scene_count=1,
+                        profile={},
+                        settings={},
+                        reference_path=None,
+                        reference_id="",
+                        progress=lambda message, stage: None,
+                        cancel_check=lambda: None,
+                        worker=worker,
+                        existing_hashes=set(),
+                    )
+                )
+
+        artifact = database.get_latest_video_artifact(video_id, "scene:0")
+        self.assertEqual(artifact["status"], "failed")
+        self.assertIn("hết 3 lượt", artifact["metadata"]["error"])
+
+    def test_scene_image_agent_interaction_failure_has_distinct_checkpoint_stage(self):
+        from nexus_engine.services.google_flow_worker import FlowAgentInteractionError
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-agent-choice-failed",
+            "Agent choice failed",
+            "Transcript",
+            "Script",
+        )
+        worker = MagicMock()
+        worker.generate_scene = AsyncMock(
+            side_effect=FlowAgentInteractionError("new session unavailable")
+        )
+        worker.download_image = AsyncMock()
+        scene = {"index": 36, "prompt": "scene 37", "action": "action"}
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            with self.assertRaises(FlowAgentInteractionError):
+                asyncio.run(
+                    video_production._generate_scene_image_async(
+                        video_id=video_id,
+                        scene=scene,
+                        scene_count=37,
+                        profile={},
+                        settings={},
+                        reference_path=None,
+                        reference_id="",
+                        progress=lambda message, stage: None,
+                        cancel_check=lambda: None,
+                        worker=worker,
+                        existing_hashes=set(),
+                    )
+                )
+
+        artifact = database.get_latest_video_artifact(video_id, "scene:36")
+        self.assertEqual(artifact["status"], "failed")
+        self.assertEqual(artifact["metadata"]["failure_stage"], "agent_interaction")
+
+    def test_scene_image_invalid_output_is_not_retried(self):
+        from nexus_engine.services.google_flow_worker import FlowInvalidOutputError
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-invalid-output-no-retry",
+            "Invalid output no retry",
+            "Transcript",
+            "Script",
+        )
+        worker = MagicMock()
+        worker.generate_scene = AsyncMock(
+            side_effect=FlowInvalidOutputError("invalid 433x461")
+        )
+        worker.download_image = AsyncMock()
+        scene = {"index": 0, "prompt": "scene", "action": "action"}
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            with self.assertRaises(FlowInvalidOutputError):
+                asyncio.run(
+                    video_production._generate_scene_image_async(
+                        video_id=video_id,
+                        scene=scene,
+                        scene_count=1,
+                        profile={},
+                        settings={},
+                        reference_path=None,
+                        reference_id="",
+                        progress=lambda message, stage: None,
+                        cancel_check=lambda: None,
+                        worker=worker,
+                        existing_hashes=set(),
+                    )
+                )
+
+        self.assertEqual(worker.generate_scene.await_count, 1)
+        worker.download_image.assert_not_awaited()
+        artifact = database.get_latest_video_artifact(video_id, "scene:0")
+        self.assertEqual(artifact["status"], "failed")
+        self.assertIn("433x461", artifact["metadata"]["error"])
+
+    def test_failed_veo_attempt_marks_artifact_failed(self):
+        from PIL import Image
+        from nexus_engine.services.google_flow_worker import FlowModeError
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-veo-failed",
+            "Veo failed",
+            "Transcript",
+            "Script",
+        )
+        start_frame = Path(self.temporary_directory.name) / "start-frame.png"
+        end_frame = Path(self.temporary_directory.name) / "end-frame.png"
+        Image.new("RGB", (1376, 768), color=(30, 40, 50)).save(start_frame)
+        Image.new("RGB", (1376, 768), color=(50, 40, 30)).save(end_frame)
+        worker = MagicMock()
+        worker.generate_scene_video = AsyncMock(
+            side_effect=FlowModeError("video mode unavailable")
+        )
+        worker.download_video = AsyncMock()
+        scene = {"index": 0, "prompt": "scene", "is_video": True}
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            with self.assertRaises(FlowModeError):
+                asyncio.run(
+                    video_production._generate_scene_video_async(
+                        video_id=video_id,
+                        scene=scene,
+                        scene_count=1,
+                        start_frame_path=start_frame,
+                        end_frame_path=end_frame,
+                        profile={},
+                        settings={},
+                        progress=lambda message, stage: None,
+                        cancel_check=lambda: None,
+                        worker=worker,
+                    )
+                )
+
+        artifact = database.get_latest_video_artifact(video_id, "scene_video:0")
+        self.assertEqual(artifact["status"], "failed")
+        self.assertIn("video mode unavailable", artifact["metadata"]["error"])
+        self.assertEqual(artifact["metadata"]["failure_stage"], "legacy_video_mode")
+        self.assertEqual(artifact["metadata"]["reason_code"], "flow_mode_error")
+        self.assertTrue(artifact["metadata"]["terminal"])
+
+    def test_completed_veo_persists_flow_detection_timing(self):
+        from PIL import Image
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-veo-timing",
+            "Veo timing",
+            "Transcript",
+            "Script",
+        )
+        start_frame = Path(self.temporary_directory.name) / "start-frame.png"
+        end_frame = Path(self.temporary_directory.name) / "end-frame.png"
+        Image.new("RGB", (1376, 768), color=(30, 40, 50)).save(start_frame)
+        Image.new("RGB", (1376, 768), color=(50, 40, 30)).save(end_frame)
+        worker = MagicMock()
+        worker.generate_scene_video = AsyncMock(
+            return_value="https://flow-content.google/video/generated.mp4"
+        )
+
+        async def save_video(_url, save_path):
+            Path(save_path).write_bytes(b"v" * 2048)
+
+        worker.download_video = AsyncMock(side_effect=save_video)
+        worker.get_last_video_timing.return_value = {
+            "video_card_seen_elapsed_seconds": 45.25,
+            "playable_url_seen_elapsed_seconds": 45.5,
+            "download_completed_elapsed_seconds": 46.0,
+        }
+        scene = {"index": 0, "prompt": "scene", "is_video": True}
+
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+            patch.object(
+                video_production,
+                "probe_scene_video",
+                return_value={
+                    "duration_seconds": 8.0,
+                    "width": 1920,
+                    "height": 1080,
+                    "video_codec": "h264",
+                },
+            ),
+        ):
+            result = asyncio.run(
+                video_production._generate_scene_video_async(
+                    video_id=video_id,
+                    scene=scene,
+                    scene_count=1,
+                    start_frame_path=start_frame,
+                    end_frame_path=end_frame,
+                    profile={},
+                    settings={},
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                    worker=worker,
+                )
+            )
+
+        self.assertTrue(result.is_file())
+        artifact = database.get_latest_video_artifact(video_id, "scene_video:0")
+        self.assertEqual(artifact["status"], "completed")
+        self.assertEqual(
+            artifact["metadata"]["flow_timing"]["playable_url_seen_elapsed_seconds"],
+            45.5,
+        )
+
+    def test_pending_veo_is_checkpointed_and_reconciled_without_resubmit(self):
+        from PIL import Image
+        from nexus_engine.services.google_flow_worker import FlowVideoPending
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-veo-pending",
+            "Veo pending",
+            "Transcript",
+            "Script",
+        )
+        start_frame = Path(self.temporary_directory.name) / "pending-start.png"
+        end_frame = Path(self.temporary_directory.name) / "pending-end.png"
+        Image.new("RGB", (1376, 768), color=(30, 40, 50)).save(start_frame)
+        Image.new("RGB", (1376, 768), color=(50, 40, 30)).save(end_frame)
+        worker = MagicMock()
+        worker.generate_scene_video = AsyncMock(
+            side_effect=FlowVideoPending("Flow is still processing")
+        )
+        worker.download_video = AsyncMock()
+        worker.get_last_video_timing.return_value = {
+            "submitted_elapsed_seconds": 1.0,
+            "video_error_count_before_submit": 2,
+            "video_tile_count_before_submit": 5,
+        }
+        scene = {"index": 0, "prompt": "scene", "is_video": True}
+
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            with self.assertRaises(FlowVideoPending):
+                asyncio.run(
+                    video_production._generate_scene_video_async(
+                        video_id=video_id,
+                        scene=scene,
+                        scene_count=1,
+                        start_frame_path=start_frame,
+                        end_frame_path=end_frame,
+                        profile={},
+                        settings={},
+                        progress=lambda message, stage: None,
+                        cancel_check=lambda: None,
+                        worker=worker,
+                    )
+                )
+
+        pending = database.get_latest_video_artifact(video_id, "scene_video:0")
+        self.assertEqual(pending["status"], "queued")
+        self.assertTrue(pending["metadata"]["queued_since"])
+        self.assertEqual(pending["metadata"]["reason_code"], "flow_video_pending")
+        self.assertTrue(pending["metadata"]["next_retry_at"])
+        self.assertEqual(pending["metadata"]["reconciliation_poll_count"], 0)
+        self.assertFalse(pending["metadata"]["terminal"])
+        self.assertFalse(Path(pending["path"]).exists())
+        self.assertEqual(video_production.cleanup_duplicate_scene_artifacts(video_id), 0)
+        self.assertEqual(
+            database.get_latest_video_artifact(video_id, "scene_video:0")["status"],
+            "queued",
+        )
+
+        worker.generate_scene_video.side_effect = None
+        worker.generate_scene_video.return_value = "blob:https://flow.google/video-late"
+
+        async def save_video(_url, save_path):
+            Path(save_path).write_bytes(b"v" * 2048)
+
+        worker.download_video.side_effect = save_video
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+            patch.object(
+                video_production,
+                "probe_scene_video",
+                return_value={
+                    "duration_seconds": 8.0,
+                    "width": 1920,
+                    "height": 1080,
+                    "video_codec": "h264",
+                },
+            ),
+        ):
+            result = asyncio.run(
+                video_production._generate_scene_video_async(
+                    video_id=video_id,
+                    scene=scene,
+                    scene_count=1,
+                    start_frame_path=start_frame,
+                    end_frame_path=end_frame,
+                    profile={},
+                    settings={},
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                    worker=worker,
+                )
+            )
+
+        self.assertTrue(result.is_file())
+        self.assertTrue(worker.generate_scene_video.await_args.kwargs["reconcile_only"])
+        self.assertEqual(
+            worker.generate_scene_video.await_args.kwargs[
+                "video_error_count_before_submit"
+            ],
+            2,
+        )
+        self.assertEqual(
+            worker.generate_scene_video.await_args.kwargs[
+                "video_tile_count_before_submit"
+            ],
+            5,
+        )
+        completed = database.get_latest_video_artifact(video_id, "scene_video:0")
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["duration_seconds"], 8.0)
+        self.assertNotIn("error", completed["metadata"])
+        self.assertNotIn("reason_code", completed["metadata"])
+
+    def test_scene_video_rejects_duplicate_download_hash(self):
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-duplicate-video",
+            "Duplicate Flow video",
+            "Transcript",
+            "Script",
+        )
+        start_frame = Path(self.temporary_directory.name) / "duplicate-start.png"
+        end_frame = Path(self.temporary_directory.name) / "duplicate-end.png"
+        Image.new("RGB", (1376, 768), color=(30, 40, 50)).save(start_frame)
+        Image.new("RGB", (1376, 768), color=(50, 40, 30)).save(end_frame)
+        duplicate_bytes = b"same-video" * 256
+        known_clip = Path(self.temporary_directory.name) / "known.mp4"
+        known_clip.write_bytes(duplicate_bytes)
+        worker = MagicMock()
+        worker.generate_scene_video = AsyncMock(return_value="https://flow/video/duplicate")
+
+        async def save_duplicate(_url, save_path):
+            Path(save_path).write_bytes(duplicate_bytes)
+
+        worker.download_video = AsyncMock(side_effect=save_duplicate)
+        worker.get_last_video_timing.return_value = {}
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+            patch.object(
+                video_production,
+                "probe_scene_video",
+                return_value={
+                    "duration_seconds": 8.0,
+                    "width": 1920,
+                    "height": 1080,
+                    "video_codec": "h264",
+                },
+            ),
+        ):
+            with self.assertRaises(video_production.SceneVideoDuplicateError):
+                asyncio.run(
+                    video_production._generate_scene_video_async(
+                        video_id=video_id,
+                        scene={"index": 1, "prompt": "scene", "is_video": True},
+                        scene_count=2,
+                        start_frame_path=start_frame,
+                        end_frame_path=end_frame,
+                        profile={},
+                        settings={},
+                        progress=lambda message, stage: None,
+                        cancel_check=lambda: None,
+                        worker=worker,
+                        existing_video_hashes={video_production._sha256_file(known_clip)},
+                    )
+                )
+
+        artifact = database.get_latest_video_artifact(video_id, "scene_video:1")
+        self.assertEqual(artifact["status"], "failed")
+        self.assertEqual(
+            artifact["metadata"]["reason_code"],
+            "scene_video_duplicate_error",
+        )
+
+    def test_pending_veo_falls_back_only_after_reconciliation_ttl_expires(self):
+        from PIL import Image
+        from nexus_engine.services.google_flow_worker import FlowVideoWaitExpired
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-veo-expired",
+            "Veo expired",
+            "Transcript",
+            "Script",
+        )
+        start_frame = Path(self.temporary_directory.name) / "expired-start.png"
+        end_frame = Path(self.temporary_directory.name) / "expired-end.png"
+        Image.new("RGB", (1376, 768), color=(30, 40, 50)).save(start_frame)
+        Image.new("RGB", (1376, 768), color=(50, 40, 30)).save(end_frame)
+        scene = {"index": 0, "prompt": "scene", "is_video": True}
+        start_hash = video_production._sha256_file(start_frame)
+        end_hash = video_production._sha256_file(end_frame)
+        content_hash = video_production._scene_hash(
+            video_id,
+            scene,
+            {},
+            "",
+            f"{start_hash}:{end_hash}",
+        )
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene_video:0",
+            path=str(Path(self.temporary_directory.name) / "expired.mp4"),
+            content_hash=content_hash,
+            status="queued",
+            mime_type="video/mp4",
+            metadata={
+                "generation_attempt": 1,
+                "queued_since": (
+                    dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=2)
+                ).isoformat(),
+            },
+        )
+        worker = MagicMock()
+        worker.generate_scene_video = AsyncMock()
+        worker.get_last_video_timing.return_value = {}
+
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            with self.assertRaises(FlowVideoWaitExpired):
+                asyncio.run(
+                    video_production._generate_scene_video_async(
+                        video_id=video_id,
+                        scene=scene,
+                        scene_count=1,
+                        start_frame_path=start_frame,
+                        end_frame_path=end_frame,
+                        profile={},
+                        settings={"intro_video_max_wait_seconds": 60},
+                        progress=lambda message, stage: None,
+                        cancel_check=lambda: None,
+                        worker=worker,
+                    )
+                )
+
+        worker.generate_scene_video.assert_not_awaited()
+        expired = database.get_latest_video_artifact(video_id, "scene_video:0")
+        self.assertEqual(expired["status"], "failed")
+        self.assertEqual(expired["metadata"]["reason_code"], "flow_video_wait_expired")
+
+    def test_flow_video_job_deadline_does_not_expire_unstarted_later_scenes(self):
+        from PIL import Image
+        from nexus_engine.services.google_flow_worker import FlowVideoPending
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-job-deadline",
+            "Flow job deadline",
+            "Transcript",
+            "Script",
+        )
+        start_frame = Path(self.temporary_directory.name) / "deadline-start.png"
+        end_frame = Path(self.temporary_directory.name) / "deadline-end.png"
+        Image.new("RGB", (1376, 768), color=(30, 40, 50)).save(start_frame)
+        Image.new("RGB", (1376, 768), color=(50, 40, 30)).save(end_frame)
+        worker = MagicMock()
+        worker.generate_scene_video = AsyncMock(
+            side_effect=FlowVideoPending("Later scene is pending")
+        )
+        worker.download_video = AsyncMock()
+        worker.get_last_video_timing.return_value = {}
+
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            with self.assertRaises(FlowVideoPending):
+                asyncio.run(
+                    video_production._generate_scene_video_async(
+                        video_id=video_id,
+                        scene={"index": 1, "prompt": "later scene", "is_video": True},
+                        scene_count=3,
+                        start_frame_path=start_frame,
+                        end_frame_path=end_frame,
+                        profile={},
+                        settings={
+                            "intro_video_max_wait_seconds": 60,
+                            "_flow_video_pending_since": (
+                                dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=2)
+                            ).isoformat(),
+                        },
+                        progress=lambda message, stage: None,
+                        cancel_check=lambda: None,
+                        worker=worker,
+                    )
+                )
+
+        worker.generate_scene_video.assert_awaited_once()
+        pending = database.get_latest_video_artifact(video_id, "scene_video:1")
+        self.assertEqual(pending["status"], "queued")
+        self.assertFalse(pending["metadata"]["terminal"])
+
+    def test_terminal_flow_video_failure_is_not_resubmitted(self):
+        from PIL import Image
+        from nexus_engine.services.google_flow_worker import FlowGenerationError
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-terminal-cache",
+            "Flow terminal cache",
+            "Transcript",
+            "Script",
+        )
+        start_frame = Path(self.temporary_directory.name) / "terminal-start.png"
+        end_frame = Path(self.temporary_directory.name) / "terminal-end.png"
+        Image.new("RGB", (1376, 768), color=(30, 40, 50)).save(start_frame)
+        Image.new("RGB", (1376, 768), color=(50, 40, 30)).save(end_frame)
+        scene = {"index": 0, "prompt": "terminal scene", "is_video": True}
+        content_hash = video_production._scene_hash(
+            video_id,
+            scene,
+            {},
+            "",
+            (
+                f"{video_production._sha256_file(start_frame)}:"
+                f"{video_production._sha256_file(end_frame)}"
+            ),
+        )
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene_video:0",
+            path=str(Path(self.temporary_directory.name) / "terminal.mp4"),
+            content_hash=content_hash,
+            status="failed",
+            mime_type="video/mp4",
+            metadata={
+                "generation_attempt": 1,
+                "reason_code": "flow_generation_error",
+                "error": "Google Flow từ chối yêu cầu theo policy.",
+            },
+        )
+        worker = MagicMock()
+        worker.generate_scene_video = AsyncMock()
+
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            with self.assertRaises(FlowGenerationError):
+                asyncio.run(
+                    video_production._generate_scene_video_async(
+                        video_id=video_id,
+                        scene=scene,
+                        scene_count=1,
+                        start_frame_path=start_frame,
+                        end_frame_path=end_frame,
+                        profile={},
+                        settings={},
+                        progress=lambda message, stage: None,
+                        cancel_check=lambda: None,
+                        worker=worker,
+                    )
+                )
+
+        worker.generate_scene_video.assert_not_awaited()
+
+    def test_pending_flow_media_job_is_rescheduled_without_render_handoff(self):
+        from nexus_engine.services.google_flow_worker import FlowVideoPending
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-pending-job",
+            "Pending Flow job",
+            "Transcript",
+            "Script",
+        )
+        job = database.create_system_job(
+            job_id="flow-media-pending",
+            job_type="flow_media_generation",
+            title="Tạo media",
+            payload={"video_id": video_id},
+            video_id=video_id,
+        )
+        database.update_system_job(job["id"], status="running")
+
+        pending_since = (
+            dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5)
+        ).isoformat()
+        main._handle_production_job_error(
+            database.get_system_job(job["id"]),
+            FlowVideoPending(
+                "Flow is still processing",
+                queued_since=pending_since,
+                pending_scene_indices=[1, 3],
+                reconciliation_poll_count=4,
+                retry_delay_seconds=75.0,
+            ),
+        )
+
+        waiting = database.get_system_job(job["id"])
+        self.assertEqual(waiting["status"], "retry_wait")
+        self.assertEqual(waiting["resume_from_step"], "flow_video_reconcile")
+        self.assertEqual(
+            waiting["result"]["flow_video_pending_since"],
+            pending_since,
+        )
+        self.assertEqual(waiting["result"]["pending_scene_indices"], [1, 3])
+        self.assertEqual(waiting["result"]["reconcile_pending_count"], 2)
+        self.assertEqual(waiting["result"]["reconcile_poll_count"], 4)
+        center_item = main._system_job_center_item(waiting, None)
+        self.assertEqual(center_item["reconcile_pending_count"], 2)
+        self.assertEqual(center_item["reconcile_poll_count"], 4)
+        self.assertEqual(center_item["pending_scene_indices"], [1, 3])
+        main._handle_production_job_error(
+            waiting,
+            FlowVideoPending(
+                "Flow is still processing",
+                queued_since=dt.datetime.now(dt.timezone.utc).isoformat(),
+            ),
+        )
+        retried = database.get_system_job(job["id"])
+        self.assertEqual(
+            retried["result"]["flow_video_pending_since"],
+            pending_since,
+        )
+        render_jobs = [
+            item
+            for item in database.list_system_jobs(video_id=video_id, limit=None)
+            if item["job_type"] == "video_render"
+        ]
+        self.assertEqual(render_jobs, [])
+
+    def test_flow_image_attention_pauses_media_job(self):
+        from nexus_engine.services.google_flow_worker import FlowImageNeedsAttention
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-image-attention",
+            "Flow image attention",
+            "Transcript",
+            "Script",
+        )
+        job = database.create_system_job(
+            job_id="flow-image-attention",
+            job_type="flow_media_generation",
+            title="Tạo media",
+            payload={"video_id": video_id},
+            video_id=video_id,
+        )
+        database.update_system_job(job["id"], status="running")
+
+        main._handle_production_job_error(
+            database.get_system_job(job["id"]),
+            FlowImageNeedsAttention("Image generation needs attention"),
+        )
+
+        paused = database.get_system_job(job["id"])
+        self.assertEqual(paused["status"], "paused")
+        self.assertEqual(
+            paused["result"]["attention_required"],
+            "flow_image_generation",
+        )
+        self.assertEqual(paused["next_retry_at"], "")
+
+    def test_scene_video_does_not_reuse_cache_from_a_different_plan(self):
+        from PIL import Image
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=stale-video-cache",
+            "Stale video cache",
+            "Transcript",
+            "Script",
+        )
+        start_frame = Path(self.temporary_directory.name) / "fresh-start.png"
+        end_frame = Path(self.temporary_directory.name) / "fresh-end.png"
+        Image.new("RGB", (1376, 768), color=(20, 60, 100)).save(start_frame)
+        Image.new("RGB", (1376, 768), color=(100, 60, 20)).save(end_frame)
+        stale_video = Path(self.temporary_directory.name) / "stale-scene.mp4"
+        stale_video.write_bytes(b"s" * 2048)
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene_video:0",
+            path=str(stale_video),
+            content_hash="hash-from-an-older-video-plan",
+            status="completed",
+            mime_type="video/mp4",
+        )
+        worker = MagicMock()
+        worker.generate_scene_video = AsyncMock(
+            return_value="https://flow/video/fresh"
+        )
+
+        async def save_fresh_video(_url, save_path):
+            Path(save_path).write_bytes(b"n" * 2048)
+
+        worker.download_video = AsyncMock(side_effect=save_fresh_video)
+        worker.get_last_video_timing.return_value = {}
+        scene = {
+            "index": 0,
+            "prompt": "A completely new animated scene inside a workshop.",
+            "action": "A technician walks around a newly assembled machine",
+            "is_video": True,
+        }
+
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+            patch.object(
+                video_production,
+                "probe_scene_video",
+                return_value={
+                    "duration_seconds": 8.0,
+                    "width": 1920,
+                    "height": 1080,
+                    "video_codec": "h264",
+                },
+            ),
+        ):
+            result = asyncio.run(
+                video_production._generate_scene_video_async(
+                    video_id=video_id,
+                    scene=scene,
+                    scene_count=1,
+                    start_frame_path=start_frame,
+                    end_frame_path=end_frame,
+                    profile={},
+                    settings={},
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                    worker=worker,
+                )
+            )
+
+        self.assertNotEqual(result, stale_video)
+        worker.generate_scene_video.assert_awaited_once()
+        start_hash = video_production._sha256_file(start_frame)
+        end_hash = video_production._sha256_file(end_frame)
+        expected_hash = video_production._scene_hash(
+            video_id,
+            scene,
+            {},
+            "",
+            f"{start_hash}:{end_hash}",
+        )
+        self.assertEqual(
+            database.get_latest_video_artifact(video_id, "scene_video:0")[
+                "content_hash"
+            ],
+            expected_hash,
+        )
+
+    def test_missing_end_frame_marks_checkpoint_failed_before_submit(self):
+        from PIL import Image
+        from nexus_engine.services.google_flow_worker import FlowFrameAttachmentError
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-missing-end-frame",
+            "Missing end frame",
+            "Transcript",
+            "Script",
+        )
+        start_frame = Path(self.temporary_directory.name) / "start-frame.png"
+        Image.new("RGB", (1376, 768), color=(30, 40, 50)).save(start_frame)
+        worker = MagicMock()
+        worker.generate_scene_video = AsyncMock()
+        scene = {"index": 0, "prompt": "scene", "is_video": True}
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            with self.assertRaises(FlowFrameAttachmentError):
+                asyncio.run(
+                    video_production._generate_scene_video_async(
+                        video_id=video_id,
+                        scene=scene,
+                        scene_count=1,
+                        start_frame_path=start_frame,
+                        end_frame_path=None,
+                        profile={},
+                        settings={},
+                        progress=lambda message, stage: None,
+                        cancel_check=lambda: None,
+                        worker=worker,
+                    )
+                )
+
+        worker.generate_scene_video.assert_not_awaited()
+        artifact = database.get_latest_video_artifact(video_id, "scene_video:0")
+        self.assertEqual(artifact["status"], "failed")
+        self.assertEqual(artifact["metadata"]["failure_stage"], "frame_sync")
+
+    def test_custom_video_motion_prompt_formatting(self):
+        prompt = video_production._format_scene_video_prompt(
+            "scene",
+            scene_action="nhân vật bước vào phòng",
+            style_prompt="Cinematic dark noir",
+            video_motion_prompt="Motion: slow dramatic dolly in, 4k 24fps.",
+            has_start_frame=True,
+            has_end_frame=False,
+        )
+        self.assertIn("Motion: slow dramatic dolly in, 4k 24fps.", prompt)
+        self.assertIn("Visual style: Cinematic dark noir.", prompt)
+        self.assertIn("Clean video without any text", prompt)
+
+    def test_build_default_visual_scene_plan_with_custom_templates(self):
+        windows = [
+            {"index": 0, "start": 0.0, "end": 8.0, "duration": 8.0, "transcript": "Mở đầu câu chuyện", "is_video": True},
+            {"index": 1, "start": 8.0, "end": 35.0, "duration": 27.0, "transcript": "Thân bài phân đoạn một", "is_video": False},
+        ]
+        custom_scene_0 = "TEMPLATE 0: {style} | Action: {action} | Ref: {reference}"
+        custom_body = "TEMPLATE BODY {scene_index}: {style} | Action: {action}"
+        plan = video_production.build_default_visual_scene_plan(
+            windows,
+            "Tiêu đề Test",
+            style_prompt="8k documentary",
+            scene_0_prompt_template=custom_scene_0,
+            scene_body_prompt_template=custom_body,
+        )
+        scene0 = plan["scenes"][0]
+        scene1 = plan["scenes"][1]
+        self.assertIn("TEMPLATE 0: 8k documentary", scene0["prompt"])
+        self.assertIn("Action:", scene0["prompt"])
+        self.assertTrue(len(scene0["action"]) > 5)
+        self.assertIn("TEMPLATE BODY 2: 8k documentary", scene1["prompt"])
+        self.assertIn("Action:", scene1["prompt"])
+        self.assertTrue(len(scene1["action"]) > 5)
+
+
+if __name__ == "__main__":
+    unittest.main()

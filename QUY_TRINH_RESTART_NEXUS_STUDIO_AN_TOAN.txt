@@ -1,30 +1,30 @@
-QUY TRÌNH RESTART NEXUS STUDIO ENGINE AN TOÀN SAU KHI SỬA CODE
-================================================================
+QUY TRINH RESTART NEXUS STUDIO ENGINE AN TOAN
+==============================================
 
-Phạm vi dự án:
+Pham vi: E:\yt\Tool\Nexus_Studio_Engine
 
-E:\yt\Tool\Nexus_Studio_Engine
+1. Chay test, lint va build phu hop voi thay doi.
+2. Kiem tra GET http://127.0.0.1:8080/api/system/maintenance-status.
+3. Chi tiep tuc khi safe_to_restart=true va total_blocking_jobs=0.
+4. Neu endpoint khong phan hoi, chay guard canonical:
 
-Sau khi sửa code, phải áp dụng đúng quy trình dưới đây. Không được restart ngay nếu chưa xác nhận hệ thống đang idle.
+   $env:PYTHONPATH = "$PWD\src"
+   .\.venv\Scripts\python.exe -m nexus_engine.services.maintenance_guard
 
+   Neu khong xac minh duoc idle thi coi la busy va KHONG restart.
 
-1. QUY TẮC BẮT BUỘC
---------------------
-
-1. Không làm gián đoạn job đang render, tạo scene, tạo audio, upload hoặc publish.
-2. Không tự thay đổi trạng thái job trong SQLite để vượt qua kiểm tra idle.
-3. Không dùng taskkill hàng loạt đối với python.exe, node.exe hoặc chrome.exe.
-4. Không đóng Chrome cá nhân của người dùng.
-5. Chỉ dùng entrypoint:
+5. Restart bang duy nhat entrypoint:
 
    E:\yt\Tool\Nexus_Studio_Engine\run_nexus_restart.bat
 
-6. Không gọi riêng stop và start nếu wrapper restart vẫn sử dụng được.
-7. Không kết luận thành công chỉ dựa vào exit code hoặc dòng chữ "restarted successfully".
-8. Phải xác minh đủ năm thành phần:
+6. Xac minh ba core service:
 
-   - Backend API.
-   - Frontend UI.
-   - OmniVoice TTS.
-   - ChatGPT Browser Service.
-   - Google Flow Browser Service.
+   - Backend API: http://127.0.0.1:8080
+   - Frontend UI: http://127.0.0.1:5173
+   - OmniVoice: http://127.0.0.1:8011
+
+ChatGPT va Google Flow la dich vu on-demand. Startup khong duoc tu mo GPM,
+profile ChatGPT, Google Flow, scanner, comment job hoac channel job.
+
+Khong taskkill hang loat python.exe, node.exe hoac chrome.exe. Stop chi duoc
+dung ownership marker/command line cua du an va khong dong browser ca nhan.
