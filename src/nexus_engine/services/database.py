@@ -968,6 +968,18 @@ def init_db():
         'CREATE INDEX IF NOT EXISTS idx_system_jobs_queue '
         'ON system_jobs(job_type, status, created_at)'
     )
+    c.execute(
+        'CREATE INDEX IF NOT EXISTS idx_system_jobs_status_created '
+        'ON system_jobs(status, created_at DESC)'
+    )
+    c.execute(
+        'CREATE INDEX IF NOT EXISTS idx_system_jobs_created '
+        'ON system_jobs(created_at DESC)'
+    )
+    c.execute(
+        'CREATE INDEX IF NOT EXISTS idx_system_jobs_video_id '
+        'ON system_jobs(video_id)'
+    )
     c.execute('''
         CREATE TABLE IF NOT EXISTS youtube_channels (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4263,6 +4275,46 @@ def _decode_system_job(row: sqlite3.Row | None) -> dict | None:
     return job
 
 
+def _fast_system_job(row: sqlite3.Row | None) -> dict | None:
+    if row is None:
+        return None
+    job = dict(row)
+    job["payload"] = {}
+    job["result"] = {}
+    for field in SYSTEM_JOB_JSON_FIELDS:
+        job.pop(field, None)
+    job["cancel_requested"] = bool(job.get("cancel_requested"))
+    return job
+
+
+def get_system_jobs_payload_and_result(job_ids: list[str]) -> dict[str, tuple[dict, dict]]:
+    if not job_ids:
+        return {}
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.row_factory = sqlite3.Row
+    placeholders = ", ".join("?" for _ in job_ids)
+    rows = conn.execute(
+        f"SELECT id, payload_json, result_json FROM system_jobs WHERE id IN ({placeholders})",
+        job_ids,
+    ).fetchall()
+    conn.close()
+    result = {}
+    for r in rows:
+        jid = r["id"]
+        try:
+            p = json.loads(r["payload_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            p = {}
+        try:
+            res = json.loads(r["result_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            res = {}
+        result[jid] = (p, res)
+    return result
+
+
 def create_system_job(
     job_id: str,
     job_type: str,
@@ -4437,8 +4489,13 @@ def list_system_jobs(
     limit: int | None = 100,
     job_type: str | None = None,
     video_id: int | None = None,
+    statuses: list[str] | set[str] | tuple[str, ...] | None = None,
+    offset: int = 0,
+    include_json: bool = True,
 ) -> list[dict]:
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     filters = [
@@ -4451,13 +4508,35 @@ def list_system_jobs(
     if video_id is not None:
         filters.append("system_jobs.video_id = ?")
         params.append(video_id)
+    if statuses:
+        status_list = list(statuses)
+        placeholders = ", ".join("?" for _ in status_list)
+        filters.append(f"system_jobs.status IN ({placeholders})")
+        params.extend(status_list)
     where_clause = f" WHERE {' AND '.join(filters)}"
-    limit_clause = " LIMIT ?" if limit is not None else ""
+    limit_clause = ""
     if limit is not None:
-        params.append(max(1, min(int(limit), 500)))
+        limit_val = max(1, min(int(limit), 500))
+        if offset > 0:
+            limit_clause = " LIMIT ? OFFSET ?"
+            params.extend([limit_val, max(0, int(offset))])
+        else:
+            limit_clause = " LIMIT ?"
+            params.append(limit_val)
+    if include_json:
+        select_fields = "system_jobs.*"
+    else:
+        select_fields = (
+            "system_jobs.id, system_jobs.job_type, system_jobs.status, system_jobs.title, "
+            "system_jobs.progress, system_jobs.error, system_jobs.video_id, system_jobs.prompt_version, "
+            "system_jobs.voice_id, system_jobs.voice_name, system_jobs.tts_provider_id, "
+            "system_jobs.voice_revision, system_jobs.attempt, system_jobs.recovery_count, "
+            "system_jobs.resume_from_step, system_jobs.next_retry_at, system_jobs.cancel_requested, "
+            "system_jobs.created_at, system_jobs.updated_at, system_jobs.started_at, system_jobs.finished_at"
+        )
     c.execute(
         f'''
-        SELECT system_jobs.*,
+        SELECT {select_fields},
                videos.url AS video_url,
                videos.title AS original_title,
                videos.generated_title AS generated_title
@@ -4471,7 +4550,104 @@ def list_system_jobs(
     )
     rows = c.fetchall()
     conn.close()
+    if not include_json:
+        return [_fast_system_job(row) for row in rows]
     return [_decode_system_job(row) for row in rows]
+
+
+def get_system_jobs_summary_counts(
+    job_type: str | None = None,
+) -> dict[str, int]:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    c = conn.cursor()
+    sys_filters = ["(system_jobs.video_id IS NULL OR videos.video_status = ?)"]
+    sys_params: list = [VIDEO_STATUS_ACTIVE]
+    normalized_type = str(job_type or "").strip()
+    if normalized_type == "all":
+        normalized_type = ""
+
+    include_system = False
+    include_audio = False
+    include_audio_review = False
+
+    if normalized_type == "youtube_publish":
+        sys_filters.append("system_jobs.job_type IN ('youtube_publish', 'youtube_upload')")
+        include_system = True
+    elif normalized_type in {
+        "video_generation", "fb_crosspost", "fb_crosspost_sync",
+        "flow_media_generation", "muse_media_generation", "video_render",
+        "video_qc", "visual_scene_plan", "competitor_scan", "comment_sync",
+        "comment_draft", "comment_publish", "comment_video_import",
+        "trust_builder_session", "thumbnail_generation", "tiktok_publish",
+    }:
+        sys_filters.append("system_jobs.job_type = ?")
+        sys_params.append(normalized_type)
+        include_system = True
+    elif not normalized_type:
+        include_system = True
+        include_audio = True
+        include_audio_review = True
+    elif normalized_type == "audio":
+        include_audio = True
+    elif normalized_type == "audio_review":
+        include_audio_review = True
+
+    total = 0
+    active = 0
+    error = 0
+
+    if include_system:
+        where_clause = f" WHERE {' AND '.join(sys_filters)}"
+        c.execute(
+            f'''
+            SELECT 
+                COUNT(1) AS total,
+                SUM(CASE WHEN system_jobs.status IN ('queued', 'running', 'retry_wait', 'paused') THEN 1 ELSE 0 END) AS active,
+                SUM(CASE WHEN system_jobs.status IN ('error', 'failed', 'review_blocked') THEN 1 ELSE 0 END) AS error
+            FROM system_jobs
+            LEFT JOIN videos ON videos.id = system_jobs.video_id
+            {where_clause}
+            ''',
+            sys_params,
+        )
+        row = c.fetchone()
+        if row:
+            total += int(row[0] or 0)
+            active += int(row[1] or 0)
+            error += int(row[2] or 0)
+
+    if include_audio:
+        c.execute('''
+            SELECT 
+                COUNT(1) AS total,
+                SUM(CASE WHEN status IN ('queued', 'pending', 'processing') THEN 1 ELSE 0 END) AS active,
+                SUM(CASE WHEN status IN ('failed', 'interrupted') THEN 1 ELSE 0 END) AS error
+            FROM audio_tasks
+        ''')
+        row = c.fetchone()
+        if row:
+            total += int(row[0] or 0)
+            active += int(row[1] or 0)
+            error += int(row[2] or 0)
+
+    if include_audio_review:
+        c.execute('''
+            SELECT 
+                COUNT(1) AS total,
+                SUM(CASE WHEN status IN ('queued', 'pending', 'processing') THEN 1 ELSE 0 END) AS active,
+                SUM(CASE WHEN status IN ('failed', 'rejected') THEN 1 ELSE 0 END) AS error
+            FROM audio_reviews
+        ''')
+        row = c.fetchone()
+        if row:
+            total += int(row[0] or 0)
+            active += int(row[1] or 0)
+            error += int(row[2] or 0)
+
+    conn.close()
+    return {"total": total, "active": active, "error": error}
 
 
 def list_active_system_jobs(job_type: str | None = None) -> list[dict]:

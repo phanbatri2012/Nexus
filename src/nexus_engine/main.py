@@ -9755,9 +9755,88 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
     }
 
 
+def _populate_system_job_payload_result(item: dict, payload: dict, result: dict) -> None:
+    item["payload"] = payload
+    item["result"] = result
+    job_type = item.get("type", "")
+    if job_type == "video_generation":
+        item["pipeline"] = chatgpt_projects.normalize_prompt_pipeline(payload.get("pipeline"))
+    if not item.get("video_url") and payload.get("url"):
+        item["video_url"] = payload.get("url")
+    if not item.get("title") and payload.get("url"):
+        item["title"] = payload.get("url")
+    if not item.get("attention_required") and result.get("attention_required"):
+        item["attention_required"] = result.get("attention_required", "")
+    if not item.get("automatic_login") and result.get("automatic_login"):
+        item["automatic_login"] = result.get("automatic_login", "")
+    if not item.get("missing_configuration") and result.get("missing_configuration"):
+        item["missing_configuration"] = result.get("missing_configuration") or []
+    if result.get("reconcile_pending_count"):
+        item["reconcile_pending_count"] = max(0, int(result.get("reconcile_pending_count") or 0))
+    if result.get("reconcile_poll_count"):
+        item["reconcile_poll_count"] = max(0, int(result.get("reconcile_poll_count") or 0))
+    if result.get("pending_scene_indices"):
+        item["pending_scene_indices"] = [int(i) for i in result.get("pending_scene_indices") or [] if str(i).lstrip("-").isdigit()]
+    if result.get("pending_image_scene_indices"):
+        item["pending_image_scene_indices"] = [int(i) for i in result.get("pending_image_scene_indices") or [] if str(i).lstrip("-").isdigit()]
+    if result.get("pending_video_scene_indices"):
+        item["pending_video_scene_indices"] = [int(i) for i in result.get("pending_video_scene_indices") or [] if str(i).lstrip("-").isdigit()]
+    if isinstance(result.get("flow_media_progress"), dict):
+        item["flow_media_progress"] = result["flow_media_progress"]
+    if isinstance(result.get("muse_media_progress"), dict):
+        item["muse_media_progress"] = result["muse_media_progress"]
+    raw_intro = result.get("intro_video_summary")
+    if isinstance(raw_intro, dict):
+        def _summary_int(val: object) -> int:
+            try:
+                return max(0, int(val or 0))
+            except (TypeError, ValueError):
+                return 0
+        fallback_scenes = []
+        for scene in raw_intro.get("fallback_scenes") or []:
+            if not isinstance(scene, dict):
+                continue
+            reason_code = str(scene.get("reason_code") or "video_generation_failed")
+            failure_stage = str(scene.get("failure_stage") or "video_generation")
+            if not re.fullmatch(r"[a-z0-9_]+", reason_code):
+                reason_code = "video_generation_failed"
+            if not re.fullmatch(r"[a-z0-9_]+", failure_stage):
+                failure_stage = "video_generation"
+            fallback_scenes.append({
+                "scene_index": _summary_int(scene.get("scene_index")),
+                "failure_stage": failure_stage,
+                "reason_code": reason_code,
+            })
+        item["intro_video_summary"] = {
+            "enabled": bool(raw_intro.get("enabled", False)),
+            "requested_count": _summary_int(raw_intro.get("requested_count")),
+            "generated_count": _summary_int(raw_intro.get("generated_count")),
+            "fallback_count": len(fallback_scenes),
+            "fallback_scenes": fallback_scenes,
+        }
+    if not item.get("publish_stage") and (result.get("publish_stage") or result.get("stage")):
+        item["publish_stage"] = str(result.get("publish_stage") or result.get("stage") or "")
+    if item.get("upload_percent") is None and result.get("upload_percent") is not None:
+        item["upload_percent"] = result.get("upload_percent")
+    if not item.get("scheduled_at") and result.get("scheduled_at"):
+        item["scheduled_at"] = str(result.get("scheduled_at") or "")
+    if not item.get("youtube_video_id") and result.get("youtube_video_id"):
+        item["youtube_video_id"] = str(result.get("youtube_video_id") or "")
+
+
 def _hydrate_job_center_items(items: list[dict]) -> list[dict]:
     if not items:
         return items
+    unhydrated_ids = [
+        item["id"] for item in items
+        if item.get("type") in JOB_CENTER_SYSTEM_JOB_TYPES and not item.get("payload")
+    ]
+    if unhydrated_ids:
+        payloads_and_results = db.get_system_jobs_payload_and_result(unhydrated_ids)
+        for item in items:
+            pair = payloads_and_results.get(item["id"])
+            if pair:
+                _populate_system_job_payload_result(item, pair[0], pair[1])
     video_ids = [int(item["video_id"]) for item in items if item.get("video_id")]
     ready_artifact_video_ids = (
         db.get_video_ids_with_ready_final_mp4(video_ids) if video_ids else set()
@@ -10069,7 +10148,11 @@ def _job_is_selectable(item: dict) -> bool:
     return any(_job_supports_action(item, action) for action in JOB_CENTER_ACTIONS)
 
 
-def _collect_job_center_items(job_type: str | None = None) -> list[dict]:
+def _collect_job_center_items(
+    job_type: str | None = None,
+    status: str = "all",
+    include_json: bool = True,
+) -> list[dict]:
     normalized_type = str(job_type or "").strip()
     if normalized_type == "all":
         normalized_type = ""
@@ -10083,12 +10166,18 @@ def _collect_job_center_items(job_type: str | None = None) -> list[dict]:
         requested_system_types = None
 
     if not normalized_type or requested_system_types:
+        statuses = None
+        if status == "active":
+            statuses = ["queued", "running", "retry_wait", "paused"]
+        elif status == "error":
+            statuses = ["error", "failed", "review_blocked"]
+
         if not normalized_type:
-            system_jobs = db.list_system_jobs(limit=None, job_type=None)
+            system_jobs = db.list_system_jobs(limit=None, job_type=None, statuses=statuses, include_json=include_json)
         else:
             system_jobs = []
             for st in requested_system_types:
-                system_jobs.extend(db.list_system_jobs(limit=None, job_type=st))
+                system_jobs.extend(db.list_system_jobs(limit=None, job_type=st, statuses=statuses, include_json=include_json))
         queue_positions: dict[str, int] = {}
         queued_counts: dict[str, int] = {}
         for job in sorted(system_jobs, key=lambda item: item["created_at"]):
@@ -10103,38 +10192,54 @@ def _collect_job_center_items(job_type: str | None = None) -> list[dict]:
         )
 
     if normalized_type in {"", "audio"}:
+        audio_tasks = db.list_audio_tasks(limit=None)
+        if status == "active":
+            audio_tasks = [t for t in audio_tasks if t.get("status") in {"queued", "pending", "processing"}]
+        elif status == "error":
+            audio_tasks = [t for t in audio_tasks if t.get("status") in {"failed", "interrupted"}]
         items.extend(
             _audio_job_center_item(task)
-            for task in db.list_audio_tasks(limit=None)
+            for task in audio_tasks
         )
     if normalized_type in {"", "audio_review"}:
+        audio_reviews = db.list_audio_reviews(limit=None)
+        if status == "active":
+            audio_reviews = [r for r in audio_reviews if r.get("status") in {"queued", "pending", "processing"}]
+        elif status == "error":
+            audio_reviews = [r for r in audio_reviews if r.get("status") in {"failed", "rejected"}]
         items.extend(
             _audio_review_job_center_item(review)
-            for review in db.list_audio_reviews(limit=None)
+            for review in audio_reviews
         )
     if normalized_type in {"", "youtube_download"}:
+        dl_jobs = download_jobs.list_jobs(limit=None)
+        if status == "active":
+            dl_jobs = [j for j in dl_jobs if j.get("status") in {"queued", "downloading"}]
+        elif status == "error":
+            dl_jobs = [j for j in dl_jobs if j.get("status") == "error"]
         items.extend(
             _download_job_center_item(job)
-            for job in download_jobs.list_jobs(limit=None)
+            for job in dl_jobs
         )
 
     operation, prompt_version = _get_chatgpt_state()
     if operation and operation != "video" and normalized_type in {"", "chatgpt"}:
-        items.append({
-            "id": "chatgpt:current",
-            "raw_id": "current",
-            "type": "chatgpt",
-            "type_label": "Tác vụ ChatGPT",
-            "status": "running",
-            "title": operation,
-            "progress": "Đang sử dụng phiên ChatGPT",
-            "error": "",
-            "prompt_version": prompt_version,
-            "created_at": "",
-            "updated_at": "",
-            "can_cancel": False,
-            "can_retry": False,
-        })
+        if status in {"all", "active"}:
+            items.append({
+                "id": "chatgpt:current",
+                "raw_id": "current",
+                "type": "chatgpt",
+                "type_label": "Tác vụ ChatGPT",
+                "status": "running",
+                "title": operation,
+                "progress": "Đang sử dụng phiên ChatGPT",
+                "error": "",
+                "prompt_version": prompt_version,
+                "created_at": "",
+                "updated_at": "",
+                "can_cancel": False,
+                "can_retry": False,
+            })
     return items
 
 
@@ -10263,16 +10368,68 @@ def list_jobs(
     requested_limit = max(1, min(int(limit), 500))
     requested_offset = max(0, int(offset))
     snapshot_at = db.utc_now()
-    all_items = _collect_job_center_items(job_type)
-    counted_items = _filter_job_center_items(
-        all_items,
-        search=search or "",
-        snapshot_at=snapshot_at,
-    )
-    filtered_items = _sort_job_center_items(
-        _filter_job_center_items(counted_items, status=status),
-        sort_by=sort_by,
-    )
+
+    if search:
+        all_items = _collect_job_center_items(job_type, status="all", include_json=False)
+        counted_items = _filter_job_center_items(
+            all_items,
+            search=search,
+            snapshot_at=snapshot_at,
+        )
+        filtered_items = _sort_job_center_items(
+            _filter_job_center_items(counted_items, status=status),
+            sort_by=sort_by,
+        )
+        counts = {
+            "total": len(counted_items),
+            "active": sum(
+                item["status"] in {"queued", "running", "retry_wait", "paused"}
+                for item in counted_items
+            ),
+            "error": sum(
+                item["status"] in {"error", "review_blocked"}
+                for item in counted_items
+            ),
+        }
+    elif status == "active":
+        filtered_items = _sort_job_center_items(
+            _filter_job_center_items(
+                _collect_job_center_items(job_type, status="active", include_json=True),
+                status="active",
+                snapshot_at=snapshot_at,
+            ),
+            sort_by=sort_by,
+        )
+        counts = db.get_system_jobs_summary_counts(job_type)
+        operation, _ = _get_chatgpt_state()
+        if operation and operation != "video" and str(job_type or "").strip() in {"", "all", "chatgpt"}:
+            counts["active"] += 1
+            counts["total"] += 1
+    elif status == "error":
+        filtered_items = _sort_job_center_items(
+            _filter_job_center_items(
+                _collect_job_center_items(job_type, status="error", include_json=True),
+                status="error",
+                snapshot_at=snapshot_at,
+            ),
+            sort_by=sort_by,
+        )
+        counts = db.get_system_jobs_summary_counts(job_type)
+        operation, _ = _get_chatgpt_state()
+        if operation and operation != "video" and str(job_type or "").strip() in {"", "all", "chatgpt"}:
+            counts["total"] += 1
+    else:
+        all_items = _collect_job_center_items(job_type, status="all", include_json=False)
+        filtered_items = _sort_job_center_items(
+            _filter_job_center_items(all_items, status="all", snapshot_at=snapshot_at),
+            sort_by=sort_by,
+        )
+        counts = db.get_system_jobs_summary_counts(job_type)
+        operation, _ = _get_chatgpt_state()
+        if operation and operation != "video" and str(job_type or "").strip() in {"", "all", "chatgpt"}:
+            counts["active"] += 1
+            counts["total"] += 1
+
     action_counts = {
         action: sum(_job_supports_action(item, action) for item in filtered_items)
         for action in JOB_CENTER_ACTIONS
@@ -10284,17 +10441,7 @@ def list_jobs(
         item.pop("download_videos", None)
     return {
         "items": paged_items,
-        "counts": {
-            "total": len(counted_items),
-            "active": sum(
-                item["status"] in {"queued", "running", "retry_wait", "paused"}
-                for item in counted_items
-            ),
-            "error": sum(
-                item["status"] in {"error", "review_blocked"}
-                for item in counted_items
-            ),
-        },
+        "counts": counts,
         "filtered_total": len(filtered_items),
         "selectable_total": sum(_job_is_selectable(item) for item in filtered_items),
         "action_counts": action_counts,
