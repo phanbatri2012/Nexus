@@ -844,6 +844,23 @@ class TestMuseStudioApiProvider(unittest.TestCase):
         post.assert_not_called()
         self.assertEqual(result["provider_task_id"], "task-1")
 
+    def test_terminal_provider_timeouts_are_classified_as_retryable(self):
+        messages = (
+            "Waiting for generation timed out; no new result appeared",
+            "Hết thời gian chờ tạo ảnh",
+            "等待生成超时，未出现新的生成结果",
+        )
+        for message in messages:
+            with self.subTest(message=message):
+                self.assertIs(
+                    muse_provider.classify_muse_failure(message),
+                    muse_provider.MuseTaskTransientFailure,
+                )
+                with self.assertRaises(muse_provider.MuseTaskTransientFailure):
+                    muse_provider.MuseStudioApiProvider._raise_task_failure(
+                        {"error": message, "elapsed": 360.9}
+                    )
+
     def test_refusal_and_external_media_url_fail_closed(self):
         for message in (
             "Generation refused by safety policy",
@@ -1600,6 +1617,152 @@ class TestMuseRecovery(unittest.TestCase):
         self.assertEqual(artifact["status"], "submitting")
         self.assertEqual(artifact["metadata"]["provider"], "muse_studio_api")
         self.assertEqual(artifact["metadata"]["provider_task_id"], "image-task-1")
+
+    def test_terminal_timeout_on_reconcile_starts_new_idempotent_attempt(self):
+        artifact = {
+            "status": "submitting",
+            "content_hash": "request",
+            "path": "",
+            "metadata": {
+                "attempt": 1,
+                "provider": muse_provider.MUSE_PROVIDER_NAME,
+                "provider_task_id": "image-task-timeout",
+                "endpoint": "/v1/images/tasks/image-task-timeout",
+                "submitted_at": "2026-01-01T00:00:00Z",
+                "submission_hash": "request",
+                "submission_variant": "original",
+                "idempotent_submission": True,
+                "prompt_strategy": "original",
+            },
+        }
+
+        def get_latest(*_args, **_kwargs):
+            return artifact
+
+        def upsert(**kwargs):
+            nonlocal artifact
+            artifact = {
+                "status": kwargs["status"],
+                "content_hash": kwargs["content_hash"],
+                "path": kwargs.get("path", ""),
+                "metadata": kwargs["metadata"],
+            }
+            return artifact
+
+        class TimedOutReceiptAdapter:
+            async def reconcile(self, **_kwargs):
+                raise muse_provider.MuseTaskTransientFailure(
+                    "等待生成超时，未出现新的生成结果"
+                )
+
+            async def create_image(self, *_args, **_kwargs):
+                raise AssertionError("A terminal receipt must be checkpointed before resubmission")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+
+            async def checkpoint_timeout():
+                with (
+                    patch.object(
+                        muse_pipeline.db,
+                        "get_latest_video_artifact",
+                        side_effect=get_latest,
+                    ),
+                    patch.object(
+                        muse_pipeline.db,
+                        "upsert_video_artifact",
+                        side_effect=upsert,
+                    ),
+                ):
+                    await muse_pipeline._generate_request(
+                        adapter=TimedOutReceiptAdapter(),
+                        video_id=1,
+                        artifact_type="muse_scene_image:0",
+                        request_hash="request",
+                        prompt="prompt",
+                        references=[],
+                        omitted=[],
+                        destination=root / "scene",
+                        expected="image",
+                        scene={"index": 0},
+                        cancel_check=lambda: None,
+                        policy_metadata={"prompt_strategy": "original"},
+                    )
+
+            with self.assertRaises(muse_pipeline.MuseRetryScheduled):
+                asyncio.run(checkpoint_timeout())
+
+            self.assertEqual(artifact["status"], "error")
+            self.assertTrue(artifact["metadata"]["retryable_generation"])
+            self.assertEqual(
+                artifact["metadata"]["last_provider_task_id"],
+                "image-task-timeout",
+            )
+            self.assertNotIn("provider_task_id", artifact["metadata"])
+
+            generated = root / "generated.png"
+            generated.write_bytes(b"generated")
+            submitted_hashes = []
+
+            class SuccessfulRetryAdapter:
+                async def create_image(self, _prompt, _references, _destination, **kwargs):
+                    submitted_hashes.append(kwargs["request_hash"])
+                    kwargs["on_submitted"](
+                        muse_provider.MuseReceipt(
+                            provider_task_id="image-task-retry",
+                            endpoint="/v1/images/tasks/image-task-retry",
+                            submitted_at="2026-01-01T00:01:00Z",
+                        )
+                    )
+                    return {
+                        "path": str(generated),
+                        "mime_type": "image/png",
+                        "provider": muse_provider.MUSE_PROVIDER_NAME,
+                        "provider_task_id": "image-task-retry",
+                        "endpoint": "/v1/images/tasks/image-task-retry",
+                        "submitted_at": "2026-01-01T00:01:00Z",
+                    }
+
+            async def retry_generation():
+                with (
+                    patch.object(
+                        muse_pipeline.db,
+                        "get_latest_video_artifact",
+                        side_effect=get_latest,
+                    ),
+                    patch.object(
+                        muse_pipeline.db,
+                        "upsert_video_artifact",
+                        side_effect=upsert,
+                    ),
+                    patch.object(
+                        muse_pipeline,
+                        "_validate_image",
+                        return_value={"width": 1920, "height": 1080},
+                    ),
+                ):
+                    return await muse_pipeline._generate_request(
+                        adapter=SuccessfulRetryAdapter(),
+                        video_id=1,
+                        artifact_type="muse_scene_image:0",
+                        request_hash="request",
+                        prompt="prompt",
+                        references=[],
+                        omitted=[],
+                        destination=root / "scene",
+                        expected="image",
+                        scene={"index": 0},
+                        cancel_check=lambda: None,
+                        policy_metadata={"prompt_strategy": "original"},
+                    )
+
+            result = asyncio.run(retry_generation())
+
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(artifact["metadata"]["attempt"], 2)
+        self.assertEqual(len(submitted_hashes), 1)
+        self.assertNotEqual(submitted_hashes[0], "request")
+        self.assertEqual(submitted_hashes[0], artifact["metadata"]["submission_hash"])
 
     def test_ambiguous_submission_remains_fail_closed(self):
         artifact = None

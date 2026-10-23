@@ -36,6 +36,7 @@ from nexus_engine.services.muse_provider import (
     MusePromptBuilder,
     MuseReceipt,
     MuseStudioApiProvider,
+    MuseTaskTransientFailure,
     MuseTransientError,
 )
 
@@ -875,6 +876,76 @@ def _record_request_state(
     )
 
 
+def _submission_hash_for_attempt(
+    base_submission_hash: str,
+    attempt: int,
+    submission_variant: str,
+) -> str:
+    if int(attempt) <= 1:
+        return base_submission_hash
+    return _json_hash(
+        {
+            "base_submission_hash": base_submission_hash,
+            "variant": "terminal_transient_retry_v1",
+            "submission_variant": submission_variant,
+            "attempt": int(attempt),
+        }
+    )
+
+
+def _checkpoint_terminal_transient_failure(
+    *,
+    video_id: int,
+    artifact_type: str,
+    request_hash: str,
+    scene: dict,
+    metadata: dict,
+    error: MuseTaskTransientFailure,
+) -> None:
+    attempt = max(1, int(metadata.get("attempt") or 1))
+    checkpoint = {
+        **metadata,
+        "last_error_class": type(error).__name__,
+        "terminal_provider_task": True,
+        "retryable_generation": attempt < MAX_REQUEST_ATTEMPTS,
+    }
+    receipt_fields = {
+        "provider_task_id": "last_provider_task_id",
+        "endpoint": "last_provider_endpoint",
+        "submitted_at": "last_submitted_at",
+    }
+    for current_key, history_key in receipt_fields.items():
+        value = checkpoint.pop(current_key, None)
+        if value:
+            checkpoint[history_key] = value
+
+    if attempt >= MAX_REQUEST_ATTEMPTS:
+        checkpoint["terminal_generation"] = True
+        _record_request_state(
+            video_id,
+            artifact_type,
+            request_hash,
+            status="error",
+            metadata=checkpoint,
+        )
+        raise MuseError(
+            f"Scene {int(scene['index']) + 1} đã hết {MAX_REQUEST_ATTEMPTS} lần thử Muse."
+        ) from error
+
+    _record_request_state(
+        video_id,
+        artifact_type,
+        request_hash,
+        status="error",
+        metadata=checkpoint,
+    )
+    raise MuseRetryScheduled(
+        str(error),
+        delay_seconds=RETRY_DELAYS_SECONDS[attempt - 1],
+        consume_attempt=True,
+    ) from error
+
+
 def _validate_image(path: Path) -> dict:
     try:
         with Image.open(path) as image:
@@ -1016,16 +1087,42 @@ async def _generate_request(
                 raise MuseAmbiguousSubmissionError(
                     f"Không thể đối soát submission Muse của scene {int(scene['index']) + 1}."
                 )
-            reconciled = await adapter.reconcile(
-                receipt=MuseReceipt(
-                    provider=provider,
-                    provider_task_id=provider_task_id,
-                    endpoint=endpoint,
-                    submitted_at=submitted_at,
-                ),
-                destination=destination,
-                expected=expected,
-            )
+            try:
+                reconciled = await adapter.reconcile(
+                    receipt=MuseReceipt(
+                        provider=provider,
+                        provider_task_id=provider_task_id,
+                        endpoint=endpoint,
+                        submitted_at=submitted_at,
+                    ),
+                    destination=destination,
+                    expected=expected,
+                )
+            except MuseTaskTransientFailure as exc:
+                _checkpoint_terminal_transient_failure(
+                    video_id=video_id,
+                    artifact_type=artifact_type,
+                    request_hash=request_hash,
+                    scene=scene,
+                    metadata=metadata,
+                    error=exc,
+                )
+            except MuseTransientError:
+                # The task may still be alive. Preserve the receipt and reconcile later.
+                raise
+            except MuseError as exc:
+                _record_request_state(
+                    video_id,
+                    artifact_type,
+                    request_hash,
+                    status="error",
+                    metadata={
+                        **metadata,
+                        "error_class": type(exc).__name__,
+                        "terminal_generation": True,
+                    },
+                )
+                raise
             if reconciled:
                 result = reconciled
                 needs_submission = False
@@ -1058,8 +1155,63 @@ async def _generate_request(
             raise MuseError(
                 f"Scene {int(scene['index']) + 1} đã hết {MAX_REQUEST_ATTEMPTS} lần thử Muse."
             )
+        retrying_terminal_failure = bool(
+            existing
+            and existing.get("content_hash") == request_hash
+            and existing.get("status") == "error"
+            and metadata.get("retryable_generation")
+        )
+        submission_variant = str(
+            (
+                metadata.get("submission_variant")
+                if resume_without_receipt or retrying_terminal_failure
+                else (policy_metadata or {}).get("prompt_strategy")
+            )
+            or "original"
+        )
+        submission_prompt = prompt
+        submission_references = references
+        refusal_fallback_used = False
+        base_submission_hash = request_hash
+        if submission_variant == "refusal_fallback":
+            submission_prompt, submission_references = _build_refusal_fallback(
+                scene,
+                expected,
+                references,
+            )
+            base_submission_hash = _json_hash(
+                {
+                    "request_hash": request_hash,
+                    "variant": "non_graphic_refusal_fallback_v1",
+                    "prompt": submission_prompt,
+                    "references": [item["sha256"] for item in submission_references],
+                }
+            )
+            refusal_fallback_used = True
+
+        previous_submission_attempt = max(1, previous_attempt)
+        expected_previous_hash = _submission_hash_for_attempt(
+            base_submission_hash,
+            previous_submission_attempt,
+            submission_variant,
+        )
+        if (resume_without_receipt or retrying_terminal_failure) and str(
+            metadata.get("submission_hash") or ""
+        ) != expected_previous_hash:
+            raise MuseAmbiguousSubmissionError(
+                "Checkpoint Muse không khớp request/attempt hiện tại."
+            )
+        submission_hash = (
+            str(metadata.get("submission_hash") or "")
+            if resume_without_receipt
+            else _submission_hash_for_attempt(
+                base_submission_hash,
+                attempt,
+                submission_variant,
+            )
+        )
         base_metadata = {
-            **(metadata if resume_without_receipt else {}),
+            **(metadata if resume_without_receipt or retrying_terminal_failure else {}),
             "request_hash": request_hash,
             "reference_hashes": [item["sha256"] for item in references],
             "selected_references": references,
@@ -1068,10 +1220,8 @@ async def _generate_request(
             "scene_index": int(scene["index"]),
             "phase": "videos" if expected == "video" else "images",
             "provider": MUSE_PROVIDER_NAME,
-            "submission_hash": request_hash,
-            "submission_variant": str(
-                (policy_metadata or {}).get("prompt_strategy") or "original"
-            ),
+            "submission_hash": submission_hash,
+            "submission_variant": submission_variant,
             "idempotent_submission": True,
             "refusal_count": int(metadata.get("refusal_count") or 0),
             "refusal_elapsed_seconds": float(
@@ -1080,14 +1230,8 @@ async def _generate_request(
             "fallback_count": int(metadata.get("fallback_count") or 0),
             **dict(policy_metadata or {}),
         }
-        if resume_without_receipt:
-            base_metadata["submission_hash"] = str(
-                metadata.get("submission_hash") or request_hash
-            )
-            base_metadata["submission_variant"] = str(
-                metadata.get("submission_variant")
-                or base_metadata["submission_variant"]
-            )
+        base_metadata.pop("retryable_generation", None)
+        base_metadata.pop("terminal_generation", None)
         _record_request_state(
             video_id,
             artifact_type,
@@ -1115,30 +1259,6 @@ async def _generate_request(
             create_media = (
                 adapter.create_video if expected == "video" else adapter.create_image
             )
-            submission_prompt = prompt
-            submission_references = references
-            submission_hash = request_hash
-            refusal_fallback_used = False
-            if resume_without_receipt and metadata.get("submission_variant") == "refusal_fallback":
-                submission_prompt, submission_references = _build_refusal_fallback(
-                    scene,
-                    expected,
-                    references,
-                )
-                submission_hash = str(metadata.get("submission_hash") or "")
-                expected_fallback_hash = _json_hash(
-                    {
-                        "request_hash": request_hash,
-                        "variant": "non_graphic_refusal_fallback_v1",
-                        "prompt": submission_prompt,
-                        "references": [item["sha256"] for item in submission_references],
-                    }
-                )
-                if submission_hash != expected_fallback_hash:
-                    raise MuseAmbiguousSubmissionError(
-                        "Checkpoint fallback Muse không khớp request hiện tại."
-                    )
-                refusal_fallback_used = True
             while True:
                 try:
                     result = await create_media(
@@ -1232,6 +1352,17 @@ async def _generate_request(
                     )
         except MuseServiceBusy:
             raise
+        except MuseTaskTransientFailure as exc:
+            current = db.get_latest_video_artifact(video_id, artifact_type) or {}
+            current_metadata = dict(current.get("metadata") or base_metadata)
+            _checkpoint_terminal_transient_failure(
+                video_id=video_id,
+                artifact_type=artifact_type,
+                request_hash=request_hash,
+                scene=scene,
+                metadata=current_metadata,
+                error=exc,
+            )
         except MuseAmbiguousSubmissionError as exc:
             current = db.get_latest_video_artifact(video_id, artifact_type) or {}
             current_metadata = dict(current.get("metadata") or base_metadata)

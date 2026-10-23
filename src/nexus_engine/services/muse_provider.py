@@ -33,6 +33,10 @@ class MuseTransientError(MuseError):
     """The operation failed before submission or can be reconciled safely."""
 
 
+class MuseTaskTransientFailure(MuseTransientError):
+    """Muse confirmed that a task ended for a retryable provider-side reason."""
+
+
 class MuseAdmissionRetry(MuseTransientError):
     """Muse2API rejected the request before accepting a generation task."""
 
@@ -79,6 +83,26 @@ _REFERENCE_ERROR_TOKENS = (
     "không đọc được ảnh",
 )
 _AUTH_ERROR_TOKENS = ("auth", "login", "cookie", "session", "account")
+_TRANSIENT_TASK_ERROR_TOKENS = (
+    "timeout",
+    "timed out",
+    "time out",
+    "temporarily unavailable",
+    "temporary failure",
+    "service unavailable",
+    "server busy",
+    "rate limit",
+    "too many requests",
+    "等待生成超时",
+    "生成超时",
+    "未出现新的生成结果",
+    "暂时不可用",
+    "服务器繁忙",
+    "hết thời gian chờ",
+    "quá thời gian chờ",
+    "tạm thời không khả dụng",
+    "máy chủ đang bận",
+)
 
 
 def classify_muse_failure(message: str) -> type[MuseError]:
@@ -89,6 +113,8 @@ def classify_muse_failure(message: str) -> type[MuseError]:
         return MuseRefusalError
     if any(token in lowered for token in _REFERENCE_ERROR_TOKENS):
         return MuseReferenceError
+    if any(token in lowered for token in _TRANSIENT_TASK_ERROR_TOKENS):
+        return MuseTaskTransientFailure
     if any(token in lowered for token in _AUTH_ERROR_TOKENS):
         return MuseAuthenticationError
     return MuseError
