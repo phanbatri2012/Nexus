@@ -7234,6 +7234,44 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
         return
 
     if (
+        isinstance(exc, muse_provider.MuseQuotaUnavailable)
+        and str(job.get("job_type") or "") == "muse_media_generation"
+    ):
+        current_job = db.get_system_job(job["id"]) or job
+        result = dict(current_job.get("result") or {})
+        result["attention_required"] = "muse_quota_exhausted"
+        capacity = getattr(exc, "capacity_preflight", None)
+        if isinstance(capacity, dict):
+            result["muse_quota_preflight"] = {
+                key: capacity[key]
+                for key in (
+                    "status", "eligible", "unknown", "exhausted", "skipped",
+                    "cache_hit", "checked_at", "elapsed_seconds",
+                )
+                if key in capacity
+            }
+        message = "Tất cả tài khoản Muse đã hết quota; hãy bổ sung/đợi quota rồi Resume."
+        db.update_system_job(
+            job["id"],
+            status="paused",
+            progress=message,
+            result_json=result,
+            error=safe_error,
+            next_retry_at="",
+            cancel_requested=0,
+            finished_at="",
+        )
+        if job.get("video_id"):
+            db.update_video_production_state(
+                int(job["video_id"]),
+                render_status="paused",
+                current_stage="muse_quota_exhausted",
+                production_progress=message,
+                blocking_reason=safe_error,
+            )
+        return
+
+    if (
         isinstance(exc, muse_provider.MuseTransientError)
         and str(job.get("job_type") or "") == "muse_media_generation"
     ):

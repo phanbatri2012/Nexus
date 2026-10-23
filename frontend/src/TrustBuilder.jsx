@@ -53,6 +53,33 @@ function getChecklistState(value) {
   return { icon: '❔', className: 'unknown' }
 }
 
+
+function getPersonaLabel(persona) {
+  switch (persona) {
+    case 'office_worker':
+      return {
+        label: 'Dân văn phòng',
+        desc: 'Tập trung cao độ vào giờ trưa (11:30 - 13:30) & tối (19:00 - 23:00). Giờ hành chính giãn cách rất thưa để tránh rủi ro.'
+      }
+    case 'night_owl':
+      return {
+        label: 'Cú đêm',
+        desc: 'Hoạt động mạnh từ chiều muộn (14:00) đến nửa đêm (02:00 sáng). Phù hợp kênh giải trí, âm nhạc, gaming.'
+      }
+    case 'legacy_uniform':
+      return {
+        label: 'Phân bổ đều 24/7 (Cũ)',
+        desc: 'Chạy đều đặn mỗi 90 - 150 phút trong khoảng 08:00 - 23:00.'
+      }
+    case 'circadian_standard':
+    default:
+      return {
+        label: 'Nhịp sinh học chuẩn',
+        desc: 'Tự nhiên theo nhịp sống người thật: Thức dậy 07:30, đỉnh điểm trưa & tối prime-time (18:30 - 23:00), ngủ sâu 23:00 - 07:30.'
+      }
+  }
+}
+
 function getActivityIcon(type) {
   switch (type) {
     case 'search': return '🔍'
@@ -399,7 +426,8 @@ export default function TrustBuilder() {
           daily_comment_target: 0,
           daily_subscribe_target: 0,
           min_watch_minutes: 10,
-          warmup_phase: 'phase_1_consumer'
+          warmup_phase: 'phase_1_consumer',
+          schedule_persona: 'circadian_standard'
         })
       })
       const data = await res.json().catch(() => ({}))
@@ -444,7 +472,8 @@ export default function TrustBuilder() {
   }
 
   const handleTargetCommit = (field, value) => {
-    handleUpdatePlan({ [field]: Number(value) })
+    const parsed = field === 'schedule_persona' ? value : Number(value)
+    handleUpdatePlan({ [field]: parsed })
   }
 
   // Plan lifecycle actions (Start, Pause, Resume, Run Now)
@@ -1019,6 +1048,36 @@ export default function TrustBuilder() {
                         onPointerUp={(e) => e.currentTarget.blur()}
                         onBlur={(e) => handleTargetCommit('daily_subscribe_target', e.currentTarget.value)}
                       />
+                    </div>
+
+                    <div className="slider-row" style={{ marginTop: '14px', paddingTop: '14px', borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+                      <div className="slider-label" style={{ marginBottom: '6px' }}>
+                        <span>🧬 Nhịp sinh học tương tác (Persona):</span>
+                        <b style={{ color: '#38bdf8' }}>{getPersonaLabel(selectedPlan.schedule_persona).label}</b>
+                      </div>
+                      <select
+                        className="trust-persona-select"
+                        value={selectedPlan.schedule_persona || 'circadian_standard'}
+                        onChange={(e) => handleTargetCommit('schedule_persona', e.target.value)}
+                        style={{
+                          width: '100%',
+                          padding: '8px 12px',
+                          borderRadius: '8px',
+                          background: 'rgba(255, 255, 255, 0.05)',
+                          color: '#e2e8f0',
+                          border: '1px solid rgba(255, 255, 255, 0.15)',
+                          fontSize: '0.85rem',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        <option value="circadian_standard">🌿 Nhịp sinh học chuẩn (Tự nhiên: trưa & tối prime-time)</option>
+                        <option value="office_worker">💼 Dân văn phòng (Tập trung trưa 12h-13h & tối sau 19h)</option>
+                        <option value="night_owl">🦉 Cú đêm (Chiều muộn & nửa đêm 14h - 02h)</option>
+                        <option value="legacy_uniform">⏱️ Phân bổ đều (Cách đều 90 - 150 phút)</option>
+                      </select>
+                      <small style={{ color: '#94a3b8', fontSize: '0.78rem', marginTop: '6px', display: 'block' }}>
+                        {getPersonaLabel(selectedPlan.schedule_persona).desc}
+                      </small>
                     </div>
                   </div>
                 </div>

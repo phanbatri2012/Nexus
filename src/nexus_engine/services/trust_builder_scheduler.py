@@ -28,6 +28,83 @@ ACTIVE_END_HOUR = 23
 SESSION_INTERVAL_MINUTES = (90, 150)
 RETRY_DELAY_MINUTES = 30
 
+PERSONA_CIRCADIAN_STANDARD = "circadian_standard"
+PERSONA_OFFICE_WORKER = "office_worker"
+PERSONA_NIGHT_OWL = "night_owl"
+PERSONA_LEGACY_UNIFORM = "legacy_uniform"
+
+SUPPORTED_PERSONAS = {
+    PERSONA_CIRCADIAN_STANDARD,
+    PERSONA_OFFICE_WORKER,
+    PERSONA_NIGHT_OWL,
+    PERSONA_LEGACY_UNIFORM,
+}
+
+
+def is_persona_active_at(persona: str, local_hour: int, local_minute: int = 0) -> bool:
+    """Check if the given local time is within the active waking window for the persona."""
+    time_val = local_hour + (local_minute / 60.0)
+    if persona == PERSONA_NIGHT_OWL:
+        # Active from 14:00 to 02:00 (next day)
+        return time_val >= 14.0 or time_val < 2.0
+    elif persona == PERSONA_OFFICE_WORKER:
+        # Active from 08:00 to 23:00
+        return 8.0 <= time_val < 23.0
+    elif persona == PERSONA_LEGACY_UNIFORM:
+        # Legacy: 08:00 to 23:00
+        return float(ACTIVE_START_HOUR) <= time_val < float(ACTIVE_END_HOUR)
+    else:  # PERSONA_CIRCADIAN_STANDARD
+        # Active from 07:30 to 23:00
+        return 7.5 <= time_val < 23.0
+
+
+def calculate_circadian_interval(
+    persona: str,
+    local_hour: int,
+    local_minute: int = 0,
+) -> int:
+    """Return the interval in minutes until the next session based on persona and local time."""
+    time_val = local_hour + (local_minute / 60.0)
+
+    if persona == PERSONA_NIGHT_OWL:
+        if 14.0 <= time_val < 18.0:
+            min_m, max_m = 120, 180
+        elif 18.0 <= time_val < 21.0:
+            min_m, max_m = 60, 90
+        elif time_val >= 21.0 or time_val < 2.0:
+            min_m, max_m = 40, 70
+        else:
+            return 120
+    elif persona == PERSONA_OFFICE_WORKER:
+        if 8.0 <= time_val < 11.5:
+            min_m, max_m = 210, 300
+        elif 11.5 <= time_val < 13.5:
+            min_m, max_m = 40, 65
+        elif 13.5 <= time_val < 19.0:
+            min_m, max_m = 210, 300
+        elif 19.0 <= time_val < 23.0:
+            min_m, max_m = 40, 65
+        else:
+            return 120
+    elif persona == PERSONA_LEGACY_UNIFORM:
+        min_m, max_m = SESSION_INTERVAL_MINUTES
+    else:  # PERSONA_CIRCADIAN_STANDARD
+        if 7.5 <= time_val < 11.5:
+            min_m, max_m = 150, 240
+        elif 11.5 <= time_val < 13.5:
+            min_m, max_m = 45, 75
+        elif 13.5 <= time_val < 18.5:
+            min_m, max_m = 180, 240
+        elif 18.5 <= time_val < 23.0:
+            min_m, max_m = 40, 70
+        else:
+            return 120
+
+    base = random.randint(min_m, max_m)
+    jitter = random.randint(-max(1, int(base * 0.1)), max(1, int(base * 0.1)))
+    return max(30, base + jitter)
+
+
 _scheduler_task: asyncio.Task | None = None
 _scheduler_running = False
 _job_tasks: set[asyncio.Task] = set()
@@ -59,20 +136,59 @@ def _plan_timezone(plan: dict[str, Any]) -> ZoneInfo:
 def _next_active_start(plan: dict[str, Any], now_utc: datetime.datetime) -> str:
     timezone = _plan_timezone(plan)
     local_now = now_utc.astimezone(timezone)
-    next_day = local_now.date() + datetime.timedelta(days=1)
-    local_start = datetime.datetime.combine(
-        next_day,
-        datetime.time(hour=ACTIVE_START_HOUR),
+    persona = str(plan.get("schedule_persona") or PERSONA_CIRCADIAN_STANDARD)
+
+    if persona == PERSONA_NIGHT_OWL:
+        if 2 <= local_now.hour < 14:
+            target_date = local_now.date()
+        else:
+            target_date = local_now.date() + datetime.timedelta(days=1)
+        base_hour, base_minute = 14, 0
+    elif persona == PERSONA_OFFICE_WORKER:
+        if local_now.hour < 8:
+            target_date = local_now.date()
+        else:
+            target_date = local_now.date() + datetime.timedelta(days=1)
+        base_hour, base_minute = 8, 0
+    elif persona == PERSONA_LEGACY_UNIFORM:
+        if local_now.hour < ACTIVE_START_HOUR:
+            target_date = local_now.date()
+        else:
+            target_date = local_now.date() + datetime.timedelta(days=1)
+        base_hour, base_minute = ACTIVE_START_HOUR, 0
+    else:  # PERSONA_CIRCADIAN_STANDARD
+        time_val = local_now.hour + (local_now.minute / 60.0)
+        if time_val < 7.5:
+            target_date = local_now.date()
+        else:
+            target_date = local_now.date() + datetime.timedelta(days=1)
+        base_hour, base_minute = 7, 30
+
+    jitter_minutes = random.randint(5, 30)
+    target_dt = datetime.datetime.combine(
+        target_date,
+        datetime.time(hour=base_hour, minute=base_minute),
         tzinfo=timezone,
+    ) + datetime.timedelta(minutes=jitter_minutes)
+    return target_dt.astimezone(datetime.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _defer_plan(plan_id: int, minutes: int, plan: dict[str, Any] | None = None) -> None:
+    now = _utc_now()
+    scheduled_run = now + datetime.timedelta(minutes=minutes)
+    if plan:
+        persona = str(plan.get("schedule_persona") or PERSONA_CIRCADIAN_STANDARD)
+        timezone = _plan_timezone(plan)
+        scheduled_local = scheduled_run.astimezone(timezone)
+        if not is_persona_active_at(persona, scheduled_local.hour, scheduled_local.minute):
+            next_start_iso = _next_active_start(plan, now)
+            db.update_channel_trust_plan(plan_id, next_run_at=next_start_iso)
+            return
+
+    db.update_channel_trust_plan(
+        plan_id,
+        next_run_at=scheduled_run.replace(microsecond=0).isoformat(),
     )
-    return local_start.astimezone(datetime.timezone.utc).replace(microsecond=0).isoformat()
-
-
-def _defer_plan(plan_id: int, minutes: int) -> None:
-    next_run = (_utc_now() + datetime.timedelta(minutes=minutes)).replace(
-        microsecond=0
-    ).isoformat()
-    db.update_channel_trust_plan(plan_id, next_run_at=next_run)
 
 
 def enqueue_trust_builder_session(
@@ -161,11 +277,15 @@ async def _execute_claimed_job(job: dict[str, Any]) -> None:
                     next_run_at=_next_active_start(plan, _utc_now()),
                 )
             elif result.get("retryable_engagement"):
-                _defer_plan(plan_id, RETRY_DELAY_MINUTES)
+                _defer_plan(plan_id, RETRY_DELAY_MINUTES, plan)
             elif result.get("success") and not result.get("skipped"):
-                _defer_plan(plan_id, random.randint(*SESSION_INTERVAL_MINUTES))
+                persona = str(plan.get("schedule_persona") or PERSONA_CIRCADIAN_STANDARD)
+                timezone = _plan_timezone(plan)
+                local_now = _utc_now().astimezone(timezone)
+                interval_minutes = calculate_circadian_interval(persona, local_now.hour, local_now.minute)
+                _defer_plan(plan_id, interval_minutes, plan)
             else:
-                _defer_plan(plan_id, RETRY_DELAY_MINUTES)
+                _defer_plan(plan_id, RETRY_DELAY_MINUTES, plan)
     except asyncio.CancelledError:
         db.update_system_job(
             job_id,
@@ -213,8 +333,9 @@ def trigger_queue_drain() -> None:
 
 def _is_plan_due(plan: dict[str, Any], now_utc: datetime.datetime) -> bool:
     timezone = _plan_timezone(plan)
-    local_hour = now_utc.astimezone(timezone).hour
-    if local_hour < ACTIVE_START_HOUR or local_hour >= ACTIVE_END_HOUR:
+    local_dt = now_utc.astimezone(timezone)
+    persona = str(plan.get("schedule_persona") or PERSONA_CIRCADIAN_STANDARD)
+    if not is_persona_active_at(persona, local_dt.hour, local_dt.minute):
         return False
     next_run_at = _parse_utc(str(plan.get("next_run_at") or ""))
     return next_run_at is None or next_run_at <= now_utc

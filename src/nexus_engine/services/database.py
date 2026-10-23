@@ -1728,6 +1728,7 @@ def init_db():
             last_session_at TEXT DEFAULT '',
             last_attempt_at TEXT DEFAULT '',
             next_run_at TEXT DEFAULT '',
+            schedule_persona TEXT NOT NULL DEFAULT 'circadian_standard',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             UNIQUE(channel_db_id)
@@ -1751,6 +1752,7 @@ def init_db():
         "reminder_enabled INTEGER NOT NULL DEFAULT 0",
         "reminder_time_local TEXT DEFAULT ''",
         "last_readiness_check_at TEXT DEFAULT ''",
+        "schedule_persona TEXT NOT NULL DEFAULT 'circadian_standard'",
     ):
         try:
             c.execute(f"ALTER TABLE channel_trust_plans ADD COLUMN {column_definition}")
@@ -7701,6 +7703,7 @@ def _decode_trust_plan(row: sqlite3.Row | dict | None) -> dict | None:
     data["daily_comment_target"] = int(0 if data.get("daily_comment_target") is None else data["daily_comment_target"])
     data["daily_subscribe_target"] = int(0 if data.get("daily_subscribe_target") is None else data["daily_subscribe_target"])
     data["min_watch_minutes"] = int(10 if data.get("min_watch_minutes") is None else data["min_watch_minutes"])
+    data["schedule_persona"] = str(data.get("schedule_persona") or "circadian_standard")
     return data
 
 
@@ -7728,6 +7731,7 @@ def create_channel_trust_plan(
     approved_sources: list[str] | None = None,
     status: str = "draft",
     warmup_phase: str = "idle",
+    schedule_persona: str = "circadian_standard",
 ) -> dict:
     now = utc_now()
     keywords_json = json.dumps(niche_keywords or [], ensure_ascii=False)
@@ -7744,15 +7748,15 @@ def create_channel_trust_plan(
             daily_watch_target, daily_search_target, daily_like_target,
             daily_comment_target, daily_subscribe_target, min_watch_minutes,
             branding_checklist, approved_sources, status, warmup_phase, mode,
-            created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'automated', ?, ?)
+            schedule_persona, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'automated', ?, ?, ?)
         """,
         (
             channel_db_id, keywords_json, channels_json,
             daily_watch_target, daily_search_target, daily_like_target,
             daily_comment_target, daily_subscribe_target, min_watch_minutes,
             branding_json, approved_sources_json, status, warmup_phase,
-            now, now
+            schedule_persona, now, now
         )
     )
     plan_id = cursor.lastrowid
@@ -7832,7 +7836,7 @@ def update_channel_trust_plan(plan_id: int, **changes) -> dict | None:
         "profile_readiness", "channel_readiness", "profile_readiness_pct",
         "channel_readiness_pct", "readiness_state", "profile_baseline",
         "approved_sources", "reminder_enabled", "reminder_time_local",
-        "last_readiness_check_at"
+        "last_readiness_check_at", "schedule_persona"
     }
 
     set_clauses = []

@@ -57,6 +57,7 @@ class TrustPlanCreateRequest(BaseModel):
     daily_subscribe_target: int = Field(default=0, ge=0, le=5)
     min_watch_minutes: int = Field(default=10, ge=1, le=30)
     warmup_phase: Literal["phase_1_consumer", "phase_2_engage"] = "phase_1_consumer"
+    schedule_persona: Literal["circadian_standard", "office_worker", "night_owl", "legacy_uniform"] = "circadian_standard"
 
     @field_validator("niche_keywords", "target_channels")
     @classmethod
@@ -83,6 +84,7 @@ class TrustPlanUpdateRequest(BaseModel):
     daily_comment_target: Optional[int] = Field(default=None, ge=0, le=5)
     daily_subscribe_target: Optional[int] = Field(default=None, ge=0, le=5)
     min_watch_minutes: Optional[int] = Field(default=None, ge=1, le=30)
+    schedule_persona: Optional[Literal["circadian_standard", "office_worker", "night_owl", "legacy_uniform"]] = None
 
     @field_validator("niche_keywords", "target_channels")
     @classmethod
@@ -144,6 +146,7 @@ def create_plan(req: TrustPlanCreateRequest):
         daily_subscribe_target=req.daily_subscribe_target,
         min_watch_minutes=req.min_watch_minutes,
         warmup_phase=req.warmup_phase,
+        schedule_persona=req.schedule_persona,
         status="draft",
     )
     return {"success": True, "plan": _public_plan(new_plan)}

@@ -34,6 +34,7 @@ from nexus_engine.services.muse_provider import (
     MuseRefusalError,
     MuseServiceBusy,
     MusePromptBuilder,
+    MuseQuotaUnavailable,
     MuseReceipt,
     MuseStudioApiProvider,
     MuseTaskTransientFailure,
@@ -881,7 +882,18 @@ def _submission_hash_for_attempt(
     base_submission_hash: str,
     attempt: int,
     submission_variant: str,
+    quota_recovery_sequence: int = 0,
 ) -> str:
+    if int(quota_recovery_sequence) > 0:
+        return _json_hash(
+            {
+                "base_submission_hash": base_submission_hash,
+                "variant": "quota_recovery_v1",
+                "submission_variant": submission_variant,
+                "attempt": int(attempt),
+                "quota_recovery_sequence": int(quota_recovery_sequence),
+            }
+        )
     if int(attempt) <= 1:
         return base_submission_hash
     return _json_hash(
@@ -891,6 +903,47 @@ def _submission_hash_for_attempt(
             "submission_variant": submission_variant,
             "attempt": int(attempt),
         }
+    )
+
+
+def _checkpoint_quota_failure(
+    *,
+    video_id: int,
+    artifact_type: str,
+    request_hash: str,
+    metadata: dict,
+    error: MuseQuotaUnavailable,
+    generation_started: float,
+    capacity_preflight: dict | None = None,
+) -> None:
+    checkpoint = {
+        **metadata,
+        "last_error_class": type(error).__name__,
+        "terminal_provider_task": True,
+        "quota_retryable": True,
+        "quota_recovery_sequence": int(
+            metadata.get("quota_recovery_sequence") or 0
+        ) + 1,
+        "generation_elapsed_seconds": round(
+            time.monotonic() - generation_started, 3
+        ),
+    }
+    if isinstance(capacity_preflight, dict):
+        checkpoint["quota_preflight"] = dict(capacity_preflight)
+    for current_key, history_key in {
+        "provider_task_id": "last_provider_task_id",
+        "endpoint": "last_provider_endpoint",
+        "submitted_at": "last_submitted_at",
+    }.items():
+        value = checkpoint.pop(current_key, None)
+        if value:
+            checkpoint[history_key] = value
+    _record_request_state(
+        video_id,
+        artifact_type,
+        request_hash,
+        status="error",
+        metadata=checkpoint,
     )
 
 
@@ -1092,7 +1145,7 @@ async def _generate_request(
             )
         if existing.get("status") == "error" and (
             metadata.get("terminal_generation") or metadata.get("invalid_media")
-        ):
+        ) and not metadata.get("quota_retryable"):
             raise MuseError(
                 f"Generation Muse scene {int(scene['index']) + 1} đã fail; hãy Recreate để gửi request mới."
             )
@@ -1149,6 +1202,21 @@ async def _generate_request(
                 )
                 if degraded:
                     return degraded
+            except MuseQuotaUnavailable as exc:
+                capacity = getattr(exc, "capacity_preflight", None) or getattr(
+                    adapter, "capacity_preflight", None
+                )
+                _checkpoint_quota_failure(
+                    video_id=video_id,
+                    artifact_type=artifact_type,
+                    request_hash=request_hash,
+                    metadata=metadata,
+                    error=exc,
+                    generation_started=generation_started,
+                    capacity_preflight=capacity,
+                )
+                exc.capacity_preflight = dict(capacity or {})
+                raise
             except MuseTransientError:
                 # The task may still be alive. Preserve the receipt and reconcile later.
                 raise
@@ -1183,6 +1251,12 @@ async def _generate_request(
                     consume_attempt=False,
                 )
     if needs_submission:
+        recovering_quota = bool(
+            existing
+            and existing.get("content_hash") == request_hash
+            and existing.get("status") == "error"
+            and metadata.get("quota_retryable")
+        )
         previous_attempt = (
             int(metadata.get("attempt") or 0)
             if existing and existing.get("content_hash") == request_hash
@@ -1190,7 +1264,7 @@ async def _generate_request(
         )
         attempt = (
             previous_attempt
-            if resume_without_receipt and previous_attempt
+            if (resume_without_receipt or recovering_quota) and previous_attempt
             else previous_attempt + 1
         )
         if attempt > MAX_REQUEST_ATTEMPTS:
@@ -1206,7 +1280,7 @@ async def _generate_request(
         submission_variant = str(
             (
                 metadata.get("submission_variant")
-                if resume_without_receipt or retrying_terminal_failure
+                if resume_without_receipt or retrying_terminal_failure or recovering_quota
                 else (policy_metadata or {}).get("prompt_strategy")
             )
             or "original"
@@ -1232,12 +1306,16 @@ async def _generate_request(
             refusal_fallback_used = True
 
         previous_submission_attempt = max(1, previous_attempt)
+        quota_recovery_sequence = int(
+            metadata.get("quota_recovery_sequence") or 0
+        )
         expected_previous_hash = _submission_hash_for_attempt(
             base_submission_hash,
             previous_submission_attempt,
             submission_variant,
+            max(0, quota_recovery_sequence - 1) if recovering_quota else 0,
         )
-        if (resume_without_receipt or retrying_terminal_failure) and str(
+        if (resume_without_receipt or retrying_terminal_failure or recovering_quota) and str(
             metadata.get("submission_hash") or ""
         ) != expected_previous_hash:
             raise MuseAmbiguousSubmissionError(
@@ -1250,10 +1328,15 @@ async def _generate_request(
                 base_submission_hash,
                 attempt,
                 submission_variant,
+                quota_recovery_sequence if recovering_quota else 0,
             )
         )
         base_metadata = {
-            **(metadata if resume_without_receipt or retrying_terminal_failure else {}),
+            **(
+                metadata
+                if resume_without_receipt or retrying_terminal_failure or recovering_quota
+                else {}
+            ),
             "request_hash": request_hash,
             "reference_hashes": [item["sha256"] for item in references],
             "selected_references": references,
@@ -1264,6 +1347,7 @@ async def _generate_request(
             "provider": MUSE_PROVIDER_NAME,
             "submission_hash": submission_hash,
             "submission_variant": submission_variant,
+            "quota_recovery_sequence": quota_recovery_sequence,
             "idempotent_submission": True,
             "refusal_count": int(metadata.get("refusal_count") or 0),
             "refusal_elapsed_seconds": float(
@@ -1274,6 +1358,10 @@ async def _generate_request(
         }
         base_metadata.pop("retryable_generation", None)
         base_metadata.pop("terminal_generation", None)
+        base_metadata.pop("quota_retryable", None)
+        base_metadata.pop("terminal_provider_task", None)
+        base_metadata.pop("last_error_class", None)
+        base_metadata.pop("error_class", None)
         _record_request_state(
             video_id,
             artifact_type,
@@ -1393,6 +1481,23 @@ async def _generate_request(
                         metadata=base_metadata,
                     )
         except MuseServiceBusy:
+            raise
+        except MuseQuotaUnavailable as exc:
+            current = db.get_latest_video_artifact(video_id, artifact_type) or {}
+            current_metadata = dict(current.get("metadata") or base_metadata)
+            capacity = getattr(exc, "capacity_preflight", None) or getattr(
+                adapter, "capacity_preflight", None
+            )
+            _checkpoint_quota_failure(
+                video_id=video_id,
+                artifact_type=artifact_type,
+                request_hash=request_hash,
+                metadata=current_metadata,
+                error=exc,
+                generation_started=generation_started,
+                capacity_preflight=capacity,
+            )
+            exc.capacity_preflight = dict(capacity or {})
             raise
         except MuseTaskTransientFailure as exc:
             current = db.get_latest_video_artifact(video_id, artifact_type) or {}
@@ -1583,6 +1688,12 @@ async def _prepare_media_async(
     provider = MuseStudioApiProvider(job_id=job_id, video_id=video_id)
     scene_results: list[dict] = []
     async with provider.open_session() as adapter:
+        quota_preflight = dict(adapter.capacity_preflight or {})
+        if quota_preflight.get("status") == "degraded":
+            progress(
+                "Muse chưa xác nhận được quota; tiếp tục bằng account unknown sau cùng",
+                "muse_quota_degraded",
+            )
         total = len(plan["scenes"])
         image_phase_started = time.monotonic()
         for scene in plan["scenes"]:
@@ -1724,6 +1835,7 @@ async def _prepare_media_async(
     outcome_metadata = [dict(item.get("metadata") or {}) for item in outcomes]
     summary = {
         "prompt_policy_version": MUSE_PROMPT_POLICY_VERSION,
+        "quota_preflight": quota_preflight,
         "planned_media_count": len(outcomes),
         "original_count": sum(
             meta.get("prompt_strategy") == "original" for meta in outcome_metadata

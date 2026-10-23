@@ -734,6 +734,85 @@ class TestMuseBalancedPromptPolicy(unittest.TestCase):
 
 
 class TestMuseStudioApiProvider(unittest.TestCase):
+    def test_open_session_preflights_capacity_once_and_allows_degraded(self):
+        for status in ("ready", "degraded"):
+            with self.subTest(status=status):
+                provider = muse_provider.MuseStudioApiProvider()
+
+                async def run():
+                    async with provider.open_session():
+                        return dict(provider.capacity_preflight)
+
+                with (
+                    patch.object(muse_provider.muse_studio_service, "acquire"),
+                    patch.object(muse_provider.muse_studio_service, "release") as release,
+                    patch.object(
+                        provider,
+                        "_post_json",
+                        return_value={
+                            "status": status,
+                            "eligible": 1 if status == "ready" else 0,
+                            "unknown": 1 if status == "degraded" else 0,
+                            "exhausted": 0,
+                            "cache_hit": True,
+                            "checked_at": 1,
+                            "elapsed_seconds": 0.1,
+                        },
+                    ) as post,
+                ):
+                    capacity = asyncio.run(run())
+
+                post.assert_called_once_with(
+                    "/v1/media-capacity/preflight", {}, "", 45.0
+                )
+                release.assert_called_once()
+                self.assertEqual(capacity["status"], status)
+
+    def test_open_session_rejects_confirmed_exhausted_capacity(self):
+        provider = muse_provider.MuseStudioApiProvider()
+
+        async def run():
+            async with provider.open_session():
+                self.fail("exhausted preflight must not enter the session")
+
+        with (
+            patch.object(muse_provider.muse_studio_service, "acquire"),
+            patch.object(muse_provider.muse_studio_service, "release") as release,
+            patch.object(
+                provider,
+                "_post_json",
+                return_value={
+                    "status": "exhausted",
+                    "eligible": 0,
+                    "unknown": 0,
+                    "exhausted": 3,
+                    "cache_hit": True,
+                },
+            ),
+            self.assertRaises(muse_provider.MuseQuotaUnavailable) as raised,
+        ):
+            asyncio.run(run())
+
+        release.assert_called_once()
+        self.assertEqual(raised.exception.capacity_preflight["exhausted"], 3)
+
+    def test_open_session_rejects_malformed_capacity_contract(self):
+        provider = muse_provider.MuseStudioApiProvider()
+
+        async def run():
+            async with provider.open_session():
+                self.fail("malformed preflight must not enter the session")
+
+        with (
+            patch.object(muse_provider.muse_studio_service, "acquire"),
+            patch.object(muse_provider.muse_studio_service, "release") as release,
+            patch.object(provider, "_post_json", return_value={"status": "maybe"}),
+            self.assertRaises(muse_provider.MuseTransientError),
+        ):
+            asyncio.run(run())
+
+        release.assert_called_once()
+
     def test_image_payload_has_all_references_and_idempotency_key(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             references = []
@@ -869,6 +948,35 @@ class TestMuseStudioApiProvider(unittest.TestCase):
                         {"error": message, "elapsed": 360.9}
                     )
 
+    def test_quota_failures_have_a_distinct_non_transient_classification(self):
+        for message in (
+            "账号额度不足",
+            "quota exceeded",
+            "media_quota_exhausted",
+            "所有 Muse 媒体账号额度均已耗尽",
+        ):
+            with self.subTest(message=message):
+                self.assertIs(
+                    muse_provider.classify_muse_failure(message),
+                    muse_provider.MuseQuotaUnavailable,
+                )
+        with self.assertRaises(muse_provider.MuseQuotaUnavailable) as raised:
+            muse_provider.MuseStudioApiProvider._raise_task_failure(
+                {
+                    "error": "账号额度不足",
+                    "updated_at": 10,
+                    "media_capacity": {
+                        "status": "exhausted",
+                        "eligible": 0,
+                        "unknown": 0,
+                        "exhausted": 3,
+                        "skipped": 1,
+                    },
+                }
+            )
+        self.assertEqual(raised.exception.capacity_preflight["exhausted"], 3)
+        self.assertNotIn("account_id", raised.exception.capacity_preflight)
+
     def test_refusal_and_external_media_url_fail_closed(self):
         for message in (
             "Generation refused by safety policy",
@@ -900,6 +1008,165 @@ class TestMuseStudioApiProvider(unittest.TestCase):
 
 
 class TestMuseRecovery(unittest.TestCase):
+    def test_quota_checkpoint_preserves_attempt_and_rotates_submission_hash(self):
+        artifact = None
+
+        def upsert(**kwargs):
+            nonlocal artifact
+            artifact = {
+                "status": kwargs["status"],
+                "content_hash": kwargs["content_hash"],
+                "metadata": kwargs["metadata"],
+            }
+            return artifact
+
+        base_hash = "request-hash"
+        initial_hash = muse_pipeline._submission_hash_for_attempt(
+            base_hash, 1, "original"
+        )
+        with patch.object(
+            muse_pipeline.db, "upsert_video_artifact", side_effect=upsert
+        ):
+            muse_pipeline._checkpoint_quota_failure(
+                video_id=1,
+                artifact_type="muse_scene_image:0",
+                request_hash=base_hash,
+                metadata={
+                    "attempt": 1,
+                    "submission_hash": initial_hash,
+                    "provider_task_id": "quota-task",
+                    "endpoint": "/v1/images/tasks/quota-task",
+                    "submitted_at": "2026-01-01T00:00:00Z",
+                },
+                error=muse_provider.MuseQuotaUnavailable("quota exceeded"),
+                generation_started=time.monotonic(),
+                capacity_preflight={"status": "ready", "eligible": 1},
+            )
+
+        metadata = artifact["metadata"]
+        recovery_hash = muse_pipeline._submission_hash_for_attempt(
+            base_hash,
+            metadata["attempt"],
+            "original",
+            metadata["quota_recovery_sequence"],
+        )
+        self.assertEqual(artifact["status"], "error")
+        self.assertEqual(metadata["attempt"], 1)
+        self.assertTrue(metadata["quota_retryable"])
+        self.assertEqual(metadata["quota_recovery_sequence"], 1)
+        self.assertEqual(metadata["last_provider_task_id"], "quota-task")
+        self.assertNotIn("provider_task_id", metadata)
+        self.assertNotEqual(recovery_hash, initial_hash)
+
+    def test_quota_resume_resubmits_with_new_key_without_consuming_attempt(self):
+        artifact = None
+        submission_hashes = []
+
+        def get_latest(*_args, **_kwargs):
+            return artifact
+
+        def upsert(**kwargs):
+            nonlocal artifact
+            artifact = {
+                "status": kwargs["status"],
+                "content_hash": kwargs["content_hash"],
+                "path": kwargs.get("path", ""),
+                "metadata": kwargs["metadata"],
+            }
+            return artifact
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            generated = root / "generated.png"
+            generated.write_bytes(b"generated")
+
+            class QuotaAdapter:
+                capacity_preflight = {
+                    "status": "exhausted",
+                    "eligible": 0,
+                    "unknown": 0,
+                    "exhausted": 3,
+                }
+
+                async def create_image(self, _prompt, _paths, _destination, **kwargs):
+                    submission_hashes.append(kwargs["request_hash"])
+                    kwargs["on_submitted"](
+                        muse_provider.MuseReceipt(
+                            provider_task_id="quota-task",
+                            endpoint="/v1/images/tasks/quota-task",
+                            submitted_at="2026-01-01T00:00:00Z",
+                        )
+                    )
+                    error = muse_provider.MuseQuotaUnavailable("quota exceeded")
+                    error.capacity_preflight = dict(self.capacity_preflight)
+                    raise error
+
+            class SuccessAdapter:
+                capacity_preflight = {
+                    "status": "ready",
+                    "eligible": 1,
+                    "unknown": 0,
+                    "exhausted": 2,
+                }
+
+                async def create_image(self, _prompt, _paths, _destination, **kwargs):
+                    submission_hashes.append(kwargs["request_hash"])
+                    kwargs["on_submitted"](
+                        muse_provider.MuseReceipt(
+                            provider_task_id="recovery-task",
+                            endpoint="/v1/images/tasks/recovery-task",
+                            submitted_at="2026-01-01T00:01:00Z",
+                        )
+                    )
+                    return {
+                        "path": str(generated),
+                        "mime_type": "image/png",
+                        "provider": muse_provider.MUSE_PROVIDER_NAME,
+                        "provider_task_id": "recovery-task",
+                        "endpoint": "/v1/images/tasks/recovery-task",
+                        "submitted_at": "2026-01-01T00:01:00Z",
+                    }
+
+            async def generate(adapter):
+                return await muse_pipeline._generate_request(
+                    adapter=adapter,
+                    video_id=1,
+                    artifact_type="muse_scene_image:0",
+                    request_hash="request",
+                    prompt="safe prompt",
+                    references=[],
+                    omitted=[],
+                    destination=root / "scene",
+                    expected="image",
+                    scene={"index": 0},
+                    cancel_check=lambda: None,
+                    policy_metadata={"prompt_strategy": "original"},
+                )
+
+            with (
+                patch.object(muse_pipeline.db, "get_latest_video_artifact", side_effect=get_latest),
+                patch.object(muse_pipeline.db, "upsert_video_artifact", side_effect=upsert),
+                patch.object(
+                    muse_pipeline,
+                    "_validate_image",
+                    return_value={"width": 1920, "height": 1080},
+                ),
+            ):
+                with self.assertRaises(muse_provider.MuseQuotaUnavailable):
+                    asyncio.run(generate(QuotaAdapter()))
+                paused_metadata = dict(artifact["metadata"])
+                result = asyncio.run(generate(SuccessAdapter()))
+
+        self.assertEqual(paused_metadata["attempt"], 1)
+        self.assertTrue(paused_metadata["quota_retryable"])
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["metadata"]["attempt"], 1)
+        self.assertEqual(result["metadata"]["quota_recovery_sequence"], 1)
+        self.assertNotIn("quota_retryable", result["metadata"])
+        self.assertNotIn("terminal_provider_task", result["metadata"])
+        self.assertEqual(len(submission_hashes), 2)
+        self.assertNotEqual(submission_hashes[0], submission_hashes[1])
+
     def test_refused_image_retries_once_with_non_graphic_fallback(self):
         artifact = None
 
@@ -2780,6 +3047,49 @@ class TestMuseRouting(unittest.TestCase):
         self.assertEqual(
             update_video.call_args.kwargs["current_stage"],
             "muse_semantic_plan_needs_attention",
+        )
+
+    def test_confirmed_muse_quota_exhaustion_pauses_for_resume(self):
+        job = {
+            "id": "muse-quota-exhausted",
+            "job_type": "muse_media_generation",
+            "video_id": 42,
+            "payload": {},
+            "result": {},
+        }
+        error = muse_provider.MuseQuotaUnavailable("quota exceeded")
+        error.capacity_preflight = {
+            "status": "exhausted",
+            "eligible": 0,
+            "unknown": 0,
+            "exhausted": 3,
+            "cache_hit": True,
+            "checked_at": 1,
+            "elapsed_seconds": 0.2,
+        }
+        with (
+            patch.object(main.db, "get_youtube_publish_workflow_by_job", return_value=None),
+            patch.object(main.db, "get_system_job", return_value=job),
+            patch.object(main.db, "schedule_system_job_recovery") as schedule,
+            patch.object(main.db, "update_system_job") as update_job,
+            patch.object(main.db, "update_video_production_state") as update_video,
+        ):
+            main._handle_production_job_error(job, error)
+
+        schedule.assert_not_called()
+        self.assertEqual(update_job.call_args.kwargs["status"], "paused")
+        self.assertEqual(
+            update_job.call_args.kwargs["result_json"]["attention_required"],
+            "muse_quota_exhausted",
+        )
+        self.assertEqual(
+            update_job.call_args.kwargs["result_json"]["muse_quota_preflight"]["exhausted"],
+            3,
+        )
+        self.assertIn("Resume", update_job.call_args.kwargs["progress"])
+        self.assertEqual(
+            update_video.call_args.kwargs["current_stage"],
+            "muse_quota_exhausted",
         )
 
     def test_chatgpt_attention_pauses_muse_planner(self):

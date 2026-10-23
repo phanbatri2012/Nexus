@@ -44,6 +44,35 @@ logger = logging.getLogger(__name__)
 TRUST_JOB_TYPE = "trust_builder_session"
 ENGAGEMENT_ACTIONS = ("like", "comment", "subscribe")
 
+def is_engagement_action_favorable(
+    action_type: str,
+    persona: str,
+    timezone_name: str,
+    now_utc: datetime.datetime | None = None,
+) -> bool:
+    """Check if the current local time of the channel is favorable for an engagement action."""
+    if persona == "legacy_uniform":
+        return True
+
+    try:
+        tz = ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        tz = ZoneInfo("Asia/Ho_Chi_Minh")
+
+    current_dt = (now_utc or datetime.datetime.now(datetime.timezone.utc)).astimezone(tz)
+    time_val = current_dt.hour + (current_dt.minute / 60.0)
+
+    if persona == "night_owl":
+        return time_val >= 17.0 or time_val < 2.0
+
+    if action_type == "like":
+        return True
+
+    is_lunch = 11.5 <= time_val <= 13.5
+    is_evening = 18.0 <= time_val <= 23.0
+    return is_lunch or is_evening
+
+
 # Mutex lock per plan_id to prevent concurrent runs on the same plan
 _plan_locks: dict[int, asyncio.Lock] = {}
 _plan_guard = asyncio.Lock()
@@ -868,7 +897,9 @@ async def run_warmup_session(
                                 session_result["liked"] = True
 
                     daily_stats = db.get_trust_daily_activity_stats(plan_id, timezone_name)
-                    if warmup_phase == "phase_2_engage" and is_safe_engage and not should_cancel():
+                    persona = str(plan.get("schedule_persona") or "circadian_standard")
+                    can_comment = not require_active or is_engagement_action_favorable("comment", persona, timezone_name)
+                    if warmup_phase == "phase_2_engage" and is_safe_engage and can_comment and not should_cancel():
                         daily_comment_target = int(plan.get("daily_comment_target") or 0)
                         if daily_stats.get("comment_count", 0) < daily_comment_target and work_state["pending"]["comment"]:
                             comment_text = generate_contextual_comment(
@@ -895,7 +926,8 @@ async def run_warmup_session(
                                 session_result["commented"] = True
 
                     daily_stats = db.get_trust_daily_activity_stats(plan_id, timezone_name)
-                    if warmup_phase == "phase_2_engage" and is_safe_engage and not should_cancel():
+                    can_sub = not require_active or is_engagement_action_favorable("subscribe", persona, timezone_name)
+                    if warmup_phase == "phase_2_engage" and is_safe_engage and can_sub and not should_cancel():
                         daily_sub_target = int(plan.get("daily_subscribe_target") or 0)
                         if daily_stats.get("subscribe_count", 0) < daily_sub_target and work_state["pending"]["subscribe"]:
                             raw_subscribe_result = await action_subscribe_channel(page)

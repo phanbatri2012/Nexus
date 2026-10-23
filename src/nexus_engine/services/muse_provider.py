@@ -45,6 +45,10 @@ class MuseAdmissionRetry(MuseTransientError):
     """Muse2API rejected the request before accepting a generation task."""
 
 
+class MuseQuotaUnavailable(MuseError):
+    """All Muse media accounts have confirmed exhausted capacity."""
+
+
 class MuseServiceBusy(MuseTransientError):
     """The local Muse ports are occupied or the owned service is busy."""
 
@@ -87,6 +91,19 @@ _REFERENCE_ERROR_TOKENS = (
     "không đọc được ảnh",
 )
 _AUTH_ERROR_TOKENS = ("auth", "login", "cookie", "session", "account")
+_QUOTA_ERROR_TOKENS = (
+    "media_quota_exhausted",
+    "账号额度不足",
+    "媒体额度已耗尽",
+    "媒体额度均已耗尽",
+    "账号额度已耗尽",
+    "账号额度均已耗尽",
+    "out of credits",
+    "quota exceeded",
+    "token limit",
+    "hết quota",
+    "hết hạn mức",
+)
 _TASK_WAIT_LIMIT_ERROR_TOKENS = (
     "total task wait limit reached",
     "total wait limit reached",
@@ -121,6 +138,8 @@ def classify_muse_failure(message: str) -> type[MuseError]:
     """Classify provider failures without broad language-specific substrings."""
 
     lowered = str(message or "").casefold()
+    if any(token in lowered for token in _QUOTA_ERROR_TOKENS):
+        return MuseQuotaUnavailable
     if any(token in lowered for token in _REFUSAL_ERROR_TOKENS):
         return MuseRefusalError
     if any(token in lowered for token in _REFERENCE_ERROR_TOKENS):
@@ -255,6 +274,7 @@ class MuseStudioApiProvider:
     def __init__(self, *, job_id: str = "", video_id: int | None = None):
         self.job_id = job_id
         self.video_id = video_id
+        self.capacity_preflight: dict = {}
 
     @contextlib.asynccontextmanager
     async def open_session(self) -> AsyncGenerator["MuseStudioApiProvider", None]:
@@ -269,6 +289,40 @@ class MuseStudioApiProvider:
         except muse_studio_service.MuseStudioServiceError as exc:
             raise MuseError(str(exc)) from exc
         try:
+            capacity = await asyncio.to_thread(
+                self._post_json,
+                "/v1/media-capacity/preflight",
+                {},
+                "",
+                45.0,
+            )
+            try:
+                self.capacity_preflight = {
+                    "status": str(capacity.get("status") or ""),
+                    "eligible": int(capacity.get("eligible") or 0),
+                    "unknown": int(capacity.get("unknown") or 0),
+                    "exhausted": int(capacity.get("exhausted") or 0),
+                    "skipped": int(capacity.get("skipped") or 0),
+                    "cache_hit": bool(capacity.get("cache_hit")),
+                    "checked_at": int(capacity.get("checked_at") or 0),
+                    "elapsed_seconds": float(capacity.get("elapsed_seconds") or 0.0),
+                }
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise MuseTransientError(
+                    "Muse2API trả preflight media capacity sai contract."
+                ) from exc
+            if self.capacity_preflight["status"] not in {
+                "ready", "degraded", "exhausted"
+            }:
+                raise MuseTransientError(
+                    "Muse2API trả trạng thái media capacity không hợp lệ."
+                )
+            if self.capacity_preflight["status"] == "exhausted":
+                error = MuseQuotaUnavailable(
+                    "Tất cả tài khoản Muse đã hết quota; hãy bổ sung/đợi quota rồi Resume."
+                )
+                error.capacity_preflight = dict(self.capacity_preflight)
+                raise error
             yield self
         finally:
             muse_studio_service.release()
@@ -491,6 +545,18 @@ class MuseStudioApiProvider:
     def _raise_task_failure(task: dict) -> None:
         message = str(task.get("error") or "Muse2API generation thất bại.")[:1000]
         error = classify_muse_failure(message)(message)
+        capacity = task.get("media_capacity")
+        if isinstance(error, MuseQuotaUnavailable) and isinstance(capacity, dict):
+            error.capacity_preflight = {
+                "status": str(capacity.get("status") or "exhausted"),
+                "eligible": int(capacity.get("eligible") or 0),
+                "unknown": int(capacity.get("unknown") or 0),
+                "exhausted": int(capacity.get("exhausted") or 0),
+                "skipped": int(capacity.get("skipped") or 0),
+                "cache_hit": True,
+                "checked_at": int(task.get("updated_at") or 0),
+                "elapsed_seconds": 0.0,
+            }
         try:
             error.provider_elapsed_seconds = float(task.get("elapsed") or 0)
         except (TypeError, ValueError):
@@ -503,6 +569,7 @@ class MuseStudioApiProvider:
         endpoint: str,
         payload: dict | None = None,
         extra_headers: dict[str, str] | None = None,
+        timeout_seconds: float = 20.0,
     ) -> dict:
         base_url, api_key = muse_studio_service.api_credentials()
         parsed = urllib.parse.urlsplit(endpoint)
@@ -522,7 +589,7 @@ class MuseStudioApiProvider:
         request = urllib.request.Request(base_url + path, data=body, headers=headers, method=method)
         opener = urllib.request.build_opener(_NoRedirectHandler())
         try:
-            with opener.open(request, timeout=20) as response:
+            with opener.open(request, timeout=timeout_seconds) as response:
                 raw = response.read().decode("utf-8")
                 return json.loads(raw) if raw.strip() else {}
         except urllib.error.HTTPError as exc:
@@ -530,6 +597,8 @@ class MuseStudioApiProvider:
             if exc.code in {401, 403}:
                 raise MuseAuthenticationError(detail) from exc
             if exc.code == 429:
+                if classify_muse_failure(detail) is MuseQuotaUnavailable:
+                    raise MuseQuotaUnavailable(detail) from exc
                 raise MuseAdmissionRetry(detail) from exc
             if exc.code in {400, 404, 409, 422}:
                 raise MuseError(detail) from exc
@@ -538,9 +607,17 @@ class MuseStudioApiProvider:
     def _get_json(self, endpoint: str) -> dict:
         return self._request_json("GET", endpoint)
 
-    def _post_json(self, endpoint: str, payload: dict, idempotency_key: str = "") -> dict:
+    def _post_json(
+        self,
+        endpoint: str,
+        payload: dict,
+        idempotency_key: str = "",
+        timeout_seconds: float = 20.0,
+    ) -> dict:
         headers = {"Idempotency-Key": idempotency_key} if idempotency_key else {}
-        return self._request_json("POST", endpoint, payload, headers)
+        return self._request_json(
+            "POST", endpoint, payload, headers, timeout_seconds
+        )
 
     @staticmethod
     def _media_url(task: dict) -> str:
