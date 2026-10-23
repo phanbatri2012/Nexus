@@ -4642,8 +4642,8 @@ def get_system_jobs_summary_counts(
             '''
             SELECT 
                 COUNT(1) AS total,
-                SUM(CASE WHEN audio_reviews.status IN ('queued', 'pending', 'processing') THEN 1 ELSE 0 END) AS active,
-                SUM(CASE WHEN audio_reviews.status IN ('failed', 'rejected') THEN 1 ELSE 0 END) AS error
+                SUM(CASE WHEN audio_reviews.status IN ('queued', 'processing') THEN 1 ELSE 0 END) AS active,
+                SUM(CASE WHEN audio_reviews.status IN ('failed', 'rejected', 'blocked') THEN 1 ELSE 0 END) AS error
             FROM audio_reviews
             JOIN videos ON videos.id = audio_reviews.video_id
             WHERE videos.video_status = ?

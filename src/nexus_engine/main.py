@@ -10204,9 +10204,9 @@ def _collect_job_center_items(
     if normalized_type in {"", "audio_review"}:
         audio_reviews = db.list_audio_reviews(limit=None)
         if status == "active":
-            audio_reviews = [r for r in audio_reviews if r.get("status") in {"queued", "pending", "processing"}]
+            audio_reviews = [r for r in audio_reviews if r.get("status") in {"queued", "processing"}]
         elif status == "error":
-            audio_reviews = [r for r in audio_reviews if r.get("status") in {"failed", "rejected"}]
+            audio_reviews = [r for r in audio_reviews if r.get("status") in {"failed", "rejected", "blocked"}]
         items.extend(
             _audio_review_job_center_item(review)
             for review in audio_reviews
