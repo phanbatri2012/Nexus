@@ -1673,6 +1673,78 @@ def init_db():
         WHERE status IN ('reserved', 'scheduled')
     """)
 
+def _migrate_channel_publication_slots_15m_grid(conn: sqlite3.Connection) -> None:
+    """Migrate legacy publication slots to ensure all minutes align with YouTube's 15-minute grid."""
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, publication_slots_json FROM youtube_channels "
+        "WHERE publication_slots_json IS NOT NULL AND publication_slots_json != ''"
+    )
+    rows = cursor.fetchall()
+    for channel_id, slots_raw in rows:
+        try:
+            slots = json.loads(slots_raw or "[]")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(slots, list):
+            continue
+        modified = False
+        new_slots = []
+        seen = set()
+        for slot in slots:
+            if not isinstance(slot, dict) or "time" not in slot:
+                continue
+            day = slot.get("day", -1)
+            time_str = str(slot.get("time") or "").strip()
+            match = re.match(r"^(\d{1,2}):(\d{2})$", time_str)
+            if not match:
+                new_slots.append(slot)
+                continue
+            h, m = int(match.group(1)), int(match.group(2))
+            if m not in (0, 15, 30, 45):
+                snapped_m = int(round(m / 15.0) * 15)
+                if snapped_m >= 60:
+                    h = (h + 1) % 24
+                    snapped_m = 0
+                snapped_time = f"{h:02d}:{snapped_m:02d}"
+                modified = True
+            else:
+                snapped_time = f"{h:02d}:{m:02d}"
+
+            key = (day, snapped_time)
+            if key not in seen:
+                seen.add(key)
+                new_slots.append({"day": day, "time": snapped_time})
+        if modified:
+            cursor.execute(
+                "UPDATE youtube_channels SET publication_slots_json = ? WHERE id = ?",
+                (json.dumps(new_slots, ensure_ascii=False, separators=(",", ":")), channel_id),
+            )
+            logger.info("Migrated channel %s publication slots to 15m grid: %s", channel_id, new_slots)
+
+    # Also update any active 'reserved' reservations that have un-snapped minutes
+    cursor.execute("SELECT id, scheduled_at FROM channel_schedule_reservations WHERE status = 'reserved'")
+    res_rows = cursor.fetchall()
+    for res_id, sched_str in res_rows:
+        try:
+            parsed = dt.datetime.fromisoformat(str(sched_str).replace("Z", "+00:00"))
+            total_sec = parsed.minute * 60 + parsed.second
+            rem = total_sec % 900
+            if rem != 0:
+                if rem < 450:
+                    snapped = parsed - dt.timedelta(seconds=rem)
+                else:
+                    snapped = parsed + dt.timedelta(seconds=(900 - rem))
+                snapped_str = snapped.replace(microsecond=0).isoformat()
+                cursor.execute(
+                    "UPDATE channel_schedule_reservations SET scheduled_at = ? WHERE id = ?",
+                    (snapped_str, res_id),
+                )
+                logger.info("Migrated reservation %s scheduled_at from %s to %s", res_id, sched_str, snapped_str)
+        except Exception:
+            pass
+
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS comfyui_workflow_profiles (
             id TEXT PRIMARY KEY,
@@ -1854,6 +1926,7 @@ def init_db():
     _migrate_fb_crossposter_queue_composite_unique(conn)
     _migrate_fb_crossposter_meta_state(conn)
     _migrate_channel_schedule_reservations_partial_unique(conn)
+    _migrate_channel_publication_slots_15m_grid(conn)
     _remove_orphan_video_dependencies(conn)
     _clean_existing_scripts_with_sanitizer(conn)
     conn.commit()
@@ -2203,6 +2276,78 @@ def _migrate_channel_schedule_reservations_partial_unique(conn: sqlite3.Connecti
         ON channel_schedule_reservations(youtube_channel_id, scheduled_at)
         WHERE status IN ('reserved', 'scheduled')
     """)
+
+def _migrate_channel_publication_slots_15m_grid(conn: sqlite3.Connection) -> None:
+    """Migrate legacy publication slots to ensure all minutes align with YouTube's 15-minute grid."""
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, publication_slots_json FROM youtube_channels "
+        "WHERE publication_slots_json IS NOT NULL AND publication_slots_json != ''"
+    )
+    rows = cursor.fetchall()
+    for channel_id, slots_raw in rows:
+        try:
+            slots = json.loads(slots_raw or "[]")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(slots, list):
+            continue
+        modified = False
+        new_slots = []
+        seen = set()
+        for slot in slots:
+            if not isinstance(slot, dict) or "time" not in slot:
+                continue
+            day = slot.get("day", -1)
+            time_str = str(slot.get("time") or "").strip()
+            match = re.match(r"^(\d{1,2}):(\d{2})$", time_str)
+            if not match:
+                new_slots.append(slot)
+                continue
+            h, m = int(match.group(1)), int(match.group(2))
+            if m not in (0, 15, 30, 45):
+                snapped_m = int(round(m / 15.0) * 15)
+                if snapped_m >= 60:
+                    h = (h + 1) % 24
+                    snapped_m = 0
+                snapped_time = f"{h:02d}:{snapped_m:02d}"
+                modified = True
+            else:
+                snapped_time = f"{h:02d}:{m:02d}"
+
+            key = (day, snapped_time)
+            if key not in seen:
+                seen.add(key)
+                new_slots.append({"day": day, "time": snapped_time})
+        if modified:
+            cursor.execute(
+                "UPDATE youtube_channels SET publication_slots_json = ? WHERE id = ?",
+                (json.dumps(new_slots, ensure_ascii=False, separators=(",", ":")), channel_id),
+            )
+            logger.info("Migrated channel %s publication slots to 15m grid: %s", channel_id, new_slots)
+
+    # Also update any active 'reserved' reservations that have un-snapped minutes
+    cursor.execute("SELECT id, scheduled_at FROM channel_schedule_reservations WHERE status = 'reserved'")
+    res_rows = cursor.fetchall()
+    for res_id, sched_str in res_rows:
+        try:
+            parsed = dt.datetime.fromisoformat(str(sched_str).replace("Z", "+00:00"))
+            total_sec = parsed.minute * 60 + parsed.second
+            rem = total_sec % 900
+            if rem != 0:
+                if rem < 450:
+                    snapped = parsed - dt.timedelta(seconds=rem)
+                else:
+                    snapped = parsed + dt.timedelta(seconds=(900 - rem))
+                snapped_str = snapped.replace(microsecond=0).isoformat()
+                cursor.execute(
+                    "UPDATE channel_schedule_reservations SET scheduled_at = ? WHERE id = ?",
+                    (snapped_str, res_id),
+                )
+                logger.info("Migrated reservation %s scheduled_at from %s to %s", res_id, sched_str, snapped_str)
+        except Exception:
+            pass
+
 
 
 def save_video(
@@ -4874,11 +5019,23 @@ def delete_system_job(job_id: str) -> dict | None:
     return _decode_system_job(row)
 
 
+SCHEDULED_RETRY_JOB_TYPES = frozenset(
+    {
+        "comment_publish",
+        "comment_sync",
+        "comment_draft",
+        "flow_media_generation",
+        "muse_media_generation",
+    }
+)
+
+
 def claim_next_system_job(job_type: str) -> dict | None:
     from nexus_engine.services import drain_mode
     if drain_mode.is_drain_mode_active():
         return None
     now = utc_now()
+    uses_scheduled_retry = int(job_type in SCHEDULED_RETRY_JOB_TYPES)
     conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
     try:
@@ -4889,7 +5046,7 @@ def claim_next_system_job(job_type: str) -> dict | None:
             WHERE job_type = ? AND cancel_requested = 0
               AND status IN ('queued', 'retry_wait')
               AND (
-                  ? NOT IN ('comment_publish', 'comment_sync', 'comment_draft', 'flow_media_generation')
+                  ? = 0
                   OR status = 'queued'
                   OR next_retry_at = '' OR next_retry_at <= ?
               )
@@ -4900,10 +5057,19 @@ def claim_next_system_job(job_type: str) -> dict | None:
                         AND videos.video_status = 'active'
                   )
               )
-            ORDER BY created_at ASC
+            ORDER BY
+                CASE WHEN ? = 1 AND status = 'queued' THEN 0 ELSE 1 END,
+                CASE WHEN ? = 1 THEN COALESCE(NULLIF(next_retry_at, ''), created_at) ELSE created_at END ASC,
+                created_at ASC
             LIMIT 1
             ''',
-            (job_type, job_type, now),
+            (
+                job_type,
+                uses_scheduled_retry,
+                now,
+                uses_scheduled_retry,
+                uses_scheduled_retry,
+            ),
         ).fetchone()
         if row is None:
             conn.execute("COMMIT")
@@ -4984,22 +5150,43 @@ def recover_interrupted_system_jobs(job_type: str) -> int:
     return recovered
 
 
+STEP_HUMAN_LABELS: dict[str, str] = {
+    "flow_image_reconcile": "Đang chờ Google Flow tạo ảnh",
+    "flow_video_reconcile": "Đang chờ Google Flow tạo video",
+    "muse_media_generation": "Đang kết nối Muse AI",
+    "youtube_transcript": "Đang lấy phụ đề YouTube",
+    "chatgpt_start": "Đang soạn kịch bản ChatGPT",
+    "comment_sync": "Đang đồng bộ bình luận YouTube",
+    "browser_preflight": "Đang kiểm tra trình duyệt",
+    "processing": "Đang xử lý trên YouTube",
+    "preflight": "Đang chuẩn bị xuất bản",
+}
+
+
 def schedule_system_job_recovery(
     job_id: str,
     resume_from_step: str,
     delay_seconds: float,
     error: str,
     result_json: dict | None = None,
+    progress: str | None = None,
 ) -> dict | None:
     retry_at = (
         datetime.datetime.now(datetime.timezone.utc)
         + datetime.timedelta(seconds=max(0.0, float(delay_seconds)))
     ).isoformat()
+    if progress:
+        progress_text = progress
+    else:
+        human_step = STEP_HUMAN_LABELS.get(resume_from_step, resume_from_step)
+        if resume_from_step in STEP_HUMAN_LABELS:
+            progress_text = f"{human_step}; sẽ tự tiếp tục"
+        else:
+            progress_text = f"Tạm dừng tại {human_step or 'bước gần nhất'}; sẽ tự thử lại"
+
     changes = {
         "status": "retry_wait",
-        "progress": (
-            f"Chờ tự phục hồi từ bước {resume_from_step or 'gần nhất'}"
-        ),
+        "progress": progress_text,
         "error": error,
         "resume_from_step": resume_from_step,
         "next_retry_at": retry_at,
@@ -5045,6 +5232,7 @@ def has_claimable_system_jobs(job_type: str) -> bool:
     if drain_mode.is_drain_mode_active():
         return False
     now = utc_now()
+    uses_scheduled_retry = int(job_type in SCHEDULED_RETRY_JOB_TYPES)
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
@@ -5054,7 +5242,7 @@ def has_claimable_system_jobs(job_type: str) -> bool:
         WHERE job_type = ? AND cancel_requested = 0
           AND status IN ('queued', 'retry_wait')
           AND (
-              ? NOT IN ('comment_publish', 'comment_sync', 'comment_draft', 'flow_media_generation')
+              ? = 0
               OR status = 'queued'
               OR next_retry_at = '' OR next_retry_at <= ?
           )
@@ -5065,10 +5253,19 @@ def has_claimable_system_jobs(job_type: str) -> bool:
                     AND videos.video_status = 'active'
               )
           )
-        ORDER BY created_at ASC
+        ORDER BY
+            CASE WHEN ? = 1 AND status = 'queued' THEN 0 ELSE 1 END,
+            CASE WHEN ? = 1 THEN COALESCE(NULLIF(next_retry_at, ''), created_at) ELSE created_at END ASC,
+            created_at ASC
         LIMIT 1
         ''',
-        (job_type, job_type, now),
+        (
+            job_type,
+            uses_scheduled_retry,
+            now,
+            uses_scheduled_retry,
+            uses_scheduled_retry,
+        ),
     )
     row = c.fetchone()
     conn.close()
@@ -5085,6 +5282,7 @@ def get_next_system_job_retry_delay(job_type: str) -> float | None:
     from nexus_engine.services import drain_mode
     if drain_mode.is_drain_mode_active():
         return None
+    uses_scheduled_retry = int(job_type in SCHEDULED_RETRY_JOB_TYPES)
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
@@ -5101,12 +5299,12 @@ def get_next_system_job_retry_delay(job_type: str) -> float | None:
               )
           )
         ORDER BY
-            CASE WHEN ? IN ('comment_publish', 'comment_sync', 'comment_draft', 'flow_media_generation') AND status = 'queued' THEN 0 ELSE 1 END,
-            CASE WHEN ? IN ('comment_publish', 'comment_sync', 'comment_draft', 'flow_media_generation') THEN next_retry_at ELSE created_at END ASC,
+            CASE WHEN ? = 1 AND status = 'queued' THEN 0 ELSE 1 END,
+            CASE WHEN ? = 1 THEN COALESCE(NULLIF(next_retry_at, ''), created_at) ELSE created_at END ASC,
             created_at ASC
         LIMIT 1
         ''',
-        (job_type, job_type, job_type),
+        (job_type, uses_scheduled_retry, uses_scheduled_retry),
     )
     row = c.fetchone()
     conn.close()

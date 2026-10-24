@@ -1,8 +1,9 @@
 import React from 'react'
-import { HOURS_12, MINUTES_60, parseTime24, formatTime24 } from './publicationTime.js'
+import { HOURS_12, MINUTES_15, parseTime24, formatTime24, snapTime24To15 } from './publicationTime.js'
 
 export default function PublicationTimePicker({ value = '09:00', onChange, disabled = false }) {
-  const { hour, minute, period } = parseTime24(value)
+  const snappedValue = snapTime24To15(value)
+  const { hour, minute, period } = parseTime24(snappedValue)
   const time24 = formatTime24(hour, minute, period)
 
   const handleHourChange = e => {
@@ -79,10 +80,10 @@ export default function PublicationTimePicker({ value = '09:00', onChange, disab
         value={minute}
         onChange={handleMinuteChange}
         disabled={disabled}
-        title="Chọn phút (00 - 59)"
+        title="Chọn phút (00, 15, 30, 45 - chuẩn YouTube Studio)"
         aria-label="Phút"
       >
-        {MINUTES_60.map(m => (
+        {MINUTES_15.map(m => (
           <option key={m} value={m}>
             {m}
           </option>

@@ -378,6 +378,29 @@ class TestGoogleFlowWorkerUpload(unittest.IsolatedAsyncioTestCase):
         finally:
             tmp_path.unlink(missing_ok=True)
 
+    async def test_get_existing_image_and_video_error_texts_scoping(self):
+        async def mock_evaluate(script, media_type=""):
+            if media_type == "image":
+                return []
+            elif media_type == "video":
+                return ["Không thành công Bạn đã đạt đến hạn mức sử dụng. Vui lòng thử lại sau."]
+            return ["Không thành công Bạn đã đạt đến hạn mức sử dụng. Vui lòng thử lại sau."]
+
+        self.worker.page.evaluate = AsyncMock(side_effect=mock_evaluate)
+        image_errors = await self.worker._get_existing_image_error_texts()
+        video_errors = await self.worker._get_existing_video_error_texts()
+
+        self.assertEqual(image_errors, set())
+        self.assertEqual(
+            video_errors,
+            {"Không thành công Bạn đã đạt đến hạn mức sử dụng. Vui lòng thử lại sau."},
+        )
+
+    def test_is_flow_image_credit_exhausted_error_ignores_tagged_video(self):
+        tagged_video_err = "[video] warning Không thành công Bạn đã đạt đến hạn mức sử dụng. Vui lòng thử lại sau."
+        self.assertFalse(_is_flow_image_credit_exhausted_error(tagged_video_err))
+        self.assertTrue(_is_flow_video_credit_exhausted_error(tagged_video_err))
+
 
 if __name__ == "__main__":
     unittest.main()

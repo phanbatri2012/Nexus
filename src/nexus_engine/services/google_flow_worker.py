@@ -343,7 +343,7 @@ def _is_flow_image_credit_exhausted_error(text: str) -> bool:
         return False
     lower = str(text).lower()
     # Explicit video cues indicate this failure tile belongs to a video model (e.g. Veo)
-    video_cues = ("interpolating", "veo", "video generation failed", "video interpolating", "1 video")
+    video_cues = ("interpolating", "veo", "video generation failed", "video interpolating", "1 video", "[video]")
     if any(cue in lower for cue in video_cues):
         return False
     return True
@@ -2745,7 +2745,7 @@ class GoogleFlowWorker:
                     else set()
                 )
             else:
-                active_errors = await self._get_existing_error_texts()
+                active_errors = await self._get_existing_video_error_texts()
             if active_errors:
                 self._record_video_timing("error_seen")
                 err_text = next(iter(active_errors))
@@ -3345,8 +3345,8 @@ class GoogleFlowWorker:
         self._validated_image_payload = None
         self._last_generated_image_identity = {}
 
-    async def _get_existing_error_texts(self) -> set[str]:
-        """Snapshot all existing error tile texts currently rendered on the page."""
+    async def _get_existing_error_texts(self, media_type: str = "") -> set[str]:
+        """Snapshot all existing error tile texts currently rendered on the page, optionally scoped to media_type ('image' or 'video')."""
         err_texts = set()
         canvas_err_selectors = [
             "flow-error-tile",
@@ -3359,19 +3359,9 @@ class GoogleFlowWorker:
             ".error-message",
             "mat-snack-bar-container",
         ]
-        for sel in canvas_err_selectors:
-            try:
-                locs = self.page.locator(sel)
-                count = await locs.count()
-                for i in range(min(count, 10)):
-                    t = (await locs.nth(i).inner_text() or "").strip()
-                    if t and _is_valid_flow_error_text(t):
-                        err_texts.add(t)
-            except Exception:
-                pass
         try:
             detected = await self.page.evaluate(
-                r'''() => {
+                r'''(targetMediaType) => {
                     const patterns = [
                         'không thành công',
                         'vi phạm chính sách',
@@ -3394,6 +3384,15 @@ class GoogleFlowWorker:
                     ));
                     const results = [];
                     for (const el of elements) {
+                        const isVideo = Boolean(
+                            el.closest('flow-video-tile, flow-a2ui-video-option, .video-container, [data-media-type="video"], flow-media-tile[data-media-type="video"]')
+                        );
+                        if (targetMediaType === 'image' && isVideo) {
+                            continue;
+                        }
+                        if (targetMediaType === 'video' && !isVideo) {
+                            continue;
+                        }
                         const text = (el.innerText || el.textContent || '').trim();
                         const lower = text.toLowerCase();
                         if (patterns.some(p => lower.includes(p)) && text.length > 5 && text.length < 1000) {
@@ -3401,7 +3400,8 @@ class GoogleFlowWorker:
                         }
                     }
                     return results;
-                }'''
+                }''',
+                media_type,
             )
             if isinstance(detected, list):
                 for item in detected:
@@ -3410,7 +3410,36 @@ class GoogleFlowWorker:
                         err_texts.add(t)
         except Exception:
             pass
+
+        if not err_texts:
+            for sel in canvas_err_selectors:
+                try:
+                    locs = self.page.locator(sel)
+                    count = await locs.count()
+                    for i in range(min(count, 10)):
+                        loc = locs.nth(i)
+                        t = (await loc.inner_text() or "").strip()
+                        if t and _is_valid_flow_error_text(t):
+                            if media_type == "image":
+                                is_vid = await loc.evaluate(
+                                    "el => Boolean(el.closest('flow-video-tile, flow-a2ui-video-option, .video-container, [data-media-type=\"video\"], flow-media-tile[data-media-type=\"video\"]'))"
+                                )
+                                if is_vid:
+                                    continue
+                            elif media_type == "video":
+                                is_vid = await loc.evaluate(
+                                    "el => Boolean(el.closest('flow-video-tile, flow-a2ui-video-option, .video-container, [data-media-type=\"video\"], flow-media-tile[data-media-type=\"video\"]'))"
+                                )
+                                if not is_vid:
+                                    continue
+                            err_texts.add(t)
+                except Exception:
+                    pass
         return err_texts
+
+    async def _get_existing_image_error_texts(self) -> set[str]:
+        """Return terminal errors rendered inside Google Flow image tiles only (excluding video containers)."""
+        return await self._get_existing_error_texts(media_type="image")
 
     async def _get_existing_video_error_texts(self) -> set[str]:
         """Return terminal errors rendered inside Google Flow video tiles only."""
@@ -3420,6 +3449,10 @@ class GoogleFlowWorker:
             "flow-video-tile .error-tile",
             "flow-video-tile [data-tile-state='error']",
             "flow-video-tile [role='alert']",
+            "flow-a2ui-video-option flow-error-tile",
+            "flow-a2ui-video-option .error-tile",
+            ".video-container flow-error-tile",
+            ".video-container .error-tile",
         ]
         for selector in selectors:
             try:
@@ -3431,6 +3464,8 @@ class GoogleFlowWorker:
                         err_texts.add(text)
             except Exception:
                 pass
+        if not err_texts:
+            err_texts = await self._get_existing_error_texts(media_type="video")
         return err_texts
 
     async def _get_existing_video_error_count(self) -> int:
@@ -3439,7 +3474,11 @@ class GoogleFlowWorker:
             "flow-video-tile flow-error-tile, "
             "flow-video-tile .error-tile, "
             "flow-video-tile [data-tile-state='error'], "
-            "flow-video-tile [role='alert']"
+            "flow-video-tile [role='alert'], "
+            "flow-a2ui-video-option flow-error-tile, "
+            "flow-a2ui-video-option .error-tile, "
+            ".video-container flow-error-tile, "
+            ".video-container .error-tile"
         )
         try:
             return max(0, int(await self.page.locator(selector).count()))
@@ -5331,7 +5370,7 @@ class GoogleFlowWorker:
                     else []
                 )
             else:
-                current_errors = await self._get_existing_error_texts()
+                current_errors = await self._get_existing_image_error_texts()
                 new_errors = [
                     text for text in current_errors
                     if text not in initial_error_texts and _is_valid_flow_error_text(text)
@@ -5572,7 +5611,7 @@ class GoogleFlowWorker:
             )
         )
         if reconcile_only or intent_requires_reconciliation:
-            canvas_errors = await self._get_existing_error_texts()
+            canvas_errors = await self._get_existing_image_error_texts()
             for err in canvas_errors:
                 if _is_flow_image_credit_exhausted_error(err):
                     logger.warning("flow_image credit quota exhausted during reconciliation: %s", err)
@@ -5599,7 +5638,7 @@ class GoogleFlowWorker:
         # never be mistaken for the result of the next prompt.
         await self.sync_reference_ingredients(reference_ids, reference_paths)
         baseline_keys = await self._capture_stable_image_baseline()
-        initial_error_texts = await self._get_existing_error_texts()
+        initial_error_texts = await self._get_existing_image_error_texts()
 
         # Locate prompt editor
         editor = await self.wait_for_editor(timeout=25.0)
@@ -5672,8 +5711,9 @@ class GoogleFlowWorker:
             self._log_generation_event("image", "completed", submitted_at)
             return immediate_source
         if submit_only:
-            canvas_errors = await self._get_existing_error_texts()
-            for err in canvas_errors:
+            canvas_errors = await self._get_existing_image_error_texts()
+            new_errors = [err for err in canvas_errors if err not in initial_error_texts]
+            for err in new_errors:
                 if _is_flow_image_credit_exhausted_error(err):
                     logger.warning("flow_image credit quota exhausted after submission: %s", err)
                     raise FlowImageCreditExhausted(
@@ -6070,7 +6110,7 @@ class GoogleFlowWorker:
 
         baseline_keys = await self._capture_video_baseline()
         self._record_video_timing("baseline_captured")
-        initial_error_texts = await self._get_existing_error_texts()
+        initial_error_texts = await self._get_existing_video_error_texts()
         initial_video_error_count = await self._get_existing_video_error_count()
         initial_video_tile_count = await self._get_existing_video_tile_count()
         self._last_video_timing["video_error_count_before_submit"] = (

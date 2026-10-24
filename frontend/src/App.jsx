@@ -1684,13 +1684,30 @@ function App() {
     setSceneResetDialog(prev => ({ ...(prev || {}), isSubmitting: true, error: '' }));
     setIsRendering(true);
     try {
-      const response = await fetch(
-        `http://127.0.0.1:8080/api/videos/${currentVideoId}/reset-scenes-from?from_index=${encodeURIComponent(fromIndex)}`,
-        { method: 'POST' }
-      );
-      const data = await response.json();
-      if (!response.ok || !data.success) {
-        throw new Error(data.detail || data.error || 'Không thể tạo lại từ cảnh.');
+      let data = null;
+      for (let attempt = 0; attempt < 45; attempt += 1) {
+        const response = await fetch(
+          `http://127.0.0.1:8080/api/videos/${currentVideoId}/reset-scenes-from?from_index=${encodeURIComponent(fromIndex)}`,
+          { method: 'POST' }
+        );
+        data = await response.json();
+        if (response.status === 202 && data.status === 'waiting_for_safe_stop') {
+          setSceneResetDialog(prev => ({
+            ...(prev || {}),
+            isSubmitting: true,
+            error: '',
+            statusText: 'Đang chờ Muse dừng tại điểm an toàn...'
+          }));
+          await new Promise(resolve => setTimeout(resolve, Math.max(1, Number(data.retry_after_seconds) || 2) * 1000));
+          continue;
+        }
+        if (!response.ok || !data.success) {
+          throw new Error(data.detail || data.error || 'Không thể tạo lại từ cảnh.');
+        }
+        break;
+      }
+      if (!data || data.status === 'waiting_for_safe_stop') {
+        throw new Error('Muse chưa dừng an toàn sau 90 giây; checkpoint vẫn được giữ nguyên.');
       }
       setSceneResetDialog(null);
       setRenderInfo(prev => ({
@@ -3652,9 +3669,22 @@ function App() {
                                         </span>
                                       </div>
                                     ) : isRenderActive ? (
-                                      <span>
-                                        ⏳ {renderInfo?.job?.progress || (renderInfo?.job?.status === 'running' ? (renderInfo?.render_mode === 'muse_ai' ? 'Đang tạo media Muse & render MP4...' : 'Đang tạo ảnh Flow & render MP4...') : 'Đang trong hàng đợi render...')}
-                                      </span>
+                                      <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+                                          <span>
+                                            {renderInfo?.phase === 'media_generation' ? '🎨' : '⏳'}{' '}
+                                            {renderInfo?.job?.progress || renderInfo?.production_progress || (renderInfo?.job?.status === 'running' ? (renderInfo?.render_mode === 'muse_ai' ? 'Đang tạo media Muse AI...' : 'Đang tạo ảnh Google Flow...') : 'Đang trong hàng đợi render...')}
+                                          </span>
+                                        </div>
+                                        {Boolean(renderInfo?.job?.flow_media_progress?.images_total) && (
+                                          <div style={{ color: '#81e6d9', fontSize: '0.88em', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                            <span>
+                                              📊 Tiến độ ảnh: <strong>{renderInfo.job.flow_media_progress.images_completed}</strong>/{renderInfo.job.flow_media_progress.images_total}
+                                              {renderInfo.job.flow_media_progress.images_pending > 0 && ` (còn ${renderInfo.job.flow_media_progress.images_pending} ảnh)`}
+                                            </span>
+                                          </div>
+                                        )}
+                                      </div>
                                     ) : isRenderError ? (
                                       <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
                                         <span style={{ fontWeight: 'bold', color: '#ff6b6b' }}>❌ Lỗi dựng video MP4</span>
@@ -3695,7 +3725,9 @@ function App() {
                                           color: '#aaa'
                                         }}
                                       >
-                                        ⏳ Đang dựng...
+                                        {renderInfo?.phase === 'media_generation'
+                                          ? (renderInfo?.job?.status === 'retry_wait' ? '⏳ Chờ ảnh...' : '⏳ Đang tạo media...')
+                                          : '⏳ Đang dựng...'}
                                       </button>
                                       <button
                                         className="btn-secondary"
@@ -3854,7 +3886,9 @@ function App() {
                                         style={{ padding: '4px 12px', fontSize: '0.8em' }}
                                         title={renderInfo?.render_mode === 'stock_video'
                                           ? "Tạo mới toàn bộ video MP4 từ đầu"
-                                          : "Tạo mới 1 project trên Google Flow và dựng lại toàn bộ từ cảnh 1"}
+                                          : renderInfo?.render_mode === 'muse_ai'
+                                            ? "Tạo lại toàn bộ media Muse từ cảnh 1"
+                                            : "Tạo mới 1 project trên Google Flow và dựng lại toàn bộ từ cảnh 1"}
                                       >
                                         🔄 Tạo lại toàn bộ
                                       </button>
@@ -3929,7 +3963,9 @@ function App() {
                                         disabled={currentVideoIsError}
                                         title={renderInfo?.render_mode === 'stock_video'
                                           ? "Tận dụng lại audio và phụ đề đã tạo, tiếp tục dựng video MP4"
-                                          : "Dùng lại project cũ trên Google Flow và tiếp tục tạo các cảnh còn thiếu"}
+                                          : renderInfo?.render_mode === 'muse_ai'
+                                            ? "Tiếp tục Muse từ checkpoint và giữ các artifact đã hoàn tất"
+                                            : "Dùng lại project cũ trên Google Flow và tiếp tục tạo các cảnh còn thiếu"}
                                         style={{
                                           padding: '4px 14px',
                                           fontSize: '0.82em',
@@ -3944,7 +3980,9 @@ function App() {
                                           gap: '4px'
                                         }}
                                       >
-                                        ▶️ Tạo tiếp
+                                        {renderInfo?.render_mode === 'muse_ai'
+                                          ? '↻ Tiếp tục từ checkpoint'
+                                          : '▶️ Tạo tiếp'}
                                       </button>
                                       {renderInfo?.render_mode !== 'stock_video' && (
                                         <button
@@ -3981,7 +4019,9 @@ function App() {
                                         disabled={currentVideoIsError}
                                         title={renderInfo?.render_mode === 'stock_video'
                                           ? "Tạo mới toàn bộ video MP4 từ đầu"
-                                          : "Tạo mới một project trên Google Flow và tạo lại toàn bộ từ cảnh 1"}
+                                          : renderInfo?.render_mode === 'muse_ai'
+                                            ? "Xóa checkpoint Muse và tạo lại toàn bộ từ cảnh 1"
+                                            : "Tạo mới một project trên Google Flow và tạo lại toàn bộ từ cảnh 1"}
                                         style={{
                                           padding: '4px 14px',
                                           fontSize: '0.82em',
@@ -4513,6 +4553,11 @@ function App() {
                   {sceneResetDialog.error}
                 </p>
               )}
+              {sceneResetDialog.statusText && !sceneResetDialog.error && (
+                <p role="status" style={{ margin: '12px 0 0', color: '#f1c40f', lineHeight: 1.4 }}>
+                  {sceneResetDialog.statusText}
+                </p>
+              )}
               <div style={{
                 margin: '14px 0 0', padding: '12px', borderRadius: '8px',
                 background: 'rgba(241, 196, 15, 0.08)', border: '1px solid rgba(241, 196, 15, 0.2)',
@@ -4520,7 +4565,7 @@ function App() {
               }}>
                 ℹ️ <strong>Nguyên lý hoạt động:</strong><br />
                 • Các cảnh từ <strong>1 đến {Math.max(1, (parseInt(sceneResetDialog.fromSceneNumber, 10) || 1) - 1)}</strong> sẽ được <strong>giữ nguyên vẹn</strong>.<br />
-                • Hệ thống sẽ xóa các ảnh lỗi từ cảnh <strong>{sceneResetDialog.fromSceneNumber || 1}</strong> trở đi và tiếp tục tạo mới với bộ lọc cấm chữ đã nâng cấp.
+                • Hệ thống sẽ xóa các ảnh lỗi từ cảnh <strong>{sceneResetDialog.fromSceneNumber || 1}</strong> trở đi. Với Muse, clip liền trước cũng được tạo lại vì dùng ảnh này làm khung kết.
               </div>
               <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px' }}>
                 <button

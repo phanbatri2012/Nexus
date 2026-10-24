@@ -78,3 +78,29 @@ def test_find_next_publication_slot_daily_advances_when_occupied():
     )
     # Advances to Wednesday 09:00 VN (02:00 UTC)
     assert result == "2026-09-16T02:00:00+00:00"
+
+def test_validate_publication_slots_rejects_non_15_minute_increments():
+    with pytest.raises(ValueError, match="Phút phải là 00, 15, 30 hoặc 45"):
+        publication_scheduler.validate_publication_slots([{"day": -1, "time": "11:59"}])
+
+    with pytest.raises(ValueError, match="Phút phải là 00, 15, 30 hoặc 45"):
+        publication_scheduler.validate_publication_slots([{"day": 2, "time": "08:07"}])
+
+    with pytest.raises(ValueError, match="Phút phải là 00, 15, 30 hoặc 45"):
+        publication_scheduler.validate_publication_slots([{"day": 0, "time": "14:22"}])
+
+
+def test_validate_publication_slots_accepts_valid_15_minute_increments():
+    slots = [
+        {"day": -1, "time": "07:00"},
+        {"day": 0, "time": "11:15"},
+        {"day": 1, "time": "12:30"},
+        {"day": 2, "time": "18:45"},
+    ]
+    validated = publication_scheduler.validate_publication_slots(slots)
+    assert len(validated) == 4
+    assert validated[0] == {"day": -1, "time": "07:00"}
+    assert validated[1] == {"day": 0, "time": "11:15"}
+    assert validated[2] == {"day": 1, "time": "12:30"}
+    assert validated[3] == {"day": 2, "time": "18:45"}
+

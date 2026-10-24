@@ -2,6 +2,7 @@
 
 export const HOURS_12 = Array.from({ length: 12 }, (_, i) => String(i + 1).padStart(2, '0'))
 export const MINUTES_60 = Array.from({ length: 60 }, (_, i) => String(i).padStart(2, '0'))
+export const MINUTES_15 = ['00', '15', '30', '45']
 
 /**
  * Parse a 24-hour ("HH:MM") or 12-hour ("hh:mm AM/PM") time string into 12-hour components { hour, minute, period }.
@@ -108,4 +109,30 @@ export function formatDateTimeAMPM(value, { includeSeconds = true } = {}) {
     : `${hour12}:${minutes} ${period}`
 
   return `${day}/${month}/${year} ${timePart}`
+}
+
+/**
+ * Snap a 24-hour ("HH:MM") time string to the nearest 15-minute interval (:00, :15, :30, :45).
+ * e.g. "11:59" -> "12:00", "07:07" -> "07:15", "07:02" -> "07:00"
+ */
+export function snapTime24To15(timeStr) {
+  const { hour, minute, period } = parseTime24(timeStr)
+  let h = parseInt(hour, 10)
+  if (isNaN(h) || h < 1 || h > 12) h = 12
+  let m = parseInt(minute, 10)
+  if (isNaN(m) || m < 0 || m > 59) m = 0
+
+  if (period === 'PM') {
+    if (h < 12) h += 12
+  } else if (period === 'AM') {
+    if (h === 12) h = 0
+  }
+
+  const totalMinutes = h * 60 + m
+  const snappedTotal = Math.round(totalMinutes / 15) * 15
+  const finalH = Math.floor(snappedTotal / 60) % 24
+  const finalM = snappedTotal % 60
+
+  return `${String(finalH).padStart(2, '0')}:${String(finalM).padStart(2, '0')}`
+
 }

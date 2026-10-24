@@ -77,6 +77,14 @@ export default function VideoGenerationProgressCard({
       })
   }, [jobs])
 
+  const recoverableMuseJobs = useMemo(() => (
+    jobs.filter(job => (
+      job.type === 'muse_media_generation'
+      && ['error', 'canceled'].includes(job.status)
+      && job.muse_can_resume
+    ))
+  ), [jobs])
+
   // Polling while jobs are active
   useEffect(() => {
     if (activeJobs.length === 0) return undefined
@@ -94,8 +102,8 @@ export default function VideoGenerationProgressCard({
       const matched = jobs.find(j => j.id === selectedJobId || j.raw_id === selectedJobId)
       if (matched) return matched
     }
-    return activeJobs[0] || null
-  }, [activeJobs, jobs, propActiveJobId, selectedJobId])
+    return activeJobs[0] || recoverableMuseJobs[0] || null
+  }, [activeJobs, jobs, propActiveJobId, recoverableMuseJobs, selectedJobId])
 
   // Auto switch when video is finished
   const handleViewCompleted = useCallback((vid) => {
@@ -156,6 +164,13 @@ export default function VideoGenerationProgressCard({
   }
 
   const stageInfo = resolveJobStage(currentJob)
+  const museWaitReason = currentJob?.muse_recovery?.wait_reason || ''
+  const musePortConflict = currentJob?.type === 'muse_media_generation' && (
+    museWaitReason === 'service_busy'
+    || museWaitReason === 'service_port_conflict'
+    || currentJob?.attention_required === 'muse_service_port_conflict'
+  )
+  const museServiceBusyAttempt = Number(currentJob?.muse_recovery?.service_busy_attempt || 0)
 
   // Compute elapsed seconds
   const startTimestamp = currentJob?.started_at || currentJob?.created_at
@@ -298,6 +313,14 @@ export default function VideoGenerationProgressCard({
         <span className="vg-ticker-msg">{stageInfo.subMessage}</span>
       </div>
 
+      {musePortConflict && (
+        <div style={{ color: '#f1c40f', fontSize: '0.82rem', marginBottom: '10px' }}>
+          ⚠️ {currentJob.status === 'paused'
+            ? 'Muse2API đang bị xung đột cổng. Checkpoint đã được giữ; hãy đóng Muse Studio chạy ngoài Nexus rồi Tiếp tục từ checkpoint.'
+            : `Muse2API đang bị xung đột cổng${museServiceBusyAttempt ? ` (lần ${museServiceBusyAttempt}/3)` : ''}; hệ thống sẽ thử lại có giới hạn.`}
+        </div>
+      )}
+
       {actionError && (
         <div style={{ color: '#ff6b6b', fontSize: '0.8rem', marginBottom: '10px' }}>
           ⚠️ {actionError}
@@ -347,7 +370,20 @@ export default function VideoGenerationProgressCard({
               disabled={Boolean(actionId)}
               onClick={() => runJobAction(currentJob.raw_id || currentJob.id, 'resume')}
             >
-              ▶ Tiếp tục
+              {currentJob.type === 'muse_media_generation'
+                ? '↻ Tiếp tục từ checkpoint'
+                : '▶ Tiếp tục'}
+            </button>
+          )}
+
+          {currentJob.muse_can_resume && ['error', 'canceled'].includes(currentJob.status) && (
+            <button
+              type="button"
+              className="vg-btn-action btn-resume"
+              disabled={Boolean(actionId)}
+              onClick={() => runJobAction(currentJob.raw_id || currentJob.id, 'retry')}
+            >
+              ↻ Tiếp tục từ checkpoint
             </button>
           )}
 

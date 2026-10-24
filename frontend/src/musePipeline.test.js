@@ -5,6 +5,10 @@ import fs from 'node:fs'
 const settingsSource = fs.readFileSync(new URL('./Settings.jsx', import.meta.url), 'utf8')
 const appSource = fs.readFileSync(new URL('./App.jsx', import.meta.url), 'utf8')
 const jobCenterSource = fs.readFileSync(new URL('./JobCenter.jsx', import.meta.url), 'utf8')
+const progressCardSource = fs.readFileSync(
+  new URL('./VideoGenerationProgressCard.jsx', import.meta.url),
+  'utf8',
+)
 
 test('Settings exposes the independent Muse pipeline and Studio API controls', () => {
   assert.match(settingsSource, /render_mode.*muse_ai/s)
@@ -30,4 +34,13 @@ test('App and Job Center recognize Muse media jobs', () => {
   assert.match(appSource, /Muse AI & Subtitles/)
   assert.match(jobCenterSource, /muse_media_generation/)
   assert.match(jobCenterSource, /Muse AI/)
+})
+
+test('Muse port conflicts stay visible and recoverable from checkpoint', () => {
+  for (const source of [jobCenterSource, progressCardSource]) {
+    assert.match(source, /muse_service_port_conflict/)
+    assert.match(source, /xung đột cổng/)
+    assert.match(source, /Tiếp tục từ checkpoint/)
+  }
+  assert.match(progressCardSource, /service_busy_attempt/)
 })

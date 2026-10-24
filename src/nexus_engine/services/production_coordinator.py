@@ -38,6 +38,11 @@ class ProductionCoordinator:
         self._current_job_id = ""
 
     def start(self) -> None:
+        for job_type in self._job_types:
+            try:
+                db.recover_interrupted_system_jobs(job_type)
+            except Exception as rec_exc:
+                logger.warning("Failed to recover interrupted jobs for %s: %s", job_type, rec_exc)
         with self._state_lock:
             if self._thread is not None and self._thread.is_alive():
                 self._wake_event.set()
@@ -125,7 +130,15 @@ class ProductionCoordinator:
                 try:
                     self._handlers[str(job["job_type"])](job)
                 except Exception as exc:
-                    self._error_handler(job, exc)
+                    try:
+                        self._error_handler(job, exc)
+                    except Exception as handler_exc:
+                        logger.error(
+                            "Production coordinator error handler failed for job %s: %s",
+                            job.get("id"),
+                            handler_exc,
+                            exc_info=True,
+                        )
                 finally:
                     with self._state_lock:
                         self._current_job_id = ""

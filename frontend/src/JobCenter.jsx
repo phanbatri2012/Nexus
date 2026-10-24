@@ -1112,6 +1112,17 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                         {job.type === 'comment_publish' ? 'Dự kiến đăng lúc' : 'Tự chạy lại lúc'} {formatDate(job.next_retry_at)}
                       </div>
                     )}
+                    {job.type === 'muse_media_generation' && (
+                      job.muse_recovery?.wait_reason === 'service_busy'
+                      || job.muse_recovery?.wait_reason === 'service_port_conflict'
+                      || job.attention_required === 'muse_service_port_conflict'
+                    ) && (
+                      <div style={{ color: '#f1c40f', marginTop: '9px', fontSize: '0.84em' }}>
+                        {job.status === 'paused'
+                          ? 'Muse2API đang bị xung đột cổng. Checkpoint vẫn an toàn; hãy đóng Muse Studio chạy ngoài Nexus rồi bấm “Tiếp tục”.'
+                          : `Muse2API đang bị xung đột cổng${job.muse_recovery?.service_busy_attempt ? ` (lần ${job.muse_recovery.service_busy_attempt}/3)` : ''}; hệ thống sẽ thử lại có giới hạn.`}
+                      </div>
+                    )}
                     {job.scheduled_at && (
                       <div style={{ color: '#4dd0e1', marginTop: '4px', fontSize: '0.78em' }}>
                         Lịch YouTube: {formatDate(job.scheduled_at)}

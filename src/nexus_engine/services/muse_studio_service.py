@@ -119,6 +119,7 @@ if ($connection) {{
             parent_process_id = [int]$process.ParentProcessId
             parent_running = [bool]($null -ne $parent)
             name = [string]$process.Name
+            executable_path = [string]$process.ExecutablePath
             command_line = [string]$process.CommandLine
         }} | ConvertTo-Json -Compress
     }}
@@ -144,6 +145,53 @@ if ($connection) {{
             "parent_process_id": int(payload.get("parent_process_id") or 0),
             "parent_running": bool(payload.get("parent_running")),
             "name": str(payload.get("name") or ""),
+            "executable_path": str(payload.get("executable_path") or ""),
+            "command_line": str(payload.get("command_line") or ""),
+        }
+    except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired):
+        return None
+
+
+def _windows_process(process_id: int) -> dict | None:
+    """Return sanitized metadata for one Windows process without logging its command."""
+
+    if os.name != "nt" or int(process_id or 0) <= 0:
+        return None
+    script = f"""
+$process = Get-CimInstance Win32_Process -Filter ("ProcessId=" + {int(process_id)}) -ErrorAction SilentlyContinue
+if ($process) {{
+    $parent = Get-CimInstance Win32_Process -Filter ("ProcessId=" + [int]$process.ParentProcessId) -ErrorAction SilentlyContinue
+    [pscustomobject]@{{
+        process_id = [int]$process.ProcessId
+        parent_process_id = [int]$process.ParentProcessId
+        parent_running = [bool]($null -ne $parent)
+        name = [string]$process.Name
+        executable_path = [string]$process.ExecutablePath
+        command_line = [string]$process.CommandLine
+    }} | ConvertTo-Json -Compress
+}}
+"""
+    try:
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=MUSE_ORPHAN_CLEANUP_TIMEOUT_SECONDS,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        raw = str(completed.stdout or "").strip()
+        if completed.returncode != 0 or not raw:
+            return None
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            return None
+        return {
+            "process_id": int(payload.get("process_id") or 0),
+            "parent_process_id": int(payload.get("parent_process_id") or 0),
+            "parent_running": bool(payload.get("parent_running")),
+            "name": str(payload.get("name") or ""),
+            "executable_path": str(payload.get("executable_path") or ""),
             "command_line": str(payload.get("command_line") or ""),
         }
     except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired):
@@ -196,6 +244,161 @@ def _cdp_is_muse_browser() -> bool:
         return False
 
 
+def _is_expected_muse_api_process(process: dict, *, require_nexus_python: bool = False) -> bool:
+    if str(process.get("name") or "").strip().lower() not in {"python.exe", "pythonw.exe"}:
+        return False
+    command_line = str(process.get("command_line") or "")
+    if not re.search(
+        r"(?:^|\s)-m\s+uvicorn(?:\.main)?\s+app:app(?:\s|$)",
+        command_line,
+        re.IGNORECASE,
+    ):
+        return False
+    if not re.search(
+        rf"(?:--port(?:=|\s+)){MUSE_API_PORT}(?:\s|$)",
+        command_line,
+        re.IGNORECASE,
+    ):
+        return False
+    if not require_nexus_python:
+        return True
+    try:
+        actual = Path(str(process.get("executable_path") or "")).resolve()
+        expected = Path(sys.executable).resolve()
+    except (OSError, ValueError):
+        return False
+    return os.path.normcase(str(actual)) == os.path.normcase(str(expected))
+
+
+def _probe_idle_unowned_muse_runtime() -> dict | None:
+    """Recognize an idle Muse2API runtime using only its public loopback contract."""
+
+    try:
+        health = _request_json("/healthz", timeout=1.5)
+        ready = _request_json("/readyz", timeout=1.5)
+        runtime_id = str(ready.get("runtime_id") or "").strip()
+        active_media_tasks = int(ready["active_media_tasks"])
+        accounts = int(ready.get("accounts") or 0)
+    except (KeyError, TypeError, ValueError, OSError, urllib.error.URLError):
+        return None
+    if (
+        str(health.get("status") or "").strip().lower() != "ok"
+        or str(ready.get("status") or "").strip().lower() != "ready"
+        or not runtime_id
+        or len(runtime_id) > 128
+        or active_media_tasks != 0
+        or accounts <= 0
+    ):
+        return None
+    return {
+        "runtime_id": runtime_id,
+        "active_media_tasks": active_media_tasks,
+    }
+
+
+def _recover_orphaned_muse_runtime(studio_path: Path) -> bool:
+    """Remove an idle, verified Muse process tree whose Nexus ownership marker was lost."""
+
+    if os.name != "nt" or MUSE_SERVICE_STATE_PATH.exists():
+        return False
+    with _lock:
+        if _process is not None or _api_key:
+            return False
+    if not _has_active_muse_jobs():
+        return False
+    if not _port_in_use(MUSE_API_PORT) or not _port_in_use(MUSE_CDP_PORT):
+        return False
+
+    api_process = _windows_port_process(MUSE_API_PORT)
+    browser_process = _windows_port_process(MUSE_CDP_PORT)
+    if (
+        not api_process
+        or not browser_process
+        or not _is_expected_muse_api_process(api_process)
+        or not _is_expected_muse_browser(browser_process, studio_path)
+        or int(browser_process.get("parent_process_id") or 0)
+        != int(api_process.get("process_id") or 0)
+        or not _cdp_is_muse_browser()
+    ):
+        return False
+
+    api_pid = int(api_process.get("process_id") or 0)
+    root_process = _windows_process(int(api_process.get("parent_process_id") or 0))
+    if root_process and _is_expected_muse_api_process(
+        root_process,
+        require_nexus_python=True,
+    ):
+        root_pid = int(root_process.get("process_id") or 0)
+    elif _is_expected_muse_api_process(api_process, require_nexus_python=True):
+        root_pid = api_pid
+    else:
+        return False
+    if root_pid <= 0:
+        return False
+
+    runtime = _probe_idle_unowned_muse_runtime()
+    if not runtime:
+        return False
+
+    confirmed_api = _windows_port_process(MUSE_API_PORT)
+    confirmed_browser = _windows_port_process(MUSE_CDP_PORT)
+    confirmed_runtime = _probe_idle_unowned_muse_runtime()
+    confirmed_root = (
+        confirmed_api
+        if root_pid == api_pid
+        else _windows_process(root_pid)
+    )
+    if (
+        not confirmed_api
+        or not confirmed_browser
+        or not confirmed_root
+        or not confirmed_runtime
+        or confirmed_runtime.get("runtime_id") != runtime.get("runtime_id")
+        or int(confirmed_api.get("process_id") or 0) != api_pid
+        or (
+            root_pid != api_pid
+            and int(confirmed_api.get("parent_process_id") or 0) != root_pid
+        )
+        or int(confirmed_browser.get("process_id") or 0)
+        != int(browser_process.get("process_id") or 0)
+        or int(confirmed_browser.get("parent_process_id") or 0) != api_pid
+        or not _is_expected_muse_api_process(confirmed_api)
+        or not _is_expected_muse_api_process(
+            confirmed_root,
+            require_nexus_python=True,
+        )
+        or not _is_expected_muse_browser(confirmed_browser, studio_path)
+        or MUSE_SERVICE_STATE_PATH.exists()
+    ):
+        return False
+
+    try:
+        completed = subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(root_pid)],
+            capture_output=True,
+            timeout=MUSE_ORPHAN_CLEANUP_TIMEOUT_SECONDS,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if completed.returncode != 0:
+        return False
+
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        if not _port_in_use(MUSE_API_PORT) and not _port_in_use(MUSE_CDP_PORT):
+            logger.info(
+                "Recovered idle Muse2API orphan runtime_id=%s root_pid=%s api_pid=%s reason=missing_ownership_marker",
+                runtime["runtime_id"],
+                root_pid,
+                api_pid,
+            )
+            return True
+        time.sleep(0.1)
+    return False
+
+
 def _recover_orphaned_muse_browser(studio_path: Path) -> bool:
     """Remove only a verified Muse Chrome orphan that owns the CDP port."""
 
@@ -243,6 +446,9 @@ def _recover_orphaned_muse_browser(studio_path: Path) -> bool:
 def _muse_ports_available(studio_path: Path) -> bool:
     api_busy = _port_in_use(MUSE_API_PORT)
     cdp_busy = _port_in_use(MUSE_CDP_PORT)
+    if api_busy and cdp_busy and _recover_orphaned_muse_runtime(studio_path):
+        api_busy = _port_in_use(MUSE_API_PORT)
+        cdp_busy = _port_in_use(MUSE_CDP_PORT)
     if not api_busy and cdp_busy and _recover_orphaned_muse_browser(studio_path):
         api_busy = _port_in_use(MUSE_API_PORT)
         cdp_busy = _port_in_use(MUSE_CDP_PORT)

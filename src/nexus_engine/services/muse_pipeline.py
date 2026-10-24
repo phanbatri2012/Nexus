@@ -48,8 +48,16 @@ from nexus_engine.services.muse_provider import (
 logger = logging.getLogger(__name__)
 SCENE_SECONDS = 10.0
 MAX_REQUEST_ATTEMPTS = 3
+MAX_RECONCILE_ATTEMPTS = 10
 RETRY_DELAYS_SECONDS = (60.0, 300.0)
 MUSE_PROMPT_POLICY_VERSION = "balanced_v2"
+MUSE_RECOVERY_STATE_VERSION = 2
+MUSE_RECOVERY_STATES = {
+    "submitting",
+    "reconciling",
+    "retry_wait",
+    "terminal_error",
+}
 
 _SEVERE_RISK_TERMS = (
     "đẫm máu",
@@ -215,6 +223,10 @@ class MuseRecoveryExhausted(MuseError):
     """Muse infrastructure retries are exhausted and the job must pause."""
 
 
+class MuseReconcileExhausted(MuseRecoveryExhausted):
+    """A submitted Muse task could not be reconciled within the poll budget."""
+
+
 class MuseSemanticPlanNeedsAttention(video_production.VideoProductionError):
     """Semantic planning failed closed before any Muse submission."""
 
@@ -229,6 +241,88 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
+
+
+def _has_provider_receipt(metadata: dict) -> bool:
+    return bool(
+        str(metadata.get("provider") or "") == MUSE_PROVIDER_NAME
+        and str(metadata.get("provider_task_id") or "")
+        and str(metadata.get("endpoint") or "")
+        and str(metadata.get("submitted_at") or "")
+    )
+
+
+def _metadata_for_recovery_state(
+    metadata: dict,
+    state: str,
+    **updates,
+) -> dict:
+    if state not in MUSE_RECOVERY_STATES:
+        raise ValueError(f"Unsupported Muse recovery state: {state}")
+    normalized = {
+        **metadata,
+        **updates,
+        "recovery_state_version": MUSE_RECOVERY_STATE_VERSION,
+        "recovery_state": state,
+    }
+    if state in {"submitting", "reconciling"}:
+        for key in (
+            "terminal_generation",
+            "retryable_generation",
+            "infrastructure_failure",
+            "recovery_exhausted",
+            "reconcile_exhausted",
+            "error_class",
+        ):
+            normalized.pop(key, None)
+    elif state == "retry_wait":
+        normalized["retryable_generation"] = True
+        for key in (
+            "terminal_generation",
+            "invalid_media",
+            "error_class",
+        ):
+            normalized.pop(key, None)
+    else:
+        normalized["terminal_generation"] = True
+        for key in (
+            "retryable_generation",
+            "infrastructure_failure",
+            "recovery_exhausted",
+            "reconcile_exhausted",
+        ):
+            normalized.pop(key, None)
+    return normalized
+
+
+def _normalize_recovery_metadata(metadata: dict) -> dict:
+    normalized = dict(metadata or {})
+    current_state = str(normalized.get("recovery_state") or "")
+    if (
+        int(normalized.get("recovery_state_version") or 0)
+        >= MUSE_RECOVERY_STATE_VERSION
+        and current_state in MUSE_RECOVERY_STATES
+    ):
+        return _metadata_for_recovery_state(normalized, current_state)
+
+    error_class = " ".join(
+        str(normalized.get(key) or "")
+        for key in ("error_class", "last_error_class")
+    ).casefold()
+    if _has_provider_receipt(normalized):
+        state = "reconciling"
+    elif (
+        normalized.get("retryable_generation")
+        or normalized.get("quota_retryable")
+        or "museserviceinterrupted" in error_class
+        or "service_restart_interrupted" in error_class
+    ):
+        state = "retry_wait"
+    elif normalized.get("terminal_generation") or normalized.get("invalid_media"):
+        state = "terminal_error"
+    else:
+        state = "submitting"
+    return _metadata_for_recovery_state(normalized, state)
 
 
 def _json_hash(value: object) -> str:
@@ -935,18 +1029,19 @@ def _checkpoint_quota_failure(
     generation_started: float,
     capacity_preflight: dict | None = None,
 ) -> None:
-    checkpoint = {
-        **metadata,
-        "last_error_class": type(error).__name__,
-        "terminal_provider_task": True,
-        "quota_retryable": True,
-        "quota_recovery_sequence": int(
+    checkpoint = _metadata_for_recovery_state(
+        metadata,
+        "retry_wait",
+        last_error_class=type(error).__name__,
+        terminal_provider_task=True,
+        quota_retryable=True,
+        quota_recovery_sequence=int(
             metadata.get("quota_recovery_sequence") or 0
         ) + 1,
-        "generation_elapsed_seconds": round(
+        generation_elapsed_seconds=round(
             time.monotonic() - generation_started, 3
         ),
-    }
+    )
     if isinstance(capacity_preflight, dict):
         checkpoint["quota_preflight"] = dict(capacity_preflight)
     for current_key, history_key in {
@@ -979,14 +1074,14 @@ def _checkpoint_terminal_transient_failure(
 ) -> dict | None:
     attempt = max(1, int(metadata.get("attempt") or 1))
     provider_retry_exhausted = isinstance(error, MuseTaskWaitLimitExceeded)
-    retryable_generation = attempt < MAX_REQUEST_ATTEMPTS and not provider_retry_exhausted
-    checkpoint = {
-        **metadata,
-        "last_error_class": type(error).__name__,
-        "terminal_provider_task": True,
-        "provider_retry_exhausted": provider_retry_exhausted,
-        "retryable_generation": retryable_generation,
-    }
+    retryable_generation = attempt < MAX_REQUEST_ATTEMPTS
+    checkpoint = _metadata_for_recovery_state(
+        metadata,
+        "retry_wait",
+        last_error_class=type(error).__name__,
+        terminal_provider_task=True,
+        provider_retry_exhausted=provider_retry_exhausted,
+    )
     receipt_fields = {
         "provider_task_id": "last_provider_task_id",
         "endpoint": "last_provider_endpoint",
@@ -1000,8 +1095,8 @@ def _checkpoint_terminal_transient_failure(
     if not retryable_generation:
         checkpoint.update(
             {
-                "terminal_generation": True,
                 "infrastructure_failure": True,
+                "recovery_exhausted": True,
                 "generation_elapsed_seconds": round(
                     time.monotonic() - generation_started,
                     3,
@@ -1144,27 +1239,47 @@ async def _generate_request(
     existing = db.get_latest_video_artifact(video_id, artifact_type)
     if _valid_cached_artifact(existing, request_hash):
         return {**existing, "_muse_cache_hit": True}
-    metadata = dict((existing or {}).get("metadata") or {})
+    metadata = _normalize_recovery_metadata(
+        dict((existing or {}).get("metadata") or {})
+    )
     stored_recovery_epoch = int(metadata.get("recovery_epoch") or 0)
-    if (
+    epoch_advanced = bool(
         existing
         and existing.get("content_hash") == request_hash
-        and existing.get("status") == "error"
-        and metadata.get("infrastructure_failure")
         and int(recovery_epoch) > stored_recovery_epoch
+    )
+    if (
+        epoch_advanced
+        and str(metadata.get("recovery_state") or "")
+        in {"retry_wait", "reconciling"}
     ):
-        metadata = {
-            key: value
-            for key, value in metadata.items()
-            if key not in {
-                "attempt", "submission_attempt", "submission_hash",
-                "provider_task_id", "endpoint", "submitted_at",
-                "terminal_generation", "retryable_generation",
-                "terminal_provider_task", "provider_retry_exhausted",
-                "infrastructure_failure", "error_class", "last_error_class",
-                "reconcile_count",
-            }
-        }
+        for key in (
+            "reconcile_count",
+            "reconcile_exhausted",
+            "recovery_exhausted",
+            "submission_transport_retry_count",
+            "infrastructure_failure",
+            "provider_retry_exhausted",
+            "terminal_provider_task",
+            "error_class",
+            "last_error_class",
+        ):
+            metadata.pop(key, None)
+        if _has_provider_receipt(metadata):
+            metadata = _metadata_for_recovery_state(
+                metadata,
+                "reconciling",
+                recovery_epoch=int(recovery_epoch),
+            )
+        else:
+            for key in ("attempt", "submission_attempt", "submission_hash"):
+                metadata.pop(key, None)
+            metadata = _metadata_for_recovery_state(
+                metadata,
+                "retry_wait",
+                recovery_epoch=int(recovery_epoch),
+            )
+    has_recoverable_receipt = _has_provider_receipt(metadata)
     if (
         existing
         and existing.get("content_hash") == request_hash
@@ -1177,15 +1292,25 @@ async def _generate_request(
             raise MuseError(
                 f"Artifact Muse scene {int(scene['index']) + 1} sai checksum hoặc bị thiếu; hãy Recreate."
             )
-        if existing.get("status") == "error" and (
-            metadata.get("terminal_generation") or metadata.get("invalid_media")
-        ) and not metadata.get("quota_retryable"):
+        if (
+            existing.get("status") == "error"
+            and metadata.get("recovery_state") == "terminal_error"
+            and not metadata.get("quota_retryable")
+            and not has_recoverable_receipt
+        ):
             raise MuseError(
                 f"Generation Muse scene {int(scene['index']) + 1} đã fail; hãy Recreate để gửi request mới."
             )
     needs_submission = True
     resume_without_receipt = False
-    if existing and existing.get("content_hash") == request_hash and existing.get("status") == "submitting":
+    if (
+        existing
+        and existing.get("content_hash") == request_hash
+        and (
+            existing.get("status") == "submitting"
+            or (existing.get("status") == "error" and has_recoverable_receipt)
+        )
+    ):
         if metadata.get("thread_url") or metadata.get("turn_id"):
             raise MuseAmbiguousSubmissionError(
                 f"Scene {int(scene['index']) + 1} còn receipt Muse browser cũ; hãy Recreate để tạo lại."
@@ -1208,9 +1333,23 @@ async def _generate_request(
                 )
         else:
             reconcile_count = int(metadata.get("reconcile_count") or 0)
-            if reconcile_count >= 10:
-                raise MuseAmbiguousSubmissionError(
-                    f"Không thể đối soát submission Muse của scene {int(scene['index']) + 1}."
+            if reconcile_count >= MAX_RECONCILE_ATTEMPTS:
+                exhausted_metadata = _metadata_for_recovery_state(
+                    metadata,
+                    "reconciling",
+                    reconcile_exhausted=True,
+                    recovery_epoch=int(recovery_epoch),
+                )
+                _record_request_state(
+                    video_id,
+                    artifact_type,
+                    request_hash,
+                    status="submitting",
+                    metadata=exhausted_metadata,
+                )
+                raise MuseReconcileExhausted(
+                    f"Không thể đối soát submission Muse của scene {int(scene['index']) + 1} "
+                    f"sau {MAX_RECONCILE_ATTEMPTS} lần; receipt đã được giữ lại."
                 )
             try:
                 reconciled = await adapter.reconcile(
@@ -1260,18 +1399,24 @@ async def _generate_request(
                     artifact_type,
                     request_hash,
                     status="error",
-                    metadata={
-                        **metadata,
-                        "error_class": type(exc).__name__,
-                        "terminal_generation": True,
-                    },
+                    metadata=_metadata_for_recovery_state(
+                        metadata,
+                        "terminal_error",
+                        error_class=type(exc).__name__,
+                    ),
                 )
                 raise
             if reconciled:
                 result = reconciled
                 needs_submission = False
             else:
-                metadata["reconcile_count"] = reconcile_count + 1
+                next_reconcile_count = reconcile_count + 1
+                metadata = _metadata_for_recovery_state(
+                    metadata,
+                    "reconciling",
+                    reconcile_count=next_reconcile_count,
+                    recovery_epoch=int(recovery_epoch),
+                )
                 _record_request_state(
                     video_id,
                     artifact_type,
@@ -1279,6 +1424,11 @@ async def _generate_request(
                     status="submitting",
                     metadata=metadata,
                 )
+                if next_reconcile_count >= MAX_RECONCILE_ATTEMPTS:
+                    raise MuseReconcileExhausted(
+                        f"Không thể đối soát submission Muse của scene {int(scene['index']) + 1} "
+                        f"sau {MAX_RECONCILE_ATTEMPTS} lần; receipt đã được giữ lại."
+                    )
                 raise MuseRetryScheduled(
                     "Submission Muse đang xử lý; sẽ đối soát lại trước khi gửi mới.",
                     delay_seconds=60,
@@ -1307,12 +1457,13 @@ async def _generate_request(
                 artifact_type,
                 request_hash,
                 status="error",
-                metadata={
-                    **metadata,
-                    "terminal_generation": True,
-                    "infrastructure_failure": True,
-                    "recovery_epoch": int(recovery_epoch),
-                },
+                metadata=_metadata_for_recovery_state(
+                    metadata,
+                    "retry_wait",
+                    infrastructure_failure=True,
+                    recovery_exhausted=True,
+                    recovery_epoch=int(recovery_epoch),
+                ),
             )
             raise MuseRecoveryExhausted(
                 f"Scene {int(scene['index']) + 1} đã hết {MAX_REQUEST_ATTEMPTS} lần thử Muse."
@@ -1362,9 +1513,11 @@ async def _generate_request(
             max(0, quota_recovery_sequence - 1) if recovering_quota else 0,
             recovery_epoch,
         )
-        if (resume_without_receipt or retrying_terminal_failure or recovering_quota) and str(
-            metadata.get("submission_hash") or ""
-        ) != expected_previous_hash:
+        if (
+            not epoch_advanced
+            and (resume_without_receipt or retrying_terminal_failure or recovering_quota)
+            and str(metadata.get("submission_hash") or "") != expected_previous_hash
+        ):
             raise MuseAmbiguousSubmissionError(
                 "Checkpoint Muse không khớp request/attempt hiện tại."
             )
@@ -1379,7 +1532,7 @@ async def _generate_request(
                 recovery_epoch,
             )
         )
-        base_metadata = {
+        base_metadata = _metadata_for_recovery_state({
             **(
                 metadata
                 if resume_without_receipt or retrying_terminal_failure or recovering_quota
@@ -1406,13 +1559,15 @@ async def _generate_request(
             "fallback_count": int(metadata.get("fallback_count") or 0),
             **frame_metadata,
             **dict(policy_metadata or {}),
-        }
+        }, "submitting")
         base_metadata.pop("retryable_generation", None)
         base_metadata.pop("terminal_generation", None)
         base_metadata.pop("quota_retryable", None)
         base_metadata.pop("terminal_provider_task", None)
         base_metadata.pop("last_error_class", None)
         base_metadata.pop("error_class", None)
+        if not resume_without_receipt:
+            base_metadata.pop("submission_transport_retry_count", None)
         _record_request_state(
             video_id,
             artifact_type,
@@ -1427,13 +1582,14 @@ async def _generate_request(
                 artifact_type,
                 request_hash,
                 status="submitting",
-                metadata={
-                    **base_metadata,
-                    "provider": receipt.provider,
-                    "provider_task_id": receipt.provider_task_id,
-                    "endpoint": receipt.endpoint,
-                    "submitted_at": receipt.submitted_at,
-                },
+                metadata=_metadata_for_recovery_state(
+                    base_metadata,
+                    "reconciling",
+                    provider=receipt.provider,
+                    provider_task_id=receipt.provider_task_id,
+                    endpoint=receipt.endpoint,
+                    submitted_at=receipt.submitted_at,
+                ),
             )
 
         try:
@@ -1541,7 +1697,10 @@ async def _generate_request(
                         artifact_type,
                         request_hash,
                         status="submitting",
-                        metadata=base_metadata,
+                        metadata=_metadata_for_recovery_state(
+                            base_metadata,
+                            "submitting",
+                        ),
                     )
         except MuseServiceBusy:
             raise
@@ -1585,11 +1744,12 @@ async def _generate_request(
                 artifact_type,
                 request_hash,
                 status="submitting",
-                metadata={
-                    **current_metadata,
-                    "error_class": type(exc).__name__,
-                    "ambiguous_submission": True,
-                },
+                metadata=_metadata_for_recovery_state(
+                    current_metadata,
+                    "submitting",
+                    last_error_class=type(exc).__name__,
+                    ambiguous_submission=True,
+                ),
             )
             raise
         except MuseTransientError as exc:
@@ -1607,35 +1767,46 @@ async def _generate_request(
                     artifact_type,
                     request_hash,
                     status="submitting",
-                    metadata={
-                        **current_metadata,
-                        "last_error_class": type(exc).__name__,
-                    },
+                    metadata=_metadata_for_recovery_state(
+                        current_metadata,
+                        "reconciling",
+                        last_error_class=type(exc).__name__,
+                    ),
                 )
                 raise MuseRetryScheduled(
                     "Submission Muse có receipt; sẽ đối soát trước khi gửi lại.",
                     delay_seconds=60,
                     consume_attempt=False,
                 ) from exc
+            transport_retry_count = int(
+                current_metadata.get("submission_transport_retry_count")
+                or base_metadata.get("submission_transport_retry_count")
+                or 0
+            ) + 1
+            exhausted = transport_retry_count >= MAX_REQUEST_ATTEMPTS
+            transport_metadata = _metadata_for_recovery_state(
+                base_metadata,
+                "retry_wait" if exhausted else "submitting",
+                last_error_class=type(exc).__name__,
+                submission_transport_retry_count=transport_retry_count,
+                infrastructure_failure=exhausted,
+                recovery_exhausted=exhausted,
+            )
             _record_request_state(
                 video_id,
                 artifact_type,
                 request_hash,
-                status="error",
-                metadata={
-                    **base_metadata,
-                    "error_class": type(exc).__name__,
-                    "retryable_generation": attempt < MAX_REQUEST_ATTEMPTS,
-                    "infrastructure_failure": attempt >= MAX_REQUEST_ATTEMPTS,
-                    "terminal_generation": attempt >= MAX_REQUEST_ATTEMPTS,
-                },
+                status="error" if exhausted else "submitting",
+                metadata=transport_metadata,
             )
-            if attempt < MAX_REQUEST_ATTEMPTS:
+            if not exhausted:
                 raise MuseRetryScheduled(
-                    str(exc), delay_seconds=RETRY_DELAYS_SECONDS[attempt - 1]
+                    str(exc),
+                    delay_seconds=RETRY_DELAYS_SECONDS[transport_retry_count - 1],
+                    consume_attempt=False,
                 ) from exc
             raise MuseRecoveryExhausted(
-                f"Scene {int(scene['index']) + 1} đã hết {MAX_REQUEST_ATTEMPTS} lần thử Muse."
+                f"Scene {int(scene['index']) + 1} đã hết {MAX_REQUEST_ATTEMPTS} lần retry kết nối Muse."
             ) from exc
         except MuseError as exc:
             current = db.get_latest_video_artifact(video_id, artifact_type) or {}
@@ -1645,11 +1816,11 @@ async def _generate_request(
                 artifact_type,
                 request_hash,
                 status="error",
-                metadata={
-                    **current_metadata,
-                    "error_class": type(exc).__name__,
-                    "terminal_generation": True,
-                },
+                metadata=_metadata_for_recovery_state(
+                    current_metadata,
+                    "terminal_error",
+                    error_class=type(exc).__name__,
+                ),
             )
             raise
         except Exception as exc:
@@ -1661,10 +1832,11 @@ async def _generate_request(
                     artifact_type,
                     request_hash,
                     status="submitting",
-                    metadata={
-                        **current_metadata,
-                        "last_error_class": type(exc).__name__,
-                    },
+                    metadata=_metadata_for_recovery_state(
+                        current_metadata,
+                        "submitting",
+                        last_error_class=type(exc).__name__,
+                    ),
                 )
                 raise
             current = db.get_latest_video_artifact(video_id, artifact_type) or {}
@@ -1674,7 +1846,11 @@ async def _generate_request(
                 artifact_type,
                 request_hash,
                 status="error",
-                metadata={**current_metadata, "error_class": type(exc).__name__},
+                metadata=_metadata_for_recovery_state(
+                    current_metadata,
+                    "terminal_error",
+                    error_class=type(exc).__name__,
+                ),
             )
             raise
 
@@ -1699,12 +1875,13 @@ async def _generate_request(
             artifact_type,
             request_hash,
             status="error",
-            metadata={
-                **current_metadata,
-                "attempt": validation_attempt,
-                "error_class": type(exc).__name__,
-                "invalid_media": True,
-            },
+            metadata=_metadata_for_recovery_state(
+                current_metadata,
+                "terminal_error",
+                attempt=validation_attempt,
+                error_class=type(exc).__name__,
+                invalid_media=True,
+            ),
         )
         raise
     checksum = _sha256_file(final_path)
@@ -1728,6 +1905,18 @@ async def _generate_request(
         "generation_elapsed_seconds": round(time.monotonic() - generation_started, 3),
         **frame_metadata,
     }
+    for key in (
+        "recovery_state",
+        "recovery_state_version",
+        "retryable_generation",
+        "terminal_generation",
+        "infrastructure_failure",
+        "recovery_exhausted",
+        "reconcile_exhausted",
+        "error_class",
+        "last_error_class",
+    ):
+        final_metadata.pop(key, None)
     ready = _record_request_state(
         video_id,
         artifact_type,
@@ -1780,13 +1969,8 @@ async def _prepare_media_async(
     if callable(set_heartbeat_callback):
         set_heartbeat_callback(heartbeat)
     scene_results: list[dict] = []
+    quota_preflight: dict = {}
     async with provider.open_session() as adapter:
-        quota_preflight = dict(adapter.capacity_preflight or {})
-        if quota_preflight.get("status") == "degraded":
-            progress(
-                "Muse chưa xác nhận được quota; tiếp tục bằng account unknown sau cùng",
-                "muse_quota_degraded",
-            )
         total = len(plan["scenes"])
         needs_terminal_frame = bool(plan["scenes"] and plan["scenes"][-1].get("is_video"))
         terminal_frame = plan.get("terminal_frame")
@@ -1979,6 +2163,13 @@ async def _prepare_media_async(
             else:
                 item["video_artifact"] = video_result
 
+        quota_preflight = dict(adapter.capacity_preflight or {})
+        if quota_preflight.get("status") == "degraded":
+            progress(
+                "Muse chưa xác nhận được quota; đã dùng account unknown sau cùng",
+                "muse_quota_degraded",
+            )
+
     video_phase_seconds = round(time.monotonic() - video_phase_started, 3)
     outcomes = []
     for item in scene_results:
@@ -2025,6 +2216,9 @@ async def _prepare_media_async(
 
 
 _MANIFEST_GENERATION_METADATA_KEYS = (
+    "frame_contract_version",
+    "start_frame_hash",
+    "end_frame_hash",
     "prompt_policy_version",
     "prompt_strategy",
     "risk_level",
@@ -2065,6 +2259,74 @@ def purge_muse_artifacts(video_id: int) -> int:
             or artifact_type.startswith("muse_scene_image:")
             or artifact_type.startswith("muse_scene_video:")
         ):
+            continue
+        path = Path(str(artifact.get("path") or ""))
+        if path.is_file():
+            path.unlink(missing_ok=True)
+        if artifact.get("id"):
+            db.delete_video_artifact(int(artifact["id"]))
+            removed += 1
+    return removed
+
+
+def inspect_muse_recovery(video_id: int) -> dict:
+    latest_by_type: dict[str, dict] = {}
+    for artifact in db.list_video_artifacts(video_id):
+        artifact_type = str(artifact.get("artifact_type") or "")
+        if not (
+            artifact_type == "muse_terminal_frame"
+            or artifact_type.startswith("muse_scene_image:")
+            or artifact_type.startswith("muse_scene_video:")
+        ):
+            continue
+        previous = latest_by_type.get(artifact_type)
+        if previous is None or int(artifact.get("id") or 0) > int(previous.get("id") or 0):
+            latest_by_type[artifact_type] = artifact
+
+    recoverable: list[str] = []
+    terminal: list[str] = []
+    for artifact_type, artifact in latest_by_type.items():
+        if str(artifact.get("status") or "") not in {"error", "submitting"}:
+            continue
+        metadata = _normalize_recovery_metadata(
+            dict(artifact.get("metadata") or {})
+        )
+        state = str(metadata.get("recovery_state") or "")
+        if state in {"submitting", "reconciling", "retry_wait"}:
+            recoverable.append(artifact_type)
+        elif state == "terminal_error":
+            terminal.append(artifact_type)
+    return {
+        "recoverable": bool(recoverable),
+        "recoverable_artifacts": sorted(recoverable),
+        "terminal_artifacts": sorted(terminal),
+    }
+
+
+def purge_muse_artifacts_from_index(video_id: int, from_index: int) -> int:
+    if int(from_index) < 0:
+        raise ValueError("Muse scene index must be non-negative")
+    first_video_index = max(0, int(from_index) - 1)
+    removed = 0
+    for artifact in db.list_video_artifacts(video_id):
+        artifact_type = str(artifact.get("artifact_type") or "")
+        should_remove = artifact_type in {
+            "muse_terminal_frame",
+            "muse_media_manifest",
+            "final_mp4",
+            "rendered_video",
+        }
+        if artifact_type.startswith("muse_scene_image:"):
+            try:
+                should_remove = int(artifact_type.split(":", 1)[1]) >= int(from_index)
+            except ValueError:
+                should_remove = False
+        elif artifact_type.startswith("muse_scene_video:"):
+            try:
+                should_remove = int(artifact_type.split(":", 1)[1]) >= first_video_index
+            except ValueError:
+                should_remove = False
+        if not should_remove:
             continue
         path = Path(str(artifact.get("path") or ""))
         if path.is_file():

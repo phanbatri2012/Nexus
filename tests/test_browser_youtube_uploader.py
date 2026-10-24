@@ -5,6 +5,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from nexus_engine.services.browser_youtube_uploader import (
+    _snap_datetime_to_15m_grid,
+    _snap_time_to_15m_grid,
     _format_date_for_picker,
     _format_time_for_picker,
     _parse_schedule_at,
@@ -57,6 +59,42 @@ class TestBrowserYouTubeUploader(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parsed.day, 3)
         self.assertEqual(parsed.hour, 11)
         self.assertEqual(parsed.minute, 0)
+
+    def test_parse_schedule_at_snaps_unsnapped_time_to_15m(self):
+        # 04:59 UTC = 11:59 Asia/Ho_Chi_Minh -> Should snap to 12:00
+        iso = "2026-10-25T04:59:00+00:00"
+        tz = "Asia/Ho_Chi_Minh"
+        parsed = _parse_schedule_at(iso, tz)
+        self.assertEqual(parsed.year, 2026)
+        self.assertEqual(parsed.month, 10)
+        self.assertEqual(parsed.day, 25)
+        self.assertEqual(parsed.hour, 12)
+        self.assertEqual(parsed.minute, 0)
+
+    def test_snap_datetime_to_15m_grid(self):
+        d_clean = dt.datetime(2026, 10, 25, 11, 45, 0)
+        snapped, modified = _snap_datetime_to_15m_grid(d_clean)
+        self.assertFalse(modified)
+        self.assertEqual(snapped, d_clean)
+
+        # Midnight rollover
+        d_late = dt.datetime(2026, 10, 25, 23, 58, 0)
+        snapped, modified = _snap_datetime_to_15m_grid(d_late)
+        self.assertTrue(modified)
+        self.assertEqual(snapped, dt.datetime(2026, 10, 26, 0, 0, 0))
+
+    def test_snap_time_to_15m_grid(self):
+        t707, mod707 = _snap_time_to_15m_grid(dt.time(7, 7))
+        self.assertTrue(mod707)
+        self.assertEqual(t707, dt.time(7, 0))
+
+        t708, mod708 = _snap_time_to_15m_grid(dt.time(7, 8))
+        self.assertTrue(mod708)
+        self.assertEqual(t708, dt.time(7, 15))
+
+        t1159, mod1159 = _snap_time_to_15m_grid(dt.time(11, 59))
+        self.assertTrue(mod1159)
+        self.assertEqual(t1159, dt.time(12, 0))
 
     def test_schedule_date_matches(self):
         d = dt.date(2026, 10, 3)

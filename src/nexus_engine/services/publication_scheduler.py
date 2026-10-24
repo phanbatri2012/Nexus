@@ -32,6 +32,10 @@ def validate_publication_slots(slots: object) -> list[dict]:
             raise ValueError("Giờ đăng phải có định dạng HH:MM.") from exc
         if day < -1 or day > 6 or parsed_time.second or parsed_time.microsecond:
             raise ValueError("Khung giờ đăng không hợp lệ.")
+        if parsed_time.minute not in (0, 15, 30, 45):
+            raise ValueError(
+                f"Giờ đăng '{time_text}' không hợp lệ. Phút phải là 00, 15, 30 hoặc 45 theo quy định của YouTube Studio."
+            )
         time_formatted = parsed_time.strftime("%H:%M")
         covered_days = list(range(7)) if day == -1 else [day]
         for d in covered_days:

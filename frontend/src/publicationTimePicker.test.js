@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { parseTime24, formatTime24, formatTime12, formatDateTimeAMPM } from './publicationTime.js'
+import { parseTime24, formatTime24, formatTime12, formatDateTimeAMPM, MINUTES_15, snapTime24To15 } from './publicationTime.js'
 
 const componentSource = readFileSync(
   new URL('./PublicationTimePicker.jsx', import.meta.url),
@@ -14,6 +14,7 @@ test('PublicationTimePicker component exposes 12h AM/PM selectors and 24h helper
   assert.match(componentSource, /AM/)
   assert.match(componentSource, /PM/)
   assert.match(componentSource, /publication-time-picker/)
+  assert.match(componentSource, /MINUTES_15/)
 })
 
 test('parseTime24 converts morning 24h to 12h AM format', () => {
@@ -78,4 +79,18 @@ test('12h and 24h conversions are lossless across all 1,440 minutes in a day', (
       assert.equal(formatted, time24)
     }
   }
+})
+
+test('MINUTES_15 contains only 15-minute intervals compatible with YouTube Studio', () => {
+  assert.deepEqual(MINUTES_15, ['00', '15', '30', '45'])
+})
+
+test('snapTime24To15 correctly snaps arbitrary minutes to 15-minute grid', () => {
+  assert.equal(snapTime24To15('11:59'), '12:00')
+  assert.equal(snapTime24To15('07:08'), '07:15')
+  assert.equal(snapTime24To15('07:07'), '07:00')
+  assert.equal(snapTime24To15('07:02'), '07:00')
+  assert.equal(snapTime24To15('18:30'), '18:30')
+  assert.equal(snapTime24To15('23:55'), '00:00')
+  assert.equal(snapTime24To15('00:00'), '00:00')
 })

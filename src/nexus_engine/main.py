@@ -192,6 +192,9 @@ SYSTEM_CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
 VIDEO_RECOVERY_DELAYS_SECONDS = (30, 120, 300)
 YOUTUBE_RECOVERY_DELAYS_SECONDS = (120, 300, 900)
 TRANSCRIPT_RECOVERY_DELAYS_SECONDS = (60, 300)
+MUSE_SERVICE_BUSY_RETRY_DELAYS_SECONDS = (15.0, 60.0)
+MUSE_SERVICE_BUSY_MAX_ATTEMPTS = len(MUSE_SERVICE_BUSY_RETRY_DELAYS_SECONDS) + 1
+MUSE_ERROR_HISTORY_LIMIT = 10
 TRANSIENT_YOUTUBE_ERROR_MARKERS = (
     "http error 429",
     "status code 429",
@@ -6431,6 +6434,22 @@ def _execute_flow_media_generation_job(job: dict) -> None:
 def _execute_muse_media_generation_job(job: dict) -> None:
     payload = dict(job.get("payload") or {})
     video_id = int(job.get("video_id") or payload.get("video_id") or 0)
+    partial_reset_from = payload.get("partial_reset_from")
+    if partial_reset_from is not None:
+        purged_count = muse_pipeline.purge_muse_artifacts_from_index(
+            video_id,
+            int(partial_reset_from),
+        )
+        payload.pop("partial_reset_from", None)
+        db.update_system_job(job["id"], payload_json=payload)
+        current = db.get_system_job(job["id"]) or job
+        reset_result = dict(current.get("result") or {})
+        reset_result["muse_partial_reset"] = {
+            "from_index": int(partial_reset_from),
+            "purged_count": int(purged_count),
+            "completed_at": db.utc_now(),
+        }
+        db.update_system_job(job["id"], result_json=reset_result)
     existing_final = db.get_latest_video_artifact(video_id, "final_mp4", status="ready")
     if existing_final and Path(existing_final.get("path") or "").is_file():
         db.update_system_job(
@@ -6459,7 +6478,52 @@ def _execute_muse_media_generation_job(job: dict) -> None:
         if isinstance(media_progress, dict):
             current = db.get_system_job(job["id"]) or job
             result = dict(current.get("result") or {})
-            result["muse_media_progress"] = media_progress
+            result["muse_media_progress"] = {
+                **media_progress,
+                "updated_at": db.utc_now(),
+            }
+            artifacts = db.list_video_artifacts(video_id)
+            latest_by_type: dict[str, dict] = {}
+            for artifact in artifacts:
+                artifact_type = str(artifact.get("artifact_type") or "")
+                previous = latest_by_type.get(artifact_type)
+                if previous is None or int(artifact.get("id") or 0) > int(previous.get("id") or 0):
+                    latest_by_type[artifact_type] = artifact
+            ready = {
+                key: value
+                for key, value in latest_by_type.items()
+                if str(value.get("status") or "") == "ready"
+            }
+            result["muse_artifacts"] = {
+                "scene_images_ready": sum(
+                    key.startswith("muse_scene_image:") for key in ready
+                ),
+                "terminal_ready": int("muse_terminal_frame" in ready),
+                "scene_videos_ready": sum(
+                    key.startswith("muse_scene_video:") for key in ready
+                ),
+            }
+            active_metadata = [
+                dict(value.get("metadata") or {})
+                for value in latest_by_type.values()
+                if str(value.get("status") or "") in {"submitting", "error"}
+            ]
+            recovery = dict(result.get("muse_recovery") or {})
+            recovery.update(
+                {
+                    "recovery_epoch": recovery_epoch,
+                    "submission_attempt": max(
+                        [int(meta.get("submission_attempt") or 0) for meta in active_metadata]
+                        or [0]
+                    ),
+                    "reconcile_count": max(
+                        [int(meta.get("reconcile_count") or 0) for meta in active_metadata]
+                        or [0]
+                    ),
+                    "wait_reason": str(result.get("muse_wait_reason") or ""),
+                }
+            )
+            result["muse_recovery"] = recovery
             updates["result_json"] = result
         db.update_system_job(job["id"], **updates)
         db.update_video_production_state(
@@ -7137,6 +7201,56 @@ def _pause_fb_crosspost_browser_job(job: dict, exc: Exception) -> bool:
     return True
 
 
+def _append_muse_error_history(result: dict, exc: Exception, message: str) -> list[dict]:
+    """Keep a small redacted history and compact consecutive duplicate failures."""
+
+    compacted: list[dict] = []
+    for raw in result.get("muse_error_history") or []:
+        if not isinstance(raw, dict):
+            continue
+        entry = {
+            key: raw[key]
+            for key in ("at", "last_at", "error_class", "message", "repeat_count")
+            if key in raw
+        }
+        if (
+            compacted
+            and compacted[-1].get("error_class") == entry.get("error_class")
+            and compacted[-1].get("message") == entry.get("message")
+        ):
+            previous = compacted[-1]
+            previous["repeat_count"] = int(previous.get("repeat_count") or 1) + int(
+                entry.get("repeat_count") or 1
+            )
+            previous["last_at"] = entry.get("last_at") or entry.get("at")
+            continue
+        entry["repeat_count"] = max(1, int(entry.get("repeat_count") or 1))
+        compacted.append(entry)
+
+    now = db.utc_now()
+    error_class = type(exc).__name__
+    if (
+        compacted
+        and compacted[-1].get("error_class") == error_class
+        and compacted[-1].get("message") == message
+    ):
+        compacted[-1]["repeat_count"] = int(
+            compacted[-1].get("repeat_count") or 1
+        ) + 1
+        compacted[-1]["last_at"] = now
+    else:
+        compacted.append(
+            {
+                "at": now,
+                "last_at": now,
+                "error_class": error_class,
+                "message": message,
+                "repeat_count": 1,
+            }
+        )
+    return compacted[-MUSE_ERROR_HISTORY_LIMIT:]
+
+
 def _handle_production_job_error(job: dict, exc: Exception) -> None:
     safe_error = security_logging.redact_sensitive(str(exc))
     workflow = db.get_youtube_publish_workflow_by_job(job["id"])
@@ -7192,8 +7306,10 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
         db.update_video_production_state(video_id, render_status="error")
         return
     from nexus_engine.services.google_flow_worker import (
+        FlowAgentSettingsError,
         FlowCreditExhausted,
         FlowImageCreditExhausted,
+        FlowModeError,
         FlowImageNeedsAttention,
         FlowImagePending,
         FlowMediaPending,
@@ -7301,22 +7417,36 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
     ):
         current_job = db.get_system_job(job["id"]) or job
         result = dict(current_job.get("result") or {})
-        history = list(result.get("muse_error_history") or [])[-19:]
-        history.append(
-            {
-                "at": db.utc_now(),
-                "error_class": type(exc).__name__,
-                "message": safe_error,
-            }
+        history = _append_muse_error_history(result, exc, safe_error)
+        reconcile_exhausted = isinstance(
+            exc,
+            muse_pipeline.MuseReconcileExhausted,
+        )
+        attention = (
+            "muse_reconcile_exhausted"
+            if reconcile_exhausted
+            else "muse_service_unstable"
+        )
+        wait_reason = (
+            "reconcile_retry_exhausted"
+            if reconcile_exhausted
+            else "infrastructure_retry_exhausted"
         )
         result.update(
             {
-                "attention_required": "muse_service_unstable",
-                "muse_wait_reason": "infrastructure_retry_exhausted",
+                "attention_required": attention,
+                "muse_wait_reason": wait_reason,
                 "muse_error_history": history,
             }
         )
-        message = "Muse không ổn định sau 3 lần submit; đã giữ checkpoint, hãy nhấn Resume."
+        recovery = dict(result.get("muse_recovery") or {})
+        recovery["wait_reason"] = wait_reason
+        result["muse_recovery"] = recovery
+        message = (
+            "Muse chưa đối soát xong task sau 10 lần; đã giữ receipt, hãy nhấn Resume."
+            if reconcile_exhausted
+            else "Muse không ổn định sau 3 lần submit; đã giữ checkpoint, hãy nhấn Resume."
+        )
         db.update_system_job(
             job["id"],
             status="paused",
@@ -7347,8 +7477,15 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
         is_planner_busy = isinstance(exc, muse_pipeline.MusePlannerBusy)
         is_request_retry = isinstance(exc, muse_pipeline.MuseRetryScheduled)
         if is_busy:
-            delay_seconds = 15.0
-            wait_reason = "service_busy"
+            service_busy_attempt = int(result.get("muse_service_busy_attempt") or 0) + 1
+            result["muse_service_busy_attempt"] = service_busy_attempt
+            if service_busy_attempt >= MUSE_SERVICE_BUSY_MAX_ATTEMPTS:
+                wait_reason = "service_port_conflict"
+            else:
+                delay_seconds = MUSE_SERVICE_BUSY_RETRY_DELAYS_SECONDS[
+                    service_busy_attempt - 1
+                ]
+                wait_reason = "service_busy"
         elif is_planner_busy:
             delay_seconds = float(exc.delay_seconds)
             wait_reason = "chatgpt_busy"
@@ -7365,28 +7502,40 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
                 delay_seconds = muse_pipeline.RETRY_DELAYS_SECONDS[session_attempt - 1]
                 wait_reason = "session_transient_error"
         result["muse_wait_reason"] = wait_reason
-        history = list(result.get("muse_error_history") or [])[-19:]
-        history.append(
-            {
-                "at": db.utc_now(),
-                "error_class": type(exc).__name__,
-                "message": safe_error,
-            }
+        result["muse_error_history"] = _append_muse_error_history(
+            result,
+            exc,
+            safe_error,
         )
-        result["muse_error_history"] = history
-        if wait_reason == "session_retry_exhausted":
+        recovery = dict(result.get("muse_recovery") or {})
+        recovery["wait_reason"] = wait_reason
+        if is_busy:
+            recovery["service_busy_attempt"] = int(
+                result.get("muse_service_busy_attempt") or 0
+            )
+        result["muse_recovery"] = recovery
+        if wait_reason in {"session_retry_exhausted", "service_port_conflict"}:
+            attention_required = (
+                "muse_service_port_conflict"
+                if wait_reason == "service_port_conflict"
+                else "muse_service_unstable"
+            )
             result.update(
                 {
-                    "attention_required": "muse_service_unstable",
+                    "attention_required": attention_required,
                 }
             )
-            message = "Muse không ổn định sau 3 lần kết nối; đã giữ checkpoint, hãy nhấn Resume."
+            message = (
+                "Muse2API bị xung đột cổng sau 3 lần kiểm tra; đã giữ checkpoint, hãy đóng Muse ngoài hệ thống rồi Resume."
+                if wait_reason == "service_port_conflict"
+                else "Muse không ổn định sau 3 lần kết nối; đã giữ checkpoint, hãy nhấn Resume."
+            )
             db.update_system_job(
                 job["id"],
                 status="paused",
                 progress=message,
                 result_json=result,
-                error=safe_error,
+                error="" if wait_reason == "service_port_conflict" else safe_error,
                 next_retry_at="",
                 cancel_requested=0,
                 finished_at="",
@@ -7395,9 +7544,11 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
                 db.update_video_production_state(
                     int(job["video_id"]),
                     render_status="paused",
-                    current_stage="muse_service_unstable",
+                    current_stage=attention_required,
                     production_progress=message,
-                    blocking_reason=safe_error,
+                    blocking_reason=(
+                        "" if wait_reason == "service_port_conflict" else safe_error
+                    ),
                 )
             return
         else:
@@ -7405,27 +7556,30 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
             if payload.get("force_new_project"):
                 payload["force_new_project"] = False
                 db.update_system_job(job["id"], payload_json=payload)
+            muse_delay_int = max(1, int(round(delay_seconds)))
+            muse_progress_msg = (
+                "Muse2API đang bận; job sẽ tự tiếp tục"
+                if is_busy
+                else (
+                    "ChatGPT đang bận; semantic planner sẽ tự tiếp tục"
+                    if is_planner_busy
+                    else f"Muse AI tạm thời gián đoạn; thử lại sau {muse_delay_int}s"
+                )
+            )
             db.schedule_system_job_recovery(
                 job["id"],
                 resume_from_step="muse_media_generation",
                 delay_seconds=delay_seconds,
-                error=safe_error,
+                error="",
                 result_json=result,
+                progress=muse_progress_msg,
             )
             if job.get("video_id"):
                 db.update_video_production_state(
                     int(job["video_id"]),
                     render_status="retry_wait",
                     current_stage="muse_media_generation",
-                    production_progress=(
-                        "Muse2API đang bận; job sẽ tự tiếp tục"
-                        if is_busy
-                        else (
-                            "ChatGPT đang bận; semantic planner sẽ tự tiếp tục"
-                            if is_planner_busy
-                            else f"Muse lỗi tạm thời; thử lại sau {delay_seconds:g} giây"
-                        )
-                    ),
+                    production_progress=muse_progress_msg,
                     blocking_reason="",
                 )
             return
@@ -7583,32 +7737,67 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
             current_payload["force_new_project"] = False
             current_payload["force_new_flow_project"] = False
             db.update_system_job(job["id"], payload_json=current_payload)
+        delay_int = max(1, int(round(retry_delay_seconds)))
+        if is_image_phase:
+            progress_msg = (
+                f"Đang chờ Google Flow tạo {len(pending_image_scene_indices)} ảnh còn lại"
+                f" (sẽ tự đối soát sau {delay_int}s)"
+            )
+            prod_progress_msg = (
+                f"Google Flow còn {len(pending_image_scene_indices)} ảnh đang xử lý; "
+                "video sẽ bắt đầu sau khi toàn bộ ảnh hoàn tất"
+            )
+        else:
+            progress_msg = (
+                f"Đang chờ Google Flow tạo {len(pending_video_scene_indices)} video intro"
+                f" (sẽ tự đối soát sau {delay_int}s)"
+            )
+            prod_progress_msg = (
+                f"Google Flow còn {len(pending_video_scene_indices)} video đang xử lý; "
+                "hệ thống sẽ tự đối soát lại"
+            )
         db.schedule_system_job_recovery(
             job["id"],
             resume_from_step=resume_from_step,
             delay_seconds=retry_delay_seconds,
             error=safe_error,
             result_json=recovery_result,
+            progress=progress_msg,
         )
         if job.get("video_id"):
             db.update_video_production_state(
                 int(job["video_id"]),
                 render_status="processing",
                 current_stage=resume_from_step,
-                production_progress=(
-                    (
-                        f"Google Flow còn {len(pending_image_scene_indices)} ảnh đang xử lý; "
-                        "video sẽ bắt đầu sau khi toàn bộ ảnh hoàn tất"
-                    )
-                    if is_image_phase
-                    else (
-                        f"Google Flow còn {len(pending_video_scene_indices)} video đang xử lý; "
-                        "hệ thống sẽ tự đối soát lại"
-                    )
-                ),
+                production_progress=prod_progress_msg,
                 blocking_reason="",
             )
         return
+    if (
+        isinstance(exc, (FlowAgentSettingsError, FlowModeError))
+        and str(job.get("job_type") or "") == "flow_media_generation"
+    ):
+        current_job = db.get_system_job(job["id"]) or job
+        recovery_count = int(current_job.get("recovery_count") or 0)
+        if recovery_count < 5:
+            delay = 10.0
+            retry_msg = f"Đang chờ giao diện Google Flow sẵn sàng (sẽ thử lại sau {int(delay)}s)"
+            db.schedule_system_job_recovery(
+                job["id"],
+                resume_from_step="flow_image_reconcile",
+                delay_seconds=delay,
+                error=safe_error,
+                progress=retry_msg,
+            )
+            if job.get("video_id"):
+                db.update_video_production_state(
+                    int(job["video_id"]),
+                    render_status="processing",
+                    current_stage="flow_image_reconcile",
+                    production_progress=retry_msg,
+                    blocking_reason="",
+                )
+            return
     if isinstance(exc, youtube_publish_workflow.PublishConfigurationRequired):
         _pause_youtube_publish_job(
             job,
@@ -8971,12 +9160,18 @@ def _kick_publish_queue() -> None:
 
 
 def _kick_flow_media_queue() -> None:
-    if db.has_claimable_system_jobs("flow_media_generation"):
+    if (
+        db.has_claimable_system_jobs("flow_media_generation")
+        or db.get_next_system_job_retry_delay("flow_media_generation") is not None
+    ):
         _flow_media_coordinator.wake()
 
 
 def _kick_muse_media_queue() -> None:
-    if db.has_claimable_system_jobs("muse_media_generation"):
+    if (
+        db.has_claimable_system_jobs("muse_media_generation")
+        or db.get_next_system_job_retry_delay("muse_media_generation") is not None
+    ):
         _muse_media_coordinator.wake()
 
 
@@ -9076,6 +9271,7 @@ def _enqueue_muse_media_job(
     snapshot: dict,
     mode: str = "resume",
     force_new_project: bool = False,
+    partial_reset_from: int | None = None,
 ) -> tuple[dict, bool]:
     prompt_version = str(
         snapshot.get("prompt_version")
@@ -9097,6 +9293,11 @@ def _enqueue_muse_media_job(
             "mode": mode,
             "force_new_project": bool(force_new_project),
             "muse_reference_snapshot": reference_snapshot,
+            **(
+                {"partial_reset_from": max(0, int(partial_reset_from))}
+                if partial_reset_from is not None
+                else {}
+            ),
         },
         video_id=video_id,
         prompt_version=prompt_version,
@@ -9110,6 +9311,118 @@ def _enqueue_muse_media_job(
     # existing recovered job too; startup recovery deliberately does not call it.
     _kick_muse_media_queue()
     return job, created
+
+
+class MuseCheckpointNotRecoverableError(ValueError):
+    pass
+
+
+def _resume_muse_media_job(
+    job: dict,
+    *,
+    snapshot: dict | None = None,
+    force_new_project: bool = False,
+    partial_reset_from: int | None = None,
+) -> dict:
+    job_id = str(job.get("id") or "")
+    video_id = int(
+        job.get("video_id") or (job.get("payload") or {}).get("video_id") or 0
+    )
+    if not job_id or not video_id:
+        raise MuseCheckpointNotRecoverableError("Job Muse thiếu định danh video.")
+    active_conflict = next(
+        (
+            candidate
+            for candidate in db.list_active_system_jobs()
+            if str(candidate.get("id") or "") != job_id
+            and int(
+                candidate.get("video_id")
+                or (candidate.get("payload") or {}).get("video_id")
+                or 0
+            )
+            == video_id
+            and candidate.get("job_type")
+            in {"flow_media_generation", "muse_media_generation", "video_render"}
+        ),
+        None,
+    )
+    if active_conflict:
+        raise MuseCheckpointNotRecoverableError(
+            "Video đã có một job media/render đang hoạt động."
+        )
+
+    status = str(job.get("status") or "")
+    if (
+        status in {"error", "failed"}
+        and not force_new_project
+        and partial_reset_from is None
+    ):
+        recovery = muse_pipeline.inspect_muse_recovery(video_id)
+        if not recovery.get("recoverable"):
+            raise MuseCheckpointNotRecoverableError(
+                "Checkpoint Muse là lỗi permanent; hãy Recreate hoặc tạo lại từ scene lỗi."
+            )
+
+    payload = dict(job.get("payload") or {})
+    if isinstance(snapshot, dict) and snapshot:
+        payload["snapshot"] = snapshot
+    payload.update(
+        {
+            "video_id": video_id,
+            "mode": "recreate" if force_new_project else "resume",
+            "force_new_project": bool(force_new_project),
+        }
+    )
+    if partial_reset_from is None:
+        payload.pop("partial_reset_from", None)
+    else:
+        payload["partial_reset_from"] = max(0, int(partial_reset_from))
+
+    result = dict(job.get("result") or {})
+    recovery_epoch = int(result.get("recovery_epoch") or 0) + 1
+    result["recovery_epoch"] = recovery_epoch
+    result["muse_recovery"] = {
+        "recovery_epoch": recovery_epoch,
+        "submission_attempt": 0,
+        "reconcile_count": 0,
+        "wait_reason": "partial_reset" if partial_reset_from is not None else "manual_resume",
+    }
+    for key in (
+        "attention_required",
+        "muse_session_attempt",
+        "muse_session_error_class",
+        "muse_service_busy_attempt",
+        "muse_wait_reason",
+    ):
+        result.pop(key, None)
+
+    updated = db.update_system_job(
+        job_id,
+        status="queued",
+        progress=(
+            f"Đang chờ tạo lại Muse từ scene {int(partial_reset_from) + 1}"
+            if partial_reset_from is not None
+            else "Đang chờ tiếp tục Muse từ checkpoint"
+        ),
+        payload_json=payload,
+        result_json=result,
+        error="",
+        next_retry_at="",
+        cancel_requested=0,
+        started_at="",
+        finished_at="",
+    )
+    if not updated:
+        raise MuseCheckpointNotRecoverableError("Không tìm thấy job Muse để Resume.")
+    db.update_video_production_state(
+        video_id,
+        render_status="queued",
+        current_stage="muse_media_generation",
+        production_progress="Đang chờ tiếp tục Muse từ checkpoint",
+        blocking_reason="",
+    )
+    _kick_muse_media_queue()
+    return updated
 
 
 def _route_video_render_job(
@@ -9129,6 +9442,23 @@ def _route_video_render_job(
         )
         return job, created, "render"
     if render_mode == "muse_ai":
+        previous_jobs = db.list_system_jobs(
+            limit=1,
+            job_type="muse_media_generation",
+            video_id=video_id,
+        )
+        previous = previous_jobs[0] if previous_jobs else None
+        if previous:
+            previous_status = str(previous.get("status") or "")
+            if previous_status in {"queued", "running", "retry_wait"}:
+                return previous, False, "media_generation"
+            if previous_status in {"paused", "error", "failed", "canceled"}:
+                previous = _resume_muse_media_job(
+                    previous,
+                    snapshot=snapshot,
+                    force_new_project=force_new_project,
+                )
+                return previous, False, "media_generation"
         job, created = _enqueue_muse_media_job(
             video_id=video_id,
             snapshot=snapshot,
@@ -9771,6 +10101,21 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
         or payload.get("url", "")
     )
     job_type = str(job.get("job_type") or "")
+    muse_checkpoint = (
+        muse_pipeline.inspect_muse_recovery(int(video_id))
+        if job_type == "muse_media_generation"
+        and video_id
+        and status in {"error", "canceled"}
+        else {}
+    )
+    muse_can_resume = bool(
+        job_type == "muse_media_generation"
+        and (
+            status == "paused"
+            or status == "canceled"
+            or (status == "error" and muse_checkpoint.get("recoverable"))
+        )
+    )
     checkpoint_resume_step = (
         _get_checkpoint_resume_step(video_id)
         if job_type == "video_generation" and status in {"error", "canceled"}
@@ -9884,7 +10229,7 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
         "generated_title": html.unescape(str(job.get("generated_title", ""))),
         "video_url": job.get("video_url") or payload.get("url", ""),
         "progress": job.get("progress", ""),
-        "error": job.get("error", ""),
+        "error": security_logging.redact_sensitive(job.get("error", "")),
         "video_id": video_id,
         "prompt_version": job.get("prompt_version", ""),
         "voice_id": job.get("voice_id", ""),
@@ -9930,6 +10275,27 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
             if isinstance(result.get("muse_media_progress"), dict)
             else {}
         ),
+        "muse_recovery": {
+            key: (result.get("muse_recovery") or {}).get(key)
+            for key in (
+                "recovery_epoch",
+                "submission_attempt",
+                "reconcile_count",
+                "wait_reason",
+                "service_busy_attempt",
+            )
+            if key in (result.get("muse_recovery") or {})
+        },
+        "muse_artifacts": {
+            key: (result.get("muse_artifacts") or {}).get(key)
+            for key in (
+                "scene_images_ready",
+                "terminal_ready",
+                "scene_videos_ready",
+            )
+            if key in (result.get("muse_artifacts") or {})
+        },
+        "muse_can_resume": muse_can_resume,
         "recovery_limit": (
             len(YOUTUBE_RECOVERY_DELAYS_SECONDS)
             if job_type in {"youtube_upload", "youtube_publish"}
@@ -9957,6 +10323,7 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
         "can_retry": (
             status in {"error", "canceled"}
             and job_type != "comment_publish"
+            and (job_type != "muse_media_generation" or muse_can_resume)
         ),
         "can_resume_checkpoint": bool(checkpoint_resume_step),
         "checkpoint_resume_step": checkpoint_resume_step,
@@ -10767,7 +11134,10 @@ def _run_system_job_center_action(
                     "Queue item Facebook này đã có một job đang chờ hoặc đang chạy. "
                     "Hãy tiếp tục job hiện có để tránh đăng trùng."
                 )
-        updated_job = db.retry_system_job(job_id)
+        if str(job.get("job_type") or "") == "muse_media_generation":
+            updated_job = _resume_muse_media_job(job)
+        else:
+            updated_job = db.retry_system_job(job_id)
         if str(job.get("job_type")) == "video_generation":
             v_id = job.get("video_id") or (job.get("payload") or {}).get("video_id")
             if v_id is not None:
@@ -10791,31 +11161,7 @@ def _run_system_job_center_action(
         updated_job = db.force_stop_system_job(job_id)
     elif action == "resume":
         if str(job.get("job_type") or "") == "muse_media_generation":
-            result = dict(job.get("result") or {})
-            result["recovery_epoch"] = int(result.get("recovery_epoch") or 0) + 1
-            for key in (
-                "attention_required",
-                "muse_session_attempt",
-                "muse_session_error_class",
-                "muse_wait_reason",
-            ):
-                result.pop(key, None)
-            updated_job = db.resume_system_job(job_id)
-            if updated_job:
-                updated_job = db.update_system_job(
-                    job_id,
-                    result_json=result,
-                    error="",
-                    started_at="",
-                )
-                if job.get("video_id"):
-                    db.update_video_production_state(
-                        int(job["video_id"]),
-                        render_status="queued",
-                        current_stage="muse_media_generation",
-                        production_progress="Đang chờ Resume Muse từ checkpoint",
-                        blocking_reason="",
-                    )
+            updated_job = _resume_muse_media_job(job)
         elif str(job.get("job_type") or "") == "flow_media_generation":
             updated_job = db.resume_system_job(job_id)
             if updated_job and job.get("video_id"):
@@ -12622,12 +12968,15 @@ def trigger_render_video(video_id: int, mode: str = "resume"):
         cancel_render_video(video_id)
         video_production.purge_video_render_artifacts(video_id)
 
-    job, created, phase = _route_video_render_job(
-        video_id=video_id,
-        snapshot=snapshot,
-        mode=mode,
-        force_new_project=force_new_project,
-    )
+    try:
+        job, created, phase = _route_video_render_job(
+            video_id=video_id,
+            snapshot=snapshot,
+            mode=mode,
+            force_new_project=force_new_project,
+        )
+    except MuseCheckpointNotRecoverableError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {
         "success": True,
         "job_id": job["id"],
@@ -12705,6 +13054,71 @@ def reset_scenes_from(video_id: int, from_index: int = 0):
         raise HTTPException(status_code=404, detail="Không tìm thấy video.")
     if from_index < 0:
         raise HTTPException(status_code=400, detail="Chỉ số cảnh phải lớn hơn hoặc bằng 0.")
+
+    muse_jobs = db.list_system_jobs(
+        limit=1,
+        job_type="muse_media_generation",
+        video_id=video_id,
+    )
+    latest_muse_job = muse_jobs[0] if muse_jobs else None
+    prompt_version = str(video.get("prompt_version") or "")
+    snapshot = (
+        dict((latest_muse_job.get("payload") or {}).get("snapshot") or {})
+        if latest_muse_job
+        else _get_prompt_production_snapshot(prompt_version)
+    )
+    if video_production.get_render_mode(snapshot) == "muse_ai":
+        active_jobs = [
+            job
+            for job in db.list_system_jobs(video_id=video_id, limit=None)
+            if job.get("job_type")
+            in {"flow_media_generation", "muse_media_generation", "video_render"}
+            and job.get("status") in {"queued", "running", "retry_wait", "paused"}
+        ]
+        if any(str(job.get("status") or "") == "running" for job in active_jobs):
+            cancel_render_video(video_id)
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "success": True,
+                    "video_id": video_id,
+                    "from_index": from_index,
+                    "status": "waiting_for_safe_stop",
+                    "retry_after_seconds": 2,
+                },
+            )
+        if active_jobs:
+            cancel_render_video(video_id)
+            if latest_muse_job:
+                latest_muse_job = db.get_system_job(latest_muse_job["id"]) or latest_muse_job
+        try:
+            if latest_muse_job:
+                muse_job = _resume_muse_media_job(
+                    latest_muse_job,
+                    snapshot=snapshot,
+                    partial_reset_from=from_index,
+                )
+                created = False
+            else:
+                muse_job, created = _enqueue_muse_media_job(
+                    video_id=video_id,
+                    snapshot=snapshot,
+                    mode="resume",
+                    partial_reset_from=from_index,
+                )
+        except MuseCheckpointNotRecoverableError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "success": True,
+            "video_id": video_id,
+            "from_index": from_index,
+            "purged_count": 0,
+            "job_id": muse_job.get("id"),
+            "status": muse_job.get("status"),
+            "job_type": muse_job.get("job_type"),
+            "phase": "media_generation",
+            "duplicate": not created,
+        }
 
     # 1. Cancel any active render job first
     cancel_render_video(video_id)
@@ -12804,7 +13218,11 @@ def get_render_status(video_id: int):
     latest_status = str(latest_job.get("status") or "") if latest_job else ""
     is_error = bool(latest_job and latest_status in {"error", "failed"})
     is_canceled = bool(latest_job and latest_status == "canceled")
-    error_message = str(latest_job.get("error") or "") if (latest_job and is_error) else ""
+    error_message = (
+        security_logging.redact_sensitive(latest_job.get("error") or "")
+        if latest_job and is_error
+        else ""
+    )
 
     # A video is only ready if an actual valid file exists AND we are NOT currently in error or running an active re-render
     has_mp4 = bool(
@@ -12858,9 +13276,81 @@ def get_render_status(video_id: int):
             else snapshot
         )
     )
+    render_job_summary = None
+    if render_job:
+        result = dict(render_job.get("result") or {})
+        job_progress = str(render_job.get("progress") or "")
+        flow_progress = result.get("flow_media_progress")
+        if isinstance(flow_progress, dict) and (not job_progress or job_progress == "Đang khởi động"):
+            phase = str(flow_progress.get("phase") or "images")
+            if phase == "images":
+                completed = flow_progress.get("images_completed", 0)
+                total = flow_progress.get("images_total", 0)
+                pending = flow_progress.get("images_pending", 0)
+                if total:
+                    job_progress = f"Đang tạo ảnh Flow ({completed}/{total}; chờ {pending} ảnh)..."
+            else:
+                completed = flow_progress.get("videos_completed", 0)
+                total = flow_progress.get("videos_total", 0)
+                pending = flow_progress.get("videos_pending", 0)
+                if total:
+                    job_progress = f"Đang tạo video Flow ({completed}/{total}; chờ {pending} video)..."
+
+        render_job_summary = {
+            "id": str(render_job.get("id") or ""),
+            "status": str(render_job.get("status") or ""),
+            "job_type": str(render_job.get("job_type") or ""),
+            "title": str(render_job.get("title") or ""),
+            "progress": job_progress,
+            "next_retry_at": str(render_job.get("next_retry_at") or ""),
+            "flow_media_progress": (
+                dict(result.get("flow_media_progress") or {})
+                if isinstance(result.get("flow_media_progress"), dict)
+                else {}
+            ),
+            "error": security_logging.redact_sensitive(
+                str(render_job.get("error") or "")
+            ),
+            "attention_required": str(result.get("attention_required") or ""),
+            "muse_media_progress": (
+                dict(result.get("muse_media_progress") or {})
+                if isinstance(result.get("muse_media_progress"), dict)
+                else {}
+            ),
+            "muse_recovery": {
+                key: (result.get("muse_recovery") or {}).get(key)
+                for key in (
+                    "recovery_epoch",
+                    "submission_attempt",
+                    "reconcile_count",
+                    "wait_reason",
+                    "service_busy_attempt",
+                )
+                if key in (result.get("muse_recovery") or {})
+            },
+            "muse_artifacts": {
+                key: (result.get("muse_artifacts") or {}).get(key)
+                for key in (
+                    "scene_images_ready",
+                    "terminal_ready",
+                    "scene_videos_ready",
+                )
+                if key in (result.get("muse_artifacts") or {})
+            },
+        }
+    safe_mp4_artifact = (
+        {
+            "status": str(artifact.get("status") or ""),
+            "duration_seconds": artifact.get("duration_seconds"),
+            "size_bytes": artifact.get("size_bytes"),
+        }
+        if artifact and has_mp4
+        else None
+    )
 
     return {
         "video_id": video_id,
+        "production_progress": str(video.get("production_progress") or ""),
         "state": state,
         "phase": phase,
         "render_mode": render_mode,
@@ -12870,9 +13360,9 @@ def get_render_status(video_id: int):
         "is_error": is_error,
         "is_canceled": is_canceled,
         "error_message": error_message,
-        "mp4_artifact": artifact if has_mp4 else None,
+        "mp4_artifact": safe_mp4_artifact,
         "mp4_details": mp4_details,
-        "job": render_job,
+        "job": render_job_summary,
     }
 
 

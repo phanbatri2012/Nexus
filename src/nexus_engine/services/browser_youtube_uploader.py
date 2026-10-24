@@ -954,6 +954,34 @@ async def _complete_ad_suitability(
     )
 
 
+def _snap_datetime_to_15m_grid(dt_obj: dt.datetime) -> tuple[dt.datetime, bool]:
+    """Snap a datetime to the nearest 15-minute interval (:00, :15, :30, :45).
+    Correctly handles day rollover when rounding past midnight.
+    Returns (snapped_dt, was_modified).
+    """
+    if dt_obj.minute in (0, 15, 30, 45) and dt_obj.second == 0 and dt_obj.microsecond == 0:
+        return dt_obj, False
+
+    dt_clean = dt_obj.replace(microsecond=0)
+    total_seconds = dt_clean.minute * 60 + dt_clean.second
+    rem_seconds = total_seconds % 900
+    if rem_seconds < 450:
+        snapped = dt_clean - dt.timedelta(seconds=rem_seconds)
+    else:
+        snapped = dt_clean + dt.timedelta(seconds=(900 - rem_seconds))
+    return snapped, True
+
+
+def _snap_time_to_15m_grid(target_time: dt.time) -> tuple[dt.time, bool]:
+    """Snap a time to the nearest 15-minute interval (:00, :15, :30, :45)."""
+    if target_time.minute in (0, 15, 30, 45) and target_time.second == 0 and target_time.microsecond == 0:
+        return target_time, False
+    dummy_date = dt.date(2000, 1, 1)
+    dummy_dt = dt.datetime.combine(dummy_date, target_time)
+    snapped_dt, _ = _snap_datetime_to_15m_grid(dummy_dt)
+    return snapped_dt.time(), True
+
+
 def _parse_schedule_at(schedule_at: str, timezone_name: str) -> dt.datetime:
     try:
         parsed = dt.datetime.fromisoformat(str(schedule_at).replace("Z", "+00:00"))
@@ -962,9 +990,17 @@ def _parse_schedule_at(schedule_at: str, timezone_name: str) -> dt.datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=dt.timezone.utc)
     try:
-        return parsed.astimezone(ZoneInfo(timezone_name))
+        local_dt = parsed.astimezone(ZoneInfo(timezone_name))
     except Exception as exc:
         raise BrowserUploadError(f"Timezone kênh không hợp lệ: {timezone_name}") from exc
+    snapped_dt, modified = _snap_datetime_to_15m_grid(local_dt)
+    if modified:
+        logger.warning(
+            "Đã tự động làm tròn thời gian đặt lịch từ %s sang %s (bước nhảy 15 phút của YouTube Studio).",
+            local_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            snapped_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+    return snapped_dt
 
 
 def _first_progress_percent(*texts: str) -> int | None:
@@ -1655,6 +1691,12 @@ async def _set_datepicker_value(page, target_date: dt.date) -> tuple[bool, str]:
 async def _set_timepicker_value(page, target_time: dt.time) -> tuple[bool, str]:
     """Robust timepicker setter for YouTube Studio Upload Wizard and Edit Page.
     Handles 24-hour and 12-hour AM/PM formats, dropdown item selection and manual typing."""
+    target_time, snapped = _snap_time_to_15m_grid(target_time)
+    if snapped:
+        logger.warning(
+            "Đã tự động làm tròn giờ đặt lịch YouTube sang %s để phù hợp với bước nhảy 15 phút của YouTube Studio.",
+            target_time.strftime("%H:%M"),
+        )
     await _ensure_schedule_accordion_expanded(page)
 
     hour_24 = target_time.strftime("%H:%M")
