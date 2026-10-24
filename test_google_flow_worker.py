@@ -15,6 +15,7 @@ from nexus_engine.services.google_flow_worker import (
     FlowFrameAttachmentError,
     FlowGenerationError,
     FlowGenerationStartError,
+    FlowImagePending,
     FlowInvalidOutputError,
     FlowModeError,
     FlowResultMissingError,
@@ -39,6 +40,7 @@ def _image_bytes(size=(1376, 768)):
 class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         GoogleFlowWorker._session_uploaded_references.clear()
+        GoogleFlowWorker._session_reference_assets.clear()
         GoogleFlowWorker._session_uploaded_image_urls.clear()
         GoogleFlowWorker._session_video_frame_assets.clear()
         GoogleFlowWorker._session_configured_agent_projects.clear()
@@ -2751,6 +2753,137 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
                 await worker._generate_scene_on_canvas("prompt", "avoid", [], {})
 
         self.assertEqual(events, ["reference", "baseline"])
+
+    async def test_fresh_image_request_skips_late_history_scan(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+
+        with (
+            patch.object(
+                worker,
+                "_find_completed_image_for_prompt",
+                AsyncMock(),
+            ) as late_scan,
+            patch.object(worker, "_ensure_agent_session_ready", AsyncMock(return_value=False)),
+            patch.object(worker, "sync_reference_ingredients", AsyncMock()),
+            patch.object(worker, "_capture_stable_image_baseline", AsyncMock(return_value=set())),
+            patch.object(worker, "_get_existing_error_texts", AsyncMock(return_value=set())),
+            patch.object(worker, "wait_for_editor", AsyncMock(side_effect=RuntimeError("stop"))),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                await worker._generate_scene_on_canvas(
+                    "prompt",
+                    "avoid",
+                    [],
+                    {},
+                    check_late_result=False,
+                )
+
+        late_scan.assert_not_awaited()
+
+    async def test_image_intent_with_existing_marker_does_not_resubmit(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+
+        async def find_marker(*_prompts):
+            worker._last_image_prompt_found = True
+            worker._last_image_prompt_scan_succeeded = True
+            return ""
+
+        with (
+            patch.object(
+                worker,
+                "_find_completed_image_for_prompt",
+                AsyncMock(side_effect=find_marker),
+            ),
+            patch.object(worker, "_ensure_agent_session_ready", AsyncMock()) as ensure_session,
+            patch.object(worker, "_submit_prompt_and_wait_for_ack", AsyncMock()) as submit,
+        ):
+            with self.assertRaises(FlowImagePending):
+                await worker._generate_scene_on_canvas(
+                    "prompt",
+                    "avoid",
+                    [],
+                    {},
+                    request_key="same-key",
+                    check_late_result=True,
+                    include_legacy_prompt=False,
+                    submit_if_prompt_missing=True,
+                )
+
+        ensure_session.assert_not_awaited()
+        submit.assert_not_awaited()
+
+    async def test_image_intent_scan_failure_fails_closed_without_resubmit(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+
+        with (
+            patch.object(
+                worker,
+                "_find_completed_image_for_prompt",
+                AsyncMock(return_value=""),
+            ),
+            patch.object(worker, "_ensure_agent_session_ready", AsyncMock()) as ensure_session,
+            patch.object(worker, "_submit_prompt_and_wait_for_ack", AsyncMock()) as submit,
+        ):
+            with self.assertRaises(FlowImagePending):
+                await worker._generate_scene_on_canvas(
+                    "prompt",
+                    "avoid",
+                    [],
+                    {},
+                    request_key="same-key",
+                    check_late_result=True,
+                    include_legacy_prompt=False,
+                    submit_if_prompt_missing=True,
+                )
+
+        ensure_session.assert_not_awaited()
+        submit.assert_not_awaited()
+
+    async def test_image_baseline_waits_only_when_candidates_change(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        candidate = {"src": "https://flow-content.google/image/one", "assetId": "one"}
+
+        with (
+            patch.object(
+                worker,
+                "_collect_image_candidates",
+                AsyncMock(return_value=[candidate]),
+            ) as collect,
+            patch("nexus_engine.services.google_flow_worker.asyncio.sleep", AsyncMock()) as sleep,
+        ):
+            first = await worker._capture_stable_image_baseline()
+            second = await worker._capture_stable_image_baseline()
+
+        self.assertEqual(first, second)
+        self.assertEqual(collect.await_count, 3)
+        self.assertEqual(sleep.await_count, 1)
+
+    async def test_reference_locator_cache_isolated_by_project_and_session(self):
+        first_page = MagicMock()
+        first_page.url = "https://flow.google.com/project/project-one"
+        first_page.context = object()
+        first_worker = GoogleFlowWorker(first_page)
+        first_worker._project_reference_asset_cache()["reference.png"] = {
+            "asset_id": "asset-one",
+            "media_keys": [],
+        }
+
+        first_page.url = "https://flow.google.com/project/project-two"
+        self.assertNotIn("reference.png", first_worker._project_reference_asset_cache())
+
+        second_page = MagicMock()
+        second_page.url = "https://flow.google.com/project/project-one"
+        second_page.context = object()
+        second_worker = GoogleFlowWorker(second_page)
+        self.assertNotIn("reference.png", second_worker._project_reference_asset_cache())
 
     async def test_scene_prompt_prevents_agent_follow_up_and_identifies_position(self):
         page = MagicMock()

@@ -40,6 +40,241 @@ class VideoProductionServiceTests(unittest.TestCase):
         except Exception:
             pass
 
+    def test_latest_video_artifact_snapshot_returns_only_newest_per_type(self):
+        video_id = database.save_video(
+            "https://youtube.com/watch?v=artifact-snapshot",
+            "Artifact snapshot",
+            "Transcript",
+            "Script",
+        )
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene:0",
+            path="old.png",
+            content_hash="old",
+            status="failed",
+        )
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene:0",
+            path="new.png",
+            content_hash="new",
+            status="completed",
+        )
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene_video:0",
+            path="video.mp4",
+            content_hash="video",
+            status="queued",
+        )
+
+        snapshot = database.list_latest_video_artifacts(
+            video_id,
+            ("scene:", "scene_video:"),
+        )
+
+        self.assertEqual(set(snapshot), {"scene:0", "scene_video:0"})
+        self.assertEqual(snapshot["scene:0"]["content_hash"], "new")
+
+    def test_image_validation_backfills_once_then_uses_stat_cache(self):
+        video_id = database.save_video(
+            "https://youtube.com/watch?v=validation-cache",
+            "Validation cache",
+            "Transcript",
+            "Script",
+        )
+        image_path = Path(self.temporary_directory.name) / "legacy.png"
+        Image.new("RGB", (1376, 768), color=(10, 20, 30)).save(image_path)
+        artifact = database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene:0",
+            path=str(image_path),
+            content_hash="plan-hash",
+            status="completed",
+            mime_type="image/png",
+        )
+        counters = {}
+
+        first = video_production._validated_image_artifact(
+            artifact,
+            expected_content_hash="plan-hash",
+            counters=counters,
+        )
+        refreshed = database.get_latest_video_artifact(video_id, "scene:0")
+        with (
+            patch.object(video_production, "_sha256_file", side_effect=AssertionError("rehash")),
+            patch.object(
+                video_production,
+                "_image_perceptual_details",
+                side_effect=AssertionError("redecode"),
+            ),
+        ):
+            second = video_production._validated_image_artifact(
+                refreshed,
+                expected_content_hash="plan-hash",
+                counters=counters,
+            )
+
+        self.assertIsNotNone(first)
+        self.assertEqual(first, second)
+        self.assertEqual(counters, {
+            "cache_misses": 1,
+            "files_hashed": 1,
+            "files_decoded": 1,
+            "cache_hits": 1,
+        })
+        self.assertIn("image_validation_v1", refreshed["metadata"])
+
+    def test_image_validation_rechecks_when_file_stat_changes(self):
+        video_id = database.save_video(
+            "https://youtube.com/watch?v=validation-change",
+            "Validation change",
+            "Transcript",
+            "Script",
+        )
+        image_path = Path(self.temporary_directory.name) / "changed.png"
+        Image.new("RGB", (1376, 768), color=(10, 20, 30)).save(image_path)
+        validation = video_production._validate_image_file(image_path)
+        artifact = database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene:0",
+            path=str(image_path),
+            content_hash="plan-hash",
+            status="completed",
+            mime_type="image/png",
+            size_bytes=validation.size_bytes,
+            width=validation.width,
+            height=validation.height,
+            metadata={
+                "image_validation_v1": video_production._image_validation_metadata(validation)
+            },
+        )
+        Image.new("RGB", (1376, 768), color=(90, 80, 70)).save(image_path)
+
+        with patch.object(
+            video_production,
+            "_validate_image_file",
+            wraps=video_production._validate_image_file,
+        ) as deep_validate:
+            changed = video_production._validated_image_artifact(
+                artifact,
+                expected_content_hash="plan-hash",
+            )
+
+        self.assertIsNotNone(changed)
+        deep_validate.assert_called_once_with(image_path)
+        self.assertNotEqual(changed.sha256, validation.sha256)
+
+    def test_processing_image_intent_reuses_request_key_without_legacy_scan(self):
+        video_id = database.save_video(
+            "https://youtube.com/watch?v=image-intent-recovery",
+            "Image intent recovery",
+            "Transcript",
+            "Script",
+        )
+        scene = {"index": 0, "prompt": "A mountain valley"}
+        content_hash = video_production._scene_hash(video_id, scene, {}, "", "")
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene:0",
+            path=str(Path(self.temporary_directory.name) / "intent.png"),
+            content_hash=content_hash,
+            status="processing",
+            mime_type="image/png",
+            metadata={
+                "generation_attempt": 1,
+                "flow_submission_intent": {
+                    "request_key": "intent-request-key",
+                    "prompt_hash": content_hash,
+                    "attempt": 1,
+                    "started_at": database.utc_now(),
+                },
+            },
+        )
+        worker = MagicMock()
+        worker.generate_scene = AsyncMock(return_value="https://flow/image/intent")
+
+        async def download_image(_url, target):
+            Image.new("RGB", (1376, 768), color=(40, 50, 60)).save(target)
+
+        worker.download_image = AsyncMock(side_effect=download_image)
+
+        result = asyncio.run(
+            video_production._generate_scene_image_async(
+                video_id=video_id,
+                scene=scene,
+                scene_count=1,
+                profile={},
+                settings={},
+                reference_path=None,
+                reference_id="",
+                progress=lambda *_args: None,
+                cancel_check=lambda: None,
+                worker=worker,
+            )
+        )
+
+        self.assertTrue(result.is_file())
+        generation_call = worker.generate_scene.await_args.kwargs
+        self.assertEqual(generation_call["request_key"], "intent-request-key")
+        self.assertTrue(generation_call["check_late_result"])
+        self.assertFalse(generation_call["include_legacy_prompt"])
+        self.assertTrue(generation_call["submit_if_prompt_missing"])
+
+    def test_legacy_processing_image_keeps_legacy_reconciliation_marker(self):
+        from nexus_engine.services.google_flow_worker import FlowImagePending
+
+        video_id = database.save_video(
+            "https://youtube.com/watch?v=legacy-image-recovery",
+            "Legacy image recovery",
+            "Transcript",
+            "Script",
+        )
+        scene = {"index": 0, "prompt": "A legacy mountain valley"}
+        content_hash = video_production._scene_hash(video_id, scene, {}, "", "")
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene:0",
+            path=str(Path(self.temporary_directory.name) / "legacy-intent.png"),
+            content_hash=content_hash,
+            status="processing",
+            mime_type="image/png",
+            metadata={"generation_attempt": 1},
+        )
+        worker = MagicMock()
+        worker.generate_scene = AsyncMock(
+            side_effect=FlowImagePending(
+                "legacy prompt pending",
+                reason_code="flow_image_prompt_pending",
+            )
+        )
+        worker.get_last_generation_receipt.return_value = {}
+
+        with self.assertRaises(FlowImagePending):
+            asyncio.run(
+                video_production._generate_scene_image_async(
+                    video_id=video_id,
+                    scene=scene,
+                    scene_count=1,
+                    profile={},
+                    settings={},
+                    reference_path=None,
+                    reference_id="",
+                    progress=lambda *_args: None,
+                    cancel_check=lambda: None,
+                    worker=worker,
+                )
+            )
+
+        generation_call = worker.generate_scene.await_args.kwargs
+        self.assertTrue(generation_call["check_late_result"])
+        self.assertTrue(generation_call["include_legacy_prompt"])
+        self.assertTrue(generation_call["submit_if_prompt_missing"])
+        artifact = database.get_latest_video_artifact(video_id, "scene:0")
+        self.assertEqual(artifact["status"], "queued")
+        self.assertTrue(artifact["metadata"]["legacy_prompt_reconciliation"])
+
     def test_build_scene_windows_splits_by_duration(self):
         captions = [{"start": i, "end": i + 1, "text": f"word {i}"} for i in range(120)]
         windows = video_production.build_scene_windows(
@@ -1140,6 +1375,96 @@ class VideoProductionServiceTests(unittest.TestCase):
         self.assertIn("first attached image", prompt)
         self.assertIn("second attached image", prompt)
         self.assertIn("not a still image", prompt)
+
+    def test_scene_media_uses_one_snapshot_and_reuses_validated_images(self):
+        video_id = database.save_video(
+            "https://youtube.com/watch?v=scene-snapshot-cache",
+            "Scene snapshot cache",
+            "Transcript",
+            "Script",
+        )
+        scenes = [
+            {"index": 0, "prompt": "scene zero", "is_video": False},
+            {"index": 1, "prompt": "scene one", "is_video": False},
+        ]
+        for scene in scenes:
+            image_path = Path(self.temporary_directory.name) / f"scene-{scene['index']}.png"
+            Image.new(
+                "RGB",
+                (1376, 768),
+                color=(20 + scene["index"] * 40, 30, 40),
+            ).save(image_path)
+            validation = video_production._validate_image_file(image_path)
+            content_hash = video_production._scene_hash(
+                video_id,
+                scene,
+                {},
+                "",
+                "",
+            )
+            database.upsert_video_artifact(
+                video_id=video_id,
+                artifact_type=f"scene:{scene['index']}",
+                path=str(image_path),
+                content_hash=content_hash,
+                status="completed",
+                mime_type="image/png",
+                size_bytes=validation.size_bytes,
+                width=validation.width,
+                height=validation.height,
+                metadata={
+                    "image_validation_v1": video_production._image_validation_metadata(
+                        validation
+                    )
+                },
+            )
+
+        @asynccontextmanager
+        async def fake_session(*_args, **_kwargs):
+            yield MagicMock()
+
+        original_get_latest = database.get_latest_video_artifact
+        with (
+            patch.object(video_production, "_flow_worker_session", fake_session),
+            patch.object(
+                database,
+                "list_latest_video_artifacts",
+                wraps=database.list_latest_video_artifacts,
+            ) as snapshot_query,
+            patch.object(
+                database,
+                "get_latest_video_artifact",
+                wraps=original_get_latest,
+            ) as latest_query,
+            patch.object(
+                video_production,
+                "_generate_scene_image_async",
+                AsyncMock(),
+            ) as generate_image,
+            patch.object(video_production, "_sha256_file", side_effect=AssertionError("rehash")),
+            patch.object(
+                video_production,
+                "_image_perceptual_details",
+                side_effect=AssertionError("redecode"),
+            ),
+        ):
+            result = video_production.generate_scene_media(
+                video_id=video_id,
+                scenes=scenes,
+                settings={"enable_intro_video": False},
+                progress=lambda *_args, **_kwargs: None,
+                cancel_check=lambda: None,
+            )
+
+        snapshot_query.assert_called_once_with(video_id, ("scene:", "scene_video:"))
+        generate_image.assert_not_awaited()
+        scene_latest_calls = [
+            call
+            for call in latest_query.call_args_list
+            if len(call.args) >= 2 and str(call.args[1]).startswith("scene:")
+        ]
+        self.assertEqual(scene_latest_calls, [])
+        self.assertEqual(result["media_paths"], result["fallback_image_paths"])
 
     def test_scene_media_reuses_one_flow_worker_session_for_images_and_video(self):
         shared_worker = MagicMock()

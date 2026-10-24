@@ -21,6 +21,7 @@ import time
 import urllib.parse
 import urllib.request
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 import imageio_ffmpeg
@@ -67,6 +68,7 @@ FLOW_VIDEO_RECONCILIATION_TTL_SECONDS = 900.0
 FLOW_MEDIA_RECONCILIATION_POLL_SECONDS = 30.0
 FLOW_IMAGE_TRANSIENT_RETRY_DELAYS_SECONDS = (30.0, 60.0, 120.0)
 FLOW_REMOTE_MAX_IN_FLIGHT = 4
+IMAGE_VALIDATION_VERSION = 1
 PERCEPTUAL_RETRY_DIRECTIONS = (
     "Use a substantially different camera distance, viewpoint, and subject arrangement",
     "Change the foreground, background, direction of movement, and visual hierarchy completely",
@@ -207,11 +209,25 @@ def _sha256_file(path: Path) -> str:
 ImagePerceptualFingerprint = tuple[int, tuple[float, float, float], float]
 
 
-def _image_perceptual_fingerprint(path: Path) -> ImagePerceptualFingerprint:
+@dataclass(frozen=True)
+class ValidatedImageArtifact:
+    path: Path
+    sha256: str
+    fingerprint: ImagePerceptualFingerprint
+    size_bytes: int
+    mtime_ns: int
+    width: int
+    height: int
+
+
+def _image_perceptual_details(
+    path: Path,
+) -> tuple[ImagePerceptualFingerprint, int, int]:
     """Return a structure-sensitive image hash plus low-variance safeguards."""
     from PIL import Image, ImageStat
 
     with Image.open(path) as source:
+        width, height = source.size
         rgb = source.convert("RGB")
         color_sample = rgb.resize((64, 64), Image.Resampling.LANCZOS)
         color_statistics = ImageStat.Stat(color_sample)
@@ -266,7 +282,177 @@ def _image_perceptual_fingerprint(path: Path) -> ImagePerceptualFingerprint:
         perceptual_hash = (perceptual_hash << 1) | int(
             coefficient > median_value
         )
-    return perceptual_hash, mean_rgb, grayscale_deviation
+    return (perceptual_hash, mean_rgb, grayscale_deviation), width, height
+
+
+def _image_perceptual_fingerprint(path: Path) -> ImagePerceptualFingerprint:
+    return _image_perceptual_details(path)[0]
+
+
+def _validate_image_file(path: Path) -> ValidatedImageArtifact:
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        raise OSError(f"Scene image is missing: {path}") from exc
+    if stat.st_size <= 0:
+        raise OSError(f"Scene image is empty: {path}")
+    try:
+        fingerprint, width, height = _image_perceptual_details(path)
+    except Exception as exc:
+        raise OSError(f"Scene image cannot be decoded: {path}") from exc
+    if width < 800 or height < 400 or width / max(1, height) < 1.15:
+        raise OSError(
+            f"Scene image does not meet widescreen validation ({width}x{height}): {path}"
+        )
+    sha256 = _sha256_file(path)
+    final_stat = path.stat()
+    if (
+        final_stat.st_size != stat.st_size
+        or final_stat.st_mtime_ns != stat.st_mtime_ns
+    ):
+        raise OSError(f"Scene image changed during validation: {path}")
+    return ValidatedImageArtifact(
+        path=path,
+        sha256=sha256,
+        fingerprint=fingerprint,
+        size_bytes=int(final_stat.st_size),
+        mtime_ns=int(final_stat.st_mtime_ns),
+        width=int(width),
+        height=int(height),
+    )
+
+
+def _image_validation_metadata(validation: ValidatedImageArtifact) -> dict[str, object]:
+    phash, mean_rgb, grayscale_stddev = validation.fingerprint
+    return {
+        "validation_version": IMAGE_VALIDATION_VERSION,
+        "sha256": validation.sha256,
+        "phash_hex": f"{phash:016x}",
+        "mean_rgb": [float(value) for value in mean_rgb],
+        "grayscale_stddev": float(grayscale_stddev),
+        "size_bytes": validation.size_bytes,
+        "mtime_ns": validation.mtime_ns,
+        "width": validation.width,
+        "height": validation.height,
+    }
+
+
+def _cached_image_validation(artifact: dict) -> ValidatedImageArtifact | None:
+    path_value = str(artifact.get("path") or "").strip()
+    metadata = artifact.get("metadata") if isinstance(artifact.get("metadata"), dict) else {}
+    cached = metadata.get("image_validation_v1") if isinstance(metadata, dict) else None
+    if not path_value or not isinstance(cached, dict):
+        return None
+    try:
+        if int(cached.get("validation_version") or 0) != IMAGE_VALIDATION_VERSION:
+            return None
+        path = Path(path_value)
+        stat = path.stat()
+        size_bytes = int(cached.get("size_bytes") or 0)
+        mtime_ns = int(cached.get("mtime_ns") or 0)
+        width = int(cached.get("width") or 0)
+        height = int(cached.get("height") or 0)
+        sha256 = str(cached.get("sha256") or "")
+        phash_hex = str(cached.get("phash_hex") or "")
+        mean_values = cached.get("mean_rgb")
+        grayscale_stddev = float(cached.get("grayscale_stddev"))
+        if (
+            stat.st_size <= 0
+            or stat.st_size != size_bytes
+            or stat.st_mtime_ns != mtime_ns
+            or width < 800
+            or height < 400
+            or width / max(1, height) < 1.15
+            or not re.fullmatch(r"[0-9a-fA-F]{64}", sha256)
+            or not re.fullmatch(r"[0-9a-fA-F]+", phash_hex)
+            or not isinstance(mean_values, list)
+            or len(mean_values) != 3
+        ):
+            return None
+        fingerprint: ImagePerceptualFingerprint = (
+            int(phash_hex, 16),
+            tuple(float(value) for value in mean_values),
+            grayscale_stddev,
+        )
+    except (OSError, TypeError, ValueError):
+        return None
+    return ValidatedImageArtifact(
+        path=path,
+        sha256=sha256.lower(),
+        fingerprint=fingerprint,
+        size_bytes=size_bytes,
+        mtime_ns=mtime_ns,
+        width=width,
+        height=height,
+    )
+
+
+def _backfill_image_validation(
+    artifact: dict,
+    validation: ValidatedImageArtifact,
+) -> dict:
+    metadata = artifact.get("metadata") if isinstance(artifact.get("metadata"), dict) else {}
+    return db.upsert_video_artifact(
+        video_id=int(artifact["video_id"]),
+        artifact_type=str(artifact["artifact_type"]),
+        path=str(validation.path),
+        content_hash=str(artifact.get("content_hash") or ""),
+        status=str(artifact.get("status") or "completed"),
+        mime_type=str(artifact.get("mime_type") or "image/png"),
+        size_bytes=validation.size_bytes,
+        duration_seconds=artifact.get("duration_seconds"),
+        width=validation.width,
+        height=validation.height,
+        codecs=artifact.get("codecs") if isinstance(artifact.get("codecs"), dict) else {},
+        metadata={
+            **metadata,
+            "image_validation_v1": _image_validation_metadata(validation),
+        },
+    )
+
+
+def _validated_image_artifact(
+    artifact: dict,
+    *,
+    expected_content_hash: str,
+    counters: dict[str, int] | None = None,
+) -> ValidatedImageArtifact | None:
+    if (
+        str(artifact.get("status") or "") != "completed"
+        or str(artifact.get("content_hash") or "") != expected_content_hash
+    ):
+        return None
+    cached = _cached_image_validation(artifact)
+    if cached is not None:
+        if counters is not None:
+            counters["cache_hits"] = counters.get("cache_hits", 0) + 1
+        return cached
+    if counters is not None:
+        counters["cache_misses"] = counters.get("cache_misses", 0) + 1
+        counters["files_hashed"] = counters.get("files_hashed", 0) + 1
+        counters["files_decoded"] = counters.get("files_decoded", 0) + 1
+    try:
+        validation = _validate_image_file(Path(str(artifact.get("path") or "")))
+    except OSError:
+        return None
+    _backfill_image_validation(artifact, validation)
+    return validation
+
+
+def _cached_reference_hash(
+    path: Path | None,
+    cache: dict[tuple[str, int, int], str] | None,
+) -> str:
+    if path is None:
+        return ""
+    stat = path.stat()
+    key = (str(path.resolve()), int(stat.st_size), int(stat.st_mtime_ns))
+    if cache is not None and key in cache:
+        return cache[key]
+    value = _sha256_file(path)
+    if cache is not None:
+        cache[key] = value
+    return value
 
 
 def _perceptual_fingerprints_match(
@@ -1168,7 +1354,11 @@ async def _generate_scene_image_async(
     existing_perceptual_hashes: list[ImagePerceptualFingerprint] | None = None,
     force_new_project: bool = False,
     submit_only: bool = False,
-) -> Path:
+    artifact_snapshot: dict[str, dict] | None = None,
+    reference_hash_cache: dict[tuple[str, int, int], str] | None = None,
+    validation_counters: dict[str, int] | None = None,
+    return_validation: bool = False,
+) -> Path | ValidatedImageArtifact:
     from nexus_engine.services.google_flow_worker import (
         FlowGenerationError,
         FlowGenerationTimeout,
@@ -1179,12 +1369,16 @@ async def _generate_scene_image_async(
     negative_prompt = str(settings.get("avoid_prompt") or settings.get("negative_prompt") or "")
     fixed_seed = int(_sha256_bytes(str(video_id).encode("utf-8"))[:15], 16)
     cancel_check()
-    reference_hash = _sha256_file(reference_path) if reference_path else ""
+    reference_hash = _cached_reference_hash(reference_path, reference_hash_cache)
     content_hash = _scene_hash(
         video_id, scene, profile, negative_prompt, reference_hash
     )
     artifact_type = f"scene:{scene['index']}"
-    existing = db.get_latest_video_artifact(video_id, artifact_type)
+    existing = (
+        artifact_snapshot.get(artifact_type)
+        if artifact_snapshot is not None
+        else db.get_latest_video_artifact(video_id, artifact_type)
+    )
     existing_metadata = existing.get("metadata", {}) if existing else {}
 
     cache_matches_plan = bool(
@@ -1203,10 +1397,15 @@ async def _generate_scene_image_async(
         and cache_matches_plan
         and existing.get("status") == "completed"
     ):
-        artifact_path = Path(existing["path"])
-        if artifact_path.exists():
-            art_hash = _sha256_file(artifact_path)
-            art_fingerprint = _image_perceptual_fingerprint(artifact_path)
+        validated = _validated_image_artifact(
+            existing,
+            expected_content_hash=content_hash,
+            counters=validation_counters,
+        )
+        if validated is not None:
+            artifact_path = validated.path
+            art_hash = validated.sha256
+            art_fingerprint = validated.fingerprint
             is_exact_duplicate = bool(
                 existing_hashes is not None and art_hash in existing_hashes
             )
@@ -1233,18 +1432,38 @@ async def _generate_scene_image_async(
                         artifact_path,
                         existing.get("metadata") or {},
                     )
-                return artifact_path
+                return validated if return_validation else artifact_path
 
     target = SCENES_DIR / f"{video_id}_{scene['index']}_{content_hash[:8]}.png"
     target.parent.mkdir(parents=True, exist_ok=True)
     receipt = existing_metadata.get("flow_receipt")
     receipt = receipt if isinstance(receipt, dict) else {}
+    existing_intent = existing_metadata.get("flow_submission_intent")
+    existing_intent = existing_intent if isinstance(existing_intent, dict) else {}
     is_reconciliation_checkpoint = bool(
         not force_new_project
         and existing
         and existing.get("content_hash") == content_hash
         and existing.get("status") == "queued"
         and receipt.get("request_key")
+    )
+    is_intent_reconciliation = bool(
+        not force_new_project
+        and existing
+        and existing.get("content_hash") == content_hash
+        and existing.get("status") == "processing"
+        and existing_intent.get("request_key")
+        and existing_intent.get("prompt_hash") == content_hash
+    )
+    is_legacy_processing_checkpoint = bool(
+        not force_new_project
+        and existing
+        and existing.get("content_hash") == content_hash
+        and existing.get("status") == "processing"
+        and not existing_intent.get("request_key")
+    )
+    uses_legacy_prompt_reconciliation = bool(
+        existing_metadata.get("legacy_prompt_reconciliation")
     )
     retry_wait_remaining = 0.0
     if (
@@ -1262,12 +1481,16 @@ async def _generate_scene_image_async(
                 pending_image_scene_indices=[int(scene.get("index", 0))],
             )
     generation_attempt = int(existing_metadata.get("generation_attempt") or 0)
-    if not is_reconciliation_checkpoint:
+    if not is_reconciliation_checkpoint and not is_intent_reconciliation:
         generation_attempt += 1
     generation_attempt = max(1, generation_attempt)
     request_key = (
-        str(receipt.get("request_key") or "")
-        if is_reconciliation_checkpoint
+        str(
+            receipt.get("request_key")
+            if is_reconciliation_checkpoint
+            else existing_intent.get("request_key")
+        )
+        if is_reconciliation_checkpoint or is_intent_reconciliation
         else secrets.token_hex(10)
     )
     pending_expired = bool(
@@ -1281,6 +1504,15 @@ async def _generate_scene_image_async(
         "generation_attempt": generation_attempt,
         "reference_id": reference_id,
         "reference_hash": reference_hash,
+        "flow_submission_intent": {
+            "request_key": request_key,
+            "prompt_hash": content_hash,
+            "attempt": generation_attempt,
+            "started_at": str(
+                existing_intent.get("started_at")
+                or dt.datetime.now(dt.timezone.utc).isoformat()
+            ),
+        },
     }
     
     started_at = time.monotonic()
@@ -1302,6 +1534,7 @@ async def _generate_scene_image_async(
     flow_frame_metadata: dict[str, str] = {}
     perceptual_duplicate_retries = 0
     safe_prompt_used = bool(existing_metadata.get("safe_prompt_used"))
+    target_validation: ValidatedImageArtifact | None = None
     try:
         if _flow_mock_enabled():
             from PIL import Image
@@ -1366,6 +1599,23 @@ async def _generate_scene_image_async(
                         perceptual_duplicate_retries,
                     )
                 )
+                current_intent = checkpoint_metadata.get("flow_submission_intent")
+                if not isinstance(current_intent, dict) or current_intent.get("request_key") != request_key:
+                    checkpoint_metadata["flow_submission_intent"] = {
+                        "request_key": request_key,
+                        "prompt_hash": content_hash,
+                        "attempt": generation_attempt,
+                        "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    }
+                db.upsert_video_artifact(
+                    video_id=video_id,
+                    artifact_type=artifact_type,
+                    path=str(target),
+                    content_hash=content_hash,
+                    status="processing",
+                    mime_type="image/png",
+                    metadata=checkpoint_metadata,
+                )
                 _log_scene_generation(
                     video_id=video_id,
                     scene_index=int(scene.get("index", 0)),
@@ -1389,6 +1639,19 @@ async def _generate_scene_image_async(
                         image_settings=image_settings,
                         request_key=request_key,
                         reconcile_only=is_reconciliation_checkpoint,
+                        check_late_result=(
+                            is_reconciliation_checkpoint
+                            or is_intent_reconciliation
+                            or is_legacy_processing_checkpoint
+                        ),
+                        include_legacy_prompt=(
+                            is_legacy_processing_checkpoint
+                            or uses_legacy_prompt_reconciliation
+                        ),
+                        submit_if_prompt_missing=(
+                            is_intent_reconciliation
+                            or is_legacy_processing_checkpoint
+                        ),
                         submit_only=submit_only,
                         request_attempt=generation_attempt,
                         deadline_seconds=FLOW_IMAGE_RECONCILIATION_TTL_SECONDS,
@@ -1413,6 +1676,21 @@ async def _generate_scene_image_async(
                     safe_prompt_used = True
                     checkpoint_metadata["safe_prompt_used"] = True
                     request_key = secrets.token_hex(10)
+                    checkpoint_metadata["flow_submission_intent"] = {
+                        "request_key": request_key,
+                        "prompt_hash": content_hash,
+                        "attempt": generation_attempt,
+                        "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    }
+                    db.upsert_video_artifact(
+                        video_id=video_id,
+                        artifact_type=artifact_type,
+                        path=str(target),
+                        content_hash=content_hash,
+                        status="processing",
+                        mime_type="image/png",
+                        metadata=checkpoint_metadata,
+                    )
                     _log_scene_generation(
                         video_id=video_id,
                         scene_index=int(scene.get("index", 0)),
@@ -1431,6 +1709,8 @@ async def _generate_scene_image_async(
                         scene_count=scene_count,
                         image_settings=image_settings,
                         request_key=request_key,
+                        check_late_result=False,
+                        include_legacy_prompt=False,
                         submit_only=submit_only,
                         request_attempt=generation_attempt,
                         deadline_seconds=FLOW_IMAGE_RECONCILIATION_TTL_SECONDS,
@@ -1442,22 +1722,9 @@ async def _generate_scene_image_async(
                         f"Ảnh tạo từ Google Flow không hợp lệ hoặc rỗng: {target}"
                     )
 
-                from PIL import Image
-
-                with Image.open(target) as image_check:
-                    image_width, image_height = image_check.size
-                    if (
-                        image_width < 800
-                        or image_height < 400
-                        or image_width / max(1, image_height) < 1.15
-                    ):
-                        raise RuntimeError(
-                            "Ảnh tải về từ Google Flow không đạt chuẩn 16:9 widescreen "
-                            f"({image_width}x{image_height})."
-                        )
-
-                target_hash = _sha256_file(target)
-                target_fingerprint = _image_perceptual_fingerprint(target)
+                target_validation = _validate_image_file(target)
+                target_hash = target_validation.sha256
+                target_fingerprint = target_validation.fingerprint
                 is_exact_duplicate = bool(
                     existing_hashes is not None and target_hash in existing_hashes
                 )
@@ -1475,7 +1742,16 @@ async def _generate_scene_image_async(
 
                 perceptual_duplicate_retries += 1
                 is_reconciliation_checkpoint = False
+                is_intent_reconciliation = False
+                is_legacy_processing_checkpoint = False
                 request_key = secrets.token_hex(10)
+                checkpoint_metadata["flow_submission_intent"] = {
+                    "request_key": request_key,
+                    "prompt_hash": content_hash,
+                    "attempt": generation_attempt,
+                    "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                }
+                target_validation = None
                 target.unlink(missing_ok=True)
                 logger.warning(
                     "Generated scene %s duplicates an earlier scene (%s); retrying with a different composition (%s/%s).",
@@ -1497,8 +1773,10 @@ async def _generate_scene_image_async(
                 if isinstance(registered_frame, dict):
                     flow_frame_metadata = registered_frame
 
-        target_hash = _sha256_file(target)
-        target_fingerprint = _image_perceptual_fingerprint(target)
+        if target_validation is None:
+            target_validation = _validate_image_file(target)
+        target_hash = target_validation.sha256
+        target_fingerprint = target_validation.fingerprint
         if existing_hashes is not None and target_hash in existing_hashes:
             raise SceneVisualDuplicateError(
                 "Tạo ảnh trùng hệt cảnh trước; dừng để tránh video lặp ảnh."
@@ -1550,6 +1828,17 @@ async def _generate_scene_image_async(
                 "next_retry_at": next_retry_at,
                 "reason_code": str(exc.reason_code or "flow_image_pending"),
                 "terminal": False,
+                "legacy_prompt_reconciliation": bool(
+                    uses_legacy_prompt_reconciliation
+                    or (
+                        is_legacy_processing_checkpoint
+                        and str(exc.reason_code or "")
+                        in {
+                            "flow_image_prompt_pending",
+                            "flow_image_history_scan_failed",
+                        }
+                    )
+                ),
             },
         )
         exc.queued_since = queued_since
@@ -1671,12 +1960,16 @@ async def _generate_scene_image_async(
         content_hash=content_hash,
         status="completed",
         mime_type="image/png",
+        size_bytes=target_validation.size_bytes,
+        width=target_validation.width,
+        height=target_validation.height,
         metadata={
             **scene,
             "generation_attempt": generation_attempt,
             "perceptual_duplicate_retries": perceptual_duplicate_retries,
             "safe_prompt_used": safe_prompt_used,
             "reference_id": reference_id,
+            "image_validation_v1": _image_validation_metadata(target_validation),
             **flow_frame_metadata,
         },
     )
@@ -1688,7 +1981,7 @@ async def _generate_scene_image_async(
         attempt=generation_attempt,
         started_at=started_at,
     )
-    return target
+    return target_validation if return_validation else target
 
 
 def _generate_scene_image(
@@ -1748,6 +2041,8 @@ async def _generate_scene_images_with_worker(
     image_perceptual_hashes: list[ImagePerceptualFingerprint] = []
     completed_paths: list[Path] = []
     need_force_new = force_new_project
+    artifact_snapshot = db.list_latest_video_artifacts(video_id, ("scene:",))
+    reference_hash_cache: dict[tuple[str, int, int], str] = {}
     for scene in scenes:
         cancel_check()
         reference_id = str(scene.get("primary_reference_id") or "").strip()
@@ -1756,7 +2051,7 @@ async def _generate_scene_images_with_worker(
             reference_path = Path(scene_ref_path)
         else:
             reference_path = references.get(reference_id) if reference_id else None
-        image_path = await _generate_scene_image_async(
+        validation_result = await _generate_scene_image_async(
             video_id=video_id,
             scene=scene,
             scene_count=len(scenes),
@@ -1770,14 +2065,23 @@ async def _generate_scene_images_with_worker(
             existing_hashes=image_hashes,
             existing_perceptual_hashes=image_perceptual_hashes,
             force_new_project=need_force_new,
+            artifact_snapshot=artifact_snapshot,
+            reference_hash_cache=reference_hash_cache,
+            return_validation=True,
         )
         need_force_new = False
-        image_hash = _sha256_file(image_path)
+        validation = (
+            validation_result
+            if isinstance(validation_result, ValidatedImageArtifact)
+            else _validate_image_file(Path(validation_result))
+        )
+        image_path = validation.path
+        image_hash = validation.sha256
         if image_hash in image_hashes:
             raise SceneVisualDuplicateError(
                 "Tạo ảnh trùng hệt cảnh trước; dừng để tránh video lặp ảnh."
             )
-        image_fingerprint = _image_perceptual_fingerprint(image_path)
+        image_fingerprint = validation.fingerprint
         if _matches_existing_perceptual_fingerprint(
             image_fingerprint,
             image_perceptual_hashes,
@@ -1806,7 +2110,6 @@ def generate_scene_images(
 ) -> list[Path]:
     if force_new_project:
         purge_all_scene_artifacts(video_id)
-    cleanup_duplicate_scene_artifacts(video_id)
 
     async def _run() -> list[Path]:
         async with _flow_worker_session(
@@ -1845,6 +2148,9 @@ async def _generate_scene_video_async(
     existing_video_hashes: set[str] | None = None,
     video_number: int | None = None,
     video_count: int | None = None,
+    artifact_snapshot: dict[str, dict] | None = None,
+    start_frame_hash: str = "",
+    end_frame_hash: str = "",
 ) -> Path:
     from nexus_engine.services.google_flow_worker import (
         FlowCreditExhausted,
@@ -1859,14 +2165,26 @@ async def _generate_scene_video_async(
     negative_prompt = video_neg if video_neg else str(settings.get("avoid_prompt") or settings.get("negative_prompt") or "")
     fixed_seed = int(_sha256_bytes(str(video_id).encode("utf-8"))[:15], 16)
     cancel_check()
-    start_hash = _sha256_file(start_frame_path) if start_frame_path and start_frame_path.is_file() else ""
-    end_hash = _sha256_file(end_frame_path) if end_frame_path and end_frame_path.is_file() else ""
+    start_hash = start_frame_hash or (
+        _sha256_file(start_frame_path)
+        if start_frame_path and start_frame_path.is_file()
+        else ""
+    )
+    end_hash = end_frame_hash or (
+        _sha256_file(end_frame_path)
+        if end_frame_path and end_frame_path.is_file()
+        else ""
+    )
     
     content_hash = _scene_hash(
         video_id, scene, profile, negative_prompt, f"{start_hash}:{end_hash}"
     )
     artifact_type = f"scene_video:{scene['index']}"
-    existing = db.get_latest_video_artifact(video_id, artifact_type)
+    existing = (
+        artifact_snapshot.get(artifact_type)
+        if artifact_snapshot is not None
+        else db.get_latest_video_artifact(video_id, artifact_type)
+    )
     existing_metadata = existing.get("metadata", {}) if existing else {}
     receipt = existing_metadata.get("flow_receipt")
     receipt = receipt if isinstance(receipt, dict) else {}
@@ -2387,7 +2705,6 @@ def generate_scene_media(
 
     if force_new_project:
         purge_all_scene_artifacts(video_id)
-    cleanup_duplicate_scene_artifacts(video_id)
 
     async def _run_batch() -> dict:
         from nexus_engine.services.google_flow_worker import (
@@ -2408,6 +2725,17 @@ def generate_scene_media(
 
         image_limit = bounded_setting("flow_image_max_in_flight", 2, 1, 4)
         video_limit = bounded_setting("intro_video_max_in_flight", 4, 1, 12)
+        snapshot_started = time.monotonic()
+        artifact_snapshot = db.list_latest_video_artifacts(
+            video_id,
+            ("scene:", "scene_video:"),
+        )
+        logger.info(
+            "flow_preflight video_id=%s state=snapshot_loaded artifacts=%s elapsed=%.3f",
+            video_id,
+            len(artifact_snapshot),
+            max(0.0, time.monotonic() - snapshot_started),
+        )
         requested_positions = [
             index
             for index, scene in enumerate(scenes)
@@ -2420,23 +2748,42 @@ def generate_scene_media(
         }
 
         def remote_counts() -> tuple[int, int]:
-            image_pending = 0
-            video_pending = 0
-            for item in scenes:
-                scene_index = int(item.get("index", 0))
-                image_artifact = db.get_latest_video_artifact(
-                    video_id, f"scene:{scene_index}"
+            def waiting(artifact: dict | None) -> bool:
+                if not artifact:
+                    return False
+                status = str(artifact.get("status") or "")
+                if status == "queued":
+                    return True
+                if status != "processing":
+                    return False
+                metadata = artifact.get("metadata")
+                return bool(
+                    isinstance(metadata, dict)
+                    and (
+                        metadata.get("flow_receipt")
+                        or metadata.get("flow_submission_intent")
+                    )
                 )
-                video_artifact = db.get_latest_video_artifact(
-                    video_id, f"scene_video:{scene_index}"
-                )
-                image_pending += int(
-                    bool(image_artifact and image_artifact.get("status") == "queued")
-                )
-                video_pending += int(
-                    bool(video_artifact and video_artifact.get("status") == "queued")
-                )
-            return image_pending, video_pending
+
+            image_pending = sum(
+                waiting(artifact)
+                for artifact_type, artifact in artifact_snapshot.items()
+                if artifact_type.startswith("scene:")
+            )
+            video_pending = sum(
+                waiting(artifact)
+                for artifact_type, artifact in artifact_snapshot.items()
+                if artifact_type.startswith("scene_video:")
+            )
+            return int(image_pending), int(video_pending)
+
+        def refresh_artifact(artifact_type: str) -> dict | None:
+            artifact = db.get_latest_video_artifact(video_id, artifact_type)
+            if artifact is None:
+                artifact_snapshot.pop(artifact_type, None)
+            else:
+                artifact_snapshot[artifact_type] = artifact
+            return artifact
 
         def append_pending(target: list[dict[str, object]], exc, scene_index: int) -> None:
             target.append(
@@ -2510,6 +2857,14 @@ def generate_scene_media(
             first_reference_position: dict[str, int] = {}
             image_hashes: set[str] = set()
             image_perceptual_hashes: list[ImagePerceptualFingerprint] = []
+            validated_images: list[ValidatedImageArtifact | None] = [None] * len(scenes)
+            reference_hash_cache: dict[tuple[str, int, int], str] = {}
+            validation_counters: dict[str, int] = {
+                "cache_hits": 0,
+                "cache_misses": 0,
+                "files_hashed": 0,
+                "files_decoded": 0,
+            }
             video_hashes: set[str] = set()
             flow_video_unsupported = False
             flow_video_credit_exhausted = False
@@ -2521,6 +2876,7 @@ def generate_scene_media(
                 if reference_id and reference_id not in first_reference_position:
                     first_reference_position[reference_id] = position
 
+            preflight_started = time.monotonic()
             for position, scene in enumerate(scenes):
                 cancel_check()
                 scene_index = int(scene.get("index", position))
@@ -2536,15 +2892,89 @@ def generate_scene_media(
                     and reference_path is None
                     and first_reference_position.get(reference_id) != position
                 ):
+                    continue
+                reference_hash = _cached_reference_hash(
+                    reference_path,
+                    reference_hash_cache,
+                )
+                expected_content_hash = _scene_hash(
+                    video_id,
+                    scene,
+                    profile or {},
+                    str(settings.get("avoid_prompt") or settings.get("negative_prompt") or ""),
+                    reference_hash,
+                )
+                current_artifact = artifact_snapshot.get(f"scene:{scene_index}")
+                validation = (
+                    _validated_image_artifact(
+                        current_artifact,
+                        expected_content_hash=expected_content_hash,
+                        counters=validation_counters,
+                    )
+                    if current_artifact
+                    else None
+                )
+                if validation is None:
+                    continue
+                if validation.sha256 in image_hashes or _matches_existing_perceptual_fingerprint(
+                    validation.fingerprint,
+                    image_perceptual_hashes,
+                ):
+                    logger.warning(
+                        "Cached scene image duplicates an earlier scene; scheduling regeneration "
+                        "video_id=%s scene=%s",
+                        video_id,
+                        scene_index,
+                    )
+                    continue
+                validated_images[position] = validation
+                base_image_paths[position] = validation.path
+                image_hashes.add(validation.sha256)
+                image_perceptual_hashes.append(validation.fingerprint)
+                if reference_id and reference_id not in references:
+                    references[reference_id] = validation.path
+
+            logger.info(
+                "flow_preflight video_id=%s state=image_validation cache_hits=%s "
+                "cache_misses=%s files_hashed=%s files_decoded=%s elapsed=%.3f",
+                video_id,
+                validation_counters["cache_hits"],
+                validation_counters["cache_misses"],
+                validation_counters["files_hashed"],
+                validation_counters["files_decoded"],
+                max(0.0, time.monotonic() - preflight_started),
+            )
+            logger.info(
+                "flow_preflight video_id=%s state=complete elapsed=%.3f",
+                video_id,
+                max(0.0, time.monotonic() - snapshot_started),
+            )
+
+            for position, scene in enumerate(scenes):
+                if validated_images[position] is not None:
+                    continue
+                cancel_check()
+                scene_index = int(scene.get("index", position))
+                artifact_type = f"scene:{scene_index}"
+                reference_id = str(scene.get("primary_reference_id") or "").strip()
+                explicit_reference = scene.get("reference_path")
+                reference_path = (
+                    Path(explicit_reference)
+                    if explicit_reference and Path(explicit_reference).is_file()
+                    else references.get(reference_id)
+                )
+                if (
+                    reference_id
+                    and reference_path is None
+                    and first_reference_position.get(reference_id) != position
+                ):
                     pending_images.append({"scene_index": scene_index})
                     continue
 
-                current_artifact = db.get_latest_video_artifact(
-                    video_id, f"scene:{scene_index}"
-                )
+                current_artifact = artifact_snapshot.get(artifact_type)
                 current_status = str((current_artifact or {}).get("status") or "")
                 image_remote, video_remote = remote_counts()
-                can_advance = current_status in {"completed", "queued", "retry_wait"}
+                can_advance = current_status in {"queued", "processing", "retry_wait"}
                 if not can_advance and (
                     image_remote >= image_limit
                     or image_remote + video_remote >= FLOW_REMOTE_MAX_IN_FLIGHT
@@ -2552,7 +2982,7 @@ def generate_scene_media(
                     pending_images.append({"scene_index": scene_index})
                     continue
                 try:
-                    image_path = await _generate_scene_image_async(
+                    validation_result = await _generate_scene_image_async(
                         video_id=video_id,
                         scene=scene,
                         scene_count=len(scenes),
@@ -2567,15 +2997,21 @@ def generate_scene_media(
                         existing_perceptual_hashes=image_perceptual_hashes,
                         force_new_project=False,
                         submit_only=True,
+                        artifact_snapshot=artifact_snapshot,
+                        reference_hash_cache=reference_hash_cache,
+                        validation_counters=validation_counters,
+                        return_validation=True,
                     )
                 except FlowImagePending as exc:
+                    refresh_artifact(artifact_type)
                     append_pending(pending_images, exc, scene_index)
                     continue
                 try:
-                    if not image_path.is_file() or image_path.stat().st_size <= 0:
-                        raise OSError(f"Scene image is missing or empty: {image_path}")
-                    image_hash = _sha256_file(image_path)
-                    image_fingerprint = _image_perceptual_fingerprint(image_path)
+                    validation = (
+                        validation_result
+                        if isinstance(validation_result, ValidatedImageArtifact)
+                        else _validate_image_file(Path(validation_result))
+                    )
                 except OSError as exc:
                     logger.warning(
                         "Scene image unavailable before phase barrier for video=%s scene=%s: %s",
@@ -2585,28 +3021,37 @@ def generate_scene_media(
                     )
                     pending_images.append({"scene_index": scene_index})
                     continue
-                image_hashes.add(image_hash)
-                image_perceptual_hashes.append(image_fingerprint)
-                base_image_paths[position] = image_path
+                refresh_artifact(artifact_type)
+                image_hashes.add(validation.sha256)
+                image_perceptual_hashes.append(validation.fingerprint)
+                validated_images[position] = validation
+                base_image_paths[position] = validation.path
                 if reference_id and reference_id not in references:
-                    references[reference_id] = image_path
+                    references[reference_id] = validation.path
 
             pending_image_indices = {
                 int(item["scene_index"])
                 for item in pending_images
             }
             for position, image_path in enumerate(base_image_paths):
+                validation = validated_images[position]
                 try:
+                    image_stat = image_path.stat() if image_path is not None else None
                     image_is_valid = bool(
                         image_path is not None
+                        and validation is not None
+                        and image_path == validation.path
                         and image_path.is_file()
-                        and image_path.stat().st_size > 0
+                        and image_stat is not None
+                        and image_stat.st_size == validation.size_bytes
+                        and image_stat.st_mtime_ns == validation.mtime_ns
                     )
                 except OSError:
                     image_is_valid = False
                 if image_is_valid:
                     continue
                 base_image_paths[position] = None
+                validated_images[position] = None
                 scene_index = int(scenes[position].get("index", position))
                 if scene_index not in pending_image_indices:
                     pending_images.append({"scene_index": scene_index})
@@ -2707,9 +3152,8 @@ def generate_scene_media(
                 ):
                     pending_videos.append({"scene_index": scene_index})
                     continue
-                current_artifact = db.get_latest_video_artifact(
-                    video_id, f"scene_video:{scene_index}"
-                )
+                artifact_type = f"scene_video:{scene_index}"
+                current_artifact = artifact_snapshot.get(artifact_type)
                 current_status = str((current_artifact or {}).get("status") or "")
                 image_remote, video_remote = remote_counts()
                 can_advance = current_status in {"completed", "queued", "failed"}
@@ -2736,12 +3180,22 @@ def generate_scene_media(
                         existing_video_hashes=video_hashes,
                         video_number=video_ordinal[index],
                         video_count=len(requested_positions),
+                        artifact_snapshot=artifact_snapshot,
+                        start_frame_hash=(validated_images[index].sha256 if validated_images[index] else ""),
+                        end_frame_hash=(
+                            validated_images[index + 1].sha256
+                            if index + 1 < len(validated_images)
+                            and validated_images[index + 1]
+                            else ""
+                        ),
                     )
+                    refresh_artifact(artifact_type)
                     video_paths[index] = video_path
                     video_hashes.add(_sha256_file(video_path))
                     summary["generated_count"] += 1
                 except Exception as exc:
                     if isinstance(exc, FlowVideoPending):
+                        refresh_artifact(artifact_type)
                         append_pending(pending_videos, exc, scene_index)
                         continue
                     if isinstance(exc, FlowCreditExhausted):
@@ -2796,11 +3250,12 @@ def generate_scene_media(
 
                 for item in scenes:
                     s_idx = int(item.get("index", 0))
-                    video_art = db.get_latest_video_artifact(video_id, f"scene_video:{s_idx}")
+                    video_artifact_type = f"scene_video:{s_idx}"
+                    video_art = artifact_snapshot.get(video_artifact_type)
                     if video_art and video_art.get("status") in {"queued", "retry_wait", "processing"}:
-                        db.upsert_video_artifact(
+                        artifact_snapshot[video_artifact_type] = db.upsert_video_artifact(
                             video_id=video_id,
-                            artifact_type=f"scene_video:{s_idx}",
+                            artifact_type=video_artifact_type,
                             path=str(video_art.get("path") or ""),
                             content_hash=str(video_art.get("content_hash") or ""),
                             status="failed",

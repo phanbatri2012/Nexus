@@ -6499,6 +6499,38 @@ def get_latest_video_artifact(
     return _decode_video_artifact(row)
 
 
+def list_latest_video_artifacts(
+    video_id: int,
+    artifact_type_prefixes: tuple[str, ...] | list[str] | None = None,
+) -> dict[str, dict]:
+    """Return the newest artifact for each type using one database snapshot query."""
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        filters = ["video_id = ?"]
+        params: list = [video_id]
+        prefixes = [str(prefix) for prefix in (artifact_type_prefixes or []) if prefix]
+        if prefixes:
+            filters.append("(" + " OR ".join("artifact_type LIKE ?" for _ in prefixes) + ")")
+            params.extend(
+                prefix if "%" in prefix else f"{prefix}%" for prefix in prefixes
+            )
+        rows = conn.execute(
+            f"SELECT * FROM video_artifacts WHERE {' AND '.join(filters)} "
+            "ORDER BY artifact_type, updated_at DESC, id DESC",
+            params,
+        ).fetchall()
+    finally:
+        conn.close()
+
+    latest: dict[str, dict] = {}
+    for row in rows:
+        artifact = _decode_video_artifact(row)
+        if artifact is not None:
+            latest.setdefault(str(artifact.get("artifact_type") or ""), artifact)
+    return latest
+
+
 def list_video_artifacts(
     video_id: int,
     artifact_type: str | None = None,

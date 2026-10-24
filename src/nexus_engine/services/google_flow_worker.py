@@ -339,6 +339,7 @@ def _upgrade_google_cdn_image_url(url: str) -> str:
 
 class GoogleFlowWorker:
     _session_uploaded_references: dict[str, set[str]] = {}
+    _session_reference_assets: dict[str, dict[str, dict[str, object]]] = {}
     _session_uploaded_image_urls: set[str] = set()
     _session_video_frame_assets: dict[str, dict[str, dict[str, str]]] = {}
     _session_configured_agent_projects: set[str] = set()
@@ -356,6 +357,7 @@ class GoogleFlowWorker:
         self._last_invalid_image_size: tuple[int, int] | None = None
         self._validated_image_payload: tuple[str, bytes] | None = None
         self._last_generated_image_identity: dict[str, str] = {}
+        self._last_reference_identity: dict[str, object] = {}
         self._agent_interface_detected = False
         self._generation_queue_active = False
         self._video_completion_pending = False
@@ -365,6 +367,10 @@ class GoogleFlowWorker:
         self._last_generation_receipt: dict[str, object] = {}
         self._active_video_submitted_at: float | None = None
         self._frame_failure_diagnostic_saved = False
+        self._image_candidate_baseline_cache: set[str] | None = None
+        self._last_image_prompt_found = False
+        self._last_image_prompt_scan_succeeded = False
+        self._late_history_scan_count = 0
 
     @staticmethod
     def _utc_timestamp() -> str:
@@ -566,6 +572,10 @@ class GoogleFlowWorker:
 
     def _project_reference_cache(self) -> set[str]:
         return self._session_uploaded_references.setdefault(self._project_id(), set())
+
+    def _project_reference_asset_cache(self) -> dict[str, dict[str, object]]:
+        session_key = f"{id(getattr(self.page, 'context', None))}:{self._project_id()}"
+        return self._session_reference_assets.setdefault(session_key, {})
 
     def _project_video_frame_cache(self) -> dict[str, dict[str, str]]:
         return self._session_video_frame_assets.setdefault(self._project_id(), {})
@@ -2730,6 +2740,9 @@ class GoogleFlowWorker:
 
     async def _find_completed_image_for_prompt(self, *prompts: str) -> str:
         """Reuse a late Agent result only when it follows the exact submitted prompt."""
+        self._last_image_prompt_found = False
+        self._last_image_prompt_scan_succeeded = False
+        self._late_history_scan_count += 1
         expected_prompts = [
             self._normalize_prompt_text(prompt).casefold()
             for prompt in prompts
@@ -2754,7 +2767,7 @@ class GoogleFlowWorker:
                             break;
                         }
                     }
-                    if (promptIndex < 0) return [];
+                    if (promptIndex < 0) return {promptFound: false, candidates: [], error: ''};
 
                     const found = [];
                     let error = '';
@@ -2811,7 +2824,7 @@ class GoogleFlowWorker:
                             });
                         }
                     }
-                    return {candidates: found, error};
+                    return {promptFound: true, candidates: found, error};
                 }''',
                 expected_prompts,
             )
@@ -2822,7 +2835,9 @@ class GoogleFlowWorker:
                 exc,
             )
             return ""
+        self._last_image_prompt_scan_succeeded = True
         if isinstance(candidates, dict):
+            self._last_image_prompt_found = bool(candidates.get("promptFound"))
             error_text = str(candidates.get("error") or "").strip()
             if error_text and _is_valid_flow_error_text(error_text):
                 raise FlowGenerationError(
@@ -3230,10 +3245,22 @@ class GoogleFlowWorker:
             return set()
 
     async def _capture_stable_image_baseline(self) -> set[str]:
+        candidates = await self._collect_image_candidates()
+        latest_keys = (
+            set().union(*(self._candidate_keys(candidate) for candidate in candidates))
+            if candidates
+            else set()
+        )
+        for candidate in candidates:
+            if self._candidate_matches_active_reference(candidate):
+                self._active_reference_keys.update(self._candidate_keys(candidate))
+        if self._image_candidate_baseline_cache == latest_keys:
+            return latest_keys | self._active_reference_keys
+
         deadline = time.monotonic() + IMAGE_BASELINE_STABILIZE_SECONDS
-        previous_keys: set[str] | None = None
-        latest_keys: set[str] = set()
+        previous_keys = latest_keys
         while True:
+            await asyncio.sleep(IMAGE_BASELINE_POLL_SECONDS)
             candidates = await self._collect_image_candidates()
             latest_keys = set().union(
                 *(self._candidate_keys(candidate) for candidate in candidates)
@@ -3242,9 +3269,9 @@ class GoogleFlowWorker:
                 if self._candidate_matches_active_reference(candidate):
                     self._active_reference_keys.update(self._candidate_keys(candidate))
             if previous_keys == latest_keys or time.monotonic() >= deadline:
+                self._image_candidate_baseline_cache = set(latest_keys)
                 return latest_keys | self._active_reference_keys
             previous_keys = latest_keys
-            await asyncio.sleep(IMAGE_BASELINE_POLL_SECONDS)
 
     def _set_active_reference_filenames(
         self,
@@ -3541,7 +3568,10 @@ class GoogleFlowWorker:
                 return item
         return None
 
-    async def _remember_reference_locator_keys(self, locator: Locator) -> None:
+    async def _remember_reference_locator_keys(
+        self,
+        locator: Locator,
+    ) -> dict[str, object] | None:
         try:
             identity = await locator.evaluate(r'''(node) => {
                 const card = node.closest(
@@ -3567,9 +3597,9 @@ class GoogleFlowWorker:
                 return {assetId, urls};
             }''')
         except Exception:
-            return
+            return None
         if not isinstance(identity, dict):
-            return
+            return None
         asset_id = str(identity.get("assetId") or "").strip().casefold()
         if asset_id:
             self._active_reference_keys.add(f"asset:{asset_id}")
@@ -3577,6 +3607,39 @@ class GoogleFlowWorker:
             url_key = self._media_key(str(url or ""))
             if url_key:
                 self._active_reference_keys.add(url_key)
+        normalized_identity = {
+            "asset_id": asset_id,
+            "media_keys": sorted(
+                {
+                    self._media_key(str(url or ""))
+                    for url in identity.get("urls") or []
+                    if self._media_key(str(url or ""))
+                }
+            ),
+        }
+        self._last_reference_identity = normalized_identity
+        return normalized_identity
+
+    async def _find_cached_picker_asset(
+        self,
+        identity: dict[str, object] | None,
+    ) -> Locator | None:
+        asset_id = str((identity or {}).get("asset_id") or "").strip().casefold()
+        if not asset_id:
+            return None
+        candidates = self.page.locator(
+            ".cdk-overlay-container [data-media-id], "
+            ".cdk-overlay-container [data-asset-id], "
+            ".cdk-overlay-container [data-id]"
+        )
+        count = await candidates.count()
+        for index in range(min(count, REFERENCE_ASSET_SCAN_LIMIT)):
+            candidate = candidates.nth(index)
+            for attribute in ("data-media-id", "data-asset-id", "data-id"):
+                value = str(await candidate.get_attribute(attribute) or "").strip().casefold()
+                if value == asset_id:
+                    return candidate
+        return None
 
     async def _remember_attached_reference_keys(self) -> None:
         """Capture identities from reference chips in the current prompt composer."""
@@ -3619,16 +3682,25 @@ class GoogleFlowWorker:
             return
         if not isinstance(identities, list):
             return
+        confirmed_asset_id = ""
+        confirmed_media_keys: set[str] = set()
         for identity in identities:
             if not isinstance(identity, dict):
                 continue
             asset_id = str(identity.get("assetId") or "").strip().casefold()
             if asset_id:
                 self._active_reference_keys.add(f"asset:{asset_id}")
+                confirmed_asset_id = asset_id
             for url in identity.get("urls") or []:
                 url_key = self._media_key(str(url or ""))
                 if url_key:
                     self._active_reference_keys.add(url_key)
+                    confirmed_media_keys.add(url_key)
+        if confirmed_asset_id or confirmed_media_keys:
+            self._last_reference_identity = {
+                "asset_id": confirmed_asset_id,
+                "media_keys": sorted(confirmed_media_keys),
+            }
 
     async def _has_ingredient_chip(self) -> bool:
         selectors = [
@@ -4240,7 +4312,11 @@ class GoogleFlowWorker:
             pass
         await self.dismiss_blocking_dialogs()
 
-    async def _attach_reference_from_picker(self, filename: str) -> str:
+    async def _attach_reference_from_picker(
+        self,
+        filename: str,
+        cached_identity: dict[str, object] | None = None,
+    ) -> str:
         """Attach an existing upload by exact filename using the searchable picker."""
         await self.dismiss_blocking_dialogs()
         add_btn = self.page.locator(
@@ -4269,20 +4345,34 @@ class GoogleFlowWorker:
                 await uploads_tab.click()
                 await asyncio.sleep(0.5)
 
-            search_input = self.page.locator(
-                ".cdk-overlay-container input[placeholder*='Search' i], "
-                ".cdk-overlay-container input[aria-label*='Search' i], "
-                ".cdk-overlay-container input[placeholder*='Tìm kiếm' i], "
-                ".cdk-overlay-container input[aria-label*='Tìm kiếm' i]"
-            ).first
-            if not await search_input.is_visible(timeout=2000):
-                await self._close_reference_ui()
-                return REFERENCE_RESULT_UI_ERROR
+            asset_item = await self._find_cached_picker_asset(cached_identity)
+            if asset_item is not None:
+                logger.info(
+                    "flow_reference status=locator_cache_hit project=%s filename=%s",
+                    self._project_id(),
+                    filename,
+                )
+            else:
+                if cached_identity:
+                    logger.info(
+                        "flow_reference status=locator_cache_fallback project=%s filename=%s",
+                        self._project_id(),
+                        filename,
+                    )
+                search_input = self.page.locator(
+                    ".cdk-overlay-container input[placeholder*='Search' i], "
+                    ".cdk-overlay-container input[aria-label*='Search' i], "
+                    ".cdk-overlay-container input[placeholder*='Tìm kiếm' i], "
+                    ".cdk-overlay-container input[aria-label*='Tìm kiếm' i]"
+                ).first
+                if not await search_input.is_visible(timeout=2000):
+                    await self._close_reference_ui()
+                    return REFERENCE_RESULT_UI_ERROR
 
-            await search_input.fill(filename)
-            await self.page.keyboard.press("Enter")
-            await asyncio.sleep(0.8)
-            asset_item = await self._find_exact_picker_asset(filename)
+                await search_input.fill(filename)
+                await self.page.keyboard.press("Enter")
+                await asyncio.sleep(0.8)
+                asset_item = await self._find_exact_picker_asset(filename)
             if asset_item is None:
                 await self._close_reference_ui()
                 return REFERENCE_RESULT_NOT_FOUND
@@ -4359,7 +4449,12 @@ class GoogleFlowWorker:
             return REFERENCE_RESULT_UI_ERROR
 
     async def _try_attach_existing_reference(self, filename: str) -> tuple[str, str]:
-        picker_result = await self._attach_reference_from_picker(filename)
+        cached_identity = self._project_reference_asset_cache().get(filename.casefold())
+        picker_result = (
+            await self._attach_reference_from_picker(filename, cached_identity)
+            if cached_identity
+            else await self._attach_reference_from_picker(filename)
+        )
         if picker_result == REFERENCE_RESULT_ATTACHED:
             return picker_result, "reused_picker"
         if (
@@ -4406,9 +4501,16 @@ class GoogleFlowWorker:
             raise ReferenceAttachmentError(f"Ảnh tham chiếu không tồn tại: {reference_path}")
 
         cache = self._project_reference_cache()
+        asset_cache = self._project_reference_asset_cache()
         filename_key = filename.casefold()
-        known_in_project = filename_key in cache
+        known_in_project = filename_key in cache or filename_key in asset_cache
         confirmed_missing = False
+        self._last_reference_identity = {}
+
+        def remember_confirmed_identity() -> None:
+            identity = dict(self._last_reference_identity)
+            if identity.get("asset_id") or identity.get("media_keys"):
+                asset_cache[filename_key] = identity
 
         for attempt in range(1, REFERENCE_ATTACH_RETRY_COUNT + 1):
             result, source = await self._try_attach_existing_reference(filename)
@@ -4423,6 +4525,7 @@ class GoogleFlowWorker:
             if result == REFERENCE_RESULT_ATTACHED:
                 await self._remember_attached_reference_keys()
                 cache.add(filename_key)
+                remember_confirmed_identity()
                 self._log_reference_event(source, filename)
                 return
             if result == REFERENCE_RESULT_NOT_FOUND:
@@ -4437,6 +4540,7 @@ class GoogleFlowWorker:
         if await self._wait_for_ingredient_chip():
             await self._remember_attached_reference_keys()
             cache.add(filename_key)
+            remember_confirmed_identity()
             self._log_reference_event(
                 "reused_picker",
                 filename,
@@ -4478,11 +4582,15 @@ class GoogleFlowWorker:
         for _ in range(REFERENCE_POST_UPLOAD_RETRY_COUNT):
             if await self._wait_for_ingredient_chip():
                 await self._remember_attached_reference_keys()
+                cache.add(filename_key)
+                remember_confirmed_identity()
                 self._log_reference_event("uploaded", filename, detail="attached_by_upload")
                 return
             result, _ = await self._try_attach_existing_reference(filename)
             if result == REFERENCE_RESULT_ATTACHED:
                 await self._remember_attached_reference_keys()
+                cache.add(filename_key)
+                remember_confirmed_identity()
                 self._log_reference_event("uploaded", filename, detail="attached_after_upload")
                 return
             await asyncio.sleep(1)
@@ -5305,10 +5413,14 @@ class GoogleFlowWorker:
         image_settings: dict | None = None,
         request_key: str = "",
         reconcile_only: bool = False,
+        check_late_result: bool = True,
+        include_legacy_prompt: bool = True,
+        submit_if_prompt_missing: bool = False,
         submit_only: bool = False,
         request_attempt: int = 1,
         deadline_seconds: float = AGENT_IMAGE_GENERATION_TIMEOUT_SECONDS,
     ) -> str:
+        self._last_generation_receipt = {}
         self._set_active_reference_filenames(reference_ids, reference_paths)
         self._reset_image_candidate_state()
         await self._ensure_project_canvas()
@@ -5323,6 +5435,9 @@ class GoogleFlowWorker:
                 image_settings=image_settings,
                 request_key=request_key,
                 reconcile_only=reconcile_only,
+                check_late_result=check_late_result,
+                include_legacy_prompt=include_legacy_prompt,
+                submit_if_prompt_missing=submit_if_prompt_missing,
                 submit_only=submit_only,
                 request_attempt=request_attempt,
                 deadline_seconds=deadline_seconds,
@@ -5343,6 +5458,9 @@ class GoogleFlowWorker:
         image_settings: dict | None = None,
         request_key: str = "",
         reconcile_only: bool = False,
+        check_late_result: bool = True,
+        include_legacy_prompt: bool = True,
+        submit_if_prompt_missing: bool = False,
         submit_only: bool = False,
         request_attempt: int = 1,
         deadline_seconds: float = AGENT_IMAGE_GENERATION_TIMEOUT_SECONDS,
@@ -5372,16 +5490,39 @@ class GoogleFlowWorker:
             f"{scene_instruction}{legacy_full_prompt}{self._request_marker(request_key)}"
         )
 
-        late_source = await self._find_completed_image_for_prompt(
-            full_prompt,
-            legacy_full_prompt,
-        )
+        late_source = ""
+        if check_late_result:
+            prompts_to_check = [full_prompt]
+            if include_legacy_prompt:
+                prompts_to_check.append(legacy_full_prompt)
+            late_source = await self._find_completed_image_for_prompt(*prompts_to_check)
+            logger.info(
+                "flow_generation media=image state=late_history_scan project=%s count=%s marker_found=%s legacy=%s",
+                self._project_id(),
+                self._late_history_scan_count,
+                self._last_image_prompt_found,
+                include_legacy_prompt,
+            )
         if late_source:
             return late_source
-        if reconcile_only:
+        intent_requires_reconciliation = bool(
+            submit_if_prompt_missing
+            and (
+                not self._last_image_prompt_scan_succeeded
+                or self._last_image_prompt_found
+            )
+        )
+        if reconcile_only or intent_requires_reconciliation:
+            pending_reason = (
+                "flow_image_history_scan_failed"
+                if submit_if_prompt_missing
+                and not self._last_image_prompt_scan_succeeded
+                else "flow_image_prompt_pending"
+            )
             raise FlowImagePending(
                 "Google Flow đã nhận yêu cầu ảnh và chưa có kết quả gắn đúng request; "
-                "sẽ tiếp tục đối soát mà không gửi lại prompt."
+                "sẽ tiếp tục đối soát mà không gửi lại prompt.",
+                reason_code=pending_reason,
             )
 
         await self._ensure_agent_session_ready()
