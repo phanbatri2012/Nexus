@@ -7183,9 +7183,12 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
         db.update_video_production_state(video_id, render_status="error")
         return
     from nexus_engine.services.google_flow_worker import (
-        FlowImagePending,
+        FlowCreditExhausted,
+        FlowImageCreditExhausted,
         FlowImageNeedsAttention,
+        FlowImagePending,
         FlowMediaPending,
+        FlowVideoCreditExhausted,
     )
 
     if (
@@ -7343,6 +7346,58 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
                     blocking_reason="",
                 )
             return
+
+    if (
+        isinstance(exc, (FlowImageCreditExhausted, FlowVideoCreditExhausted, FlowCreditExhausted))
+        and str(job.get("job_type") or "") == "flow_media_generation"
+    ):
+        is_video_quota = isinstance(exc, FlowVideoCreditExhausted) or "video" in str(exc).lower()
+        quota_type = "video" if is_video_quota else "image"
+        current_job = db.get_system_job(job["id"]) or job
+        result = dict(current_job.get("result") or {})
+        result["attention_required"] = f"flow_{quota_type}_quota_exhausted"
+        result["quota_exhausted_type"] = quota_type
+
+        video_id = int(job.get("video_id") or (job.get("payload") or {}).get("video_id") or 0)
+        img_completed = 0
+        vid_completed = 0
+        if video_id:
+            artifacts = db.list_latest_video_artifacts(video_id, ("scene:", "scene_video:"))
+            img_completed = sum(1 for k, v in artifacts.items() if k.startswith("scene:") and v.get("status") == "completed")
+            vid_completed = sum(1 for k, v in artifacts.items() if k.startswith("scene_video:") and v.get("status") == "completed")
+
+        if is_video_quota:
+            message = (
+                f"Google Flow đã hết Quota Video (Veo) (Đã xong {vid_completed} video, {img_completed} ảnh). "
+                "Đã dừng tại checkpoint; hãy chờ reset quota video rồi nhấn Resume."
+            )
+            stage = "flow_video_quota_exhausted"
+        else:
+            message = (
+                f"Google Flow đã hết Quota tạo ảnh (Đã xong {img_completed} ảnh). "
+                "Đã dừng tại checkpoint; hãy chờ Google reset quota rồi nhấn Resume."
+            )
+            stage = "flow_image_quota_exhausted"
+
+        db.update_system_job(
+            job["id"],
+            status="paused",
+            progress=message,
+            error=safe_error,
+            result_json=result,
+            next_retry_at="",
+            cancel_requested=0,
+            finished_at="",
+        )
+        if video_id:
+            db.update_video_production_state(
+                video_id,
+                render_status="paused",
+                current_stage=stage,
+                production_progress=message,
+                blocking_reason=safe_error,
+            )
+        return
 
     if (
         isinstance(exc, FlowImageNeedsAttention)

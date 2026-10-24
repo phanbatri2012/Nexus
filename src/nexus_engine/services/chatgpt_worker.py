@@ -6186,6 +6186,7 @@ def generate_muse_scene_plan_only(
                 repair_prompt = muse_semantic_planner.build_repair_prompt(
                     first_error.errors,
                     scene_count=len(windows),
+                    needs_terminal_frame=bool(windows and windows[-1].get("is_video")),
                 )
                 repaired_response = send_prompt(page, repair_prompt).strip()
                 repaired_payload = muse_semantic_planner.parse_planner_response(

@@ -28,6 +28,7 @@ from nexus_engine.services import (
     video_production,
 )
 from nexus_engine.services.muse_provider import (
+    MUSE_FRAME_CONTRACT_VERSION,
     MUSE_PROVIDER_NAME,
     MuseAmbiguousSubmissionError,
     MuseError,
@@ -36,6 +37,7 @@ from nexus_engine.services.muse_provider import (
     MusePromptBuilder,
     MuseQuotaUnavailable,
     MuseReceipt,
+    MuseReferenceError,
     MuseStudioApiProvider,
     MuseTaskTransientFailure,
     MuseTaskWaitLimitExceeded,
@@ -388,19 +390,20 @@ def _build_refusal_fallback(
     """Build one deterministic, non-graphic fallback after a terminal refusal."""
 
     if expected == "video":
-        if not references:
-            raise MuseRefusalError("Video Muse bị từ chối và không có first frame để fallback.")
+        if len(references) != 2:
+            raise MuseReferenceError(
+                "Video Muse cần đủ ảnh đầu và ảnh cuối để tạo fallback an toàn."
+            )
         prompt = MusePromptBuilder.video(
             (
-                "Animate @Image1 with subtle cinematic motion only: a slow camera push-in, "
-                "gentle parallax, and natural atmospheric movement. Preserve the existing "
-                "image content, subject, setting, era, and visual style. Do not introduce new "
-                "people, objects, actions, violence, injuries, graphic content, text, or logos."
+                "Move continuously from @Image1 to @Image2 with restrained cinematic motion, "
+                "gentle parallax, and natural atmospheric movement. Preserve the subject, "
+                "setting, era, composition, and visual style of both endpoints. Do not introduce "
+                "new people, objects, violence, injuries, graphic content, text, or logos."
             ),
-            reference_count=1,
             duration_seconds=float(scene.get("duration") or SCENE_SECONDS),
         )
-        return prompt, [references[0]]
+        return prompt, references[:2]
 
     composition = str(scene.get("composition") or "wide 16:9 cinematic framing").strip()
     lighting = str(scene.get("lighting") or "natural atmospheric light").strip()
@@ -1126,7 +1129,20 @@ async def _generate_request(
     cancel_check: Callable[[], None],
     policy_metadata: dict | None = None,
 ) -> dict:
+    if expected == "video" and len(references) != 2:
+        raise MuseReferenceError(
+            "Video Muse không được submit khi thiếu ảnh đầu hoặc ảnh cuối."
+        )
     generation_started = time.monotonic()
+    frame_metadata = (
+        {
+            "frame_contract_version": MUSE_FRAME_CONTRACT_VERSION,
+            "start_frame_hash": str(references[0].get("sha256") or ""),
+            "end_frame_hash": str(references[1].get("sha256") or ""),
+        }
+        if expected == "video"
+        else {}
+    )
     existing = db.get_latest_video_artifact(video_id, artifact_type)
     if _valid_cached_artifact(existing, request_hash):
         return {**existing, "_muse_cache_hit": True}
@@ -1354,6 +1370,7 @@ async def _generate_request(
                 metadata.get("refusal_elapsed_seconds") or 0
             ),
             "fallback_count": int(metadata.get("fallback_count") or 0),
+            **frame_metadata,
             **dict(policy_metadata or {}),
         }
         base_metadata.pop("retryable_generation", None)
@@ -1386,19 +1403,31 @@ async def _generate_request(
             )
 
         try:
-            create_media = (
-                adapter.create_video if expected == "video" else adapter.create_image
-            )
             while True:
                 try:
-                    result = await create_media(
-                        submission_prompt,
-                        [Path(item["path"]) for item in submission_references],
-                        destination,
-                        request_hash=submission_hash,
-                        on_submitted=on_submitted,
-                        cancel_check=cancel_check,
-                    )
+                    if expected == "video":
+                        if len(submission_references) != 2:
+                            raise MuseReferenceError(
+                                "Video Muse fallback phải giữ đủ ảnh đầu và ảnh cuối."
+                            )
+                        result = await adapter.create_video(
+                            submission_prompt,
+                            Path(submission_references[0]["path"]),
+                            Path(submission_references[1]["path"]),
+                            destination,
+                            request_hash=submission_hash,
+                            on_submitted=on_submitted,
+                            cancel_check=cancel_check,
+                        )
+                    else:
+                        result = await adapter.create_image(
+                            submission_prompt,
+                            [Path(item["path"]) for item in submission_references],
+                            destination,
+                            request_hash=submission_hash,
+                            on_submitted=on_submitted,
+                            cancel_check=cancel_check,
+                        )
                     break
                 except MuseRefusalError as exc:
                     current = db.get_latest_video_artifact(video_id, artifact_type) or {}
@@ -1655,6 +1684,7 @@ async def _generate_request(
         "download_method": str(result.get("download_method") or ""),
         "provider_elapsed_seconds": result.get("provider_elapsed_seconds"),
         "generation_elapsed_seconds": round(time.monotonic() - generation_started, 3),
+        **frame_metadata,
     }
     ready = _record_request_state(
         video_id,
@@ -1695,8 +1725,22 @@ async def _prepare_media_async(
                 "muse_quota_degraded",
             )
         total = len(plan["scenes"])
+        needs_terminal_frame = bool(plan["scenes"] and plan["scenes"][-1].get("is_video"))
+        terminal_frame = plan.get("terminal_frame")
+        if needs_terminal_frame and not isinstance(terminal_frame, dict):
+            raise MuseSemanticPlanNeedsAttention(
+                "Plan Muse thiếu terminal_frame cho scene video cuối; hãy Recreate."
+            )
+        if not needs_terminal_frame and terminal_frame:
+            raise MuseSemanticPlanNeedsAttention(
+                "Plan Muse có terminal_frame dù scene cuối là ảnh tĩnh; hãy Recreate."
+            )
+        image_items = [(scene, False) for scene in plan["scenes"]]
+        if isinstance(terminal_frame, dict):
+            image_items.append((terminal_frame, True))
+        terminal_frame_artifact: dict | None = None
         image_phase_started = time.monotonic()
-        for scene in plan["scenes"]:
+        for image_number, (scene, is_terminal) in enumerate(image_items, 1):
             cancel_check()
             index = int(scene["index"])
             selected, omitted = select_scene_references(scene, references, limit=6)
@@ -1727,50 +1771,90 @@ async def _prepare_media_async(
                 }
             )
             progress(
-                f"Muse images: cảnh {index + 1}/{total}",
+                (
+                    f"Muse images: ảnh kết {image_number}/{len(image_items)}"
+                    if is_terminal
+                    else f"Muse images: cảnh {image_number}/{len(image_items)}"
+                ),
                 "muse_images",
-                media_progress={"phase": "images", "completed": index, "total": total},
+                media_progress={
+                    "phase": "images",
+                    "completed": image_number - 1,
+                    "total": len(image_items),
+                },
             )
             image_artifact = await _generate_request(
                 adapter=adapter,
                 video_id=video_id,
-                artifact_type=f"muse_scene_image:{index}",
+                artifact_type=(
+                    "muse_terminal_frame"
+                    if is_terminal
+                    else f"muse_scene_image:{index}"
+                ),
                 request_hash=request_hash,
                 prompt=prompt,
                 references=submission_references,
                 omitted=[*omitted, *policy_omitted],
-                destination=MUSE_ARTIFACTS_DIR / str(video_id) / "images" / f"scene_{index:04d}",
+                destination=(
+                    MUSE_ARTIFACTS_DIR / str(video_id) / "images" / "terminal_frame"
+                    if is_terminal
+                    else MUSE_ARTIFACTS_DIR
+                    / str(video_id)
+                    / "images"
+                    / f"scene_{index:04d}"
+                ),
                 expected="image",
                 scene=scene,
                 cancel_check=cancel_check,
                 policy_metadata=policy_metadata,
             )
-            scene_results.append({"scene": scene, "image_artifact": image_artifact})
+            if is_terminal:
+                terminal_frame_artifact = image_artifact
+            else:
+                scene_results.append({"scene": scene, "image_artifact": image_artifact})
 
         image_phase_seconds = round(time.monotonic() - image_phase_started, 3)
         requested_videos = [item for item in scene_results if item["scene"].get("is_video")]
+        scene_result_by_index = {
+            int(item["scene"]["index"]): item for item in scene_results
+        }
+
+        def frame_reference(artifact: dict | None, *, role: str) -> dict:
+            path = Path(str((artifact or {}).get("path") or ""))
+            checksum = str(((artifact or {}).get("metadata") or {}).get("checksum") or "")
+            if not path.is_file() or path.stat().st_size <= 0 or not checksum:
+                raise MuseReferenceError(
+                    f"Thiếu {role} hợp lệ; Nexus không submit video Muse."
+                )
+            return {
+                "set_id": role,
+                "set_name": "Start frame" if role == "start_frame" else "End frame",
+                "set_index": -1,
+                "image_index": 0,
+                "aliases": [],
+                "source_filename": path.name,
+                "path": str(path),
+                "sha256": checksum,
+                "primary": role == "start_frame",
+            }
+
         video_phase_started = time.monotonic()
         for video_number, item in enumerate(requested_videos, 1):
             cancel_check()
             scene = item["scene"]
             index = int(scene["index"])
-            selected, omitted = select_scene_references(scene, references, limit=5)
-            scene_image = item["image_artifact"]
-            first_frame = {
-                "set_id": "scene_first_frame",
-                "set_name": "Scene first frame",
-                "set_index": -1,
-                "image_index": 0,
-                "aliases": [],
-                "source_filename": Path(scene_image["path"]).name,
-                "path": scene_image["path"],
-                "sha256": (scene_image.get("metadata") or {}).get("checksum"),
-                "primary": True,
-            }
-            video_references = [first_frame, *selected]
+            next_scene_result = scene_result_by_index.get(index + 1)
+            end_artifact = (
+                next_scene_result["image_artifact"]
+                if next_scene_result is not None
+                else terminal_frame_artifact
+            )
+            video_references = [
+                frame_reference(item.get("image_artifact"), role="start_frame"),
+                frame_reference(end_artifact, role="end_frame"),
+            ]
             original_prompt = MusePromptBuilder.video(
                 str(scene.get("action") or scene.get("prompt") or ""),
-                reference_count=len(video_references),
                 duration_seconds=float(scene["duration"]),
             )
             prompt, submission_references, policy_metadata = _prepare_balanced_submission(
@@ -1779,22 +1863,20 @@ async def _prepare_media_async(
                 original_prompt,
                 video_references,
             )
-            submitted_hashes = {item["sha256"] for item in submission_references}
-            policy_omitted = [
-                {**reference, "omission_reason": "balanced_policy"}
-                for reference in video_references
-                if reference["sha256"] not in submitted_hashes
-            ]
+            if len(submission_references) != 2:
+                raise MuseReferenceError(
+                    "Muse video policy phải giữ nguyên đủ ảnh đầu và ảnh cuối."
+                )
             request_hash = _json_hash(
                 {
                     "kind": "video",
                     "scene": scene,
+                    "frame_contract_version": MUSE_FRAME_CONTRACT_VERSION,
+                    "start_frame_hash": submission_references[0]["sha256"],
+                    "end_frame_hash": submission_references[1]["sha256"],
                     "prompt_policy_version": MUSE_PROMPT_POLICY_VERSION,
                     "prompt_strategy": policy_metadata["prompt_strategy"],
                     "prompt": prompt,
-                    "references": [
-                        reference["sha256"] for reference in submission_references
-                    ],
                     "aspect_ratio": "16:9",
                 }
             )
@@ -1814,7 +1896,7 @@ async def _prepare_media_async(
                 request_hash=request_hash,
                 prompt=prompt,
                 references=submission_references,
-                omitted=[*omitted, *policy_omitted],
+                omitted=[],
                 destination=MUSE_ARTIFACTS_DIR / str(video_id) / "videos" / f"scene_{index:04d}",
                 expected="video",
                 scene=scene,
@@ -1864,7 +1946,11 @@ async def _prepare_media_async(
         "video_phase_seconds": video_phase_seconds,
         "total_seconds": round(time.monotonic() - pipeline_started, 3),
     }
-    return {"scene_results": scene_results, "generation_summary": summary}
+    return {
+        "scene_results": scene_results,
+        "terminal_frame_artifact": terminal_frame_artifact,
+        "generation_summary": summary,
+    }
 
 
 _MANIFEST_GENERATION_METADATA_KEYS = (

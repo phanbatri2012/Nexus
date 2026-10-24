@@ -317,12 +317,26 @@ def _probe_owned_service(*, timeout: float = 3.0) -> dict:
     } if isinstance(model_rows, list) else set()
     if not {"muse-image", "muse-video"}.issubset(model_ids):
         raise MuseStudioConfigurationError("Muse2API không tương thích: /v1/models sai contract.")
+    capabilities = models.get("capabilities")
+    try:
+        start_end_version = int(
+            capabilities.get("video_start_end_frames")
+            if isinstance(capabilities, dict)
+            else 0
+        )
+    except (TypeError, ValueError):
+        start_end_version = 0
+    if start_end_version < 1:
+        raise MuseStudioConfigurationError(
+            "Muse2API không hỗ trợ contract video start/end bắt buộc; hãy cập nhật Muse_AI_Studio."
+        )
     return {
         "running": True,
         "owned": True,
         "api_ready": True,
         "accounts": int(ready.get("accounts") or 0),
         "browser_running": bool(ready.get("browser_running")),
+        "video_start_end_frames": start_end_version,
         "api_url": MUSE_API_BASE_URL,
     }
 
@@ -473,6 +487,7 @@ def status(*, probe: bool = False) -> dict:
         "api_ready": False,
         "accounts": 0,
         "browser_running": False,
+        "video_start_end_frames": 0,
         "api_url": MUSE_API_BASE_URL,
     }
     try:

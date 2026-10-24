@@ -8,7 +8,7 @@ import unicodedata
 from typing import Iterable
 
 
-PLANNER_VERSION = "semantic_v2"
+PLANNER_VERSION = "semantic_v3"
 
 REQUIRED_SCENE_FIELDS = (
     "subject",
@@ -37,6 +37,9 @@ _GENERIC_VALUES = {
 }
 _CTA_PATTERN = re.compile(
     r"(?i)(?<!\w)(?:like|subscribe|đăng\s*ký|chia\s*sẻ|nhấn\s*chuông|follow)(?!\w)"
+)
+_TERMINAL_TEXT_PATTERN = re.compile(
+    r"(?i)(?<!\w)(?:text|caption|logo|watermark|chữ|phụ\s*đề|biểu\s*trưng)(?!\w)"
 )
 _UNSAFE_SAFE_ANCHOR_PATTERN = re.compile(
     r"(?i)(?<!\w)(?:"
@@ -161,6 +164,22 @@ def build_planner_prompt(*, title: str, style: str, windows: list[dict]) -> str:
             }
         ],
     }
+    needs_terminal_frame = bool(windows and windows[-1].get("is_video"))
+    if needs_terminal_frame:
+        schema["terminal_frame"] = {
+            "index": len(scene_inputs),
+            "subject": "same grounded subject at the end of the final transition",
+            "action": "a visibly different completed end state",
+            "setting": "same source-grounded environment and continuity",
+            "era": "same specific source-grounded time context",
+            "visual_anchor": "distinct final image reached after the last scene image",
+            "safe_visual_anchor": "same final meaning without active violence, injury, death, or gore",
+            "must_show": ["2-5 indispensable visible anchors"],
+            "composition": "camera framing and spatial arrangement",
+            "lighting": "specific lighting",
+            "color": "specific palette",
+            "narrative_role": "conclusion",
+        }
     return (
         "Bạn là visual planner cho video thuộc mọi chủ đề như tài liệu, giáo dục, công nghệ, "
         "đời sống và kể chuyện. Lập kế hoạch ngữ nghĩa cho TOÀN BỘ scene trong một lần. "
@@ -177,6 +196,15 @@ def build_planner_prompt(*, title: str, style: str, windows: list[dict]) -> str:
         "- Nếu scene cuối có CTA like/đăng ký/chia sẻ, bỏ CTA khỏi hình và tạo một kết luận "
         "trực quan đúng chủ đề. Chỉ dùng sắc thái tưởng niệm khi chính nội dung nguồn yêu cầu. "
         "Không đưa chữ/logo vào hình.\n"
+        + (
+            "- Vì scene cuối là video, bắt buộc thêm terminal_frame ở top level. Dùng cùng schema "
+            f"với scene, index={len(scene_inputs)}, bám source anchors của scene cuối và mô tả trạng "
+            "thái kết thúc ngay sau scene cuối. terminal_frame phải khác visual_anchor/action của scene "
+            "cuối, giữ continuity, narrative_role=conclusion và tuyệt đối không CTA, chữ, caption hoặc logo.\n"
+            if needs_terminal_frame
+            else "- Vì scene cuối là ảnh tĩnh, không trả terminal_frame.\n"
+        )
+        +
         f"- Trả đúng {len(scene_inputs)} scene, index liên tục từ 0.\n\n"
         f"TITLE: {_clean_text(title, max_chars=500)}\n"
         f"STYLE: {_clean_text(style, max_chars=800)}\n"
@@ -187,12 +215,23 @@ def build_planner_prompt(*, title: str, style: str, windows: list[dict]) -> str:
     )
 
 
-def build_repair_prompt(errors: Iterable[str], *, scene_count: int) -> str:
+def build_repair_prompt(
+    errors: Iterable[str],
+    *,
+    scene_count: int,
+    needs_terminal_frame: bool = False,
+) -> str:
     concise_errors = [_clean_text(error, max_chars=240) for error in errors]
     return (
         "JSON kế hoạch vừa trả về không đạt validation. Hãy sửa TOÀN BỘ JSON trước đó và chỉ "
         "trả về JSON object hợp lệ, không markdown, không giải thích. "
-        f"Phải có đúng {scene_count} scene theo đúng index. Các lỗi cần sửa: "
+        f"Phải có đúng {scene_count} scene theo đúng index. "
+        + (
+            f"Phải có terminal_frame top-level với index={scene_count}. "
+            if needs_terminal_frame
+            else "Không được có terminal_frame. "
+        )
+        + "Các lỗi cần sửa: "
         + json.dumps(concise_errors, ensure_ascii=False)
     )
 
@@ -224,6 +263,101 @@ def _must_show_values(value: object) -> list[str]:
     return [item for item in cleaned if item]
 
 
+def _normalize_semantic_entry(
+    raw_scene: object,
+    *,
+    window: dict,
+    expected_index: int,
+    seen_anchors: set[str],
+    label: str,
+    forbid_text_elements: bool = False,
+) -> tuple[dict | None, list[str]]:
+    errors: list[str] = []
+    if not isinstance(raw_scene, dict):
+        return None, [f"{label} không phải object."]
+    try:
+        supplied_index = int(raw_scene.get("index", -1))
+    except (TypeError, ValueError):
+        supplied_index = -1
+    if supplied_index != expected_index:
+        errors.append(f"{label} sai index ({supplied_index}).")
+
+    scene = {"index": expected_index}
+    generic_values = {_identity(item) for item in _GENERIC_VALUES}
+    for field in REQUIRED_SCENE_FIELDS:
+        if field == "must_show":
+            values = _must_show_values(raw_scene.get(field))
+            if not 2 <= len(values) <= 5:
+                errors.append(f"{label} must_show phải có 2-5 anchor.")
+            scene[field] = values
+            continue
+        value = _clean_text(raw_scene.get(field))
+        minimum = 12 if field in {"action", "visual_anchor", "safe_visual_anchor"} else 3
+        if len(value) < minimum:
+            errors.append(f"{label} thiếu hoặc quá ngắn: {field}.")
+        if _identity(value) in generic_values:
+            errors.append(f"{label} dùng placeholder chung chung ở {field}.")
+        scene[field] = value
+
+    anchor_key = _identity(scene.get("visual_anchor"))
+    if anchor_key and anchor_key in seen_anchors:
+        errors.append(f"{label} trùng visual_anchor với scene trước.")
+    if anchor_key:
+        seen_anchors.add(anchor_key)
+
+    safe_anchor = scene.get("safe_visual_anchor", "")
+    if _UNSAFE_SAFE_ANCHOR_PATTERN.search(safe_anchor):
+        errors.append(f"{label} safe_visual_anchor vẫn chứa hành động rủi ro.")
+
+    transcript = str(window.get("transcript") or "")
+    source_anchors = extract_source_anchors(transcript)
+    combined = " ".join(
+        [
+            scene.get("subject", ""),
+            scene.get("setting", ""),
+            scene.get("era", ""),
+            scene.get("visual_anchor", ""),
+            scene.get("safe_visual_anchor", ""),
+            *scene.get("must_show", []),
+        ]
+    )
+    combined_identity = _identity(combined)
+    compact_combined_identity = combined_identity.replace(" ", "")
+    retained = [
+        anchor
+        for anchor in source_anchors
+        if _identity(anchor)
+        and (
+            _identity(anchor) in combined_identity
+            or (
+                len(_identity(anchor).replace(" ", "")) >= 5
+                and _identity(anchor).replace(" ", "") in compact_combined_identity
+            )
+        )
+    ]
+    if source_anchors and not retained:
+        errors.append(
+            f"{label} làm mất anchor nguồn; cần giữ ít nhất một trong: "
+            + ", ".join(source_anchors[:5])
+        )
+    scene["source_anchors"] = source_anchors
+    scene["retained_source_anchors"] = retained
+
+    visual_fields = " ".join(
+        [
+            *(str(scene.get(key) or "") for key in REQUIRED_SCENE_FIELDS if key != "must_show"),
+            *scene.get("must_show", []),
+        ]
+    )
+    if (_CTA_PATTERN.search(transcript) or forbid_text_elements) and _CTA_PATTERN.search(
+        visual_fields
+    ):
+        errors.append(f"{label} còn CTA trong mô tả hình.")
+    if forbid_text_elements and _TERMINAL_TEXT_PATTERN.search(visual_fields):
+        errors.append(f"{label} không được chứa chữ, caption hoặc logo.")
+    return scene, errors
+
+
 def validate_semantic_plan(payload: dict, windows: list[dict]) -> dict:
     errors: list[str] = []
     if not isinstance(payload, dict):
@@ -241,93 +375,71 @@ def validate_semantic_plan(payload: dict, windows: list[dict]) -> dict:
     seen_anchors: set[str] = set()
     for window, raw_scene in zip(windows, supplied):
         expected_index = int(window["index"])
-        if not isinstance(raw_scene, dict):
-            errors.append(f"Scene {expected_index} không phải object.")
-            continue
-        try:
-            supplied_index = int(raw_scene.get("index", -1))
-        except (TypeError, ValueError):
-            supplied_index = -1
-        if supplied_index != expected_index:
-            errors.append(f"Scene {expected_index} sai index ({supplied_index}).")
-
-        scene = {"index": expected_index}
-        for field in REQUIRED_SCENE_FIELDS:
-            if field == "must_show":
-                values = _must_show_values(raw_scene.get(field))
-                if not 2 <= len(values) <= 5:
-                    errors.append(f"Scene {expected_index} must_show phải có 2-5 anchor.")
-                scene[field] = values
-                continue
-            value = _clean_text(raw_scene.get(field))
-            minimum = 12 if field in {"action", "visual_anchor", "safe_visual_anchor"} else 3
-            if len(value) < minimum:
-                errors.append(f"Scene {expected_index} thiếu hoặc quá ngắn: {field}.")
-            if _identity(value) in {_identity(item) for item in _GENERIC_VALUES}:
-                errors.append(f"Scene {expected_index} dùng placeholder chung chung ở {field}.")
-            scene[field] = value
-
-        anchor_key = _identity(scene.get("visual_anchor"))
-        if anchor_key and anchor_key in seen_anchors:
-            errors.append(f"Scene {expected_index} trùng visual_anchor với scene trước.")
-        seen_anchors.add(anchor_key)
-
-        safe_anchor = scene.get("safe_visual_anchor", "")
-        if _UNSAFE_SAFE_ANCHOR_PATTERN.search(safe_anchor):
-            errors.append(f"Scene {expected_index} safe_visual_anchor vẫn chứa hành động rủi ro.")
-
-        transcript = str(window.get("transcript") or "")
-        source_anchors = extract_source_anchors(transcript)
-        combined = " ".join(
-            [
-                scene.get("subject", ""),
-                scene.get("setting", ""),
-                scene.get("era", ""),
-                scene.get("visual_anchor", ""),
-                scene.get("safe_visual_anchor", ""),
-                *scene.get("must_show", []),
-            ]
+        scene, scene_errors = _normalize_semantic_entry(
+            raw_scene,
+            window=window,
+            expected_index=expected_index,
+            seen_anchors=seen_anchors,
+            label=f"Scene {expected_index}",
         )
-        combined_identity = _identity(combined)
-        compact_combined_identity = combined_identity.replace(" ", "")
-        retained = [
-            anchor
-            for anchor in source_anchors
-            if _identity(anchor)
-            and (
-                _identity(anchor) in combined_identity
-                or (
-                    len(_identity(anchor).replace(" ", "")) >= 5
-                    and _identity(anchor).replace(" ", "") in compact_combined_identity
-                )
-            )
-        ]
-        if source_anchors and not retained:
-            errors.append(
-                f"Scene {expected_index} làm mất anchor nguồn; cần giữ ít nhất một trong: "
-                + ", ".join(source_anchors[:5])
-            )
-        scene["source_anchors"] = source_anchors
-        scene["retained_source_anchors"] = retained
+        errors.extend(scene_errors)
+        if scene is not None:
+            normalized_scenes.append(scene)
 
-        if _CTA_PATTERN.search(transcript):
-            visual_fields = " ".join(
-                str(scene.get(key) or "")
-                for key in ("subject", "action", "visual_anchor", "safe_visual_anchor")
-            )
-            if _CTA_PATTERN.search(visual_fields):
-                errors.append(f"Scene {expected_index} còn CTA trong mô tả hình.")
-        normalized_scenes.append(scene)
+    needs_terminal_frame = bool(windows and windows[-1].get("is_video"))
+    terminal_frame: dict | None = None
+    raw_terminal = payload.get("terminal_frame")
+    if needs_terminal_frame:
+        terminal_frame, terminal_errors = _normalize_semantic_entry(
+            raw_terminal,
+            window=windows[-1],
+            expected_index=len(windows),
+            seen_anchors=seen_anchors,
+            label="Terminal frame",
+            forbid_text_elements=True,
+        )
+        errors.extend(terminal_errors)
+        if terminal_frame is not None:
+            if _identity(terminal_frame.get("narrative_role")) != "conclusion":
+                errors.append("Terminal frame narrative_role phải là conclusion.")
+            if normalized_scenes:
+                final_scene = normalized_scenes[-1]
+                if _identity(terminal_frame.get("action")) == _identity(final_scene.get("action")):
+                    errors.append("Terminal frame action phải là trạng thái kết thúc khác scene cuối.")
+    elif raw_terminal not in (None, {}):
+        errors.append("Không được có terminal_frame khi scene cuối là ảnh tĩnh.")
 
     if errors:
         raise SemanticPlanValidationError(errors)
-    return {"story_context": story_context, "scenes": normalized_scenes}
+    result = {"story_context": story_context, "scenes": normalized_scenes}
+    if terminal_frame is not None:
+        result["terminal_frame"] = terminal_frame
+    return result
 
 
 def _style_summary(style: str) -> str:
     return _clean_text(
         style or "cinematic visual realism, photorealistic, natural detail",
         max_chars=420,
+    )
+
+
+def _compile_still_prompt(semantic: dict, *, style_text: str, terminal: bool = False) -> str:
+    must_show = ", ".join(semantic["must_show"])
+    opening = (
+        "Create the distinct final still reached after the last video transition. "
+        if terminal
+        else "Create a coherent cinematic still for this video scene. "
+    )
+    return _clean_text(
+        opening
+        + f"Subject: {semantic['subject']}. Action: {semantic['action']}. "
+        f"Setting: {semantic['setting']}. Era or time: {semantic['era']}. "
+        f"Visual anchor: {semantic['visual_anchor']}. Must show: {must_show}. "
+        f"Composition: {semantic['composition']}. Lighting: {semantic['lighting']}. "
+        f"Color palette: {semantic['color']}. Style: {style_text}. "
+        "Photorealistic 16:9 widescreen image, no text, no captions, no logo.",
+        max_chars=1800,
     )
 
 
@@ -344,17 +456,7 @@ def compile_muse_scene_plan(
     compiled: list[dict] = []
     style_text = _style_summary(style)
     for window, semantic in zip(windows, validated["scenes"]):
-        must_show = ", ".join(semantic["must_show"])
-        prompt = _clean_text(
-            "Create a coherent cinematic still for this video scene. "
-            f"Subject: {semantic['subject']}. Action: {semantic['action']}. "
-            f"Setting: {semantic['setting']}. Era or time: {semantic['era']}. "
-            f"Visual anchor: {semantic['visual_anchor']}. Must show: {must_show}. "
-            f"Composition: {semantic['composition']}. Lighting: {semantic['lighting']}. "
-            f"Color palette: {semantic['color']}. Style: {style_text}. "
-            "Photorealistic 16:9 widescreen image, no text, no captions, no logo.",
-            max_chars=1800,
-        )
+        prompt = _compile_still_prompt(semantic, style_text=style_text)
         compiled.append(
             {
                 **window,
@@ -371,7 +473,7 @@ def compile_muse_scene_plan(
     total = len(compiled)
     retained = sum(bool(scene.get("retained_source_anchors")) for scene in compiled)
     required = sum(bool(scene.get("source_anchors")) for scene in compiled)
-    return {
+    result = {
         "planner_version": PLANNER_VERSION,
         "story_context": validated["story_context"],
         "visual_bible": {"title": _clean_text(title, max_chars=500), "style": style_text},
@@ -383,3 +485,19 @@ def compile_muse_scene_plan(
         },
         "scenes": compiled,
     }
+    terminal_frame = validated.get("terminal_frame")
+    if isinstance(terminal_frame, dict):
+        result["terminal_frame"] = {
+            **terminal_frame,
+            "is_video": False,
+            "media_type": "image",
+            "prompt": _compile_still_prompt(
+                terminal_frame,
+                style_text=style_text,
+                terminal=True,
+            ),
+            "style": style_text,
+            "primary_reference_id": "",
+            "reference_path": "",
+        }
+    return result

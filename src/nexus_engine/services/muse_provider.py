@@ -23,6 +23,7 @@ MUSE_IMAGE_TIMEOUT_SECONDS = 360
 MUSE_VIDEO_TIMEOUT_SECONDS = 900
 MUSE_POLL_INTERVAL_SECONDS = 2.0
 MUSE_PROVIDER_NAME = "muse_studio_api"
+MUSE_FRAME_CONTRACT_VERSION = "start_end_v1"
 
 
 class MuseError(RuntimeError):
@@ -176,7 +177,8 @@ class MuseProvider(Protocol):
     async def create_video(
         self,
         prompt: str,
-        reference_paths: list[Path],
+        start_frame_path: Path,
+        end_frame_path: Path,
         destination: Path,
         *,
         request_hash: str = "",
@@ -208,13 +210,12 @@ class MusePromptBuilder:
         )
 
     @staticmethod
-    def video(prompt: str, *, reference_count: int, duration_seconds: float = 10.0) -> str:
-        mapping = "@Image1 is the required first frame for the video."
-        if reference_count > 1:
-            mapping += (
-                " @Image2 through @Image%d are canonical character references; keep their "
-                "identities separate and unchanged." % reference_count
-            )
+    def video(prompt: str, *, duration_seconds: float = 10.0) -> str:
+        mapping = (
+            "@Image1 is the required first frame and @Image2 is the required final frame. "
+            "Create one continuous, physically coherent transition from @Image1 to @Image2. "
+            "Do not reinterpret either endpoint as a character or turnaround reference."
+        )
         return (
             f"{mapping}\nGenerate one 16:9 widescreen image-to-video clip at 1920x1080, "
             f"approximately {max(1, min(10, round(duration_seconds)))} seconds. {prompt.strip()}\n"
@@ -371,16 +372,20 @@ class MuseStudioApiProvider:
     async def create_video(
         self,
         prompt: str,
-        reference_paths: list[Path],
+        start_frame_path: Path,
+        end_frame_path: Path,
         destination: Path,
         *,
         request_hash: str = "",
         on_submitted: Callable[[MuseReceipt], None] | None = None,
         cancel_check: Callable[[], None] | None = None,
     ) -> dict:
-        references = _validate_reference_paths(reference_paths, limit=6)
-        if not references:
-            raise MuseReferenceError("Video Muse bắt buộc phải có ảnh scene làm @Image1.")
+        references = _validate_reference_paths(
+            [start_frame_path, end_frame_path],
+            limit=2,
+        )
+        if len(references) != 2:
+            raise MuseReferenceError("Video Muse bắt buộc phải có đủ ảnh đầu và ảnh cuối.")
         payload = {
             "prompt": prompt.strip(),
             "model": "muse-video",
@@ -388,7 +393,8 @@ class MuseStudioApiProvider:
             "resolution": "1920x1080",
             "duration": 10,
             "timeout": MUSE_VIDEO_TIMEOUT_SECONDS,
-            "reference_image": [str(path) for path in references],
+            "start_image": str(references[0]),
+            "end_image": str(references[1]),
         }
         return await self._submit_and_wait(
             submit_endpoint="/v1/videos",

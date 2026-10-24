@@ -151,6 +151,8 @@ VIDEO_FAILURE_STAGE_BY_ERROR = {
     "FlowAgentInteractionError": "agent_interaction",
     "FlowAgentSettingsError": "agent_settings",
     "FlowCreditExhausted": "credit_exhausted",
+    "FlowImageCreditExhausted": "image_credit_exhausted",
+    "FlowVideoCreditExhausted": "video_credit_exhausted",
     "FlowFrameAttachmentError": "frame_sync",
     "FlowModeError": "legacy_video_mode",
     "FlowSubmissionError": "submit",
@@ -1360,8 +1362,10 @@ async def _generate_scene_image_async(
     return_validation: bool = False,
 ) -> Path | ValidatedImageArtifact:
     from nexus_engine.services.google_flow_worker import (
+        FlowCreditExhausted,
         FlowGenerationError,
         FlowGenerationTimeout,
+        FlowImageCreditExhausted,
         FlowImageNeedsAttention,
         FlowImagePending,
     )
@@ -1657,6 +1661,8 @@ async def _generate_scene_image_async(
                         deadline_seconds=FLOW_IMAGE_RECONCILIATION_TTL_SECONDS,
                     )
                 except FlowGenerationError as first_error:
+                    if isinstance(first_error, FlowCreditExhausted):
+                        raise
                     if safe_prompt_used:
                         raise
                     logger.warning(
@@ -2156,6 +2162,7 @@ async def _generate_scene_video_async(
         FlowCreditExhausted,
         FlowFrameAttachmentError,
         FlowGenerationError,
+        FlowVideoCreditExhausted,
         FlowVideoPending,
         FlowVideoWaitExpired,
     )
@@ -2202,6 +2209,7 @@ async def _generate_scene_video_async(
     }
     terminal_reason_codes = {
         "flow_credit_exhausted",
+        "flow_video_credit_exhausted",
         "flow_generation_error",
         "flow_video_wait_expired",
     }
@@ -2293,8 +2301,8 @@ async def _generate_scene_video_async(
         )
     ):
         cached_error = str(existing_metadata.get("error") or "").strip()
-        if terminal_reason == "flow_credit_exhausted":
-            raise FlowCreditExhausted(
+        if terminal_reason in {"flow_credit_exhausted", "flow_video_credit_exhausted"}:
+            raise FlowVideoCreditExhausted(
                 cached_error or "Google Flow đã xác nhận hết hạn mức video."
             )
         if terminal_reason == "flow_video_wait_expired":
@@ -2710,9 +2718,11 @@ def generate_scene_media(
         from nexus_engine.services.google_flow_worker import (
             FlowAgentSettingsError,
             FlowCreditExhausted,
+            FlowImageCreditExhausted,
             FlowImagePending,
             FlowMediaPending,
             FlowModeError,
+            FlowVideoCreditExhausted,
             FlowVideoPending,
         )
 
@@ -3198,7 +3208,7 @@ def generate_scene_media(
                         refresh_artifact(artifact_type)
                         append_pending(pending_videos, exc, scene_index)
                         continue
-                    if isinstance(exc, FlowCreditExhausted):
+                    if isinstance(exc, (FlowVideoCreditExhausted, FlowCreditExhausted)):
                         logger.warning(
                             "flow_video credits are explicitly exhausted (%s); "
                             "falling back all remaining video scenes to base images.",

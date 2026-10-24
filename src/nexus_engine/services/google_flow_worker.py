@@ -108,6 +108,18 @@ class FlowCreditExhausted(FlowGenerationError):
     reason_code = "flow_credit_exhausted"
 
 
+class FlowImageCreditExhausted(FlowCreditExhausted):
+    """Raised when Google Flow image generation quota (Nano Banana) is exhausted."""
+
+    reason_code = "flow_image_credit_exhausted"
+
+
+class FlowVideoCreditExhausted(FlowCreditExhausted):
+    """Raised when Google Flow video generation quota (Veo) is exhausted."""
+
+    reason_code = "flow_video_credit_exhausted"
+
+
 class FlowGenerationStartError(RuntimeError):
     """Raised when Flow never shows progress or a new result after submission."""
 
@@ -2683,7 +2695,7 @@ class GoogleFlowWorker:
             self._record_video_timing("error_seen")
             error_message = f"{matched.get('error') or 'Thao tác không thành công'}"
             if _is_flow_credit_exhausted_error(error_message):
-                raise FlowCreditExhausted(
+                raise FlowVideoCreditExhausted(
                     f"Google Flow đã xác nhận hết credit khi tạo video: {error_message}"
                 )
             raise FlowGenerationError(
@@ -2707,7 +2719,7 @@ class GoogleFlowWorker:
                 self._record_video_timing("error_seen")
                 err_text = next(iter(active_errors))
                 if _is_flow_credit_exhausted_error(err_text):
-                    raise FlowCreditExhausted(
+                    raise FlowVideoCreditExhausted(
                         f"Google Flow đã xác nhận hết credit khi tạo video: {err_text}"
                     )
                 raise FlowGenerationError(
@@ -2730,7 +2742,7 @@ class GoogleFlowWorker:
                 self._record_video_timing("error_seen")
                 err_text = next(iter(video_errors))
                 if _is_flow_credit_exhausted_error(err_text):
-                    raise FlowCreditExhausted(
+                    raise FlowVideoCreditExhausted(
                         f"Google Flow đã xác nhận hết credit khi tạo video: {err_text}"
                     )
                 raise FlowGenerationError(
@@ -3306,6 +3318,8 @@ class GoogleFlowWorker:
             "[data-tile-state='error']",
             ".error-tile",
             "[role='alert']",
+            ".error-message",
+            "mat-snack-bar-container",
         ]
         for sel in canvas_err_selectors:
             try:
@@ -3330,11 +3344,15 @@ class GoogleFlowWorker:
                         'người nổi tiếng',
                         'failed to generate',
                         'generation failed',
+                        'hạn mức sử dụng',
+                        'hạn mức',
+                        'credit quota',
+                        'daily quota',
                     ];
                     const elements = Array.from(document.querySelectorAll(
                         'flow-error-tile, flow-media-tile, flow-canvas-tile, flow-canvas-item, ' +
                         '.error-tile, [data-tile-state="error"], [role="alert"], ' +
-                        '.canvas-tile, .message-row, [data-testid*="error" i]'
+                        '.canvas-tile, .message-row, [data-testid*="error" i], .error-message, mat-snack-bar-container'
                     ));
                     const results = [];
                     for (const el of elements) {
@@ -5295,9 +5313,12 @@ class GoogleFlowWorker:
                     detail=explicit_error,
                 )
                 if _is_flow_credit_exhausted_error(explicit_error):
-                    raise FlowCreditExhausted(
-                        f"Google Flow đã xác nhận hết credit khi tạo {media_type}: "
-                        f"{explicit_error}"
+                    if media_type == "video":
+                        raise FlowVideoCreditExhausted(
+                            f"Google Flow đã xác nhận hết credit khi tạo video: {explicit_error}"
+                        )
+                    raise FlowImageCreditExhausted(
+                        f"Google Flow đã xác nhận hết credit khi tạo ảnh: {explicit_error}"
                     )
                 raise FlowGenerationError(
                     f"Google Flow báo lỗi khi tạo {media_type}: {explicit_error}"
@@ -5513,6 +5534,13 @@ class GoogleFlowWorker:
             )
         )
         if reconcile_only or intent_requires_reconciliation:
+            canvas_errors = await self._get_existing_error_texts()
+            for err in canvas_errors:
+                if _is_flow_credit_exhausted_error(err):
+                    logger.warning("flow_image credit quota exhausted during reconciliation: %s", err)
+                    raise FlowImageCreditExhausted(
+                        f"Google Flow đã xác nhận hết hạn mức tạo ảnh (Nano Banana): {err}"
+                    )
             pending_reason = (
                 "flow_image_history_scan_failed"
                 if submit_if_prompt_missing
@@ -5606,6 +5634,13 @@ class GoogleFlowWorker:
             self._log_generation_event("image", "completed", submitted_at)
             return immediate_source
         if submit_only:
+            canvas_errors = await self._get_existing_error_texts()
+            for err in canvas_errors:
+                if _is_flow_credit_exhausted_error(err):
+                    logger.warning("flow_image credit quota exhausted after submission: %s", err)
+                    raise FlowImageCreditExhausted(
+                        f"Google Flow đã xác nhận hết hạn mức tạo ảnh (Nano Banana): {err}"
+                    )
             raise FlowImagePending(
                 "Google Flow đã nhận yêu cầu ảnh; sẽ đối soát kết quả theo request.",
                 receipt=receipt,

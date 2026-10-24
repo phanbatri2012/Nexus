@@ -29,7 +29,7 @@ def _captions(duration: int) -> list[dict]:
 
 
 def _semantic_payload(windows: list[dict]) -> dict:
-    return {
+    payload = {
         "story_context": "A coherent documentary story with concrete visual continuity.",
         "scenes": [
             {
@@ -54,6 +54,26 @@ def _semantic_payload(windows: list[dict]) -> dict:
             for window in windows
         ],
     }
+    if windows and windows[-1].get("is_video"):
+        index = len(windows)
+        payload["terminal_frame"] = {
+            "index": index,
+            "subject": f"documentary subject {windows[-1]['index']}",
+            "action": "settles into a visibly completed final state after the transition",
+            "setting": f"specific location {windows[-1]['index']}",
+            "era": f"period {windows[-1]['index']}",
+            "visual_anchor": f"distinct terminal visual anchor after scene {windows[-1]['index']}",
+            "safe_visual_anchor": "quiet non-violent completed documentary moment",
+            "must_show": [
+                f"visible object {windows[-1]['index']}",
+                f"location marker {windows[-1]['index']}",
+            ],
+            "composition": "wide layered documentary framing after the movement completes",
+            "lighting": "soft directional daylight",
+            "color": "muted earth tones",
+            "narrative_role": "conclusion",
+        }
+    return payload
 
 
 class TestMuseSettings(unittest.TestCase):
@@ -331,7 +351,24 @@ class TestMuseSemanticPlanner(unittest.TestCase):
                     "narrative_role": roles[index],
                 }
             )
-        payload = {"story_context": "The 1954 GM100 retreat through Mang Yang.", "scenes": scenes}
+        payload = {
+            "story_context": "The 1954 GM100 retreat through Mang Yang.",
+            "scenes": scenes,
+            "terminal_frame": {
+                "index": len(windows),
+                "subject": "những người được tưởng niệm",
+                "action": "stand in a completed quiet remembrance after the final camera move",
+                "setting": "đèo Mang Yang, Việt Nam",
+                "era": "năm 1954 remembered from the present day",
+                "visual_anchor": "A distinct final wide view of Mang Yang after the memorial gathering settles.",
+                "safe_visual_anchor": "A quiet completed memorial moment at Mang Yang.",
+                "must_show": ["đèo Mang Yang", "những người được tưởng niệm"],
+                "composition": "wide final landscape framing with still foreground figures",
+                "lighting": "humid overcast daylight",
+                "color": "muted tropical earth tones",
+                "narrative_role": "conclusion",
+            },
+        }
         plan = muse_semantic_planner.compile_muse_scene_plan(
             payload,
             windows,
@@ -382,6 +419,20 @@ class TestMuseSemanticPlanner(unittest.TestCase):
                     "narrative_role": "demonstration",
                 }
             ],
+            "terminal_frame": {
+                "index": 1,
+                "subject": "Apple product designers and iPhone 17",
+                "action": "The designers finish the demonstration and place the phone on its stand.",
+                "setting": "a product design studio inside Apple Park, California",
+                "era": "September 2026 after the product demonstration",
+                "visual_anchor": "The iPhone 17 rests on its stand with Apple Park visible beyond the studio.",
+                "safe_visual_anchor": "Designers calmly observe the finished phone display at Apple Park.",
+                "must_show": ["iPhone 17 prototype", "Apple Park studio"],
+                "composition": "clean final wide product framing",
+                "lighting": "soft daylight through glass walls",
+                "color": "silver, white, and natural green",
+                "narrative_role": "conclusion",
+            },
         }
         plan = muse_semantic_planner.compile_muse_scene_plan(
             payload,
@@ -390,7 +441,7 @@ class TestMuseSemanticPlanner(unittest.TestCase):
             style="clean contemporary technology product photography",
         )
         scene = plan["scenes"][0]
-        self.assertEqual(plan["planner_version"], "semantic_v2")
+        self.assertEqual(plan["planner_version"], "semantic_v3")
         self.assertEqual(scene["narrative_role"], "demonstration")
         self.assertEqual(scene["style"], "clean contemporary technology product photography")
         self.assertIn("Apple Park", scene["prompt"])
@@ -435,6 +486,25 @@ class TestMuseSemanticPlanner(unittest.TestCase):
         self.assertEqual(plan["anchor_coverage"]["ratio"], 1.0)
         self.assertIn("warm lifestyle photography", plan["scenes"][0]["prompt"])
         self.assertNotIn("historical", plan["scenes"][0]["prompt"].casefold())
+        self.assertNotIn("terminal_frame", plan)
+
+    def test_final_video_requires_terminal_frame(self):
+        windows = [
+            {
+                "index": 0,
+                "start": 0.0,
+                "end": 8.0,
+                "duration": 8.0,
+                "transcript": "a quiet lower-case transcript",
+                "is_video": True,
+                "media_type": "video",
+            }
+        ]
+        payload = _semantic_payload(windows)
+        payload.pop("terminal_frame")
+
+        with self.assertRaises(muse_semantic_planner.SemanticPlanValidationError):
+            muse_semantic_planner.validate_semantic_plan(payload, windows)
 
     def test_parser_accepts_fenced_json_and_validator_rejects_generic_plan(self):
         windows = [
@@ -638,13 +708,174 @@ class TestMuseReferences(unittest.TestCase):
         self.assertEqual(len(omitted), 2)
         self.assertTrue(all(item["omission_reason"] == "reference_limit" for item in omitted))
 
-    def test_video_prompt_maps_scene_frame_to_image_one(self):
+    def test_video_prompt_maps_start_and_end_frames(self):
         prompt = muse_provider.MusePromptBuilder.video(
-            "A character walks forward.", reference_count=6, duration_seconds=10
+            "A character walks forward.", duration_seconds=10
         )
         self.assertIn("@Image1 is the required first frame", prompt)
-        self.assertIn("@Image2 through @Image6", prompt)
+        self.assertIn("@Image2 is the required final frame", prompt)
+        self.assertNotIn("character references", prompt)
         self.assertIn("16:9", prompt)
+
+
+class TestMuseStartEndPipeline(unittest.TestCase):
+    @staticmethod
+    def _plan() -> dict:
+        scenes = []
+        for index in range(3):
+            scenes.append(
+                {
+                    "index": index,
+                    "duration": 10.0,
+                    "is_video": True,
+                    "media_type": "video",
+                    "prompt": f"scene image prompt {index}",
+                    "action": f"camera moves through scene {index}",
+                    "transcript": f"scene narration {index}",
+                    "style": "documentary realism",
+                }
+            )
+        return {
+            "planner_version": "semantic_v3",
+            "reference_snapshot": [
+                {
+                    "set_id": "character",
+                    "set_name": "Character",
+                    "set_index": 0,
+                    "image_index": 0,
+                    "aliases": ["character"],
+                    "path": "character.png",
+                    "sha256": "character-hash",
+                    "primary": True,
+                }
+            ],
+            "scenes": scenes,
+            "terminal_frame": {
+                "index": 3,
+                "is_video": False,
+                "media_type": "image",
+                "prompt": "distinct terminal image prompt",
+                "action": "the final state settles visibly",
+                "transcript": "scene narration 2",
+                "style": "documentary realism",
+            },
+        }
+
+    def _run_prepare(self, root: Path, checksum_overrides: dict[str, str] | None = None):
+        checksum_overrides = checksum_overrides or {}
+        root.mkdir(parents=True, exist_ok=True)
+        video_calls = []
+
+        class Session:
+            async def __aenter__(self):
+                return self.provider
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def __init__(self, provider):
+                self.provider = provider
+
+        class FakeProvider:
+            def __init__(self, **_kwargs):
+                self.capacity_preflight = {"status": "ready"}
+
+            def open_session(self):
+                return Session(self)
+
+        async def fake_generate(**kwargs):
+            artifact_type = kwargs["artifact_type"]
+            if kwargs["expected"] == "image":
+                path = root / f"{artifact_type.replace(':', '_')}.png"
+                path.write_bytes(artifact_type.encode("utf-8"))
+                return {
+                    "status": "ready",
+                    "path": str(path),
+                    "metadata": {
+                        "checksum": checksum_overrides.get(
+                            artifact_type,
+                            f"{artifact_type}-hash",
+                        )
+                    },
+                }
+            video_calls.append(
+                {
+                    "scene_index": int(kwargs["scene"]["index"]),
+                    "request_hash": kwargs["request_hash"],
+                    "references": list(kwargs["references"]),
+                }
+            )
+            return {
+                "status": "ready",
+                "path": str(root / f"video_{kwargs['scene']['index']}.mp4"),
+                "metadata": {
+                    "frame_contract_version": muse_provider.MUSE_FRAME_CONTRACT_VERSION
+                },
+            }
+
+        with (
+            patch.object(muse_pipeline, "MuseStudioApiProvider", FakeProvider),
+            patch.object(muse_pipeline, "_generate_request", new=fake_generate),
+        ):
+            result = asyncio.run(
+                muse_pipeline._prepare_media_async(
+                    video_id=7,
+                    snapshot={"image_generation_settings": {}},
+                    prepared={},
+                    plan=self._plan(),
+                    progress=lambda *_args, **_kwargs: None,
+                    cancel_check=lambda: None,
+                    job_id="job-7",
+                )
+            )
+        return result, video_calls
+
+    def test_pairs_consecutive_scenes_and_last_scene_to_terminal(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result, calls = self._run_prepare(Path(temp_dir))
+
+        self.assertEqual(len(result["scene_results"]), 3)
+        self.assertIsNotNone(result["terminal_frame_artifact"])
+        self.assertEqual(
+            [
+                [reference["sha256"] for reference in call["references"]]
+                for call in calls
+            ],
+            [
+                ["muse_scene_image:0-hash", "muse_scene_image:1-hash"],
+                ["muse_scene_image:1-hash", "muse_scene_image:2-hash"],
+                ["muse_scene_image:2-hash", "muse_terminal_frame-hash"],
+            ],
+        )
+        self.assertTrue(
+            all(
+                reference["sha256"] != "character-hash"
+                for call in calls
+                for reference in call["references"]
+            )
+        )
+
+    def test_changing_endpoint_checksum_changes_related_request_hash(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _, baseline = self._run_prepare(root / "baseline")
+            _, changed_scene = self._run_prepare(
+                root / "changed-scene",
+                {"muse_scene_image:1": "changed-scene-1-hash"},
+            )
+            _, changed_terminal = self._run_prepare(
+                root / "changed-terminal",
+                {"muse_terminal_frame": "changed-terminal-hash"},
+            )
+
+        baseline_hashes = [call["request_hash"] for call in baseline]
+        changed_scene_hashes = [call["request_hash"] for call in changed_scene]
+        changed_terminal_hashes = [call["request_hash"] for call in changed_terminal]
+        self.assertNotEqual(baseline_hashes[0], changed_scene_hashes[0])
+        self.assertNotEqual(baseline_hashes[1], changed_scene_hashes[1])
+        self.assertEqual(baseline_hashes[2], changed_scene_hashes[2])
+        self.assertEqual(baseline_hashes[:2], changed_terminal_hashes[:2])
+        self.assertNotEqual(baseline_hashes[2], changed_terminal_hashes[2])
 
 
 class TestMuseBalancedPromptPolicy(unittest.TestCase):
@@ -690,7 +921,7 @@ class TestMuseBalancedPromptPolicy(unittest.TestCase):
         self.assertNotIn("Súng máy", prompt)
         self.assertNotIn("phá hủy", prompt)
 
-    def test_high_risk_video_uses_only_first_frame(self):
+    def test_high_risk_video_keeps_both_endpoint_frames(self):
         references = [
             {"path": "scene.png", "sha256": "scene"},
             {"path": "hero.png", "sha256": "hero"},
@@ -701,9 +932,9 @@ class TestMuseBalancedPromptPolicy(unittest.TestCase):
             "original prompt",
             references,
         )
-        self.assertEqual(selected, references[:1])
+        self.assertEqual(selected, references)
         self.assertEqual(metadata["prompt_strategy"], "risk_rewritten")
-        self.assertIn("subtle cinematic motion", prompt)
+        self.assertIn("@Image1 to @Image2", prompt)
         self.assertNotIn("đoàn xe bị phá hủy", prompt)
 
     def test_modern_high_risk_rewrite_preserves_requested_genre(self):
@@ -838,10 +1069,10 @@ class TestMuseStudioApiProvider(unittest.TestCase):
             self.assertEqual(payload["reference_image"], [str(path.resolve()) for path in references])
             self.assertEqual(idempotency_key, "a" * 64)
 
-    def test_video_payload_keeps_scene_frame_first_and_has_idempotency_key(self):
+    def test_video_payload_sends_explicit_start_end_and_has_idempotency_key(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             references = []
-            for name in ("scene.png", "hero.png", "villain.png"):
+            for name in ("start.png", "end.png"):
                 path = Path(temp_dir) / name
                 path.write_bytes(name.encode())
                 references.append(path)
@@ -853,15 +1084,17 @@ class TestMuseStudioApiProvider(unittest.TestCase):
                 asyncio.run(
                     provider.create_video(
                         "video prompt",
-                        references,
+                        references[0],
+                        references[1],
                         Path(temp_dir) / "clip",
                         request_hash="b" * 64,
                     )
                 )
             endpoint, payload, idempotency_key = post.call_args.args
             self.assertEqual(endpoint, "/v1/videos")
-            self.assertEqual(payload["reference_image"][0], str(references[0].resolve()))
-            self.assertEqual(payload["reference_image"], [str(path.resolve()) for path in references])
+            self.assertEqual(payload["start_image"], str(references[0].resolve()))
+            self.assertEqual(payload["end_image"], str(references[1].resolve()))
+            self.assertNotIn("reference_image", payload)
             self.assertEqual(idempotency_key, "b" * 64)
 
     def test_image_and_idempotent_video_connection_loss_are_retryable(self):
@@ -875,7 +1108,9 @@ class TestMuseStudioApiProvider(unittest.TestCase):
                     asyncio.run(provider.create_image("prompt", [], Path(temp_dir) / "image"))
             with patch.object(provider, "_post_json", side_effect=failure):
                 with self.assertRaises(muse_provider.MuseTransientError):
-                    asyncio.run(provider.create_video("prompt", [scene], Path(temp_dir) / "video"))
+                    asyncio.run(
+                        provider.create_video("prompt", scene, scene, Path(temp_dir) / "video")
+                    )
 
     def test_admission_429_is_retryable_before_video_submission(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -886,7 +1121,9 @@ class TestMuseStudioApiProvider(unittest.TestCase):
                 provider, "_post_json", side_effect=muse_provider.MuseAdmissionRetry("queue full")
             ):
                 with self.assertRaises(muse_provider.MuseAdmissionRetry):
-                    asyncio.run(provider.create_video("prompt", [scene], Path(temp_dir) / "video"))
+                    asyncio.run(
+                        provider.create_video("prompt", scene, scene, Path(temp_dir) / "video")
+                    )
 
     def test_idempotent_video_missing_task_id_is_retryable(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -898,7 +1135,8 @@ class TestMuseStudioApiProvider(unittest.TestCase):
                     asyncio.run(
                         provider.create_video(
                             "prompt",
-                            [scene],
+                            scene,
+                            scene,
                             Path(temp_dir) / "video",
                             request_hash="c" * 64,
                         )
@@ -1289,12 +1527,16 @@ class TestMuseRecovery(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             first_frame = root / "scene.png"
+            end_frame = root / "end.png"
             first_frame.write_bytes(b"scene")
+            end_frame.write_bytes(b"end")
             calls = []
 
             class AlwaysRefuseAdapter:
-                async def create_video(self, prompt, reference_paths, _destination, **kwargs):
-                    calls.append((prompt, list(reference_paths), kwargs["request_hash"]))
+                async def create_video(
+                    self, prompt, start_frame, final_frame, _destination, **kwargs
+                ):
+                    calls.append((prompt, [start_frame, final_frame], kwargs["request_hash"]))
                     kwargs["on_submitted"](
                         muse_provider.MuseReceipt(
                             provider_task_id="video-task-1",
@@ -1317,7 +1559,10 @@ class TestMuseRecovery(unittest.TestCase):
                         artifact_type="muse_scene_video:0",
                         request_hash="request",
                         prompt="safe motion prompt",
-                        references=[{"path": str(first_frame), "sha256": "scene-hash"}],
+                        references=[
+                            {"path": str(first_frame), "sha256": "scene-hash"},
+                            {"path": str(end_frame), "sha256": "end-hash"},
+                        ],
                         omitted=[],
                         destination=root / "clip",
                         expected="video",
@@ -1360,11 +1605,15 @@ class TestMuseRecovery(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             first_frame = root / "scene.png"
+            end_frame = root / "end.png"
             first_frame.write_bytes(b"scene")
+            end_frame.write_bytes(b"end")
             calls = []
 
             class WaitLimitAdapter:
-                async def create_video(self, _prompt, _reference_paths, _destination, **kwargs):
+                async def create_video(
+                    self, _prompt, _start_frame, _end_frame, _destination, **kwargs
+                ):
                     calls.append(kwargs["request_hash"])
                     kwargs["on_submitted"](
                         muse_provider.MuseReceipt(
@@ -1388,7 +1637,10 @@ class TestMuseRecovery(unittest.TestCase):
                         artifact_type="muse_scene_video:0",
                         request_hash="request",
                         prompt="subtle camera motion",
-                        references=[{"path": str(first_frame), "sha256": "scene-hash"}],
+                        references=[
+                            {"path": str(first_frame), "sha256": "scene-hash"},
+                            {"path": str(end_frame), "sha256": "end-hash"},
+                        ],
                         omitted=[],
                         destination=root / "clip",
                         expected="video",
@@ -1506,14 +1758,16 @@ class TestMuseRecovery(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             first_frame = root / "scene.png"
-            extra_reference = root / "hero.png"
+            end_frame = root / "end.png"
             first_frame.write_bytes(b"scene")
-            extra_reference.write_bytes(b"hero")
+            end_frame.write_bytes(b"end")
             calls = []
 
             class AlwaysRefuseAdapter:
-                async def create_video(self, prompt, reference_paths, _destination, **kwargs):
-                    calls.append((prompt, list(reference_paths), kwargs["request_hash"]))
+                async def create_video(
+                    self, prompt, start_frame, final_frame, _destination, **kwargs
+                ):
+                    calls.append((prompt, [start_frame, final_frame], kwargs["request_hash"]))
                     number = len(calls)
                     kwargs["on_submitted"](
                         muse_provider.MuseReceipt(
@@ -1539,7 +1793,7 @@ class TestMuseRecovery(unittest.TestCase):
                         prompt="ordinary camera motion",
                         references=[
                             {"path": str(first_frame), "sha256": "scene-hash"},
-                            {"path": str(extra_reference), "sha256": "hero-hash"},
+                            {"path": str(end_frame), "sha256": "end-hash"},
                         ],
                         omitted=[],
                         destination=root / "clip",
@@ -1558,8 +1812,8 @@ class TestMuseRecovery(unittest.TestCase):
             result = asyncio.run(run())
 
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0][1], [first_frame, extra_reference])
-        self.assertEqual(calls[1][1], [first_frame])
+        self.assertEqual(calls[0][1], [first_frame, end_frame])
+        self.assertEqual(calls[1][1], [first_frame, end_frame])
         self.assertTrue(result["degraded_to_image"])
         self.assertEqual(result["metadata"]["refusal_count"], 2)
         self.assertEqual(result["metadata"]["fallback_count"], 1)
@@ -2849,6 +3103,42 @@ class TestMuseStudioServiceLifecycle(unittest.TestCase):
             ):
                 muse_studio_service._probe_owned_service()
 
+    def test_probe_rejects_muse_without_start_end_capability(self):
+        muse_studio_service._api_key = "in-memory-only"
+        responses = [
+            {"status": "ok"},
+            {"status": "ready", "accounts": 1, "browser_running": True},
+            {
+                "object": "list",
+                "data": [{"id": "muse-image"}, {"id": "muse-video"}],
+            },
+        ]
+        with patch.object(muse_studio_service, "_request_json", side_effect=responses):
+            with self.assertRaisesRegex(
+                muse_studio_service.MuseStudioConfigurationError,
+                "start/end",
+            ):
+                muse_studio_service._probe_owned_service()
+
+    def test_probe_accepts_and_sanitizes_start_end_capability(self):
+        muse_studio_service._api_key = "in-memory-only"
+        responses = [
+            {"status": "ok"},
+            {"status": "ready", "accounts": 1, "browser_running": True},
+            {
+                "object": "list",
+                "data": [{"id": "muse-image"}, {"id": "muse-video"}],
+                "capabilities": {"video_start_end_frames": 1},
+            },
+        ]
+        with patch.object(muse_studio_service, "_request_json", side_effect=responses):
+            status = muse_studio_service._probe_owned_service()
+
+        self.assertEqual(status["video_start_end_frames"], 1)
+        serialized = json.dumps(status).casefold()
+        for secret_field in ("api_key", "cookie", "token", "password"):
+            self.assertNotIn(secret_field, serialized)
+
     def test_release_schedules_sixty_second_idle_close(self):
         process = MagicMock()
         process.poll.return_value = None
@@ -3156,6 +3446,7 @@ class TestMuseRouting(unittest.TestCase):
             "api_ready": True,
             "accounts": 2,
             "browser_running": True,
+            "video_start_end_frames": 1,
             "api_url": "http://127.0.0.1:18610",
         }
         with (
