@@ -337,6 +337,29 @@ def _is_flow_credit_exhausted_error(text: str) -> bool:
     return any(phrase in normalized for phrase in explicit_phrases)
 
 
+def _is_flow_image_credit_exhausted_error(text: str) -> bool:
+    """Return True if credit exhausted error belongs to image generation, filtering out video errors."""
+    if not _is_flow_credit_exhausted_error(text):
+        return False
+    lower = str(text).lower()
+    # Explicit video cues indicate this failure tile belongs to a video model (e.g. Veo)
+    video_cues = ("interpolating", "veo", "video generation failed", "video interpolating", "1 video")
+    if any(cue in lower for cue in video_cues):
+        return False
+    return True
+
+
+def _is_flow_video_credit_exhausted_error(text: str) -> bool:
+    """Return True if credit exhausted error belongs to video generation."""
+    if not _is_flow_credit_exhausted_error(text):
+        return False
+    lower = str(text).lower()
+    # Explicit image cues indicate this failure tile belongs to an image model
+    if ("nano banana" in lower or "image generation failed" in lower) and "video" not in lower:
+        return False
+    return True
+
+
 def _upgrade_google_cdn_image_url(url: str) -> str:
     """If url is a Google CDN image with thumbnail size params (e.g. =s512, =w512-h288), upgrade to =s0."""
     clean = str(url or "").strip()
@@ -2410,7 +2433,11 @@ class GoogleFlowWorker:
                         if (!user) continue;
                         const prompt = user.querySelector('.prompt-text') || user;
                         const text = normalize(prompt.textContent);
-                        if (expectedPrompts.some((expected) =>
+                        const tokenMatch = expectedPrompts.some((expected) => {
+                            const match = String(expected || '').match(/ayt-[a-z0-9_-]+/i);
+                            return match && text.includes(match[0].toLowerCase());
+                        });
+                        if (tokenMatch || expectedPrompts.some((expected) =>
                             text === expected || text.includes(expected)
                         )) {
                             promptIndex = index;
@@ -2637,7 +2664,11 @@ class GoogleFlowWorker:
                         );
                         if (!user) continue;
                         const text = normalize((user.querySelector('.prompt-text') || user).textContent);
-                        if (expectedPrompts.some((expected) => text === expected || text.includes(expected))) {
+                        const tokenMatch = expectedPrompts.some((expected) => {
+                            const match = String(expected || '').match(/ayt-[a-z0-9_-]+/i);
+                            return match && text.includes(match[0].toLowerCase());
+                        });
+                        if (tokenMatch || expectedPrompts.some((expected) => text === expected || text.includes(expected))) {
                             promptIndex = index;
                             break;
                         }
@@ -2694,7 +2725,7 @@ class GoogleFlowWorker:
         if matched_state == "failed":
             self._record_video_timing("error_seen")
             error_message = f"{matched.get('error') or 'Thao tác không thành công'}"
-            if _is_flow_credit_exhausted_error(error_message):
+            if _is_flow_video_credit_exhausted_error(error_message):
                 raise FlowVideoCreditExhausted(
                     f"Google Flow đã xác nhận hết credit khi tạo video: {error_message}"
                 )
@@ -2718,7 +2749,7 @@ class GoogleFlowWorker:
             if active_errors:
                 self._record_video_timing("error_seen")
                 err_text = next(iter(active_errors))
-                if _is_flow_credit_exhausted_error(err_text):
+                if _is_flow_video_credit_exhausted_error(err_text):
                     raise FlowVideoCreditExhausted(
                         f"Google Flow đã xác nhận hết credit khi tạo video: {err_text}"
                     )
@@ -2741,7 +2772,7 @@ class GoogleFlowWorker:
             if video_errors and has_new_video_error:
                 self._record_video_timing("error_seen")
                 err_text = next(iter(video_errors))
-                if _is_flow_credit_exhausted_error(err_text):
+                if _is_flow_video_credit_exhausted_error(err_text):
                     raise FlowVideoCreditExhausted(
                         f"Google Flow đã xác nhận hết credit khi tạo video: {err_text}"
                     )
@@ -2774,7 +2805,11 @@ class GoogleFlowWorker:
                         if (!user) continue;
                         const prompt = user.querySelector('.prompt-text') || user;
                         const text = normalize(prompt.textContent);
-                        if (expectedPrompts.some((expected) => text.includes(expected))) {
+                        const tokenMatch = expectedPrompts.some((expected) => {
+                            const match = String(expected || '').match(/ayt-[a-z0-9_-]+/i);
+                            return match && text.includes(match[0].toLowerCase());
+                        });
+                        if (tokenMatch || expectedPrompts.some((expected) => text.includes(expected))) {
                             promptIndex = index;
                             break;
                         }
@@ -3024,7 +3059,10 @@ class GoogleFlowWorker:
                         const user = turn.matches('.message-row.user-row, [data-message-role="user"]')
                             ? turn : turn.querySelector('.user-bubble');
                         const prompt = user.querySelector('.prompt-text') || user;
-                        return normalize(prompt.textContent).includes(expected);
+                        const text = normalize(prompt.textContent);
+                        const match = String(expected || '').match(/ayt-[a-z0-9_-]+/i);
+                        if (match && text.includes(match[0].toLowerCase())) return true;
+                        return text.includes(expected);
                     }
                 }''',
                 norm_prompt.casefold(),
@@ -5312,11 +5350,11 @@ class GoogleFlowWorker:
                     submitted_at,
                     detail=explicit_error,
                 )
-                if _is_flow_credit_exhausted_error(explicit_error):
-                    if media_type == "video":
-                        raise FlowVideoCreditExhausted(
-                            f"Google Flow đã xác nhận hết credit khi tạo video: {explicit_error}"
-                        )
+                if media_type == "video" and _is_flow_video_credit_exhausted_error(explicit_error):
+                    raise FlowVideoCreditExhausted(
+                        f"Google Flow đã xác nhận hết credit khi tạo video: {explicit_error}"
+                    )
+                if media_type != "video" and _is_flow_image_credit_exhausted_error(explicit_error):
                     raise FlowImageCreditExhausted(
                         f"Google Flow đã xác nhận hết credit khi tạo ảnh: {explicit_error}"
                     )
@@ -5536,7 +5574,7 @@ class GoogleFlowWorker:
         if reconcile_only or intent_requires_reconciliation:
             canvas_errors = await self._get_existing_error_texts()
             for err in canvas_errors:
-                if _is_flow_credit_exhausted_error(err):
+                if _is_flow_image_credit_exhausted_error(err):
                     logger.warning("flow_image credit quota exhausted during reconciliation: %s", err)
                     raise FlowImageCreditExhausted(
                         f"Google Flow đã xác nhận hết hạn mức tạo ảnh (Nano Banana): {err}"
@@ -5636,7 +5674,7 @@ class GoogleFlowWorker:
         if submit_only:
             canvas_errors = await self._get_existing_error_texts()
             for err in canvas_errors:
-                if _is_flow_credit_exhausted_error(err):
+                if _is_flow_image_credit_exhausted_error(err):
                     logger.warning("flow_image credit quota exhausted after submission: %s", err)
                     raise FlowImageCreditExhausted(
                         f"Google Flow đã xác nhận hết hạn mức tạo ảnh (Nano Banana): {err}"

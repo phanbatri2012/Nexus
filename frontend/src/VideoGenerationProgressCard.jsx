@@ -4,6 +4,7 @@ import './VideoGenerationProgressCard.css'
 
 const API_BASE = 'http://127.0.0.1:8080'
 const ACTIVE_STATUSES = ['queued', 'running', 'retry_wait', 'paused']
+const VIDEO_PIPELINE_JOB_TYPES = ['video_generation', 'muse_media_generation']
 const POLLING_INTERVAL_MS = 2000
 
 export default function VideoGenerationProgressCard({
@@ -28,13 +29,18 @@ export default function VideoGenerationProgressCard({
 
   const loadJobs = useCallback(async () => {
     try {
-      const response = await fetch(`${API_BASE}/api/jobs?job_type=video_generation&limit=50`)
-      const data = await response.json()
-      if (response.ok && Array.isArray(data.items)) {
-        setJobs(data.items)
+      const responses = await Promise.all(
+        VIDEO_PIPELINE_JOB_TYPES.map(jobType => (
+          fetch(`${API_BASE}/api/jobs?job_type=${jobType}&limit=50`)
+        ))
+      )
+      const payloads = await Promise.all(responses.map(response => response.json()))
+      if (responses.every(response => response.ok)) {
+        const pipelineJobs = payloads.flatMap(data => (Array.isArray(data.items) ? data.items : []))
+        setJobs(pipelineJobs)
 
         // Check if any previously running job just completed
-        const currentDone = data.items.filter(j => j.status === 'done')
+        const currentDone = pipelineJobs.filter(j => j.status === 'done')
         for (const doneJob of currentDone) {
           if (prevRunningIdsRef.current.has(doneJob.id) && doneJob.video_id) {
             setRecentlyCompletedVideo({
@@ -46,7 +52,7 @@ export default function VideoGenerationProgressCard({
         }
 
         const currentlyRunning = new Set(
-          data.items
+          pipelineJobs
             .filter(j => ACTIVE_STATUSES.includes(j.status))
             .map(j => j.id)
         )

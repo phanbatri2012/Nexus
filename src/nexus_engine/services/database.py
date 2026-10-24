@@ -4919,7 +4919,7 @@ def claim_next_system_job(job_type: str) -> dict | None:
             '''
             UPDATE system_jobs
             SET status = 'running', progress = ?, attempt = attempt + 1,
-                started_at = ?, finished_at = '', next_retry_at = '', updated_at = ?
+                error = '', started_at = ?, finished_at = '', next_retry_at = '', updated_at = ?
             WHERE id = ? AND status IN ('queued', 'retry_wait')
             ''',
             ("Đang khởi động", now, now, row["id"]),

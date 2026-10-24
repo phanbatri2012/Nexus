@@ -232,9 +232,10 @@ function App() {
   const [isRendering, setIsRendering] = useState(false)
   const [isCancelingRender, setIsCancelingRender] = useState(false)
 
-  const isRenderActive = Boolean(isRendering || renderInfo?.is_active || ['queued', 'running', 'retry_wait'].includes(renderInfo?.job?.status))
-  const isRenderError = !isRenderActive && Boolean(renderInfo?.is_error || renderInfo?.job?.status === 'error' || renderInfo?.job?.status === 'failed')
-  const isRenderCanceled = !isRenderActive && Boolean(renderInfo?.is_canceled || renderInfo?.job?.status === 'canceled')
+  const isRenderPaused = Boolean(!isRendering && (renderInfo?.is_paused || renderInfo?.job?.status === 'paused'))
+  const isRenderActive = Boolean(isRendering || renderInfo?.is_active || ['queued', 'running', 'retry_wait'].includes(renderInfo?.job?.status)) && !isRenderPaused
+  const isRenderError = !isRenderActive && !isRenderPaused && Boolean(renderInfo?.is_error || renderInfo?.job?.status === 'error' || renderInfo?.job?.status === 'failed')
+  const isRenderCanceled = !isRenderActive && !isRenderPaused && Boolean(renderInfo?.is_canceled || renderInfo?.job?.status === 'canceled')
   const hasMp4Ready = Boolean(!isRenderActive && !isRenderError && !isRenderCanceled && renderInfo?.has_mp4)
   const [progressMsg, setProgressMsg] = useState('')
   const [queueRefreshKey, setQueueRefreshKey] = useState(0)
@@ -3198,8 +3199,8 @@ function App() {
                           {/* 3. Render MP4 */}
                           <div
                             style={{
-                              background: isRenderActive ? 'rgba(183, 148, 246, 0.08)' : 'rgba(255, 255, 255, 0.03)',
-                              border: isRenderActive ? '1px solid rgba(183, 148, 246, 0.4)' : '1px solid rgba(255, 255, 255, 0.08)',
+                              background: isRenderPaused ? 'rgba(241, 196, 15, 0.08)' : isRenderActive ? 'rgba(183, 148, 246, 0.08)' : 'rgba(255, 255, 255, 0.03)',
+                              border: isRenderPaused ? '1px solid rgba(241, 196, 15, 0.4)' : isRenderActive ? '1px solid rgba(183, 148, 246, 0.4)' : '1px solid rgba(255, 255, 255, 0.08)',
                               borderRadius: '8px',
                               padding: '10px 12px',
                               display: 'flex',
@@ -3215,19 +3216,21 @@ function App() {
                               <div style={{
                                 fontSize: '0.85em',
                                 fontWeight: '600',
-                                color: isRenderActive ? '#b794f6' : hasMp4Ready ? '#2ecc71' : (isRenderError || isRenderCanceled) ? '#ff6b6b' : '#888'
+                                color: isRenderPaused ? '#f1c40f' : isRenderActive ? '#b794f6' : hasMp4Ready ? '#2ecc71' : (isRenderError || isRenderCanceled) ? '#ff6b6b' : '#888'
                               }}>
-                                {isRenderActive
-                                  ? `⏳ ${renderInfo?.job?.progress || 'Đang dựng MP4 & Flow...'}`
-                                  : hasMp4Ready
-                                    ? (renderInfo?.mp4_details?.duration_formatted
-                                        ? `✅ MP4 đã xong (${renderInfo.mp4_details.duration_formatted} · ${renderInfo.mp4_details.size_formatted || '1080p'})`
-                                        : '✅ MP4 đã dựng xong (1080p)')
-                                    : isRenderCanceled
-                                      ? '⏹️ Đã dừng dựng'
-                                      : isRenderError
-                                        ? '❌ Lỗi dựng MP4'
-                                        : '⚪ Chưa dựng MP4'}
+                                {isRenderPaused
+                                  ? `⏸️ ${renderInfo?.job?.progress || 'Đã tạm dừng tại checkpoint'}`
+                                  : isRenderActive
+                                    ? `⏳ ${renderInfo?.job?.progress || 'Đang dựng MP4 & Flow...'}`
+                                    : hasMp4Ready
+                                      ? (renderInfo?.mp4_details?.duration_formatted
+                                          ? `✅ MP4 đã xong (${renderInfo.mp4_details.duration_formatted} · ${renderInfo.mp4_details.size_formatted || '1080p'})`
+                                          : '✅ MP4 đã dựng xong (1080p)')
+                                      : isRenderCanceled
+                                        ? '⏹️ Đã dừng dựng'
+                                        : isRenderError
+                                          ? '❌ Lỗi dựng MP4'
+                                          : '⚪ Chưa dựng MP4'}
                               </div>
                             </div>
                             {isRenderActive && (
@@ -3251,6 +3254,50 @@ function App() {
                                   title="Dừng tiến trình dựng video này ngay lập tức"
                                 >
                                   {isCancelingRender ? '⏳ Đang dừng...' : '⏹️ Dừng Render'}
+                                </button>
+                              </div>
+                            )}
+                            {isRenderPaused && (
+                              <div style={{ marginTop: '4px', display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                                <button
+                                  onClick={() => handleRenderVideo('resume')}
+                                  disabled={isRendering}
+                                  style={{
+                                    background: 'linear-gradient(135deg, #1abc9c, #16a085)',
+                                    color: 'white',
+                                    border: 'none',
+                                    borderRadius: '4px',
+                                    padding: '4px 10px',
+                                    fontSize: '0.78em',
+                                    fontWeight: 'bold',
+                                    cursor: isRendering ? 'not-allowed' : 'pointer',
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    gap: '4px'
+                                  }}
+                                  title="Tiếp tục tiến trình dựng từ checkpoint an toàn"
+                                >
+                                  ▶️ Tiếp tục Render
+                                </button>
+                                <button
+                                  onClick={handleCancelRenderVideo}
+                                  disabled={isCancelingRender}
+                                  style={{
+                                    background: 'rgba(231, 76, 60, 0.2)',
+                                    border: '1px solid #e74c3c',
+                                    color: '#ff6b6b',
+                                    borderRadius: '4px',
+                                    padding: '4px 8px',
+                                    fontSize: '0.78em',
+                                    fontWeight: 'bold',
+                                    cursor: isCancelingRender ? 'not-allowed' : 'pointer',
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    gap: '4px'
+                                  }}
+                                  title="Hủy bỏ tác vụ dựng này"
+                                >
+                                  {isCancelingRender ? '⏳ Đang dừng...' : '⏹️ Dừng hẳn'}
                                 </button>
                               </div>
                             )}
@@ -3592,12 +3639,19 @@ function App() {
                                     )}
                                   </div>
                                   <div style={{
-                                    color: isRenderActive ? '#f39c12' : isRenderError ? '#e74c3c' : isRenderCanceled ? '#e67e22' : hasMp4Ready ? '#2ecc71' : '#aaa',
+                                    color: isRenderPaused ? '#f1c40f' : isRenderActive ? '#f39c12' : isRenderError ? '#e74c3c' : isRenderCanceled ? '#e67e22' : hasMp4Ready ? '#2ecc71' : '#aaa',
                                     fontSize: '0.82em',
                                     marginTop: '4px',
                                     lineHeight: '1.4'
                                   }}>
-                                    {isRenderActive ? (
+                                    {isRenderPaused ? (
+                                      <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                                        <span style={{ fontWeight: 'bold', color: '#f1c40f' }}>⏸️ Đã tạm dừng tại checkpoint</span>
+                                        <span style={{ color: '#f39c12', fontSize: '0.92em', wordBreak: 'break-word' }}>
+                                          {renderInfo?.job?.progress || 'Tác vụ đã dừng an toàn tại checkpoint; nhấn Tiếp tục để chạy tiếp.'}
+                                        </span>
+                                      </div>
+                                    ) : isRenderActive ? (
                                       <span>
                                         ⏳ {renderInfo?.job?.progress || (renderInfo?.job?.status === 'running' ? (renderInfo?.render_mode === 'muse_ai' ? 'Đang tạo media Muse & render MP4...' : 'Đang tạo ảnh Flow & render MP4...') : 'Đang trong hàng đợi render...')}
                                       </span>
@@ -3663,6 +3717,103 @@ function App() {
                                         }}
                                       >
                                         {isCancelingRender ? '⏳ Đang dừng...' : '⏹️ Dừng'}
+                                      </button>
+                                    </>
+                                  ) : isRenderPaused ? (
+                                    <>
+                                      <button
+                                        className="btn-primary"
+                                        onClick={() => handleRenderVideo('resume')}
+                                        disabled={isRendering || currentVideoIsError}
+                                        title={renderInfo?.render_mode === 'stock_video'
+                                          ? "Tận dụng lại audio và phụ đề đã tạo, tiếp tục dựng video MP4"
+                                          : "Tiếp tục tạo các cảnh media còn lại từ checkpoint"}
+                                        style={{
+                                          padding: '4px 14px',
+                                          fontSize: '0.82em',
+                                          background: 'linear-gradient(135deg, #1abc9c, #16a085)',
+                                          cursor: 'pointer',
+                                          fontWeight: 'bold',
+                                          borderRadius: '4px',
+                                          border: 'none',
+                                          color: '#fff',
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          gap: '4px'
+                                        }}
+                                      >
+                                        ▶️ Tiếp tục
+                                      </button>
+                                      {renderInfo?.render_mode !== 'stock_video' && (
+                                        <button
+                                          className="btn-secondary"
+                                          onClick={() => setSceneResetDialog({
+                                            videoId: currentVideoId,
+                                            videoTitle: videoTitle || `Video #${currentVideoId}`,
+                                            fromSceneNumber: 1,
+                                            isSubmitting: false,
+                                            error: ''
+                                          })}
+                                          disabled={isRendering || currentVideoIsError}
+                                          title="Xóa và tạo lại từ một phân cảnh bất kỳ"
+                                          style={{
+                                            padding: '4px 14px',
+                                            fontSize: '0.82em',
+                                            background: 'rgba(241, 196, 15, 0.15)',
+                                            border: '1px solid #f1c40f',
+                                            color: '#f1c40f',
+                                            cursor: 'pointer',
+                                            fontWeight: 'bold',
+                                            borderRadius: '4px',
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            gap: '4px'
+                                          }}
+                                        >
+                                          🎯 Tạo lại từ cảnh...
+                                        </button>
+                                      )}
+                                      <button
+                                        className="btn-secondary"
+                                        onClick={() => handleRenderVideo('recreate')}
+                                        disabled={isRendering || currentVideoIsError}
+                                        title="Tạo lại từ đầu"
+                                        style={{
+                                          padding: '4px 14px',
+                                          fontSize: '0.82em',
+                                          background: 'rgba(231, 76, 60, 0.15)',
+                                          border: '1px solid #e74c3c',
+                                          color: '#ff6b6b',
+                                          cursor: 'pointer',
+                                          fontWeight: 'bold',
+                                          borderRadius: '4px',
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          gap: '4px'
+                                        }}
+                                      >
+                                        🔄 Tạo lại toàn bộ
+                                      </button>
+                                      <button
+                                        className="btn-secondary"
+                                        onClick={handleCancelRenderVideo}
+                                        disabled={isCancelingRender}
+                                        title="Hủy bỏ tác vụ này"
+                                        style={{
+                                          padding: '4px 14px',
+                                          fontSize: '0.82em',
+                                          background: 'rgba(231, 76, 60, 0.2)',
+                                          border: '1px solid #e74c3c',
+                                          color: '#ff6b6b',
+                                          cursor: isCancelingRender ? 'not-allowed' : 'pointer',
+                                          fontWeight: 'bold',
+                                          borderRadius: '4px',
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          gap: '4px'
+                                        }}
+                                      >
+                                        {isCancelingRender ? '⏳ Đang dừng...' : '⏹️ Dừng hẳn'}
                                       </button>
                                     </>
                                   ) : hasMp4Ready ? (

@@ -330,6 +330,27 @@ def _probe_owned_service(*, timeout: float = 3.0) -> dict:
         raise MuseStudioConfigurationError(
             "Muse2API không hỗ trợ contract video start/end bắt buộc; hãy cập nhật Muse_AI_Studio."
         )
+    try:
+        task_recovery_version = int(
+            capabilities.get("task_recovery")
+            if isinstance(capabilities, dict)
+            else 0
+        )
+    except (TypeError, ValueError):
+        task_recovery_version = 0
+    if task_recovery_version < 1:
+        raise MuseStudioConfigurationError(
+            "Muse2API không hỗ trợ contract task recovery bắt buộc; hãy cập nhật Muse_AI_Studio."
+        )
+    try:
+        active_media_tasks = max(0, int(ready.get("active_media_tasks") or 0))
+    except (TypeError, ValueError) as exc:
+        raise MuseStudioServiceUnavailable(
+            "Muse2API /readyz trả active_media_tasks sai contract."
+        ) from exc
+    runtime_id = str(ready.get("runtime_id") or "").strip()
+    if not runtime_id:
+        raise MuseStudioServiceUnavailable("Muse2API /readyz thiếu runtime_id.")
     return {
         "running": True,
         "owned": True,
@@ -337,6 +358,9 @@ def _probe_owned_service(*, timeout: float = 3.0) -> dict:
         "accounts": int(ready.get("accounts") or 0),
         "browser_running": bool(ready.get("browser_running")),
         "video_start_end_frames": start_end_version,
+        "task_recovery": task_recovery_version,
+        "active_media_tasks": active_media_tasks,
+        "runtime_id": runtime_id,
         "api_url": MUSE_API_BASE_URL,
     }
 
@@ -362,16 +386,32 @@ def _cancel_idle_timer() -> None:
 
 
 def _has_active_muse_jobs() -> bool:
-    now = db.utc_now()
-    for job in db.list_system_jobs(limit=None, job_type="muse_media_generation"):
-        status = str(job.get("status") or "").strip().lower()
-        if status in {"processing", "queued", "running"}:
-            return True
-        if status == "retry_wait":
-            next_retry_at = str(job.get("next_retry_at") or "").strip()
-            if not next_retry_at or next_retry_at <= now:
+    try:
+        for job in db.list_system_jobs(limit=None, job_type="muse_media_generation"):
+            status = str(job.get("status") or "").strip().lower()
+            if status in {"processing", "queued", "running", "retry_wait"}:
                 return True
-    return False
+        return False
+    except Exception:
+        logger.warning("Không thể xác minh trạng thái job Muse; giữ service để fail closed.")
+        return True
+
+
+def _has_active_provider_tasks() -> bool:
+    """Fail closed unless Muse2API confirms that no media task is active."""
+
+    with _lock:
+        process = _process
+    if process is None or process.poll() is not None:
+        return False
+    try:
+        ready = _request_json("/readyz", timeout=2.0)
+        if not str(ready.get("runtime_id") or "").strip():
+            raise ValueError("missing runtime_id")
+        return int(ready.get("active_media_tasks")) > 0
+    except Exception:
+        logger.warning("Không thể xác minh active media task Muse2API; hoãn idle shutdown.")
+        return True
 
 
 def ensure_started(*, timeout_seconds: float = 20.0) -> dict:
@@ -450,7 +490,15 @@ def ensure_started(*, timeout_seconds: float = 20.0) -> dict:
         if process is None or process.poll() is not None:
             break
         try:
-            return _probe_owned_service(timeout=2.0)
+            status_payload = _probe_owned_service(timeout=2.0)
+            logger.info(
+                "Muse2API ready instance_id=%s runtime_id=%s pid=%s active_media_tasks=%s",
+                _instance_id,
+                status_payload.get("runtime_id"),
+                getattr(process, "pid", 0),
+                status_payload.get("active_media_tasks", 0),
+            )
+            return status_payload
         except MuseStudioConfigurationError:
             shutdown_owned_service()
             raise
@@ -488,6 +536,9 @@ def status(*, probe: bool = False) -> dict:
         "accounts": 0,
         "browser_running": False,
         "video_start_end_frames": 0,
+        "task_recovery": 0,
+        "active_media_tasks": 0,
+        "runtime_id": "",
         "api_url": MUSE_API_BASE_URL,
     }
     try:
@@ -531,6 +582,11 @@ def shutdown_owned_service() -> None:
             # The live handle is stronger ownership evidence than a second CIM lookup,
             # which can fail and otherwise leave an orphan with an in-memory API key.
             if process.poll() is None:
+                logger.info(
+                    "Stopping owned Muse2API instance_id=%s pid=%s reason=shutdown_owned_service",
+                    _instance_id,
+                    getattr(process, "pid", 0),
+                )
                 if os.name == "nt":
                     try:
                         process.send_signal(signal.CTRL_BREAK_EVENT)
@@ -557,7 +613,7 @@ def _idle_close_callback() -> None:
     global _idle_timer
     with _lock:
         _idle_timer = None
-    if _has_active_muse_jobs():
+    if _has_active_muse_jobs() or _has_active_provider_tasks():
         schedule_idle_close()
         return
     shutdown_owned_service()

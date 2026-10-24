@@ -211,6 +211,10 @@ class MusePlannerBusy(MuseRetryScheduled):
     """ChatGPT profile is busy; retry without consuming a Muse attempt."""
 
 
+class MuseRecoveryExhausted(MuseError):
+    """Muse infrastructure retries are exhausted and the job must pause."""
+
+
 class MuseSemanticPlanNeedsAttention(video_production.VideoProductionError):
     """Semantic planning failed closed before any Muse submission."""
 
@@ -886,7 +890,19 @@ def _submission_hash_for_attempt(
     attempt: int,
     submission_variant: str,
     quota_recovery_sequence: int = 0,
+    recovery_epoch: int = 0,
 ) -> str:
+    if int(recovery_epoch) > 0:
+        return _json_hash(
+            {
+                "base_submission_hash": base_submission_hash,
+                "variant": "infrastructure_recovery_v1",
+                "submission_variant": submission_variant,
+                "submission_attempt": int(attempt),
+                "recovery_epoch": int(recovery_epoch),
+                "quota_recovery_sequence": int(quota_recovery_sequence),
+            }
+        )
     if int(quota_recovery_sequence) > 0:
         return _json_hash(
             {
@@ -981,36 +997,17 @@ def _checkpoint_terminal_transient_failure(
         if value:
             checkpoint[history_key] = value
 
-    if expected == "video" and not retryable_generation:
+    if not retryable_generation:
         checkpoint.update(
             {
-                "degraded_to_image": True,
-                "degrade_reason": (
-                    "muse_provider_wait_exhausted"
-                    if provider_retry_exhausted
-                    else "muse_transient_exhausted"
-                ),
+                "terminal_generation": True,
+                "infrastructure_failure": True,
                 "generation_elapsed_seconds": round(
                     time.monotonic() - generation_started,
                     3,
                 ),
             }
         )
-        degraded = _record_request_state(
-            video_id,
-            artifact_type,
-            request_hash,
-            status="degraded",
-            metadata=checkpoint,
-        )
-        return {
-            **degraded,
-            "degraded_to_image": True,
-            "_muse_cache_hit": False,
-        }
-
-    if not retryable_generation:
-        checkpoint["terminal_generation"] = True
         _record_request_state(
             video_id,
             artifact_type,
@@ -1018,7 +1015,7 @@ def _checkpoint_terminal_transient_failure(
             status="error",
             metadata=checkpoint,
         )
-        raise MuseError(
+        raise MuseRecoveryExhausted(
             (
                 f"Muse đã hết tổng thời gian chờ cho scene {int(scene['index']) + 1}."
                 if provider_retry_exhausted
@@ -1128,6 +1125,7 @@ async def _generate_request(
     scene: dict,
     cancel_check: Callable[[], None],
     policy_metadata: dict | None = None,
+    recovery_epoch: int = 0,
 ) -> dict:
     if expected == "video" and len(references) != 2:
         raise MuseReferenceError(
@@ -1147,6 +1145,26 @@ async def _generate_request(
     if _valid_cached_artifact(existing, request_hash):
         return {**existing, "_muse_cache_hit": True}
     metadata = dict((existing or {}).get("metadata") or {})
+    stored_recovery_epoch = int(metadata.get("recovery_epoch") or 0)
+    if (
+        existing
+        and existing.get("content_hash") == request_hash
+        and existing.get("status") == "error"
+        and metadata.get("infrastructure_failure")
+        and int(recovery_epoch) > stored_recovery_epoch
+    ):
+        metadata = {
+            key: value
+            for key, value in metadata.items()
+            if key not in {
+                "attempt", "submission_attempt", "submission_hash",
+                "provider_task_id", "endpoint", "submitted_at",
+                "terminal_generation", "retryable_generation",
+                "terminal_provider_task", "provider_retry_exhausted",
+                "infrastructure_failure", "error_class", "last_error_class",
+                "reconcile_count",
+            }
+        }
     if (
         existing
         and existing.get("content_hash") == request_hash
@@ -1284,7 +1302,19 @@ async def _generate_request(
             else previous_attempt + 1
         )
         if attempt > MAX_REQUEST_ATTEMPTS:
-            raise MuseError(
+            _record_request_state(
+                video_id,
+                artifact_type,
+                request_hash,
+                status="error",
+                metadata={
+                    **metadata,
+                    "terminal_generation": True,
+                    "infrastructure_failure": True,
+                    "recovery_epoch": int(recovery_epoch),
+                },
+            )
+            raise MuseRecoveryExhausted(
                 f"Scene {int(scene['index']) + 1} đã hết {MAX_REQUEST_ATTEMPTS} lần thử Muse."
             )
         retrying_terminal_failure = bool(
@@ -1330,6 +1360,7 @@ async def _generate_request(
             previous_submission_attempt,
             submission_variant,
             max(0, quota_recovery_sequence - 1) if recovering_quota else 0,
+            recovery_epoch,
         )
         if (resume_without_receipt or retrying_terminal_failure or recovering_quota) and str(
             metadata.get("submission_hash") or ""
@@ -1345,6 +1376,7 @@ async def _generate_request(
                 attempt,
                 submission_variant,
                 quota_recovery_sequence if recovering_quota else 0,
+                recovery_epoch,
             )
         )
         base_metadata = {
@@ -1358,6 +1390,8 @@ async def _generate_request(
             "selected_references": references,
             "omitted_references": omitted,
             "attempt": attempt,
+            "submission_attempt": attempt,
+            "recovery_epoch": int(recovery_epoch),
             "scene_index": int(scene["index"]),
             "phase": "videos" if expected == "video" else "images",
             "provider": MUSE_PROVIDER_NAME,
@@ -1588,13 +1622,21 @@ async def _generate_request(
                 artifact_type,
                 request_hash,
                 status="error",
-                metadata={**base_metadata, "error_class": type(exc).__name__},
+                metadata={
+                    **base_metadata,
+                    "error_class": type(exc).__name__,
+                    "retryable_generation": attempt < MAX_REQUEST_ATTEMPTS,
+                    "infrastructure_failure": attempt >= MAX_REQUEST_ATTEMPTS,
+                    "terminal_generation": attempt >= MAX_REQUEST_ATTEMPTS,
+                },
             )
             if attempt < MAX_REQUEST_ATTEMPTS:
                 raise MuseRetryScheduled(
                     str(exc), delay_seconds=RETRY_DELAYS_SECONDS[attempt - 1]
                 ) from exc
-            raise
+            raise MuseRecoveryExhausted(
+                f"Scene {int(scene['index']) + 1} đã hết {MAX_REQUEST_ATTEMPTS} lần thử Muse."
+            ) from exc
         except MuseError as exc:
             current = db.get_latest_video_artifact(video_id, artifact_type) or {}
             current_metadata = dict(current.get("metadata") or base_metadata)
@@ -1711,11 +1753,32 @@ async def _prepare_media_async(
     progress,
     cancel_check,
     job_id: str,
+    recovery_epoch: int = 0,
 ) -> dict:
     pipeline_started = time.monotonic()
     settings = snapshot.get("image_generation_settings") or {}
     references = plan.get("reference_snapshot") or []
     provider = MuseStudioApiProvider(job_id=job_id, video_id=video_id)
+
+    def heartbeat(payload: dict) -> None:
+        phase = str(payload.get("phase") or "media")
+        scene_index = int(payload.get("scene_index") or 0)
+        task_status = str(payload.get("task_status") or "processing")
+        task_progress = int(payload.get("progress") or 0)
+        progress(
+            f"Muse {phase}: cảnh {scene_index + 1}, task {task_status} ({task_progress}%)",
+            f"muse_{phase}",
+            media_progress={
+                "phase": phase,
+                "scene_index": scene_index,
+                "task_status": task_status,
+                "progress": task_progress,
+            },
+        )
+
+    set_heartbeat_callback = getattr(provider, "set_heartbeat_callback", None)
+    if callable(set_heartbeat_callback):
+        set_heartbeat_callback(heartbeat)
     scene_results: list[dict] = []
     async with provider.open_session() as adapter:
         quota_preflight = dict(adapter.capacity_preflight or {})
@@ -1743,6 +1806,9 @@ async def _prepare_media_async(
         for image_number, (scene, is_terminal) in enumerate(image_items, 1):
             cancel_check()
             index = int(scene["index"])
+            set_heartbeat_context = getattr(adapter, "set_heartbeat_context", None)
+            if callable(set_heartbeat_context):
+                set_heartbeat_context(phase="images", scene_index=index)
             selected, omitted = select_scene_references(scene, references, limit=6)
             original_prompt = MusePromptBuilder.image(
                 str(scene["prompt"]), has_references=bool(selected)
@@ -1807,6 +1873,7 @@ async def _prepare_media_async(
                 scene=scene,
                 cancel_check=cancel_check,
                 policy_metadata=policy_metadata,
+                recovery_epoch=recovery_epoch,
             )
             if is_terminal:
                 terminal_frame_artifact = image_artifact
@@ -1843,6 +1910,9 @@ async def _prepare_media_async(
             cancel_check()
             scene = item["scene"]
             index = int(scene["index"])
+            set_heartbeat_context = getattr(adapter, "set_heartbeat_context", None)
+            if callable(set_heartbeat_context):
+                set_heartbeat_context(phase="videos", scene_index=index)
             next_scene_result = scene_result_by_index.get(index + 1)
             end_artifact = (
                 next_scene_result["image_artifact"]
@@ -1902,6 +1972,7 @@ async def _prepare_media_async(
                 scene=scene,
                 cancel_check=cancel_check,
                 policy_metadata=policy_metadata,
+                recovery_epoch=recovery_epoch,
             )
             if video_result.get("degraded_to_image"):
                 item["video_degradation"] = video_result
@@ -1990,6 +2061,7 @@ def purge_muse_artifacts(video_id: int) -> int:
         if not (
             artifact_type == "muse_scene_plan"
             or artifact_type == "muse_media_manifest"
+            or artifact_type == "muse_terminal_frame"
             or artifact_type.startswith("muse_scene_image:")
             or artifact_type.startswith("muse_scene_video:")
         ):
@@ -2013,6 +2085,7 @@ def prepare_muse_media(
     force_new_project: bool = False,
     reference_snapshot: list[dict] | None = None,
     semantic_plan_builder: Callable[[dict], dict] | None = None,
+    recovery_epoch: int = 0,
 ) -> dict:
     if force_new_project:
         purge_muse_artifacts(video_id)
@@ -2040,6 +2113,7 @@ def prepare_muse_media(
             progress=progress,
             cancel_check=cancel_check,
             job_id=job_id,
+            recovery_epoch=recovery_epoch,
         )
     )
     results = prepared_media["scene_results"]

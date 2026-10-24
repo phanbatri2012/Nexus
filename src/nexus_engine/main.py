@@ -6429,7 +6429,7 @@ def _execute_flow_media_generation_job(job: dict) -> None:
 
 
 def _execute_muse_media_generation_job(job: dict) -> None:
-    payload = job.get("payload") or {}
+    payload = dict(job.get("payload") or {})
     video_id = int(job.get("video_id") or payload.get("video_id") or 0)
     existing_final = db.get_latest_video_artifact(video_id, "final_mp4", status="ready")
     if existing_final and Path(existing_final.get("path") or "").is_file():
@@ -6443,6 +6443,14 @@ def _execute_muse_media_generation_job(job: dict) -> None:
     snapshot = payload.get("snapshot") or _get_prompt_production_snapshot(
         job.get("prompt_version") or ""
     )
+    force_new_project = bool(payload.get("force_new_project", False))
+    if force_new_project:
+        muse_pipeline.purge_muse_artifacts(video_id)
+        payload["force_new_project"] = False
+        db.update_system_job(job["id"], payload_json=payload)
+        force_new_project = False
+    current_result = dict((db.get_system_job(job["id"]) or job).get("result") or {})
+    recovery_epoch = max(0, int(current_result.get("recovery_epoch") or 0))
 
     def update(message: str, stage: str = "", *args, **kwargs) -> None:
         del args
@@ -6494,9 +6502,10 @@ def _execute_muse_media_generation_job(job: dict) -> None:
         update,
         lambda: _raise_if_video_job_canceled(job["id"]),
         job_id=job["id"],
-        force_new_project=bool(payload.get("force_new_project", False)),
+        force_new_project=force_new_project,
         reference_snapshot=payload.get("muse_reference_snapshot"),
         semantic_plan_builder=build_semantic_plan,
+        recovery_epoch=recovery_epoch,
     )
     _raise_if_video_job_canceled(job["id"])
     render_job, _ = _enqueue_video_render_job(
@@ -7287,6 +7296,48 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
         return
 
     if (
+        isinstance(exc, muse_pipeline.MuseRecoveryExhausted)
+        and str(job.get("job_type") or "") == "muse_media_generation"
+    ):
+        current_job = db.get_system_job(job["id"]) or job
+        result = dict(current_job.get("result") or {})
+        history = list(result.get("muse_error_history") or [])[-19:]
+        history.append(
+            {
+                "at": db.utc_now(),
+                "error_class": type(exc).__name__,
+                "message": safe_error,
+            }
+        )
+        result.update(
+            {
+                "attention_required": "muse_service_unstable",
+                "muse_wait_reason": "infrastructure_retry_exhausted",
+                "muse_error_history": history,
+            }
+        )
+        message = "Muse không ổn định sau 3 lần submit; đã giữ checkpoint, hãy nhấn Resume."
+        db.update_system_job(
+            job["id"],
+            status="paused",
+            progress=message,
+            result_json=result,
+            error=safe_error,
+            next_retry_at="",
+            cancel_requested=0,
+            finished_at="",
+        )
+        if job.get("video_id"):
+            db.update_video_production_state(
+                int(job["video_id"]),
+                render_status="paused",
+                current_stage="muse_service_unstable",
+                production_progress=message,
+                blocking_reason=safe_error,
+            )
+        return
+
+    if (
         isinstance(exc, muse_provider.MuseTransientError)
         and str(job.get("job_type") or "") == "muse_media_generation"
     ):
@@ -7314,9 +7365,41 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
                 delay_seconds = muse_pipeline.RETRY_DELAYS_SECONDS[session_attempt - 1]
                 wait_reason = "session_transient_error"
         result["muse_wait_reason"] = wait_reason
+        history = list(result.get("muse_error_history") or [])[-19:]
+        history.append(
+            {
+                "at": db.utc_now(),
+                "error_class": type(exc).__name__,
+                "message": safe_error,
+            }
+        )
+        result["muse_error_history"] = history
         if wait_reason == "session_retry_exhausted":
-            db.update_system_job(job["id"], result_json=result)
-            # Fall through to the common terminal-error path below.
+            result.update(
+                {
+                    "attention_required": "muse_service_unstable",
+                }
+            )
+            message = "Muse không ổn định sau 3 lần kết nối; đã giữ checkpoint, hãy nhấn Resume."
+            db.update_system_job(
+                job["id"],
+                status="paused",
+                progress=message,
+                result_json=result,
+                error=safe_error,
+                next_retry_at="",
+                cancel_requested=0,
+                finished_at="",
+            )
+            if job.get("video_id"):
+                db.update_video_production_state(
+                    int(job["video_id"]),
+                    render_status="paused",
+                    current_stage="muse_service_unstable",
+                    production_progress=message,
+                    blocking_reason=safe_error,
+                )
+            return
         else:
             payload = dict(current_job.get("payload") or {})
             if payload.get("force_new_project"):
@@ -9065,6 +9148,24 @@ def _route_video_render_job(
     phase = (
         "render" if job.get("job_type") == "video_render" else "media_generation"
     )
+    if not created and mode == "resume" and str(job.get("status") or "") == "paused":
+        job_id = job["id"]
+        job_type = str(job.get("job_type") or "")
+        db.resume_system_job(job_id)
+        stage = (
+            "flow_media_generation"
+            if job_type == "flow_media_generation"
+            else ("muse_media_generation" if job_type == "muse_media_generation" else "rendering")
+        )
+        db.update_video_production_state(
+            video_id,
+            render_status="queued",
+            current_stage=stage,
+            production_progress="Đang chờ tiếp tục tiến trình dựng từ checkpoint",
+            blocking_reason="",
+        )
+        _kick_job_queues({job_type})
+        job = db.get_system_job(job_id) or job
     return job, created, phase
 
 
@@ -10689,7 +10790,44 @@ def _run_system_job_center_action(
                 pass
         updated_job = db.force_stop_system_job(job_id)
     elif action == "resume":
-        updated_job = db.resume_system_job(job_id)
+        if str(job.get("job_type") or "") == "muse_media_generation":
+            result = dict(job.get("result") or {})
+            result["recovery_epoch"] = int(result.get("recovery_epoch") or 0) + 1
+            for key in (
+                "attention_required",
+                "muse_session_attempt",
+                "muse_session_error_class",
+                "muse_wait_reason",
+            ):
+                result.pop(key, None)
+            updated_job = db.resume_system_job(job_id)
+            if updated_job:
+                updated_job = db.update_system_job(
+                    job_id,
+                    result_json=result,
+                    error="",
+                    started_at="",
+                )
+                if job.get("video_id"):
+                    db.update_video_production_state(
+                        int(job["video_id"]),
+                        render_status="queued",
+                        current_stage="muse_media_generation",
+                        production_progress="Đang chờ Resume Muse từ checkpoint",
+                        blocking_reason="",
+                    )
+        elif str(job.get("job_type") or "") == "flow_media_generation":
+            updated_job = db.resume_system_job(job_id)
+            if updated_job and job.get("video_id"):
+                db.update_video_production_state(
+                    int(job["video_id"]),
+                    render_status="queued",
+                    current_stage="flow_media_generation",
+                    production_progress="Đang chờ tiếp tục tạo media Google Flow từ checkpoint",
+                    blocking_reason="",
+                )
+        else:
+            updated_job = db.resume_system_job(job_id)
     else:
         updated_job = db.request_cancel_system_job(job_id)
         if str(job.get("job_type")) == "fb_crosspost":
@@ -12639,12 +12777,20 @@ def get_render_status(video_id: int):
         (
             j
             for j in render_jobs
-            if j.get("status") in {"queued", "running", "retry_wait", "paused"}
+            if j.get("status") in {"queued", "running", "retry_wait"}
+        ),
+        None,
+    )
+    paused_job = next(
+        (
+            j
+            for j in render_jobs
+            if j.get("status") == "paused"
         ),
         None,
     )
     latest_job = render_jobs[0] if render_jobs else None
-    render_job = active_job or latest_job
+    render_job = active_job or paused_job or latest_job
     phase = (
         "media_generation"
         if render_job
@@ -12654,6 +12800,7 @@ def get_render_status(video_id: int):
     )
 
     is_active = bool(active_job)
+    is_paused = bool(paused_job and not active_job)
     latest_status = str(latest_job.get("status") or "") if latest_job else ""
     is_error = bool(latest_job and latest_status in {"error", "failed"})
     is_canceled = bool(latest_job and latest_status == "canceled")
@@ -12665,6 +12812,7 @@ def get_render_status(video_id: int):
         and artifact.get("status") == "ready"
         and Path(artifact.get("path") or "").is_file()
         and not is_active
+        and not is_paused
         and not is_error
         and not is_canceled
     )
@@ -12672,6 +12820,8 @@ def get_render_status(video_id: int):
     # Determine canonical lifecycle state
     if is_active:
         state = "active"
+    elif is_paused:
+        state = "paused"
     elif is_error:
         state = "error"
     elif is_canceled:
@@ -12716,6 +12866,7 @@ def get_render_status(video_id: int):
         "render_mode": render_mode,
         "has_mp4": has_mp4,
         "is_active": is_active,
+        "is_paused": is_paused,
         "is_error": is_error,
         "is_canceled": is_canceled,
         "error_message": error_message,

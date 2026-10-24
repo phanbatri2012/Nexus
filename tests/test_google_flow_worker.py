@@ -12,6 +12,8 @@ from nexus_engine.services.google_flow_worker import (
     REFERENCE_RESULT_NOT_FOUND,
     _upgrade_google_cdn_image_url,
     _is_flow_credit_exhausted_error,
+    _is_flow_image_credit_exhausted_error,
+    _is_flow_video_credit_exhausted_error,
 )
 
 
@@ -335,6 +337,25 @@ class TestGoogleFlowWorkerUpload(unittest.IsolatedAsyncioTestCase):
         normal_err = "Policy violation: prompt contains prohibited terms."
         self.assertFalse(_is_flow_credit_exhausted_error(normal_err))
         self.assertFalse(_is_flow_credit_exhausted_error(""))
+
+    def test_image_and_video_credit_quota_distinction(self):
+        video_quota_err = "The video generation failed because your daily quota for this model has been reached."
+        veo_err = "I will generate 1 video interpolating between images using Veo 3.1. Bạn đã đạt đến hạn mức sử dụng."
+        image_quota_err = "Bạn đã đạt đến hạn mức sử dụng. Vui lòng thử lại sau."
+
+        # Video quota error should be identified as video, NOT image
+        self.assertTrue(_is_flow_video_credit_exhausted_error(video_quota_err))
+        self.assertFalse(_is_flow_image_credit_exhausted_error(video_quota_err))
+        self.assertTrue(_is_flow_video_credit_exhausted_error(veo_err))
+        self.assertFalse(_is_flow_image_credit_exhausted_error(veo_err))
+
+        # Generic quota tile without video cues should not be blocked from image classification
+        self.assertTrue(_is_flow_credit_exhausted_error(image_quota_err))
+
+    def test_request_marker_format(self):
+        marker = GoogleFlowWorker._request_marker("8fedd269baa4985a7960")
+        self.assertIn("AYT-8fedd269baa4985a7960", marker)
+        self.assertIn("Internal tracking token:", marker)
 
     async def test_ensure_agent_video_frame_falls_back_to_upload_on_picker_error(self):
         import tempfile

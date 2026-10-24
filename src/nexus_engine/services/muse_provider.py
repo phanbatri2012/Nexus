@@ -8,6 +8,7 @@ import hashlib
 import json
 import mimetypes
 import socket
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -40,6 +41,10 @@ class MuseTaskTransientFailure(MuseTransientError):
 
 class MuseTaskWaitLimitExceeded(MuseTaskTransientFailure):
     """Muse exhausted its provider-side retry/wait budget for the task."""
+
+
+class MuseServiceInterrupted(MuseTaskTransientFailure):
+    """Muse2API restarted after accepting the task."""
 
 
 class MuseAdmissionRetry(MuseTransientError):
@@ -132,6 +137,7 @@ _TRANSIENT_TASK_ERROR_TOKENS = (
     "quá thời gian chờ",
     "tạm thời không khả dụng",
     "máy chủ đang bận",
+    "服务重启中断了任务",
 )
 
 
@@ -139,6 +145,8 @@ def classify_muse_failure(message: str) -> type[MuseError]:
     """Classify provider failures without broad language-specific substrings."""
 
     lowered = str(message or "").casefold()
+    if "服务重启中断了任务" in lowered:
+        return MuseServiceInterrupted
     if any(token in lowered for token in _QUOTA_ERROR_TOKENS):
         return MuseQuotaUnavailable
     if any(token in lowered for token in _REFUSAL_ERROR_TOKENS):
@@ -272,10 +280,61 @@ def _idempotency_key(prompt: str, paths: list[Path]) -> str:
 class MuseStudioApiProvider:
     """Job-scoped adapter around Muse AI Studio's unchanged local API."""
 
-    def __init__(self, *, job_id: str = "", video_id: int | None = None):
+    def __init__(
+        self,
+        *,
+        job_id: str = "",
+        video_id: int | None = None,
+        heartbeat: Callable[[dict], None] | None = None,
+    ):
         self.job_id = job_id
         self.video_id = video_id
         self.capacity_preflight: dict = {}
+        self._heartbeat = heartbeat
+        self._heartbeat_context: dict = {}
+        self._last_heartbeat_at = time.monotonic()
+
+    def set_heartbeat_context(self, *, phase: str, scene_index: int) -> None:
+        self._heartbeat_context = {
+            "phase": str(phase),
+            "scene_index": int(scene_index),
+        }
+        self._last_heartbeat_at = time.monotonic()
+
+    def set_heartbeat_callback(self, heartbeat: Callable[[dict], None] | None) -> None:
+        self._heartbeat = heartbeat
+
+    def _emit_heartbeat(self, task: dict) -> None:
+        if self._heartbeat is None:
+            return
+        now = time.monotonic()
+        if now - self._last_heartbeat_at < 10.0:
+            return
+        self._last_heartbeat_at = now
+        payload = {
+            **self._heartbeat_context,
+            "task_status": str(task.get("status") or ""),
+            "progress": max(0, min(100, int(task.get("progress") or 0))),
+        }
+        self._heartbeat(payload)
+
+    def _capture_media_capacity(self, response: dict) -> None:
+        capacity = response.get("media_capacity")
+        if not isinstance(capacity, dict):
+            return
+        try:
+            self.capacity_preflight = {
+                "status": str(capacity.get("status") or ""),
+                "eligible": int(capacity.get("eligible") or 0),
+                "unknown": int(capacity.get("unknown") or 0),
+                "exhausted": int(capacity.get("exhausted") or 0),
+                "skipped": int(capacity.get("skipped") or 0),
+                "cache_hit": bool(capacity.get("cache_hit")),
+                "checked_at": int(capacity.get("checked_at") or 0),
+                "elapsed_seconds": float(capacity.get("elapsed_seconds") or 0.0),
+            }
+        except (TypeError, ValueError):
+            self.capacity_preflight = {}
 
     @contextlib.asynccontextmanager
     async def open_session(self) -> AsyncGenerator["MuseStudioApiProvider", None]:
@@ -290,40 +349,6 @@ class MuseStudioApiProvider:
         except muse_studio_service.MuseStudioServiceError as exc:
             raise MuseError(str(exc)) from exc
         try:
-            capacity = await asyncio.to_thread(
-                self._post_json,
-                "/v1/media-capacity/preflight",
-                {},
-                "",
-                45.0,
-            )
-            try:
-                self.capacity_preflight = {
-                    "status": str(capacity.get("status") or ""),
-                    "eligible": int(capacity.get("eligible") or 0),
-                    "unknown": int(capacity.get("unknown") or 0),
-                    "exhausted": int(capacity.get("exhausted") or 0),
-                    "skipped": int(capacity.get("skipped") or 0),
-                    "cache_hit": bool(capacity.get("cache_hit")),
-                    "checked_at": int(capacity.get("checked_at") or 0),
-                    "elapsed_seconds": float(capacity.get("elapsed_seconds") or 0.0),
-                }
-            except (AttributeError, TypeError, ValueError) as exc:
-                raise MuseTransientError(
-                    "Muse2API trả preflight media capacity sai contract."
-                ) from exc
-            if self.capacity_preflight["status"] not in {
-                "ready", "degraded", "exhausted"
-            }:
-                raise MuseTransientError(
-                    "Muse2API trả trạng thái media capacity không hợp lệ."
-                )
-            if self.capacity_preflight["status"] == "exhausted":
-                error = MuseQuotaUnavailable(
-                    "Tất cả tài khoản Muse đã hết quota; hãy bổ sung/đợi quota rồi Resume."
-                )
-                error.capacity_preflight = dict(self.capacity_preflight)
-                raise error
             yield self
         finally:
             muse_studio_service.release()
@@ -428,6 +453,7 @@ class MuseStudioApiProvider:
                 "Mất kết nối khi đối soát task Muse2API; không gửi lại generation."
             ) from exc
         status = str(task.get("status") or "").strip().lower()
+        self._emit_heartbeat(task)
         if status in {"queued", "processing", "pending", "running"}:
             return None
         if status in {"failed", "error", "cancelled", "canceled"}:
@@ -483,6 +509,7 @@ class MuseStudioApiProvider:
                 "POST video Muse2API mất kết nối trước khi nhận task_id; không tự gửi lại."
             ) from exc
         task_id = str(submitted.get("task_id") or submitted.get("id") or "").strip()
+        self._capture_media_capacity(submitted)
         if not task_id:
             if expected == "video" and not idempotency_key:
                 raise MuseAmbiguousSubmissionError(
@@ -528,6 +555,7 @@ class MuseStudioApiProvider:
                     "Mất kết nối khi đang theo dõi task Muse2API; sẽ reconcile task cũ."
                 ) from exc
             status = str(task.get("status") or "").strip().lower()
+            self._emit_heartbeat(task)
             if status in {"completed", "success", "succeeded", "done"}:
                 result = await asyncio.to_thread(
                     self._download_completed_task, task, destination, expected
@@ -550,7 +578,17 @@ class MuseStudioApiProvider:
     @staticmethod
     def _raise_task_failure(task: dict) -> None:
         message = str(task.get("error") or "Muse2API generation thất bại.")[:1000]
-        error = classify_muse_failure(message)(message)
+        error_code = str(task.get("error_code") or "").strip().lower()
+        retryable = bool(task.get("retryable"))
+        if error_code == "service_restart_interrupted":
+            error = MuseServiceInterrupted(message)
+        elif retryable:
+            error = MuseTaskTransientFailure(message)
+        else:
+            error = classify_muse_failure(message)(message)
+        error.error_code = error_code
+        error.retryable = retryable
+        error.runtime_id = str(task.get("runtime_id") or "")
         capacity = task.get("media_capacity")
         if isinstance(error, MuseQuotaUnavailable) and isinstance(capacity, dict):
             error.capacity_preflight = {
@@ -609,6 +647,10 @@ class MuseStudioApiProvider:
             if exc.code in {400, 404, 409, 422}:
                 raise MuseError(detail) from exc
             raise MuseTransientError(detail) from exc
+        except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError, OSError) as exc:
+            raise MuseTransientError("Không thể kết nối ổn định tới Muse2API.") from exc
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise MuseTransientError("Muse2API trả JSON không hợp lệ.") from exc
 
     def _get_json(self, endpoint: str) -> dict:
         return self._request_json("GET", endpoint)
@@ -686,6 +728,10 @@ class MuseStudioApiProvider:
                         if total > max_bytes:
                             raise MuseError("Media Muse2API vượt giới hạn kích thước an toàn.")
                         stream.write(chunk)
+        except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError, OSError) as exc:
+            if target is not None:
+                target.unlink(missing_ok=True)
+            raise MuseTransientError("Mất kết nối khi tải media từ Muse2API.") from exc
         except Exception:
             if target is not None:
                 target.unlink(missing_ok=True)
