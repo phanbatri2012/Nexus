@@ -107,6 +107,181 @@ async def handle_ad_skipping(page: Any) -> bool:
     return False
 
 
+def _youtube_video_id_from_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(str(url or ""))
+    host = parsed.netloc.lower().split(":", 1)[0]
+    if host.startswith("www."):
+        host = host[4:]
+    if host == "youtu.be":
+        return parsed.path.strip("/").split("/", 1)[0]
+    if parsed.path == "/watch":
+        return str(urllib.parse.parse_qs(parsed.query).get("v", [""])[0]).strip()
+    for prefix in ("/shorts/", "/live/", "/embed/"):
+        if parsed.path.startswith(prefix):
+            return parsed.path[len(prefix):].split("/", 1)[0].strip()
+    return ""
+
+
+async def action_get_current_youtube_video_id(page: Any) -> str:
+    """Read the exact video ID currently loaded in the authenticated page."""
+    try:
+        current = await page.evaluate(
+            r"""() => {
+                const url = new URL(window.location.href);
+                const pathMatch = url.pathname.match(/^\/(?:shorts|live|embed)\/([^/?#]+)/);
+                return url.searchParams.get('v') || (pathMatch ? pathMatch[1] : '');
+            }"""
+        )
+        if str(current or "").strip():
+            return str(current).strip()
+    except Exception as exc:
+        logger.debug(
+            "Không thể đọc YouTube video ID từ DOM: %s",
+            security_logging.redact_sensitive(exc),
+        )
+    return _youtube_video_id_from_url(str(getattr(page, "url", "") or ""))
+
+
+def _sample_context_segments(segments: list[str], maximum: int = 8) -> list[str]:
+    cleaned = [re.sub(r"\s+", " ", str(item or "")).strip() for item in segments]
+    cleaned = [item for item in cleaned if item]
+    if len(cleaned) <= maximum:
+        return cleaned
+    indexes = sorted(
+        {
+            round(index * (len(cleaned) - 1) / max(1, maximum - 1))
+            for index in range(maximum)
+        }
+    )
+    return [cleaned[index] for index in indexes]
+
+
+async def action_collect_video_context(
+    page: Any,
+    *,
+    watched_from_seconds: float = 0.0,
+    watched_until_seconds: float = 0.0,
+) -> dict[str, Any]:
+    """Collect bounded public context from the current YouTube watch page."""
+    try:
+        await page.evaluate(
+            r"""() => {
+                const candidates = Array.from(document.querySelectorAll(
+                    'ytd-video-description-transcript-section-renderer button, '
+                    + 'button[aria-label*="transcript" i], button[aria-label*="bản chép lời" i]'
+                ));
+                const button = candidates.find(node => {
+                    const text = `${node.textContent || ''} ${node.getAttribute('aria-label') || ''}`.toLowerCase();
+                    return text.includes('transcript') || text.includes('bản chép lời');
+                });
+                if (button) {
+                    button.click();
+                    return true;
+                }
+                return false;
+            }"""
+        )
+        await asyncio.sleep(1.0)
+    except Exception as exc:
+        logger.debug(
+            "Không thể mở transcript YouTube để thu thập ngữ cảnh: %s",
+            security_logging.redact_sensitive(exc),
+        )
+
+    snapshot = await page.evaluate(
+        r"""() => {
+            const firstText = selectors => {
+                for (const selector of selectors) {
+                    const node = document.querySelector(selector);
+                    const text = (node?.textContent || '').trim();
+                    if (text) return text;
+                }
+                return '';
+            };
+            const uniqueTexts = (selectors, limit) => {
+                const values = [];
+                const seen = new Set();
+                for (const selector of selectors) {
+                    for (const node of document.querySelectorAll(selector)) {
+                        const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
+                        if (text && !seen.has(text)) {
+                            seen.add(text);
+                            values.push(text);
+                        }
+                        if (values.length >= limit) return values;
+                    }
+                }
+                return values;
+            };
+            const url = new URL(window.location.href);
+            const pathMatch = url.pathname.match(/^\/(?:shorts|live|embed)\/([^/?#]+)/);
+            const transcript = Array.from(document.querySelectorAll(
+                'ytd-transcript-segment-renderer, ytd-transcript-segment-list-renderer [role="button"]'
+            )).slice(0, 200).map(node => {
+                const timestamp = (node.querySelector('.segment-timestamp, [class*="timestamp"]')?.textContent || '').trim();
+                const text = (node.querySelector('.segment-text, [class*="segment-text"]')?.textContent || node.textContent || '')
+                    .replace(/\s+/g, ' ').trim();
+                return { timestamp, text };
+            }).filter(item => item.text);
+            return {
+                youtube_video_id: url.searchParams.get('v') || (pathMatch ? pathMatch[1] : ''),
+                title: firstText(['h1.ytd-watch-metadata yt-formatted-string', 'h1.title']),
+                channel: firstText(['ytd-channel-name #text', '#owner #channel-name', '#upload-info #channel-name']),
+                description: firstText([
+                    '#description-inline-expander yt-attributed-string',
+                    '#description-inline-expander',
+                    'ytd-text-inline-expander#description-inline-expander',
+                    '#description'
+                ]),
+                chapters: uniqueTexts([
+                    'ytd-macro-markers-list-item-renderer #details',
+                    'ytd-chapter-renderer #details',
+                    '#chapters ytd-macro-markers-list-item-renderer'
+                ], 20),
+                top_comments: uniqueTexts([
+                    'ytd-comment-thread-renderer #content-text',
+                    'ytd-comment-view-model #content-text',
+                    '#comments #content-text'
+                ], 5),
+                transcript
+            };
+        }"""
+    ) or {}
+
+    def timestamp_seconds(value: str) -> float:
+        try:
+            parts = [float(part) for part in str(value or "").strip().split(":")]
+        except ValueError:
+            return 0.0
+        total = 0.0
+        for part in parts:
+            total = total * 60.0 + part
+        return total
+
+    raw_segments = snapshot.pop("transcript", []) if isinstance(snapshot, dict) else []
+    segment_texts: list[str] = []
+    for item in raw_segments if isinstance(raw_segments, list) else []:
+        if not isinstance(item, dict):
+            continue
+        timestamp = str(item.get("timestamp") or "").strip()
+        if timestamp:
+            segment_second = timestamp_seconds(timestamp)
+            if watched_from_seconds > 0 and segment_second < max(
+                0.0, watched_from_seconds - 10.0
+            ):
+                continue
+            if watched_until_seconds > 0 and segment_second > watched_until_seconds + 10:
+                continue
+        text = re.sub(r"\s+", " ", str(item.get("text") or "")).strip()
+        if timestamp and text.startswith(timestamp):
+            text = text[len(timestamp):].strip()
+        if text:
+            segment_texts.append(text)
+    snapshot["transcript_segments"] = _sample_context_segments(segment_texts, maximum=8)
+    snapshot["top_comments"] = list(snapshot.get("top_comments") or [])[:5]
+    return snapshot
+
+
 async def action_search_and_pick_video(
     page: Any,
     keyword: str,
@@ -915,6 +1090,7 @@ async def action_watch_video(
 
     watched_seconds = 0.0
     wall_seconds = 0.0
+    observed_comments: list[str] = []
     step = 5.0
     last_interaction = 0.0
     previous_time = float(initial_snapshot.get("currentTime") or 0.0)
@@ -965,6 +1141,10 @@ async def action_watch_video(
                         max_dwell_seconds=max_dwell,
                         cancel_check=cancel_check,
                     )
+                    for observed in read_res.get("comments") or []:
+                        clean_observed = str(observed or "").strip()
+                        if clean_observed and clean_observed not in observed_comments:
+                            observed_comments.append(clean_observed)
                     dwell_done = float(read_res.get("dwell_seconds") or 0.0)
                     try:
                         snapshot = await page.evaluate(snapshot_script) or {}
@@ -997,6 +1177,8 @@ async def action_watch_video(
                     await page.evaluate("() => document.querySelector('video.html5-main-video, video')?.play().catch(() => {})")
                 elif action_choice == "mouse_move":
                     await page.mouse.move(random.randint(150, 700), random.randint(150, 500))
+            except RuntimeError:
+                raise
             except Exception as exc:
                 logger.debug(
                     "Không thể thực hiện tương tác xem tự nhiên: %s",
@@ -1016,6 +1198,12 @@ async def action_watch_video(
         "watched_seconds": round(watched_seconds, 2),
         "total_duration": total_duration,
         "retention_percentage": round(min(100.0, (watched_seconds / total_duration) * 100), 2),
+        "youtube_video_id": str(initial_snapshot.get("videoId") or expected_video_id),
+        "first_position_seconds": round(
+            max(0.0, float(initial_snapshot.get("currentTime") or 0.0)), 2
+        ),
+        "last_position_seconds": round(max(0.0, previous_time), 2),
+        "observed_comments": observed_comments[:5],
     }
 
 

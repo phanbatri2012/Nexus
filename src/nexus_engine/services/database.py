@@ -1673,78 +1673,6 @@ def init_db():
         WHERE status IN ('reserved', 'scheduled')
     """)
 
-def _migrate_channel_publication_slots_15m_grid(conn: sqlite3.Connection) -> None:
-    """Migrate legacy publication slots to ensure all minutes align with YouTube's 15-minute grid."""
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id, publication_slots_json FROM youtube_channels "
-        "WHERE publication_slots_json IS NOT NULL AND publication_slots_json != ''"
-    )
-    rows = cursor.fetchall()
-    for channel_id, slots_raw in rows:
-        try:
-            slots = json.loads(slots_raw or "[]")
-        except (TypeError, json.JSONDecodeError):
-            continue
-        if not isinstance(slots, list):
-            continue
-        modified = False
-        new_slots = []
-        seen = set()
-        for slot in slots:
-            if not isinstance(slot, dict) or "time" not in slot:
-                continue
-            day = slot.get("day", -1)
-            time_str = str(slot.get("time") or "").strip()
-            match = re.match(r"^(\d{1,2}):(\d{2})$", time_str)
-            if not match:
-                new_slots.append(slot)
-                continue
-            h, m = int(match.group(1)), int(match.group(2))
-            if m not in (0, 15, 30, 45):
-                snapped_m = int(round(m / 15.0) * 15)
-                if snapped_m >= 60:
-                    h = (h + 1) % 24
-                    snapped_m = 0
-                snapped_time = f"{h:02d}:{snapped_m:02d}"
-                modified = True
-            else:
-                snapped_time = f"{h:02d}:{m:02d}"
-
-            key = (day, snapped_time)
-            if key not in seen:
-                seen.add(key)
-                new_slots.append({"day": day, "time": snapped_time})
-        if modified:
-            cursor.execute(
-                "UPDATE youtube_channels SET publication_slots_json = ? WHERE id = ?",
-                (json.dumps(new_slots, ensure_ascii=False, separators=(",", ":")), channel_id),
-            )
-            logger.info("Migrated channel %s publication slots to 15m grid: %s", channel_id, new_slots)
-
-    # Also update any active 'reserved' reservations that have un-snapped minutes
-    cursor.execute("SELECT id, scheduled_at FROM channel_schedule_reservations WHERE status = 'reserved'")
-    res_rows = cursor.fetchall()
-    for res_id, sched_str in res_rows:
-        try:
-            parsed = dt.datetime.fromisoformat(str(sched_str).replace("Z", "+00:00"))
-            total_sec = parsed.minute * 60 + parsed.second
-            rem = total_sec % 900
-            if rem != 0:
-                if rem < 450:
-                    snapped = parsed - dt.timedelta(seconds=rem)
-                else:
-                    snapped = parsed + dt.timedelta(seconds=(900 - rem))
-                snapped_str = snapped.replace(microsecond=0).isoformat()
-                cursor.execute(
-                    "UPDATE channel_schedule_reservations SET scheduled_at = ? WHERE id = ?",
-                    (snapped_str, res_id),
-                )
-                logger.info("Migrated reservation %s scheduled_at from %s to %s", res_id, sched_str, snapped_str)
-        except Exception:
-            pass
-
-
     c.execute("""
         CREATE TABLE IF NOT EXISTS comfyui_workflow_profiles (
             id TEXT PRIMARY KEY,
@@ -1847,6 +1775,24 @@ def _migrate_channel_publication_slots_15m_grid(conn: sqlite3.Connection) -> Non
         )
     ''')
 
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS trust_video_chats (
+            youtube_video_id TEXT NOT NULL,
+            prompt_version TEXT NOT NULL,
+            chat_url TEXT NOT NULL,
+            linked_video_id INTEGER REFERENCES videos(id) ON DELETE SET NULL,
+            context_source TEXT NOT NULL DEFAULT 'trust_created',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_used_at TEXT NOT NULL,
+            PRIMARY KEY (youtube_video_id, prompt_version)
+        )
+    ''')
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_trust_video_chats_last_used "
+        "ON trust_video_chats(last_used_at DESC)"
+    )
+
     try:
         c.execute(
             "ALTER TABLE trust_activity_log ADD COLUMN "
@@ -1931,6 +1877,93 @@ def _migrate_channel_publication_slots_15m_grid(conn: sqlite3.Connection) -> Non
     _clean_existing_scripts_with_sanitizer(conn)
     conn.commit()
     conn.close()
+
+
+def _migrate_channel_publication_slots_15m_grid(conn: sqlite3.Connection) -> None:
+    """Migrate legacy publication slots to YouTube's 15-minute grid."""
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, publication_slots_json FROM youtube_channels "
+        "WHERE publication_slots_json IS NOT NULL AND publication_slots_json != ''"
+    )
+    rows = cursor.fetchall()
+    for channel_id, slots_raw in rows:
+        try:
+            slots = json.loads(slots_raw or "[]")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(slots, list):
+            continue
+        modified = False
+        new_slots = []
+        seen = set()
+        for slot in slots:
+            if not isinstance(slot, dict) or "time" not in slot:
+                continue
+            day = slot.get("day", -1)
+            time_str = str(slot.get("time") or "").strip()
+            match = re.match(r"^(\d{1,2}):(\d{2})$", time_str)
+            if not match:
+                new_slots.append(slot)
+                continue
+            hour, minute = int(match.group(1)), int(match.group(2))
+            if minute not in (0, 15, 30, 45):
+                snapped_minute = int(round(minute / 15.0) * 15)
+                if snapped_minute >= 60:
+                    hour = (hour + 1) % 24
+                    snapped_minute = 0
+                snapped_time = f"{hour:02d}:{snapped_minute:02d}"
+                modified = True
+            else:
+                snapped_time = f"{hour:02d}:{minute:02d}"
+            key = (day, snapped_time)
+            if key not in seen:
+                seen.add(key)
+                new_slots.append({"day": day, "time": snapped_time})
+        if modified:
+            cursor.execute(
+                "UPDATE youtube_channels SET publication_slots_json = ? WHERE id = ?",
+                (
+                    json.dumps(new_slots, ensure_ascii=False, separators=(",", ":")),
+                    channel_id,
+                ),
+            )
+            logger.info(
+                "Migrated channel %s publication slots to 15m grid: %s",
+                channel_id,
+                new_slots,
+            )
+
+    cursor.execute(
+        "SELECT id, scheduled_at FROM channel_schedule_reservations "
+        "WHERE status = 'reserved'"
+    )
+    for reservation_id, scheduled_at in cursor.fetchall():
+        try:
+            parsed = dt.datetime.fromisoformat(
+                str(scheduled_at).replace("Z", "+00:00")
+            )
+            remainder = (parsed.minute * 60 + parsed.second) % 900
+            if remainder == 0:
+                continue
+            if remainder < 450:
+                snapped = parsed - dt.timedelta(seconds=remainder)
+            else:
+                snapped = parsed + dt.timedelta(seconds=900 - remainder)
+            snapped_at = snapped.replace(microsecond=0).isoformat()
+            cursor.execute(
+                "UPDATE channel_schedule_reservations SET scheduled_at = ? "
+                "WHERE id = ?",
+                (snapped_at, reservation_id),
+            )
+            logger.info(
+                "Migrated reservation %s scheduled_at from %s to %s",
+                reservation_id,
+                scheduled_at,
+                snapped_at,
+            )
+        except Exception:
+            pass
 
 
 def _clean_existing_scripts_with_sanitizer(conn: sqlite3.Connection) -> None:
@@ -3415,6 +3448,8 @@ def list_video_publication_identities() -> list[dict]:
                publications.youtube_channel_id,
                publications.youtube_video_id,
                publications.published_url,
+               publications.created_at AS publication_created_at,
+               videos.created_at AS video_created_at,
                videos.chat_url, videos.prompt_version, videos.video_status,
                COALESCE(videos.source_type, ?) AS source_type
         FROM video_publications AS publications
@@ -7951,6 +7986,93 @@ def _decode_trust_activity_log(row: sqlite3.Row | dict | None) -> dict | None:
     data["duration_seconds"] = float(data.get("duration_seconds") or 0.0)
     data["success"] = bool(data.get("success", 1))
     return data
+
+
+def list_trust_video_chats(youtube_video_id: str) -> list[dict]:
+    """Return Trust-created ChatGPT conversations for one exact YouTube ID."""
+    normalized_id = str(youtube_video_id or "").strip()
+    if not normalized_id:
+        return []
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        '''
+        SELECT * FROM trust_video_chats
+        WHERE youtube_video_id = ?
+        ORDER BY last_used_at DESC, created_at DESC
+        ''',
+        (normalized_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def set_trust_video_chat_if_empty(
+    *,
+    youtube_video_id: str,
+    prompt_version: str,
+    chat_url: str,
+    linked_video_id: int | None = None,
+    context_source: str = "trust_created",
+) -> dict:
+    """Persist one Trust chat atomically without replacing an existing URL."""
+    normalized_id = str(youtube_video_id or "").strip()
+    normalized_prompt = str(prompt_version or "").strip()
+    normalized_chat = str(chat_url or "").strip().rstrip("/")
+    if not normalized_id:
+        raise ValueError("Thiếu YouTube Video ID.")
+    if not normalized_prompt:
+        raise ValueError("Thiếu prompt version cho Trust video chat.")
+    if not normalized_chat:
+        raise ValueError("Chat URL không được để trống.")
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            '''
+            INSERT OR IGNORE INTO trust_video_chats (
+                youtube_video_id, prompt_version, chat_url, linked_video_id,
+                context_source, created_at, updated_at, last_used_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                normalized_id,
+                normalized_prompt,
+                normalized_chat,
+                linked_video_id,
+                str(context_source or "trust_created").strip() or "trust_created",
+                now,
+                now,
+                now,
+            ),
+        )
+        conn.execute(
+            '''
+            UPDATE trust_video_chats
+            SET last_used_at = ?,
+                updated_at = ?,
+                linked_video_id = COALESCE(linked_video_id, ?)
+            WHERE youtube_video_id = ? AND prompt_version = ?
+            ''',
+            (now, now, linked_video_id, normalized_id, normalized_prompt),
+        )
+        row = conn.execute(
+            '''
+            SELECT * FROM trust_video_chats
+            WHERE youtube_video_id = ? AND prompt_version = ?
+            ''',
+            (normalized_id, normalized_prompt),
+        ).fetchone()
+        conn.execute("COMMIT")
+        return dict(row)
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
 
 
 def create_channel_trust_plan(

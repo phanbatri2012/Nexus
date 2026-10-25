@@ -127,6 +127,7 @@
 .nav-item[data-view="autologin"]::before { content: '🔑'; }
 .nav-item[data-view="flowlogin"]::before { content: '🌊'; }
 .nav-item[data-view="tts"]::before { content: '🎙️'; }
+.nav-item[data-view="muse"]::before { content: '🎨'; }
 .nav-item[data-view="settings"]::before { content: '⚙️'; }
 
 .nav-item:hover {

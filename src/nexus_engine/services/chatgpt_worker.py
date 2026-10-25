@@ -6502,6 +6502,68 @@ def initialize_comment_video_chat(
         return page.url.strip().rstrip("/")
 
 
+def generate_trust_builder_comment(chat_url: str, prompt_text: str) -> str:
+    """Generate one Trust Builder draft in an existing video conversation."""
+    conversation_url = get_video_chat_url(chat_url)
+    profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
+    if not profile_dir.exists():
+        raise Exception(
+            "Profile directory not found. Please run the auto-login tool first."
+        )
+
+    with sync_playwright() as playwright, closing(
+        launch_chatgpt_context(playwright.chromium, profile_dir)
+    ) as context:
+        page = context.pages[0] if context.pages else context.new_page()
+        page.goto(
+            conversation_url,
+            wait_until="domcontentloaded",
+            timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+        )
+        check_chatgpt_page_attention(page)
+        ensure_expected_conversation_page(page.url, conversation_url)
+        return send_prompt(page, str(prompt_text or "").strip()).strip()
+
+
+def initialize_trust_video_chat_and_generate_comment(
+    *, prompt_version: str, prompt_text: str
+) -> dict[str, str | bool]:
+    """Create a dedicated Project conversation and return its first draft."""
+    profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
+    if not profile_dir.exists():
+        raise Exception(
+            "Profile directory not found. Please run the auto-login tool first."
+        )
+    project_url = get_chatgpt_project_url(prompt_version)
+    normalized_prompt = str(prompt_text or "").strip()
+    if not normalized_prompt:
+        raise ValueError("Trust Builder comment prompt is required.")
+
+    with sync_playwright() as playwright, closing(
+        launch_chatgpt_context(playwright.chromium, profile_dir)
+    ) as context:
+        page = context.pages[0] if context.pages else context.new_page()
+        navigate_to_chatgpt_project(page, project_url)
+        try:
+            response_text = send_prompt(page, normalized_prompt).strip()
+        except Exception:
+            # The prompt may have been delivered even if response polling failed.
+            # Preserve the conversation URL so a retry never creates another chat.
+            if is_expected_project_conversation_url(page.url, project_url):
+                return {
+                    "chat_url": page.url.strip().rstrip("/"),
+                    "response_text": "",
+                    "delivery_uncertain": True,
+                }
+            raise
+        ensure_expected_project_conversation_page(page.url, project_url)
+        return {
+            "chat_url": page.url.strip().rstrip("/"),
+            "response_text": response_text,
+            "delivery_uncertain": False,
+        }
+
+
 def generate_thumbnails_only(
     script_text: str,
     chat_url: str = '',

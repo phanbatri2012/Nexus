@@ -90,6 +90,32 @@ class TestTrustBuilderAutomation(unittest.TestCase):
         self.assertEqual(updated["daily_like_target"], 0)
         self.assertEqual(updated["min_watch_minutes"], 1)
 
+    def test_comment_readiness_fails_closed_without_unique_prompt_mapping(self):
+        plan = self._plan(daily_comment_target=1)
+        with patch.object(
+            service, "get_gpm_profile_detail", return_value={
+                "name": "Dedicated test profile",
+                "os": "Windows",
+                "browser_type": "chromium",
+                "browser_version": "1",
+            }
+        ), patch.object(
+            service,
+            "inspect_profile_browser_readiness",
+            return_value={"busy": False, "requires_user_action": False, "state": "closed"},
+        ), patch.object(
+            service.trust_builder_comments,
+            "prompt_versions_for_channel",
+            return_value=[],
+        ):
+            result = service.run_passive_readiness_check(plan["id"])
+
+        checks = {item["id"]: item for item in result["channel"]["checks"]}
+        self.assertEqual(checks["comment_prompt_mapping"]["status"], "fail")
+        self.assertTrue(checks["comment_prompt_mapping"]["required"])
+        self.assertEqual(checks["comment_chatgpt_project"]["status"], "fail")
+        self.assertIn("Prompt riêng cho Trust Builder", result["blockers"])
+
     def test_start_pause_resume_and_manual_session_queue(self):
         plan = self._plan(status="draft", warmup_phase="idle")
         with patch.object(service, "validate_plan_browser_configuration", return_value="gpm-profile-test"), patch.object(
@@ -243,7 +269,26 @@ class TestTrustBuilderAutomation(unittest.TestCase):
         ), patch.object(
             service,
             "action_watch_video",
-            new=AsyncMock(return_value={"watched_seconds": 60.0, "total_duration": 100.0, "retention_percentage": 60.0}),
+            new=AsyncMock(return_value={"watched_seconds": 60.0, "total_duration": 100.0, "retention_percentage": 60.0, "youtube_video_id": "safe2"}),
+        ), patch.object(
+            service,
+            "_prepare_grounded_comment",
+            new=AsyncMock(return_value={
+                "status": "ready",
+                "comment_text": "A grounded comment about this specific video topic.",
+                "youtube_video_id": "safe2",
+                "linked_video_id": None,
+                "chat_reused": True,
+                "context_source": "stored_video",
+                "prompt_version": "test",
+                "quality_score": 1.0,
+                "quality_checks": {"evidence_exact": True},
+                "context_chars": 500,
+            }),
+        ), patch.object(
+            service,
+            "action_get_current_youtube_video_id",
+            new=AsyncMock(return_value="safe2"),
         ), patch.object(service.safety, "is_safe_for_interaction", return_value=(True, "")), patch.object(
             service,
             "action_comment_video",
@@ -283,7 +328,7 @@ class TestTrustBuilderAutomation(unittest.TestCase):
         ), patch.object(
             service,
             "action_watch_video",
-            new=AsyncMock(return_value={"watched_seconds": 60.0, "total_duration": 100.0, "retention_percentage": 60.0}),
+            new=AsyncMock(return_value={"watched_seconds": 60.0, "total_duration": 100.0, "retention_percentage": 60.0, "youtube_video_id": "safe1"}),
         ), patch.object(service.safety, "is_safe_for_interaction", return_value=(False, "blocked")), patch.object(
             service, "action_like_video", new=like
         ), patch.object(service, "action_comment_video", new=comment), patch.object(
@@ -300,6 +345,131 @@ class TestTrustBuilderAutomation(unittest.TestCase):
         self.assertNotIn("like", activity_types)
         self.assertNotIn("comment", activity_types)
         self.assertNotIn("subscribe", activity_types)
+
+    def test_contextual_comment_pipeline_preserves_safe_action_order(self):
+        plan = self._plan(
+            status="paused",
+            warmup_phase="phase_2_engage",
+            daily_watch_target=1,
+            daily_search_target=1,
+            daily_like_target=0,
+            daily_comment_target=1,
+            daily_subscribe_target=0,
+            min_watch_minutes=1,
+        )
+        context = unittest.mock.Mock()
+        context.new_page = AsyncMock(return_value=object())
+        events = []
+
+        async def pick_video(*_args, **_kwargs):
+            events.append("select_video")
+            return {
+                "url": "https://youtube.com/watch?v=ordered1",
+                "title": "Battery storage",
+                "channel": "Safe channel",
+            }
+
+        async def watch_video(*_args, **_kwargs):
+            events.append("watch_and_verify_id")
+            return {
+                "watched_seconds": 60.0,
+                "total_duration": 100.0,
+                "retention_percentage": 60.0,
+                "youtube_video_id": "ordered1",
+                "last_position_seconds": 60.0,
+                "observed_comments": [],
+            }
+
+        async def collect_context(*_args, **_kwargs):
+            events.append("collect_context")
+            return {
+                "youtube_video_id": "ordered1",
+                "title": "Battery storage",
+                "description": "solar battery storage reduces evening grid demand",
+                "chapters": [],
+                "transcript_segments": [],
+                "top_comments": [],
+            }
+
+        def resolve_chat(*_args, **_kwargs):
+            events.append("resolve_chat")
+            return {
+                "status": "existing_chat",
+                "youtube_video_id": "ordered1",
+                "chat_url": "https://chatgpt.com/c/12345678-1234-1234-1234-123456789abc",
+                "chat_reused": True,
+                "linked_video_id": None,
+                "prompt_version": "test-prompt",
+                "context_source": "publication",
+            }
+
+        def generate_comment(*_args, **_kwargs):
+            events.append("generate_comment")
+            return (
+                '{"comment":"The point that solar battery storage reduces evening grid demand '
+                'makes this tradeoff much clearer.","language":"en",'
+                '"evidence":"solar battery storage reduces evening grid demand",'
+                '"anchor_terms":["solar battery storage"]}'
+            )
+
+        original_validate = service.trust_builder_comments.validate_comment_draft
+
+        def validate_comment(*args, **kwargs):
+            events.append("validate_comment")
+            return original_validate(*args, **kwargs)
+
+        async def recheck_video_id(*_args, **_kwargs):
+            events.append("recheck_id")
+            return "ordered1"
+
+        async def post_comment(*_args, **_kwargs):
+            events.append("post_comment")
+            return {
+                "status": "performed",
+                "reason_code": "comment_confirmed",
+                "message": "",
+            }
+
+        with patch.object(service, "validate_plan_browser_configuration", return_value="gpm-profile-test"), patch.object(
+            service, "is_profile_browser_busy", return_value=False
+        ), patch.object(service, "channel_browser_session", return_value=_BrowserSession(context)), patch.object(
+            service, "cleanup_owned_page", new=AsyncMock()
+        ), patch.object(service, "action_search_and_pick_video", new=pick_video), patch.object(
+            service, "action_watch_video", new=watch_video
+        ), patch.object(service.safety, "is_safe_for_interaction", return_value=(True, "")), patch.object(
+            service, "action_collect_video_context", new=collect_context
+        ), patch.object(
+            service, "resolve_market_language_config", return_value={"lang_code": "en"}
+        ), patch.object(
+            service.trust_builder_comments, "resolve_video_chat", side_effect=resolve_chat
+        ), patch.object(
+            service.trust_builder_comments, "validate_comment_draft", side_effect=validate_comment
+        ), patch.object(
+            service.chatgpt_runtime, "try_start_operation", return_value=True
+        ), patch.object(
+            service.chatgpt_runtime, "finish_operation"
+        ), patch.object(
+            service.chatgpt_worker, "generate_trust_builder_comment", side_effect=generate_comment
+        ), patch.object(
+            service, "action_get_current_youtube_video_id", new=recheck_video_id
+        ), patch.object(service, "action_comment_video", new=post_comment):
+            result = asyncio.run(service.run_warmup_session(plan["id"]))
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["details"]["commented"])
+        self.assertEqual(
+            events,
+            [
+                "select_video",
+                "watch_and_verify_id",
+                "resolve_chat",
+                "collect_context",
+                "generate_comment",
+                "validate_comment",
+                "recheck_id",
+                "post_comment",
+            ],
+        )
 
     def test_reverse_migration_restores_score_but_keeps_plan_paused_and_jobs_canceled(self):
         plan = self._plan(status="active")

@@ -14,7 +14,14 @@ import re
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from nexus_engine.services import database as db, security_logging, trust_builder_safety as safety
+from nexus_engine.services import (
+    chatgpt_runtime,
+    chatgpt_worker,
+    database as db,
+    security_logging,
+    trust_builder_comments,
+    trust_builder_safety as safety,
+)
 from nexus_engine.services.channel_scanner_service import (
     channel_browser_session,
     cleanup_owned_page,
@@ -33,11 +40,14 @@ from nexus_engine.services.trust_builder_actions import (
     action_browse_and_read_comments,
     action_refocus_video_player,
     action_comment_video,
+    action_collect_video_context,
+    action_get_current_youtube_video_id,
     action_like_video,
     action_search_and_pick_video,
     action_subscribe_channel,
     action_watch_video,
 )
+from nexus_engine.services.youtube_comments import extract_youtube_video_id
 
 logger = logging.getLogger(__name__)
 
@@ -372,6 +382,218 @@ def generate_contextual_comment(
     return random.choice(available) if available else ""
 
 
+def _failed_comment_validation(error_code: str) -> dict[str, Any]:
+    return {
+        "valid": False,
+        "comment": "",
+        "quality_score": 0.0,
+        "quality_checks": {},
+        "errors": [error_code],
+    }
+
+
+async def _prepare_grounded_comment(
+    *,
+    page: Any,
+    plan: dict[str, Any],
+    youtube_video_id: str,
+    watch_result: dict[str, Any],
+    recent_comments: set[str],
+) -> dict[str, Any]:
+    """Resolve one video's chat and return a quality-gated comment draft."""
+    resolution = trust_builder_comments.resolve_video_chat(youtube_video_id, plan)
+    base_detail: dict[str, Any] = {
+        "youtube_video_id": youtube_video_id,
+        "linked_video_id": resolution.get("linked_video_id"),
+        "chat_reused": bool(resolution.get("chat_reused")),
+        "context_source": str(resolution.get("context_source") or ""),
+        "prompt_version": str(resolution.get("prompt_version") or ""),
+        "quality_score": 0.0,
+        "quality_checks": {},
+    }
+    if resolution.get("status") not in {"existing_chat", "new_chat"}:
+        return {
+            "status": "skipped",
+            "skip_reason": str(resolution.get("skip_reason") or "ambiguous_chat"),
+            **base_detail,
+        }
+
+    page_context = await action_collect_video_context(
+        page,
+        watched_from_seconds=float(watch_result.get("first_position_seconds") or 0.0),
+        watched_until_seconds=float(watch_result.get("last_position_seconds") or 0.0),
+    )
+    current_video_id = str(page_context.get("youtube_video_id") or "").strip()
+    if current_video_id != youtube_video_id:
+        return {
+            "status": "skipped",
+            "skip_reason": "video_id_changed_during_context_collection",
+            **base_detail,
+        }
+
+    linked_video_id = resolution.get("linked_video_id")
+    stored_video = db.get_video(int(linked_video_id)) if linked_video_id else None
+    context = trust_builder_comments.build_context_packet(
+        youtube_video_id=youtube_video_id,
+        page_context=page_context,
+        stored_video=stored_video,
+        observed_comments=list(watch_result.get("observed_comments") or []),
+    )
+    base_detail["context_chars"] = int(context.get("context_chars") or 0)
+    if stored_video and (stored_video.get("transcript") or stored_video.get("description")):
+        base_detail["context_source"] = "stored_video"
+    else:
+        base_detail["context_source"] = "youtube_page"
+    if not context.get("has_grounding"):
+        return {
+            "status": "skipped",
+            "skip_reason": "grounding_context_missing",
+            **base_detail,
+        }
+
+    market_language = resolve_market_language_config(
+        str(plan.get("publication_timezone") or "Asia/Ho_Chi_Minh")
+    ).get("lang_code", "en")
+    expected_language = trust_builder_comments.detect_context_language(
+        context,
+        market_language=str(market_language or "en"),
+    )
+    prompt_text = trust_builder_comments.build_comment_prompt(
+        context,
+        expected_language,
+        include_context=not bool(resolution.get("chat_url")),
+    )
+    prompt_version = str(resolution.get("prompt_version") or "")
+    existing_chat_url = str(resolution.get("chat_url") or "").strip()
+    if resolution.get("relationship") == "trust_created" and existing_chat_url:
+        db.set_trust_video_chat_if_empty(
+            youtube_video_id=youtube_video_id,
+            prompt_version=prompt_version,
+            chat_url=existing_chat_url,
+            linked_video_id=(int(linked_video_id) if linked_video_id else None),
+            context_source=str(base_detail["context_source"] or "trust_created"),
+        )
+    acquired = chatgpt_runtime.try_start_operation(
+        "trust-builder-comment",
+        prompt_version=prompt_version,
+        video_id=int(linked_video_id) if linked_video_id else None,
+    )
+    if not acquired:
+        return {
+            "status": "deferred",
+            "skip_reason": "chatgpt_busy",
+            **base_detail,
+        }
+
+    chat_url = existing_chat_url
+    try:
+        if chat_url:
+            response_text = await asyncio.to_thread(
+                chatgpt_worker.generate_trust_builder_comment,
+                chat_url,
+                prompt_text,
+            )
+        else:
+            created = await asyncio.to_thread(
+                chatgpt_worker.initialize_trust_video_chat_and_generate_comment,
+                prompt_version=prompt_version,
+                prompt_text=prompt_text,
+            )
+            chat_url = str(created.get("chat_url") or "").strip()
+            if chat_url:
+                saved = db.set_trust_video_chat_if_empty(
+                    youtube_video_id=youtube_video_id,
+                    prompt_version=prompt_version,
+                    chat_url=chat_url,
+                    linked_video_id=(int(linked_video_id) if linked_video_id else None),
+                    context_source=str(base_detail["context_source"] or "youtube_page"),
+                )
+                saved_url = str(saved.get("chat_url") or "").strip()
+                if saved_url and saved_url != chat_url:
+                    return {
+                        "status": "skipped",
+                        "skip_reason": "ambiguous_chat",
+                        **base_detail,
+                    }
+                chat_url = saved_url or chat_url
+            if created.get("delivery_uncertain"):
+                return {
+                    "status": "deferred",
+                    "skip_reason": "chatgpt_delivery_uncertain",
+                    **base_detail,
+                }
+            response_text = str(created.get("response_text") or "")
+
+        try:
+            payload = trust_builder_comments.parse_comment_response(response_text)
+            validation = trust_builder_comments.validate_comment_draft(
+                payload,
+                context,
+                expected_language=expected_language,
+                recent_comments=recent_comments,
+            )
+        except ValueError as exc:
+            validation = _failed_comment_validation(str(exc) or "invalid_json")
+
+        if not validation.get("valid"):
+            repair_prompt = trust_builder_comments.build_repair_prompt(
+                list(validation.get("errors") or ["quality_gate_failed"]),
+                expected_language,
+            )
+            repaired_text = await asyncio.to_thread(
+                chatgpt_worker.generate_trust_builder_comment,
+                chat_url,
+                repair_prompt,
+            )
+            try:
+                repaired_payload = trust_builder_comments.parse_comment_response(
+                    repaired_text
+                )
+                validation = trust_builder_comments.validate_comment_draft(
+                    repaired_payload,
+                    context,
+                    expected_language=expected_language,
+                    recent_comments=recent_comments,
+                )
+            except ValueError as exc:
+                validation = _failed_comment_validation(str(exc) or "invalid_json")
+    except Exception as exc:
+        logger.warning(
+            "Trust Builder ChatGPT generation deferred for %s: %s",
+            youtube_video_id,
+            security_logging.redact_sensitive(exc),
+        )
+        return {
+            "status": "deferred",
+            "skip_reason": "chatgpt_error",
+            "error_message": str(security_logging.redact_sensitive(exc)),
+            **base_detail,
+        }
+    finally:
+        chatgpt_runtime.finish_operation()
+
+    base_detail.update(
+        {
+            "quality_score": float(validation.get("quality_score") or 0.0),
+            "quality_checks": dict(validation.get("quality_checks") or {}),
+            "chat_url": chat_url,
+        }
+    )
+    if not validation.get("valid"):
+        return {
+            "status": "skipped",
+            "skip_reason": "quality_gate_failed:" + ",".join(
+                str(item) for item in (validation.get("errors") or [])
+            ),
+            **base_detail,
+        }
+    return {
+        "status": "ready",
+        "comment_text": str(validation.get("comment") or "").strip(),
+        **base_detail,
+    }
+
+
 def validate_plan_browser_configuration(plan: dict[str, Any]) -> str:
     """Return the dedicated proxied GPM profile id or raise a safe validation error."""
     channel_db_id = int(plan.get("channel_db_id") or 0)
@@ -536,6 +758,46 @@ def run_passive_readiness_check(
         "channel_record", "Kênh đã kết nối", "pass" if channel.get("channel_id") else "fail",
         "Đã có bản ghi kênh YouTube." if channel.get("channel_id") else "Không tìm thấy Channel ID.",
         required=True,
+    ))
+    comment_enabled = int(plan.get("daily_comment_target") or 0) > 0
+    mapped_prompts = trust_builder_comments.prompt_versions_for_channel(
+        str(plan.get("youtube_channel_ucid") or channel.get("channel_id") or "")
+    )
+    prompt_mapping_ok = not comment_enabled or len(mapped_prompts) == 1
+    mapping_detail = "Comment tự động đang tắt."
+    if comment_enabled:
+        if len(mapped_prompts) == 1:
+            mapping_detail = f"Đã map prompt: {mapped_prompts[0]}."
+        elif mapped_prompts:
+            mapping_detail = "Có nhiều prompt cùng map vào kênh; không thể chọn an toàn."
+        else:
+            mapping_detail = "Không có prompt nào map đúng Channel ID này."
+    channel_checks.append(_readiness_check(
+        "comment_prompt_mapping",
+        "Prompt riêng cho Trust Builder",
+        "pass" if prompt_mapping_ok else "fail",
+        mapping_detail,
+        required=comment_enabled,
+        action="Map đúng một prompt_version vào Channel ID",
+    ))
+    project_ok = not comment_enabled
+    project_detail = "Comment tự động đang tắt."
+    if comment_enabled and len(mapped_prompts) == 1:
+        try:
+            chatgpt_worker.get_chatgpt_project_url(mapped_prompts[0])
+            project_ok = True
+            project_detail = "Prompt đã có ChatGPT Project hợp lệ."
+        except Exception as exc:
+            project_detail = str(security_logging.redact_sensitive(exc))
+    elif comment_enabled:
+        project_detail = "Chưa thể xác minh Project khi ánh xạ prompt chưa duy nhất."
+    channel_checks.append(_readiness_check(
+        "comment_chatgpt_project",
+        "ChatGPT Project cho comment",
+        "pass" if project_ok else "fail",
+        project_detail,
+        required=comment_enabled,
+        action="Cấu hình ChatGPT Project URL cho prompt đã map",
     ))
     branding = plan.get("branding_checklist") or {}
     for field, label in (("avatar", "Ảnh đại diện"), ("banner", "Ảnh bìa"), ("about", "Mô tả kênh"), ("handle", "Handle")):
@@ -818,8 +1080,15 @@ async def run_warmup_session(
                         )
                     video_url = pick_res.get("url", "")
                     video_title = pick_res.get("title", "")
+                    try:
+                        youtube_video_id = extract_youtube_video_id(video_url)
+                    except ValueError as exc:
+                        raise RuntimeError(
+                            "Không thể xác định YouTube video ID từ video đã chọn."
+                        ) from exc
                     session_result["video_url"] = video_url
                     session_result["video_title"] = video_title
+                    session_result["youtube_video_id"] = youtube_video_id
                     if work_state["needs_search"]:
                         session_result["searched"] = True
                         db.create_trust_activity_log(
@@ -846,6 +1115,14 @@ async def run_warmup_session(
                         max_watch_seconds=max_watch_sec,
                         cancel_check=should_cancel,
                     )
+                    observed_video_id = str(
+                        watch_res.get("youtube_video_id")
+                        or await action_get_current_youtube_video_id(page)
+                    ).strip()
+                    if observed_video_id != youtube_video_id:
+                        raise RuntimeError(
+                            "YouTube video ID trên trang không khớp video đã chọn; dừng tương tác."
+                        )
                     session_result["watched"] = count_as_watch
 
                     db.create_trust_activity_log(
@@ -855,6 +1132,7 @@ async def run_warmup_session(
                         target_title=video_title,
                         duration_seconds=watch_res.get("watched_seconds", 0.0),
                         detail_json={
+                            "youtube_video_id": youtube_video_id,
                             "total_duration": watch_res.get("total_duration", 0.0),
                             "retention_pct": watch_res.get("retention_percentage", 0.0),
                         },
@@ -902,28 +1180,100 @@ async def run_warmup_session(
                     if warmup_phase == "phase_2_engage" and is_safe_engage and can_comment and not should_cancel():
                         daily_comment_target = int(plan.get("daily_comment_target") or 0)
                         if daily_stats.get("comment_count", 0) < daily_comment_target and work_state["pending"]["comment"]:
-                            comment_text = generate_contextual_comment(
-                                video_title,
-                                excluded_comments=used_comments,
-                                market_timezone=timezone_name,
+                            prepared_comment = await _prepare_grounded_comment(
+                                page=page,
+                                plan=plan,
+                                youtube_video_id=youtube_video_id,
+                                watch_result=watch_res,
+                                recent_comments=used_comments,
                             )
-                            raw_comment_result = (
-                                await action_comment_video(page, comment_text)
-                                if comment_text
-                                else {"status": "failed", "reason_code": "comment_template_missing", "message": "Không tạo được nội dung bình luận."}
-                            )
-                            comment_result = _record_engagement_result(
-                                plan_id=plan_id,
-                                action="comment",
-                                result=raw_comment_result,
-                                target_url=video_url,
-                                target_title=video_title,
-                                extra_detail={"comment_text": comment_text},
-                            )
-                            session_result["comment_status"] = comment_result["status"]
-                            session_result["comment_reason_code"] = comment_result["reason_code"]
-                            if comment_result["status"] == ACTION_PERFORMED:
-                                session_result["commented"] = True
+                            comment_detail = {
+                                key: prepared_comment.get(key)
+                                for key in (
+                                    "youtube_video_id",
+                                    "linked_video_id",
+                                    "chat_reused",
+                                    "context_source",
+                                    "prompt_version",
+                                    "quality_score",
+                                    "quality_checks",
+                                    "context_chars",
+                                )
+                            }
+                            if prepared_comment.get("status") != "ready":
+                                skip_reason = str(
+                                    prepared_comment.get("skip_reason")
+                                    or "comment_not_ready"
+                                )
+                                activity_type = (
+                                    "comment_deferred"
+                                    if prepared_comment.get("status") == "deferred"
+                                    else "comment_skipped"
+                                )
+                                db.create_trust_activity_log(
+                                    plan_id=plan_id,
+                                    activity_type=activity_type,
+                                    target_url=video_url,
+                                    target_title=video_title,
+                                    detail_json={
+                                        **comment_detail,
+                                        "skip_reason": skip_reason,
+                                    },
+                                    success=False,
+                                    error_message=str(
+                                        prepared_comment.get("error_message")
+                                        or skip_reason
+                                    ),
+                                )
+                                session_result["comment_status"] = activity_type
+                                session_result["comment_reason_code"] = skip_reason
+                                session_result.update(comment_detail)
+                            else:
+                                comment_text = str(
+                                    prepared_comment.get("comment_text") or ""
+                                ).strip()
+                                current_video_id = await action_get_current_youtube_video_id(
+                                    page
+                                )
+                                if current_video_id != youtube_video_id:
+                                    skip_reason = "video_id_changed_before_submit"
+                                    db.create_trust_activity_log(
+                                        plan_id=plan_id,
+                                        activity_type="comment_skipped",
+                                        target_url=video_url,
+                                        target_title=video_title,
+                                        detail_json={
+                                            **comment_detail,
+                                            "skip_reason": skip_reason,
+                                        },
+                                        success=False,
+                                        error_message=skip_reason,
+                                    )
+                                    session_result["comment_status"] = "comment_skipped"
+                                    session_result["comment_reason_code"] = skip_reason
+                                    session_result.update(comment_detail)
+                                else:
+                                    raw_comment_result = await action_comment_video(
+                                        page, comment_text
+                                    )
+                                    comment_result = _record_engagement_result(
+                                        plan_id=plan_id,
+                                        action="comment",
+                                        result=raw_comment_result,
+                                        target_url=video_url,
+                                        target_title=video_title,
+                                        extra_detail={
+                                            **comment_detail,
+                                            "comment_text": comment_text,
+                                        },
+                                    )
+                                    session_result.update(comment_detail)
+                                    session_result["comment_text"] = comment_text
+                                    session_result["comment_status"] = comment_result["status"]
+                                    session_result["comment_reason_code"] = comment_result["reason_code"]
+                                    if comment_result["status"] == ACTION_PERFORMED:
+                                        session_result["commented"] = True
+                                        used_comments.add(comment_text)
 
                     daily_stats = db.get_trust_daily_activity_stats(plan_id, timezone_name)
                     can_sub = not require_active or is_engagement_action_favorable("subscribe", persona, timezone_name)

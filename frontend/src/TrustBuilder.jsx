@@ -1162,6 +1162,17 @@ export default function TrustBuilder() {
                       const matchedChannel = log.detail_json?.matched_channel || ''
                       const actionStatus = log.detail_json?.status || ''
                       const reasonCode = log.detail_json?.reason_code || ''
+                      const videoId = log.detail_json?.youtube_video_id || ''
+                      const hasChatReuse = log.detail_json?.chat_reused !== undefined && log.detail_json?.chat_reused !== null
+                      const linkedVideoId = log.detail_json?.linked_video_id
+                      const promptVersion = log.detail_json?.prompt_version || ''
+                      const contextSource = log.detail_json?.context_source || ''
+                      const skipReason = log.detail_json?.skip_reason || ''
+                      const qualityScore = log.detail_json?.quality_score
+                      const qualityChecks = log.detail_json?.quality_checks || {}
+                      const passedChecks = Object.entries(qualityChecks)
+                        .filter(([, passed]) => passed)
+                        .map(([name]) => name)
                       return (
                         <div key={log.id} className={`activity-log-row ${log.success ? 'success' : 'failed'}`}>
                           <div className="activity-type-icon">{getActivityIcon(log.activity_type)}</div>
@@ -1171,6 +1182,29 @@ export default function TrustBuilder() {
                             </div>
                             {log.detail_json?.comment_text && (
                               <div className="activity-detail-comment">"{log.detail_json.comment_text}"</div>
+                            )}
+                            {videoId && (
+                              <div className="activity-detail-comment">
+                                Video ID: {videoId}
+                                {linkedVideoId ? ` · Video nội bộ: ${linkedVideoId}` : ''}
+                                {hasChatReuse ? ` · Chat: ${log.detail_json.chat_reused ? 'tái sử dụng' : 'tạo riêng'}` : ''}
+                              </div>
+                            )}
+                            {(promptVersion || contextSource) && (
+                              <div className="activity-detail-comment">
+                                {promptVersion ? `Prompt: ${promptVersion}` : ''}
+                                {promptVersion && contextSource ? ' · ' : ''}
+                                {contextSource ? `Nguồn: ${contextSource}` : ''}
+                              </div>
+                            )}
+                            {qualityScore !== undefined && qualityScore !== null && (
+                              <div className="activity-detail-comment">
+                                Quality: {Math.round(Number(qualityScore) * 100)}%
+                                {passedChecks.length ? ` · Đạt: ${passedChecks.join(', ')}` : ''}
+                              </div>
+                            )}
+                            {skipReason && (
+                              <div className="activity-detail-error">Bỏ qua: {skipReason}</div>
                             )}
                             {actionStatus && (
                               <div className={log.success ? 'activity-detail-comment' : 'activity-detail-error'}>

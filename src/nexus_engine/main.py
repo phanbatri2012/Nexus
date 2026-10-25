@@ -66,6 +66,7 @@ from nexus_engine.services.chatgpt_runtime import (
     ChatGPTAttentionRequiredError,
     ChatGPTPreSendTransientError,
 )
+from nexus_engine.services import chatgpt_runtime as shared_chatgpt_runtime
 from nexus_engine.services.chatgpt_worker import sanitize_generated_script
 from nexus_engine.services import process_registry
 from nexus_engine.services.system_cleaner import cleaner as system_cleaner
@@ -165,11 +166,6 @@ _youtube_oauth_states: dict[str, dict] = {}
 _youtube_oauth_states_lock = threading.Lock()
 _prompts_config_lock = threading.Lock()
 _tts_config_lock = threading.Lock()
-_chatgpt_profile_lock = threading.Lock()
-_chatgpt_state_lock = threading.Lock()
-_chatgpt_operation = ""
-_chatgpt_prompt_version = ""
-_chatgpt_video_id: int | None = None
 CHATGPT_BUSY_ERROR = (
     "ChatGPT đang bận với tác vụ khác. Hãy đợi tác vụ hiện tại hoàn tất."
 )
@@ -294,23 +290,18 @@ def _try_start_chatgpt_operation(
     prompt_version: str = "",
     video_id: int | None = None,
 ) -> bool:
-    global _chatgpt_operation, _chatgpt_prompt_version, _chatgpt_video_id
-    if not _chatgpt_profile_lock.acquire(blocking=False):
-        return False
-    with _chatgpt_state_lock:
-        _chatgpt_operation = operation
-        _chatgpt_prompt_version = str(prompt_version or "").strip()
-        _chatgpt_video_id = int(video_id) if video_id is not None else None
-    return True
+    return shared_chatgpt_runtime.try_start_operation(
+        operation,
+        prompt_version,
+        video_id,
+    )
 
 
 def _finish_chatgpt_operation() -> None:
-    global _chatgpt_operation, _chatgpt_prompt_version, _chatgpt_video_id
-    with _chatgpt_state_lock:
-        _chatgpt_operation = ""
-        _chatgpt_prompt_version = ""
-        _chatgpt_video_id = None
-    _chatgpt_profile_lock.release()
+    shared_chatgpt_runtime.finish_operation()
+
+
+def _wake_chatgpt_dependent_queues() -> None:
     queue_kicker = globals().get("_kick_video_queue")
     if queue_kicker:
         queue_kicker()
@@ -319,25 +310,23 @@ def _finish_chatgpt_operation() -> None:
         comment_queue_kicker()
 
 
+shared_chatgpt_runtime.set_finish_callback(_wake_chatgpt_dependent_queues)
+
+
 def _get_chatgpt_operation() -> str:
-    with _chatgpt_state_lock:
-        return _chatgpt_operation
+    return shared_chatgpt_runtime.get_operation()
 
 
 def _get_chatgpt_state() -> tuple[str, str]:
-    with _chatgpt_state_lock:
-        return _chatgpt_operation, _chatgpt_prompt_version
+    return shared_chatgpt_runtime.get_state()
 
 
 def _set_chatgpt_video_id(video_id: int) -> None:
-    global _chatgpt_video_id
-    with _chatgpt_state_lock:
-        _chatgpt_video_id = int(video_id)
+    shared_chatgpt_runtime.set_video_id(video_id)
 
 
 def _get_chatgpt_video_id() -> int | None:
-    with _chatgpt_state_lock:
-        return _chatgpt_video_id
+    return shared_chatgpt_runtime.get_video_id()
 
 class AccountData(BaseModel):
     email: str = ""
@@ -9863,7 +9852,7 @@ def _drain_video_queue() -> None:
             _video_queue_worker_active = False
         if (
             not blocked_by_chatgpt
-            and not _chatgpt_profile_lock.locked()
+            and not shared_chatgpt_runtime.is_busy()
         ):
             if db.has_claimable_system_jobs("video_generation"):
                 _kick_video_queue()
@@ -11992,7 +11981,7 @@ def get_job(job_id: str):
 def get_chatgpt_status():
     operation, prompt_version = _get_chatgpt_state()
     status = {
-        "busy": _chatgpt_profile_lock.locked(),
+        "busy": shared_chatgpt_runtime.is_busy(),
         "operation": operation,
         "prompt_version": prompt_version,
     }
@@ -14103,7 +14092,7 @@ def _get_active_prompt_version_id() -> str:
 
 def _get_locked_prompt_version() -> str:
     _, prompt_version = _get_chatgpt_state()
-    return prompt_version if _chatgpt_profile_lock.locked() else ""
+    return prompt_version if shared_chatgpt_runtime.is_busy() else ""
 
 
 def _assert_prompt_version_editable(version_id: str) -> None:
