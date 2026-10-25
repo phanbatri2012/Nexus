@@ -1,0 +1,448 @@
+.muse-page {
+  max-width: 1600px;
+  width: 100%;
+  color: #eee;
+  padding-bottom: 40px;
+}
+
+.muse-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.muse-heading h1 {
+  margin: 0;
+  font-size: 2.1rem;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.muse-heading p {
+  margin: 4px 0 0 0;
+  color: #9aa0ad;
+  font-size: 0.95rem;
+}
+
+/* Service Control Header */
+.muse-control-bar {
+  border: 1px solid #334155;
+  border-radius: 14px;
+  background: #141722;
+  padding: 18px 22px;
+  margin-bottom: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+}
+
+.muse-control-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+
+.muse-status-container {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.muse-status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  font-size: 0.88rem;
+  font-weight: 600;
+  border: 1px solid transparent;
+}
+
+.muse-status-badge.online {
+  background: rgba(34, 197, 94, 0.15);
+  color: #4ade80;
+  border-color: rgba(34, 197, 94, 0.35);
+}
+
+.muse-status-badge.stopped {
+  background: rgba(239, 68, 68, 0.15);
+  color: #f87171;
+  border-color: rgba(239, 68, 68, 0.35);
+}
+
+.muse-status-badge.busy {
+  background: rgba(234, 179, 8, 0.15);
+  color: #fde047;
+  border-color: rgba(234, 179, 8, 0.35);
+}
+
+.muse-status-badge.starting {
+  background: rgba(59, 130, 246, 0.15);
+  color: #60a5fa;
+  border-color: rgba(59, 130, 246, 0.35);
+}
+
+.muse-status-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.muse-status-badge.online .muse-status-dot { background: #22c55e; box-shadow: 0 0 8px #22c55e; }
+.muse-status-badge.stopped .muse-status-dot { background: #ef4444; }
+.muse-status-badge.busy .muse-status-dot { background: #eab308; box-shadow: 0 0 8px #eab308; }
+.muse-status-badge.starting .muse-status-dot { background: #3b82f6; box-shadow: 0 0 8px #3b82f6; }
+
+.muse-btn-group {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.muse-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 16px;
+  border-radius: 8px;
+  font-size: 0.88rem;
+  font-weight: 600;
+  border: 1px solid #475569;
+  background: #1e293b;
+  color: #f1f5f9;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.muse-btn:hover:not(:disabled) {
+  border-color: #94a3b8;
+  background: #334155;
+  transform: translateY(-1px);
+}
+
+.muse-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.muse-btn.primary {
+  background: #2563eb;
+  border-color: #3b82f6;
+  color: #fff;
+}
+.muse-btn.primary:hover:not(:disabled) {
+  background: #1d4ed8;
+  border-color: #60a5fa;
+}
+
+.muse-btn.success {
+  background: #15803d;
+  border-color: #22c55e;
+  color: #fff;
+}
+.muse-btn.success:hover:not(:disabled) {
+  background: #166534;
+  border-color: #4ade80;
+}
+
+.muse-btn.danger {
+  background: #b91c1c;
+  border-color: #ef4444;
+  color: #fff;
+}
+.muse-btn.danger:hover:not(:disabled) {
+  background: #991b1b;
+  border-color: #f87171;
+}
+
+.muse-btn.warning {
+  background: #b45309;
+  border-color: #f59e0b;
+  color: #fff;
+}
+.muse-btn.warning:hover:not(:disabled) {
+  background: #92400e;
+  border-color: #fbbf24;
+}
+
+.muse-metrics-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 20px;
+  padding-top: 12px;
+  border-top: 1px solid #1e293b;
+  font-size: 0.85rem;
+  color: #94a3b8;
+}
+
+.muse-metric-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.muse-metric-item strong {
+  color: #e2e8f0;
+}
+
+/* Tabs Navigation */
+.muse-nav-tabs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 2px solid #27273a;
+  margin-bottom: 22px;
+}
+
+.muse-tab-btn {
+  padding: 10px 18px;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #94a3b8;
+  background: transparent;
+  border: none;
+  border-bottom: 3px solid transparent;
+  cursor: pointer;
+  margin-bottom: -2px;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.muse-tab-btn:hover {
+  color: #f1f5f9;
+}
+
+.muse-tab-btn.active {
+  color: #a78bfa;
+  border-bottom-color: #8b5cf6;
+}
+
+/* Card & Content Styles */
+.muse-card {
+  border: 1px solid #334155;
+  border-radius: 14px;
+  background: #141722;
+  padding: 20px;
+  margin-bottom: 20px;
+}
+
+.muse-card-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.muse-card-title h2 {
+  margin: 0;
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: #f8fafc;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Reference Set Styles */
+.muse-refset-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 16px;
+}
+
+.muse-refset-card {
+  border: 1px solid #334155;
+  border-radius: 12px;
+  background: #0f172a;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.muse-refset-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.muse-refset-name-input {
+  width: 100%;
+  font-weight: 600;
+  font-size: 1rem;
+  background: #1e293b;
+  border: 1px solid #475569;
+  border-radius: 6px;
+  padding: 6px 10px;
+  color: #f8fafc;
+}
+
+.muse-refset-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.muse-refset-field label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #94a3b8;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.muse-refset-field input, .muse-refset-field textarea {
+  background: #1e293b;
+  border: 1px solid #475569;
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: #f1f5f9;
+  font-family: inherit;
+  font-size: 0.9rem;
+}
+
+/* Accounts Table */
+.muse-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+}
+
+.muse-table th {
+  padding: 12px 16px;
+  background: #1e293b;
+  color: #94a3b8;
+  font-size: 0.85rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  border-bottom: 2px solid #334155;
+}
+
+.muse-table td {
+  padding: 12px 16px;
+  border-bottom: 1px solid #1e293b;
+  font-size: 0.9rem;
+}
+
+.muse-table tr:hover td {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.muse-pill {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.muse-pill.active {
+  background: rgba(34, 197, 94, 0.15);
+  color: #4ade80;
+}
+
+.muse-pill.expired {
+  background: rgba(239, 68, 68, 0.15);
+  color: #f87171;
+}
+
+/* Gallery Grid */
+.muse-gallery-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 16px;
+}
+
+.muse-gallery-item {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid #334155;
+  background: #0b0f19;
+  cursor: pointer;
+  transition: transform 0.2s ease, border-color 0.2s ease;
+}
+
+.muse-gallery-item:hover {
+  transform: scale(1.02);
+  border-color: #8b5cf6;
+}
+
+.muse-gallery-thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.muse-gallery-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  background: rgba(0, 0, 0, 0.7);
+  color: #fff;
+  text-transform: uppercase;
+}
+
+.muse-gallery-name {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 6px 8px;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.85));
+  font-size: 0.75rem;
+  color: #cbd5e1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Notification & Status Messages */
+.muse-notice {
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 0.9rem;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.muse-notice.info {
+  background: rgba(59, 130, 246, 0.15);
+  border: 1px solid rgba(59, 130, 246, 0.3);
+  color: #93c5fd;
+}
+
+.muse-notice.error {
+  background: rgba(239, 68, 68, 0.15);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  color: #fca5a5;
+}
+
+.muse-notice.success {
+  background: rgba(34, 197, 94, 0.15);
+  border: 1px solid rgba(34, 197, 94, 0.3);
+  color: #86efac;
+}

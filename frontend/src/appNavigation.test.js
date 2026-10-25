@@ -214,3 +214,15 @@ test('wires Trust Builder into navigation and view rendering', async () => {
   assert.match(trustSource, /import\s*\{\s*extractErrorMessage\s*\}\s*from\s*['"]\.\/apiError['"]/)
   assert.match(trustSource, /Trust Builder/)
 })
+
+test('wires Muse AI Studio into navigation and view rendering', async () => {
+  const appSource = await readFile(new URL('./App.jsx', import.meta.url), 'utf8')
+
+  assert.match(
+    appSource,
+    /import MuseStudio from ['"]\.\/MuseStudio['"]/
+  )
+  assert.match(appSource, /activeView === ['"]muse['"]/)
+  assert.match(appSource, />Muse AI Studio<\/li>/)
+  assert.match(appSource, /<MuseStudio\s*\/>/)
+})

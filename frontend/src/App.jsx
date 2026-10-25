@@ -14,6 +14,7 @@ import VideoGenerationProgressCard from './VideoGenerationProgressCard'
 import YouTubeDownloader from './YouTubeDownloader'
 import YouTubeComments from './YouTubeComments'
 import TTSSettings from './TTSSettings'
+import MuseStudio from './MuseStudio'
 import CrossPoster from './CrossPoster'
 import TrustBuilder from './TrustBuilder'
 import CompetitorRadar from './CompetitorRadar'
@@ -2013,6 +2014,11 @@ function App() {
             onClick={() => setActiveView('tts')}
           >Giọng đọc &amp; TTS</li>
           <li
+            className={`nav-item ${activeView === 'muse' ? 'active' : ''}`}
+            data-view="muse"
+            onClick={() => setActiveView('muse')}
+          >Muse AI Studio</li>
+          <li
             className={`nav-item ${activeView === 'settings' ? 'active' : ''}`}
             data-view="settings"
             onClick={() => setActiveView('settings')}
@@ -2061,6 +2067,8 @@ function App() {
             <GoogleFlowLogin />
           ) : activeView === 'tts' ? (
             <TTSSettings />
+          ) : activeView === 'muse' ? (
+            <MuseStudio />
           ) : activeView === 'channels' ? (
             <ChannelManager />
           ) : activeView === 'competitors' ? (

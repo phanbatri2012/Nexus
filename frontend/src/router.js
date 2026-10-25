@@ -85,6 +85,12 @@ export const ROUTE_REGISTRY = {
     aliases: ['/tts', '/tts-settings', '/giong-doc-tts', '/omnivoice'],
     title: 'Giọng đọc & TTS'
   },
+  muse: {
+    id: 'muse',
+    canonicalPath: '/muse',
+    aliases: ['/muse', '/muse-studio', '/muse-ai', '/visual-studio'],
+    title: 'Muse AI Studio'
+  },
   settings: {
     id: 'settings',
     canonicalPath: '/settings',

@@ -9,10 +9,10 @@ import {
   stringifyQueryParams
 } from './router.js'
 
-test('registers all 13 primary modules in ROUTE_REGISTRY', () => {
+test('registers all 14 primary modules in ROUTE_REGISTRY', () => {
   const expectedKeys = [
     'dashboard', 'jobs', 'competitors', 'comments', 'channels', 'trustbuilder', 'crossposter',
-    'fetcher', 'downloader', 'autologin', 'flowlogin', 'tts', 'settings'
+    'fetcher', 'downloader', 'autologin', 'flowlogin', 'tts', 'muse', 'settings'
   ]
   for (const key of expectedKeys) {
     assert.ok(ROUTE_REGISTRY[key], `Missing registry entry for ${key}`)
@@ -38,7 +38,7 @@ test('parses query strings and formats them back reliably', () => {
   assert.equal(formatted, '?status=failed&limit=10')
 })
 
-test('parses primary routes across all 13 menus correctly', () => {
+test('parses primary routes across all 14 menus correctly', () => {
   const expectedMappings = [
     { url: '/', viewId: 'dashboard' },
     { url: '/dashboard', viewId: 'dashboard' },
@@ -63,6 +63,8 @@ test('parses primary routes across all 13 menus correctly', () => {
     { url: '/flowlogin', viewId: 'flowlogin' },
     { url: '/google-flow', viewId: 'flowlogin' },
     { url: '/tts', viewId: 'tts' },
+    { url: '/muse', viewId: 'muse' },
+    { url: '/muse-studio', viewId: 'muse' },
     { url: '/settings', viewId: 'settings' }
   ]
 

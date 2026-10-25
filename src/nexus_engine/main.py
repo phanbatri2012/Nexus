@@ -1484,6 +1484,150 @@ async def verify_muse_service_endpoint():
         raise _muse_http_exception(503, exc) from exc
 
 
+@app.post("/api/muse/service/start")
+def start_muse_service_endpoint():
+    try:
+        service_status = muse_studio_service.manual_start_service()
+        return _muse_json_response({"success": True, "service": service_status})
+    except muse_studio_service.MuseStudioConfigurationError as exc:
+        raise _muse_http_exception(400, exc) from exc
+    except muse_studio_service.MuseStudioServiceBusy as exc:
+        raise _muse_http_exception(409, exc) from exc
+    except Exception as exc:
+        raise _muse_http_exception(503, exc) from exc
+
+
+@app.post("/api/muse/service/stop")
+def stop_muse_service_endpoint():
+    try:
+        service_status = muse_studio_service.manual_stop_service()
+        return _muse_json_response({"success": True, "service": service_status})
+    except Exception as exc:
+        raise _muse_http_exception(503, exc) from exc
+
+
+@app.post("/api/muse/service/restart")
+def restart_muse_service_endpoint():
+    try:
+        service_status = muse_studio_service.manual_restart_service()
+        return _muse_json_response({"success": True, "service": service_status})
+    except muse_studio_service.MuseStudioConfigurationError as exc:
+        raise _muse_http_exception(400, exc) from exc
+    except muse_studio_service.MuseStudioServiceBusy as exc:
+        raise _muse_http_exception(409, exc) from exc
+    except Exception as exc:
+        raise _muse_http_exception(503, exc) from exc
+
+
+@app.get("/api/muse/accounts")
+def get_muse_accounts_endpoint():
+    try:
+        settings = muse_settings.load_muse_settings()
+        configured = str(settings.get("muse_studio_path") or "").strip()
+        if not configured:
+            return _muse_json_response({"items": []})
+        studio_path = Path(configured).expanduser().resolve()
+        data_dir = muse_studio_service._studio_data_dir(studio_path)
+        accounts_file = data_dir / "accounts.json"
+        if not accounts_file.is_file():
+            return _muse_json_response({"items": []})
+        raw = json.loads(accounts_file.read_text(encoding="utf-8"))
+        if not isinstance(raw, list):
+            return _muse_json_response({"items": []})
+        # Sanitize: Rule 8 Credential Security - NEVER return raw cookies!
+        sanitized = []
+        now = time.time()
+        for acc in raw:
+            if not isinstance(acc, dict):
+                continue
+            cookies = acc.get("cookies") if isinstance(acc.get("cookies"), dict) else {}
+            cookies_exp = acc.get("cookies_exp") if isinstance(acc.get("cookies_exp"), dict) else {}
+            min_exp = None
+            for exp in cookies_exp.values():
+                try:
+                    exp_float = float(exp)
+                    if min_exp is None or exp_float < min_exp:
+                        min_exp = exp_float
+                except (ValueError, TypeError):
+                    pass
+            is_expired = bool(min_exp is not None and min_exp < now)
+            sanitized.append({
+                "id": str(acc.get("id") or ""),
+                "label": str(acc.get("label") or ""),
+                "cookie_count": len(cookies),
+                "is_expired": is_expired,
+                "expires_at": min_exp,
+            })
+        return _muse_json_response({"items": sanitized})
+    except Exception as exc:
+        logger.warning("Không thể lấy danh sách tài khoản Muse: %s", exc)
+        return _muse_json_response({"items": []})
+
+
+@app.get("/api/muse/media")
+def list_muse_media_endpoint():
+    try:
+        settings = muse_settings.load_muse_settings()
+        configured = str(settings.get("muse_studio_path") or "").strip()
+        if not configured:
+            return _muse_json_response({"items": []})
+        studio_path = Path(configured).expanduser().resolve()
+        data_dir = muse_studio_service._studio_data_dir(studio_path)
+        media_dir = data_dir / "media"
+        if not media_dir.is_dir():
+            return _muse_json_response({"items": []})
+        items = []
+        for file in sorted(media_dir.iterdir(), key=lambda f: f.stat().st_mtime if f.is_file() else 0, reverse=True):
+            if not file.is_file():
+                continue
+            ext = file.suffix.lower()
+            if ext in {".png", ".jpg", ".jpeg", ".webp"}:
+                media_type = "image"
+            elif ext in {".mp4", ".webm", ".mov"}:
+                media_type = "video"
+            else:
+                continue
+            stat = file.stat()
+            items.append({
+                "filename": file.name,
+                "type": media_type,
+                "size_bytes": stat.st_size,
+                "mtime": stat.st_mtime,
+                "url": f"/api/muse/media/{file.name}",
+            })
+            if len(items) >= 100:
+                break
+        return _muse_json_response({"items": items})
+    except Exception as exc:
+        logger.warning("Không thể liệt kê media Muse: %s", exc)
+        return _muse_json_response({"items": []})
+
+
+@app.get("/api/muse/media/{filename}")
+def get_muse_media_file_endpoint(filename: str):
+    settings = muse_settings.load_muse_settings()
+    configured = str(settings.get("muse_studio_path") or "").strip()
+    if not configured:
+        raise HTTPException(status_code=404, detail="Muse Studio path chưa được cấu hình.")
+    studio_path = Path(configured).expanduser().resolve()
+    data_dir = muse_studio_service._studio_data_dir(studio_path)
+    safe_name = Path(filename).name
+    file_path = (data_dir / "media" / safe_name).resolve()
+    if not file_path.is_file() or not str(file_path).startswith(str((data_dir / "media").resolve())):
+        raise HTTPException(status_code=404, detail="File media không tồn tại.")
+    ext = file_path.suffix.lower()
+    media_types = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".mp4": "video/mp4",
+        ".webm": "video/webm",
+    }
+    return FileResponse(str(file_path), media_type=media_types.get(ext, "application/octet-stream"))
+
+
+
 @app.get("/api/gpm/profiles")
 def list_gpm_profiles_endpoint(
     search: str = Query("", description="Tìm theo tên profile"),

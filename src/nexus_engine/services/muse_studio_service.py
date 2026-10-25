@@ -822,12 +822,14 @@ def status(*, probe: bool = False) -> dict:
         process = _process
         running = bool(process is not None and process.poll() is None)
         owned = running and bool(_api_key)
+        pid = int(process.pid) if running and process is not None else 0
     release_status = task_recovery_release_status()
     result = {
         "configured": False,
         "studio_path": configured_path,
         "running": running,
         "owned": owned,
+        "pid": pid,
         "api_ready": False,
         "accounts": 0,
         "browser_running": False,
@@ -1007,3 +1009,26 @@ def open_studio() -> dict:
 
 def shutdown_muse_resources() -> None:
     shutdown_owned_service()
+
+
+def manual_start_service(*, timeout_seconds: float = 20.0) -> dict:
+    """Manually start Muse2API service without an idle timeout."""
+    ensure_started(timeout_seconds=timeout_seconds)
+    _cancel_idle_timer()
+    return status(probe=True)
+
+
+def manual_stop_service() -> dict:
+    """Manually stop the owned Muse2API service."""
+    shutdown_owned_service()
+    return status(probe=False)
+
+
+def manual_restart_service(*, timeout_seconds: float = 20.0) -> dict:
+    """Manually restart the owned Muse2API service cleanly."""
+    shutdown_owned_service()
+    time.sleep(1.0)
+    ensure_started(timeout_seconds=timeout_seconds)
+    _cancel_idle_timer()
+    return status(probe=True)
+
