@@ -6688,12 +6688,16 @@ def get_latest_video_artifact(
     if status:
         filters.append("status = ?")
         params.append(status)
-    row = conn.execute(
-        f"SELECT * FROM video_artifacts WHERE {' AND '.join(filters)} "
-        "ORDER BY updated_at DESC, id DESC LIMIT 1",
-        params,
-    ).fetchone()
-    conn.close()
+    try:
+        row = conn.execute(
+            f"SELECT * FROM video_artifacts WHERE {' AND '.join(filters)} "
+            "ORDER BY updated_at DESC, id DESC LIMIT 1",
+            params,
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    finally:
+        conn.close()
     return _decode_video_artifact(row)
 
 
@@ -6718,6 +6722,8 @@ def list_latest_video_artifacts(
             "ORDER BY artifact_type, updated_at DESC, id DESC",
             params,
         ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
     finally:
         conn.close()
 

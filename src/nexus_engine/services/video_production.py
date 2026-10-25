@@ -2712,7 +2712,10 @@ def generate_scene_media(
     """Advance one bounded Flow scheduling pass and return once all media is ready."""
     settings = settings or {}
     enable_intro_video = bool(settings.get("enable_intro_video", True))
-    existing_final = db.get_latest_video_artifact(video_id, "final_mp4", status="ready")
+    try:
+        existing_final = db.get_latest_video_artifact(video_id, "final_mp4", status="ready")
+    except Exception:
+        existing_final = None
     if existing_final and Path(existing_final.get("path") or "").is_file():
         logger.info("Video %s đã có final_mp4 hoàn tất; bỏ qua generate_scene_media.", video_id)
         return {
@@ -5119,7 +5122,10 @@ def prepare_google_flow_media(
     force_new_flow_project: bool = False,
     flow_video_pending_since: str = "",
 ) -> dict:
-    existing_final = db.get_latest_video_artifact(video_id, "final_mp4", status="ready")
+    try:
+        existing_final = db.get_latest_video_artifact(video_id, "final_mp4", status="ready")
+    except Exception:
+        existing_final = None
     if existing_final and Path(existing_final.get("path") or "").is_file():
         logger.info(
             "Video %s đã có final_mp4 hoàn tất; bỏ qua prepare_google_flow_media.",

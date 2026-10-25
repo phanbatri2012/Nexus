@@ -51,6 +51,29 @@ class TestIntroVideoSummary(unittest.TestCase):
                 ),
             ),
             patch.object(video_production, "cleanup_duplicate_scene_artifacts"),
+            patch.object(
+                video_production,
+                "_validate_image_file",
+                side_effect=lambda p: video_production.ValidatedImageArtifact(
+                    path=Path(p),
+                    sha256=f"hash-{Path(p).name}",
+                    fingerprint=12345,
+                    size_bytes=1000,
+                    mtime_ns=1000,
+                    width=1920,
+                    height=1080,
+                ),
+            ),
+            patch.object(
+                Path,
+                "is_file",
+                return_value=True,
+            ),
+            patch.object(
+                Path,
+                "stat",
+                return_value=type("Stat", (), {"st_size": 1000, "st_mtime_ns": 1000})(),
+            ),
         ):
             result = video_production.generate_scene_media(
                 video_id=305,
