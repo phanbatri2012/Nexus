@@ -2452,12 +2452,6 @@ async def _generate_scene_video_async(
                 )
             except (TypeError, ValueError):
                 baseline_tile_count = None
-            if pending_expired:
-                await _best_effort_cancel_flow_request(worker, request_key)
-                raise FlowVideoWaitExpired(
-                    f"Google Flow không cung cấp video tải xuống cho scene {scene.get('index')} "
-                    f"trước khi hết thời hạn đối soát {max_wait_seconds:.0f} giây."
-                )
             video_url = await worker.generate_scene_video(
                 prompt=video_prompt,
                 avoid_prompt=negative_prompt,
@@ -3364,8 +3358,8 @@ def generate_scene_media(
                         )
                         flow_video_credit_exhausted = True
                         progress(
-                            "Google Flow đã xác nhận hết credit video; "
-                            "chuyển các cảnh video còn lại sang dùng ảnh",
+                            "Google Flow đã hết credit video; "
+                            "chuyển các cảnh video còn lại sang dùng ảnh tĩnh",
                             "flow_video_credit_exhausted",
                         )
                     is_system_unsupported = isinstance(
@@ -3426,6 +3420,47 @@ def generate_scene_media(
                             },
                         )
             summary["fallback_count"] = len(summary["fallback_scenes"])
+            MAX_RECONCILE_POLLS = 5
+            expired_poll_videos = [
+                item for item in list(pending_videos)
+                if int(item.get("reconciliation_poll_count") or 0) >= MAX_RECONCILE_POLLS
+            ]
+            if expired_poll_videos:
+                logger.info(
+                    "Đã đạt giới hạn đối soát (%d lần) cho %d video; chốt fallback sang ảnh tĩnh để hoàn tất media.",
+                    MAX_RECONCILE_POLLS,
+                    len(expired_poll_videos),
+                )
+                for item in expired_poll_videos:
+                    s_idx = int(item["scene_index"])
+                    if not any(f.get("scene_index") == s_idx for f in summary["fallback_scenes"]):
+                        summary["fallback_scenes"].append(
+                            {
+                                "scene_index": s_idx,
+                                "failure_stage": "reconciliation_timeout",
+                                "reason_code": "flow_video_poll_limit_fallback",
+                            }
+                        )
+                    if item in pending_videos:
+                        pending_videos.remove(item)
+                    video_artifact_type = f"scene_video:{s_idx}"
+                    video_art = artifact_snapshot.get(video_artifact_type)
+                    if video_art and video_art.get("status") in {"queued", "retry_wait", "processing"}:
+                        artifact_snapshot[video_artifact_type] = db.upsert_video_artifact(
+                            video_id=video_id,
+                            artifact_type=video_artifact_type,
+                            path=str(video_art.get("path") or ""),
+                            content_hash=str(video_art.get("content_hash") or ""),
+                            status="failed",
+                            mime_type="video/mp4",
+                            metadata={
+                                **(video_art.get("metadata") or {}),
+                                "failure_stage": "reconciliation_timeout",
+                                "reason_code": "flow_video_poll_limit_fallback",
+                                "terminal": True,
+                            },
+                        )
+                summary["fallback_count"] = len(summary["fallback_scenes"])
             emit_progress(
                 base_image_paths,
                 video_paths,

@@ -6448,26 +6448,17 @@ def _execute_flow_media_generation_job(job: dict) -> None:
         ),
     )
     _raise_if_video_job_canceled(job["id"])
-    render_job, _ = _enqueue_video_render_job(
-        video_id=video_id,
-        snapshot=snapshot,
-        mode=str(payload.get("mode") or "resume"),
-        source_media_job_id=job["id"],
-    )
-    result = {
-        **result,
-        "render_job_id": render_job["id"],
-    }
     intro_summary = result.get("intro_video_summary") or {}
     fallback_count = int(intro_summary.get("fallback_count") or 0)
-    completed_progress = "Media Google Flow đã sẵn sàng; đã chuyển sang hàng đợi MP4"
+    completed_progress = "Media Google Flow đã hoàn tất; chuyển sang hàng đợi dựng MP4"
     if fallback_count:
         completed_progress = (
-            "Media Google Flow đã sẵn sàng; "
+            "Media Google Flow đã hoàn tất: "
             f"Intro {int(intro_summary.get('generated_count') or 0)}/"
             f"{int(intro_summary.get('requested_count') or 0)} clip; "
-            f"{fallback_count} cảnh dùng ảnh tĩnh; đã chuyển sang hàng đợi MP4"
+            f"{fallback_count} cảnh dùng ảnh tĩnh; chuyển sang hàng đợi dựng MP4"
         )
+    # Hoan tat dứt điểm job Media truoc
     db.update_system_job(
         job["id"],
         status="completed",
@@ -6475,6 +6466,15 @@ def _execute_flow_media_generation_job(job: dict) -> None:
         result_json=result,
         finished_at=db.utc_now(),
     )
+    # Chi enqueue render sau khi job media da completed
+    render_job, _ = _enqueue_video_render_job(
+        video_id=video_id,
+        snapshot=snapshot,
+        mode=str(payload.get("mode") or "resume"),
+        source_media_job_id=job["id"],
+    )
+    result["render_job_id"] = render_job["id"]
+    db.update_system_job(job["id"], result_json=result)
     db.update_video_production_state(
         video_id,
         render_status="queued",
@@ -7005,6 +7005,28 @@ def _execute_video_render_job(job: dict) -> None:
 
     payload = job.get("payload") or {}
     video_id = int(job.get("video_id") or payload.get("video_id") or 0)
+
+    # STRICT GUARD: Khong bao gio cho phep render MP4 neu job tao media tien nhiem chua completed
+    if video_id:
+        active_media_jobs = [
+            j for j in db.list_system_jobs(video_id=video_id, limit=None)
+            if j.get("job_type") in {"flow_media_generation", "muse_media_generation"}
+            and j.get("id") != job.get("id")
+            and j.get("status") in {"running", "queued", "retry_wait", "paused"}
+        ]
+        if active_media_jobs:
+            logger.warning(
+                "video_render job %s paused because prerequisite media job %s is not completed yet (%s)",
+                job.get("id"),
+                active_media_jobs[0].get("id"),
+                active_media_jobs[0].get("status"),
+            )
+            db.update_system_job(
+                job["id"],
+                status="paused",
+                progress="Tam dung: Cho tac vu tao media hoan tat truoc khi dung MP4.",
+            )
+            return
     snapshot = payload.get("snapshot") or _get_prompt_production_snapshot(
         job.get("prompt_version") or ""
     )

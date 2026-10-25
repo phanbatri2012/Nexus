@@ -288,6 +288,11 @@ def _is_valid_flow_error_text(text: str) -> bool:
     ignored_keywords = [
         "ban muon tao gi",
         "keyboard_return",
+        "play_circle",
+        "play_arrow",
+        "favorite",
+        "more_vert",
+        "redo",
         "avoid:",
         "cinematic",
         "narrative scene",
@@ -3583,12 +3588,17 @@ class GoogleFlowWorker:
             return 0
 
     async def _get_video_error_texts_since(self, first_tile_index: int) -> list[str]:
-        """Return errors only from video tiles created for the current request."""
+        """Return errors only from error containers inside video tiles created for the current request."""
         errors: list[str] = []
         try:
-            tiles = self.page.locator("flow-video-tile")
+            tiles = self.page.locator(
+                "flow-video-tile flow-error-tile, "
+                "flow-video-tile .error-tile, "
+                "flow-video-tile [data-tile-state='error'], "
+                "flow-video-tile [role='alert']"
+            )
             tile_count = await tiles.count()
-            for index in range(max(0, int(first_tile_index)), min(tile_count, 100)):
+            for index in range(min(tile_count, 100)):
                 text = (await tiles.nth(index).inner_text() or "").strip()
                 if text and _is_valid_flow_error_text(text):
                     errors.append(text)
