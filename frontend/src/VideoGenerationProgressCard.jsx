@@ -164,6 +164,7 @@ export default function VideoGenerationProgressCard({
   }
 
   const stageInfo = resolveJobStage(currentJob)
+  const currentDisplayStatus = currentJob?.display_status || currentJob?.status || ''
   const museWaitReason = currentJob?.muse_recovery?.wait_reason || ''
   const musePortConflict = currentJob?.type === 'muse_media_generation' && (
     museWaitReason === 'service_busy'
@@ -199,15 +200,15 @@ export default function VideoGenerationProgressCard({
       {/* Header Bar */}
       <div className="vg-hud-header">
         <div className="vg-hud-title-group">
-          <span className={`vg-live-badge status-${currentJob.status}`}>
+          <span className={`vg-live-badge status-${currentDisplayStatus}`}>
             <span className="vg-live-dot" />
-            {currentJob.status === 'running'
+            {currentDisplayStatus === 'running'
               ? 'LIVE PRODUCTION'
-              : currentJob.status === 'retry_wait'
+              : currentDisplayStatus === 'retry_wait'
               ? 'TỰ PHỤC HỒI'
-              : currentJob.status === 'paused'
+              : currentDisplayStatus === 'paused'
               ? 'TẠM DỪNG'
-              : currentJob.status === 'done'
+              : currentDisplayStatus === 'done'
               ? 'HOÀN TẤT'
               : 'HÀNG ĐỢI'}
           </span>
@@ -223,7 +224,7 @@ export default function VideoGenerationProgressCard({
           <div className="vg-timer-item" title="Thời gian đã chạy">
             ⏱ Đã chạy: <strong>{formatSeconds(elapsedSeconds)}</strong>
           </div>
-          {currentJob.status === 'running' && (
+          {currentDisplayStatus === 'running' && (
             <div className="vg-timer-item" title="Ước tính thời gian còn lại">
               ⏳ Dự kiến: <strong>~{formatSeconds(estimatedRemainingSec)}</strong>
             </div>
@@ -262,9 +263,9 @@ export default function VideoGenerationProgressCard({
           <div className="vg-stepper-line-fill" style={{ width: `calc(${lineFillPercent}% * 0.85)` }} />
 
           {PIPELINE_STAGES.map((stage, idx) => {
-            const isCompleted = idx < stageInfo.stageIndex || currentJob.status === 'done'
-            const isActive = idx === stageInfo.stageIndex && currentJob.status !== 'done'
-            const isError = currentJob.status === 'error' && isActive
+            const isCompleted = idx < stageInfo.stageIndex || currentDisplayStatus === 'done'
+            const isActive = idx === stageInfo.stageIndex && currentDisplayStatus !== 'done'
+            const isError = currentDisplayStatus === 'error' && isActive
 
             let statusClass = ''
             if (isError) statusClass = 'error'
@@ -281,7 +282,7 @@ export default function VideoGenerationProgressCard({
                   {isCompleted
                     ? 'Hoàn thành'
                     : isActive
-                    ? (currentJob.status === 'paused' ? 'Tạm dừng' : 'Đang chạy')
+                    ? (currentDisplayStatus === 'paused' ? 'Tạm dừng' : 'Đang chạy')
                     : 'Chờ'}
                 </div>
               </div>
@@ -315,7 +316,7 @@ export default function VideoGenerationProgressCard({
 
       {musePortConflict && (
         <div style={{ color: '#f1c40f', fontSize: '0.82rem', marginBottom: '10px' }}>
-          ⚠️ {currentJob.status === 'paused'
+          ⚠️ {currentDisplayStatus === 'paused'
             ? 'Muse2API đang bị xung đột cổng. Checkpoint đã được giữ; hãy đóng Muse Studio chạy ngoài Nexus rồi Tiếp tục từ checkpoint.'
             : `Muse2API đang bị xung đột cổng${museServiceBusyAttempt ? ` (lần ${museServiceBusyAttempt}/3)` : ''}; hệ thống sẽ thử lại có giới hạn.`}
         </div>

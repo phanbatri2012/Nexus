@@ -92,6 +92,8 @@ UPLOAD_ACTION_SELECTOR = (
     "[role='menuitem']:has-text('Upload'), [role='menuitem']:has-text('Tải lên'), "
     "[role='menuitem']:has-text('File'), .sidebar-upload-btn"
 )
+_PERSISTENT_CONFIGURED_AGENT_IMAGE_PROJECTS: dict[str, tuple[str, str, int]] = {}
+_PERSISTENT_CONFIGURED_AGENT_VIDEO_PROJECTS: dict[str, tuple[str, int]] = {}
 
 
 class ReferenceAttachmentError(RuntimeError):
@@ -1232,7 +1234,10 @@ class GoogleFlowWorker:
         if (
             self._session_configured_agent_image_projects.get(project_id)
             == settings_signature
+            or _PERSISTENT_CONFIGURED_AGENT_IMAGE_PROJECTS.get(project_id)
+            == settings_signature
         ):
+            self._session_configured_agent_image_projects[project_id] = settings_signature
             return
 
         try:
@@ -1243,10 +1248,23 @@ class GoogleFlowWorker:
             await asyncio.sleep(0.4)
 
             panel = self.page.locator(
-                "flow-agent-settings, flow-agent-panel, .cdk-overlay-pane, mat-dialog-container"
-            ).filter(has_text=re.compile("Cài đặt tác nhân|Agent settings", re.IGNORECASE)).first
+                "flow-agent-settings, flow-agent-panel, .cdk-overlay-pane, mat-dialog-container, [role='dialog'], [role='menu']"
+            ).filter(
+                has=self.page.locator(
+                    ":is(button, mat-button-toggle, [role='radio'], [role='option'], div):has-text('16:9'), "
+                    ":is(button, mat-button-toggle, [role='radio'], [role='option'], div):has-text('Không bao giờ'), "
+                    ":is(button, mat-button-toggle, [role='radio'], [role='option'], div):has-text('Never'), "
+                    ":is(h1, h2, h3, h4, span, div):has-text('Cài đặt tác nhân'), "
+                    ":is(h1, h2, h3, h4, span, div):has-text('Agent settings'), "
+                    ":is(h1, h2, h3, h4, span, div):has-text('Cài đặt')"
+                )
+            ).first
             if not await panel.is_visible(timeout=3000):
-                raise FlowAgentSettingsError("Bảng Cài đặt tác nhân không xuất hiện.")
+                panel = self.page.locator(
+                    "flow-agent-settings, flow-agent-panel, .cdk-overlay-pane, mat-dialog-container"
+                ).filter(has_text=re.compile("Cài đặt tác nhân|Agent settings|Cài đặt", re.IGNORECASE)).first
+                if not await panel.is_visible(timeout=1000):
+                    raise FlowAgentSettingsError("Bảng Cài đặt tác nhân không xuất hiện.")
 
             if not await self._click_agent_setting_text(
                 panel,
@@ -1297,22 +1315,49 @@ class GoogleFlowWorker:
             await asyncio.sleep(0.2)
 
             save_button = await self._find_agent_settings_save_button(panel)
-            if save_button is None:
-                raise FlowAgentSettingsError("Không tìm thấy nút Lưu cài đặt Agent.")
-            await save_button.click(timeout=2000)
+            if save_button is not None and await save_button.is_visible(timeout=500):
+                await save_button.click(timeout=2000)
+            else:
+                close_button = panel.locator(
+                    "button:has-text('close'), button mat-icon:text-is('close'), "
+                    "button[aria-label*='close' i], button[aria-label*='đóng' i], "
+                    "button.close-button"
+                ).first
+                if await close_button.is_visible(timeout=500):
+                    await close_button.click(timeout=1500)
+                else:
+                    await self.page.keyboard.press("Escape")
+
             deadline = time.monotonic() + 5.0
             while await panel.is_visible(timeout=100):
                 if time.monotonic() >= deadline:
+                    await self.page.keyboard.press("Escape")
+                    await asyncio.sleep(0.3)
+                    if not await panel.is_visible(timeout=100):
+                        break
                     raise FlowAgentSettingsError("Bảng Cài đặt tác nhân không đóng sau khi lưu.")
                 await asyncio.sleep(0.2)
-        except FlowAgentSettingsError:
-            await self._save_debug_screenshot("agent_image_settings_failed")
-            raise
         except Exception as exc:
-            await self._save_debug_screenshot("agent_image_settings_failed")
+            try:
+                await self.page.keyboard.press("Escape")
+            except Exception:
+                pass
+            if await self._is_agent_interface_active():
+                logger.warning(
+                    "flow_generation media=image state=agent_settings_fallback_accepted project=%s detail=%s",
+                    project_id,
+                    exc,
+                )
+                self._session_configured_agent_image_projects[project_id] = settings_signature
+                _PERSISTENT_CONFIGURED_AGENT_IMAGE_PROJECTS[project_id] = settings_signature
+                return
+            await self._save_debug_screenshot("agent_image_settings_failed", exc)
+            if isinstance(exc, FlowAgentSettingsError):
+                raise
             raise FlowAgentSettingsError("Không thể lưu cài đặt Google Flow Agent (Hình ảnh).") from exc
 
         self._session_configured_agent_image_projects[project_id] = settings_signature
+        _PERSISTENT_CONFIGURED_AGENT_IMAGE_PROJECTS[project_id] = settings_signature
         logger.info(
             "flow_generation media=image state=agent_settings_saved project=%s "
             "aspect=%s outputs=%d model=%s",
@@ -1341,7 +1386,13 @@ class GoogleFlowWorker:
             )
 
         project_id = self._project_id()
-        if project_id in self._session_configured_agent_projects:
+        video_signature = (model_id, output_count)
+        if (
+            project_id in self._session_configured_agent_projects
+            or _PERSISTENT_CONFIGURED_AGENT_VIDEO_PROJECTS.get(project_id)
+            == video_signature
+        ):
+            self._session_configured_agent_projects.add(project_id)
             return
 
         try:
@@ -1352,10 +1403,23 @@ class GoogleFlowWorker:
             await asyncio.sleep(0.4)
 
             panel = self.page.locator(
-                "flow-agent-settings, flow-agent-panel, .cdk-overlay-pane, mat-dialog-container"
-            ).filter(has_text=re.compile("Cài đặt tác nhân|Agent settings", re.IGNORECASE)).first
+                "flow-agent-settings, flow-agent-panel, .cdk-overlay-pane, mat-dialog-container, [role='dialog'], [role='menu']"
+            ).filter(
+                has=self.page.locator(
+                    ":is(button, mat-button-toggle, [role='radio'], [role='option'], div):has-text('16:9'), "
+                    ":is(button, mat-button-toggle, [role='radio'], [role='option'], div):has-text('Không bao giờ'), "
+                    ":is(button, mat-button-toggle, [role='radio'], [role='option'], div):has-text('Never'), "
+                    ":is(h1, h2, h3, h4, span, div):has-text('Cài đặt tác nhân'), "
+                    ":is(h1, h2, h3, h4, span, div):has-text('Agent settings'), "
+                    ":is(h1, h2, h3, h4, span, div):has-text('Cài đặt')"
+                )
+            ).first
             if not await panel.is_visible(timeout=3000):
-                raise FlowAgentSettingsError("Bảng Cài đặt tác nhân không xuất hiện.")
+                panel = self.page.locator(
+                    "flow-agent-settings, flow-agent-panel, .cdk-overlay-pane, mat-dialog-container"
+                ).filter(has_text=re.compile("Cài đặt tác nhân|Agent settings|Cài đặt", re.IGNORECASE)).first
+                if not await panel.is_visible(timeout=1000):
+                    raise FlowAgentSettingsError("Bảng Cài đặt tác nhân không xuất hiện.")
 
             if not await self._click_agent_setting_text(
                 panel,
@@ -1410,22 +1474,49 @@ class GoogleFlowWorker:
             await asyncio.sleep(0.2)
 
             save_button = await self._find_agent_settings_save_button(panel)
-            if save_button is None:
-                raise FlowAgentSettingsError("Không tìm thấy nút Lưu cài đặt Agent.")
-            await save_button.click(timeout=2000)
+            if save_button is not None and await save_button.is_visible(timeout=500):
+                await save_button.click(timeout=2000)
+            else:
+                close_button = panel.locator(
+                    "button:has-text('close'), button mat-icon:text-is('close'), "
+                    "button[aria-label*='close' i], button[aria-label*='đóng' i], "
+                    "button.close-button"
+                ).first
+                if await close_button.is_visible(timeout=500):
+                    await close_button.click(timeout=1500)
+                else:
+                    await self.page.keyboard.press("Escape")
+
             deadline = time.monotonic() + 5.0
             while await panel.is_visible(timeout=100):
                 if time.monotonic() >= deadline:
+                    await self.page.keyboard.press("Escape")
+                    await asyncio.sleep(0.3)
+                    if not await panel.is_visible(timeout=100):
+                        break
                     raise FlowAgentSettingsError("Bảng Cài đặt tác nhân không đóng sau khi lưu.")
                 await asyncio.sleep(0.2)
-        except FlowAgentSettingsError:
-            await self._save_debug_screenshot("agent_settings_failed")
-            raise
         except Exception as exc:
-            await self._save_debug_screenshot("agent_settings_failed")
+            try:
+                await self.page.keyboard.press("Escape")
+            except Exception:
+                pass
+            if await self._is_agent_interface_active():
+                logger.warning(
+                    "flow_generation media=video state=agent_settings_fallback_accepted project=%s detail=%s",
+                    project_id,
+                    exc,
+                )
+                self._session_configured_agent_projects.add(project_id)
+                _PERSISTENT_CONFIGURED_AGENT_VIDEO_PROJECTS[project_id] = video_signature
+                return
+            await self._save_debug_screenshot("agent_settings_failed", exc)
+            if isinstance(exc, FlowAgentSettingsError):
+                raise
             raise FlowAgentSettingsError("Không thể lưu cài đặt Google Flow Agent.") from exc
 
         self._session_configured_agent_projects.add(project_id)
+        _PERSISTENT_CONFIGURED_AGENT_VIDEO_PROJECTS[project_id] = video_signature
         logger.info(
             "flow_generation media=video state=agent_settings_saved project=%s "
             "outputs=%d model=%s",
@@ -5618,15 +5709,28 @@ class GoogleFlowWorker:
                     raise FlowImageCreditExhausted(
                         f"Google Flow đã xác nhận hết hạn mức tạo ảnh (Nano Banana): {err}"
                     )
-            pending_reason = (
-                "flow_image_history_scan_failed"
-                if submit_if_prompt_missing
-                and not self._last_image_prompt_scan_succeeded
-                else "flow_image_prompt_pending"
+            prompt_missing = bool(
+                self._last_image_prompt_scan_succeeded
+                and not self._last_image_prompt_found
             )
+            if prompt_missing:
+                pending_reason = "flow_image_prompt_missing"
+                pending_message = (
+                    "Google Flow chưa nhận được prompt hoặc không tìm thấy request này trên giao diện."
+                )
+            else:
+                pending_reason = (
+                    "flow_image_history_scan_failed"
+                    if submit_if_prompt_missing
+                    and not self._last_image_prompt_scan_succeeded
+                    else "flow_image_prompt_pending"
+                )
+                pending_message = (
+                    "Google Flow đã nhận yêu cầu ảnh và chưa có kết quả gắn đúng request; "
+                    "sẽ tiếp tục đối soát mà không gửi lại prompt."
+                )
             raise FlowImagePending(
-                "Google Flow đã nhận yêu cầu ảnh và chưa có kết quả gắn đúng request; "
-                "sẽ tiếp tục đối soát mà không gửi lại prompt.",
+                pending_message,
                 reason_code=pending_reason,
             )
 

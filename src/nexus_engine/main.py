@@ -5427,6 +5427,53 @@ def _comment_sync_scheduler() -> None:
             continue
 
 
+def _pause_muse_jobs_for_manual_resume_after_restart() -> int:
+    """Keep Muse checkpoints durable without auto-launching its browser at startup."""
+
+    message = (
+        "Muse đã giữ checkpoint sau khi Nexus khởi động lại; "
+        "bấm Tiếp tục từ checkpoint để chạy tiếp."
+    )
+    paused = 0
+    jobs = db.list_system_jobs(
+        limit=None,
+        job_type="muse_media_generation",
+        statuses={"queued", "retry_wait"},
+    )
+    for job in jobs:
+        result = dict(job.get("result") or {})
+        result["attention_required"] = "muse_resume_after_restart"
+        result["muse_wait_reason"] = "restart_resume_required"
+        result["muse_error_history"] = _compact_muse_error_history(
+            result.get("muse_error_history") or []
+        )
+        recovery = dict(result.get("muse_recovery") or {})
+        recovery["wait_reason"] = "restart_resume_required"
+        result["muse_recovery"] = recovery
+        updated = db.update_system_job(
+            str(job["id"]),
+            status="paused",
+            progress=message,
+            result_json=result,
+            error="",
+            next_retry_at="",
+            cancel_requested=0,
+            finished_at="",
+        )
+        if not updated:
+            continue
+        paused += 1
+        if job.get("video_id"):
+            db.update_video_production_state(
+                int(job["video_id"]),
+                render_status="paused",
+                current_stage="muse_resume_after_restart",
+                production_progress=message,
+                blocking_reason="",
+            )
+    return paused
+
+
 @app.on_event("startup")
 def resume_background_jobs() -> None:
     from nexus_engine.services import drain_mode
@@ -5470,6 +5517,12 @@ def resume_background_jobs() -> None:
         "fb_crosspost_sync",
     ):
         db.recover_interrupted_system_jobs(prod_job)
+    paused_muse_jobs = _pause_muse_jobs_for_manual_resume_after_restart()
+    if paused_muse_jobs:
+        logger.info(
+            "Paused %d Muse media job(s) for explicit checkpoint resume after restart.",
+            paused_muse_jobs,
+        )
     migrated_flow_jobs = _migrate_legacy_google_flow_render_jobs()
     if migrated_flow_jobs:
         logger.info(
@@ -7201,11 +7254,11 @@ def _pause_fb_crosspost_browser_job(job: dict, exc: Exception) -> bool:
     return True
 
 
-def _append_muse_error_history(result: dict, exc: Exception, message: str) -> list[dict]:
-    """Keep a small redacted history and compact consecutive duplicate failures."""
+def _compact_muse_error_history(raw_history: object) -> list[dict]:
+    """Normalize legacy Muse failures into a small, redacted history."""
 
     compacted: list[dict] = []
-    for raw in result.get("muse_error_history") or []:
+    for raw in raw_history if isinstance(raw_history, list) else []:
         if not isinstance(raw, dict):
             continue
         entry = {
@@ -7226,6 +7279,15 @@ def _append_muse_error_history(result: dict, exc: Exception, message: str) -> li
             continue
         entry["repeat_count"] = max(1, int(entry.get("repeat_count") or 1))
         compacted.append(entry)
+    return compacted[-MUSE_ERROR_HISTORY_LIMIT:]
+
+
+def _append_muse_error_history(result: dict, exc: Exception, message: str) -> list[dict]:
+    """Keep a small redacted history and compact consecutive duplicate failures."""
+
+    compacted = _compact_muse_error_history(
+        result.get("muse_error_history") or []
+    )
 
     now = db.utc_now()
     error_class = type(exc).__name__
@@ -7370,6 +7432,45 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
                 current_stage="muse_semantic_plan_needs_attention",
                 production_progress="Semantic scene plan cần kiểm tra; chưa gọi Muse",
                 blocking_reason=safe_error,
+            )
+        return
+
+    if (
+        isinstance(exc, muse_studio_service.MuseStudioCapabilityDisabled)
+        and str(job.get("job_type") or "") == "muse_media_generation"
+    ):
+        current_job = db.get_system_job(job["id"]) or job
+        result = dict(current_job.get("result") or {})
+        result.update(
+            {
+                "attention_required": "muse_capability_disabled",
+                "muse_wait_reason": "capability_disabled",
+            }
+        )
+        recovery = dict(result.get("muse_recovery") or {})
+        recovery["wait_reason"] = "capability_disabled"
+        result["muse_recovery"] = recovery
+        message = (
+            "Muse task recovery chưa được phát hành vì E2E start/end chưa đạt 3 lượt; "
+            "checkpoint vẫn được giữ nguyên."
+        )
+        db.update_system_job(
+            job["id"],
+            status="paused",
+            progress=message,
+            result_json=result,
+            error="",
+            next_retry_at="",
+            cancel_requested=0,
+            finished_at="",
+        )
+        if job.get("video_id"):
+            db.update_video_production_state(
+                int(job["video_id"]),
+                render_status="paused",
+                current_stage="muse_capability_disabled",
+                production_progress=message,
+                blocking_reason="",
             )
         return
 
@@ -10084,6 +10185,109 @@ def _get_checkpoint_resume_step(video_id: int | None) -> str:
     return str(checkpoint.get("current_step") or "checkpoint").strip() or "checkpoint"
 
 
+MEDIA_RESUME_STEP_LABELS = {
+    "flow_image_reconcile": "Google Flow tạo ảnh",
+    "flow_video_reconcile": "Google Flow tạo video",
+    "muse_media_generation": "Muse AI",
+}
+
+
+def _media_job_coordinator_running(job_type: str) -> bool:
+    coordinator = (
+        _muse_media_coordinator
+        if job_type == "muse_media_generation"
+        else _flow_media_coordinator
+        if job_type == "flow_media_generation"
+        else None
+    )
+    if coordinator is None:
+        return False
+    try:
+        return bool(coordinator.status().get("running"))
+    except Exception:
+        return False
+
+
+def _public_media_job_notification(job: dict) -> dict:
+    """Build provider-aware display state without exposing internal step IDs."""
+
+    job_type = str(job.get("job_type") or "")
+    status = str(job.get("status") or "")
+    result = dict(job.get("result") or {})
+    progress = security_logging.redact_sensitive(str(job.get("progress") or ""))
+    resume_step = str(job.get("resume_from_step") or "").strip()
+    resume_step_label = MEDIA_RESUME_STEP_LABELS.get(resume_step, "")
+    provider = (
+        "muse"
+        if job_type == "muse_media_generation"
+        else "flow"
+        if job_type == "flow_media_generation"
+        else ""
+    )
+    coordinator_running = _media_job_coordinator_running(job_type)
+    attention_required = str(result.get("attention_required") or "")
+    wait_reason = str(
+        (result.get("muse_recovery") or {}).get("wait_reason")
+        or result.get("muse_wait_reason")
+        or ""
+    )
+
+    if progress.startswith("Chờ tự phục hồi từ bước "):
+        if resume_step == "flow_image_reconcile":
+            progress = "Đang chờ Google Flow tạo ảnh; sẽ tự tiếp tục"
+        elif resume_step == "flow_video_reconcile":
+            progress = "Đang chờ Google Flow tạo video; sẽ tự tiếp tục"
+        elif resume_step == "muse_media_generation":
+            progress = "Đang kết nối Muse AI; sẽ tự tiếp tục"
+
+    display_status = status
+    state = status or "idle"
+    retry_active = status == "retry_wait" and (
+        not provider or coordinator_running
+    )
+    action_required = attention_required
+    resume_label = ""
+
+    muse_resume_required = job_type == "muse_media_generation" and (
+        attention_required == "muse_resume_after_restart"
+        or wait_reason == "restart_resume_required"
+        or (status == "retry_wait" and not coordinator_running)
+    )
+    if muse_resume_required:
+        display_status = "paused"
+        state = "resume_required"
+        retry_active = False
+        action_required = "muse_resume_after_restart"
+        resume_label = "Tiếp tục từ checkpoint"
+        progress = (
+            "Muse đã giữ checkpoint sau khi Nexus khởi động lại; "
+            "bấm Tiếp tục từ checkpoint để chạy tiếp."
+        )
+    elif status == "retry_wait":
+        state = "auto_recovery"
+        if provider == "muse" and wait_reason in {
+            "service_busy",
+            "service_port_conflict",
+        }:
+            progress = "Muse2API đang bận hoặc xung đột cổng; hệ thống sẽ tự thử lại."
+        elif not progress and resume_step_label:
+            progress = f"Đang chờ {resume_step_label}; sẽ tự tiếp tục"
+    elif status == "paused" and provider == "muse":
+        resume_label = "Tiếp tục từ checkpoint"
+
+    return {
+        "provider": provider,
+        "state": state,
+        "display_status": display_status,
+        "message": progress,
+        "retry_active": retry_active,
+        "retry_at": str(job.get("next_retry_at") or "") if retry_active else "",
+        "resume_step_label": resume_step_label,
+        "resume_label": resume_label,
+        "action_required": action_required,
+    }
+
+
 def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: bool = False) -> dict:
     payload = job.get("payload") or {}
     result = job.get("result") or {}
@@ -10101,6 +10305,8 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
         or payload.get("url", "")
     )
     job_type = str(job.get("job_type") or "")
+    notification = _public_media_job_notification(job)
+    display_status = str(notification.get("display_status") or status)
     muse_checkpoint = (
         muse_pipeline.inspect_muse_recovery(int(video_id))
         if job_type == "muse_media_generation"
@@ -10114,6 +10320,7 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
             status == "paused"
             or status == "canceled"
             or (status == "error" and muse_checkpoint.get("recoverable"))
+            or notification.get("state") == "resume_required"
         )
     )
     checkpoint_resume_step = (
@@ -10222,13 +10429,15 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
         "type": job_type,
         "type_label": type_label,
         "status": status,
+        "display_status": display_status,
+        "notification": notification,
         "title": html.unescape(str(title or "")),
         "original_title": html.unescape(
             str(job.get("original_title") or job.get("title", ""))
         ),
         "generated_title": html.unescape(str(job.get("generated_title", ""))),
         "video_url": job.get("video_url") or payload.get("url", ""),
-        "progress": job.get("progress", ""),
+        "progress": notification.get("message") or job.get("progress", ""),
         "error": security_logging.redact_sensitive(job.get("error", "")),
         "video_id": video_id,
         "prompt_version": job.get("prompt_version", ""),
@@ -10327,8 +10536,17 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
         ),
         "can_resume_checkpoint": bool(checkpoint_resume_step),
         "checkpoint_resume_step": checkpoint_resume_step,
-        "can_pause": status in {"queued", "retry_wait"},
-        "can_resume": status == "paused",
+        "can_pause": (
+            status in {"queued", "retry_wait"}
+            and notification.get("state") != "resume_required"
+        ),
+        "can_resume": (
+            status == "paused"
+            or (
+                job_type == "muse_media_generation"
+                and notification.get("state") == "resume_required"
+            )
+        ),
         "can_edit": job_type == "video_generation" and (
             status in {"error", "canceled"}
             or (status in {"queued", "paused"} and video_id is None)
@@ -13205,6 +13423,16 @@ def get_render_status(video_id: int):
     )
     latest_job = render_jobs[0] if render_jobs else None
     render_job = active_job or paused_job or latest_job
+    render_notification = (
+        _public_media_job_notification(render_job)
+        if render_job
+        else {}
+    )
+    render_display_status = str(
+        render_notification.get("display_status")
+        or (render_job or {}).get("status")
+        or ""
+    )
     phase = (
         "media_generation"
         if render_job
@@ -13213,8 +13441,11 @@ def get_render_status(video_id: int):
         else "render"
     )
 
-    is_active = bool(active_job)
-    is_paused = bool(paused_job and not active_job)
+    is_active = bool(
+        render_job
+        and render_display_status in {"queued", "running", "retry_wait"}
+    )
+    is_paused = bool(render_job and render_display_status == "paused")
     latest_status = str(latest_job.get("status") or "") if latest_job else ""
     is_error = bool(latest_job and latest_status in {"error", "failed"})
     is_canceled = bool(latest_job and latest_status == "canceled")
@@ -13279,7 +13510,11 @@ def get_render_status(video_id: int):
     render_job_summary = None
     if render_job:
         result = dict(render_job.get("result") or {})
-        job_progress = str(render_job.get("progress") or "")
+        job_progress = str(
+            render_notification.get("message")
+            or render_job.get("progress")
+            or ""
+        )
         flow_progress = result.get("flow_media_progress")
         if isinstance(flow_progress, dict) and (not job_progress or job_progress == "Đang khởi động"):
             phase = str(flow_progress.get("phase") or "images")
@@ -13299,6 +13534,7 @@ def get_render_status(video_id: int):
         render_job_summary = {
             "id": str(render_job.get("id") or ""),
             "status": str(render_job.get("status") or ""),
+            "display_status": render_display_status,
             "job_type": str(render_job.get("job_type") or ""),
             "title": str(render_job.get("title") or ""),
             "progress": job_progress,
@@ -13312,6 +13548,7 @@ def get_render_status(video_id: int):
                 str(render_job.get("error") or "")
             ),
             "attention_required": str(result.get("attention_required") or ""),
+            "notification": render_notification,
             "muse_media_progress": (
                 dict(result.get("muse_media_progress") or {})
                 if isinstance(result.get("muse_media_progress"), dict)

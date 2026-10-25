@@ -974,22 +974,23 @@ function JobCenter({ onOpenVideo, refreshKey }) {
           {renderPagination()}
           <div style={{ display: 'grid', gap: '12px', marginTop: '12px', marginBottom: '12px' }}>
           {filteredJobs.map(job => {
+            const displayStatus = job.display_status || job.status
             const status = (
-              job.status === 'paused' && job.attention_required === 'chatgpt_verification'
+              displayStatus === 'paused' && job.attention_required === 'chatgpt_verification'
                 ? job.automatic_login === 'pending'
                   ? { label: 'Đang Auto Login', color: '#4dd0e1' }
                   : { label: 'Cần xác minh ChatGPT', color: '#f1c40f' }
-                : job.status === 'paused' && ['youtube_browser_cdp', 'fb_browser_cdp'].includes(job.attention_required)
+                : displayStatus === 'paused' && ['youtube_browser_cdp', 'fb_browser_cdp'].includes(job.attention_required)
                   ? { label: 'Chờ Profile CDP', color: '#f1c40f' }
-                : job.status === 'paused' && job.attention_required === 'fb_browser_review'
+                : displayStatus === 'paused' && job.attention_required === 'fb_browser_review'
                   ? { label: 'Cần kiểm tra Facebook', color: '#f1c40f' }
-                : job.status === 'paused' && job.attention_required?.startsWith('youtube_')
+                : displayStatus === 'paused' && job.attention_required?.startsWith('youtube_')
                   ? job.missing_configuration?.length > 0
                     ? { label: 'Cần cấu hình', color: '#f1c40f' }
                     : { label: 'Chờ tiếp tục', color: '#4dd0e1' }
                 : job.type === 'comment_publish' && job.status === 'retry_wait'
                 ? { label: 'Đã hẹn đăng', color: '#4dd0e1' }
-                : STATUS_META[job.status] || STATUS_META.error
+                : STATUS_META[displayStatus] || STATUS_META.error
             )
             return (
               <div key={job.id} className="result-panel" style={{ padding: '18px 20px' }}>
@@ -1101,15 +1102,20 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                             : `Đối soát Flow: ${(job.pending_image_scene_indices || []).length} ảnh, ${(job.pending_video_scene_indices || job.pending_scene_indices || []).length} video đang chờ · ${job.reconcile_poll_count || 0} lượt kiểm tra`}
                       </div>
                     )}
-                    {job.type !== 'flow_media_generation' && job.recovery_count > 0 && !(job.processing_poll_count > 0 && job.publish_stage === 'processing') && (
+                    {job.type !== 'flow_media_generation' && job.notification?.retry_active && job.recovery_count > 0 && !(job.processing_poll_count > 0 && job.publish_stage === 'processing') && (
                       <div style={{ color: '#4dd0e1', marginTop: '6px', fontSize: '0.8em' }}>
                         Tự phục hồi: {job.recovery_count}/{job.recovery_limit || 3}
-                        {job.resume_from_step ? ` · Tiếp tục từ ${job.resume_from_step}` : ''}
+                        {job.notification?.resume_step_label ? ` · ${job.notification.resume_step_label}` : ''}
                       </div>
                     )}
-                    {job.status === 'retry_wait' && job.next_retry_at && (
+                    {job.notification?.retry_active && job.notification?.retry_at && (
                       <div style={{ color: '#8aa', marginTop: '4px', fontSize: '0.78em' }}>
-                        {job.type === 'comment_publish' ? 'Dự kiến đăng lúc' : 'Tự chạy lại lúc'} {formatDate(job.next_retry_at)}
+                        {job.type === 'comment_publish' ? 'Dự kiến đăng lúc' : 'Tự chạy lại lúc'} {formatDate(job.notification.retry_at)}
+                      </div>
+                    )}
+                    {job.type === 'muse_media_generation' && job.notification?.state === 'resume_required' && (
+                      <div style={{ color: '#f1c40f', marginTop: '9px', fontSize: '0.84em' }}>
+                        Muse đã giữ nguyên checkpoint sau khi Nexus khởi động lại. Bấm “Tiếp tục từ checkpoint” để chạy tiếp.
                       </div>
                     )}
                     {job.type === 'muse_media_generation' && (
@@ -1118,7 +1124,7 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                       || job.attention_required === 'muse_service_port_conflict'
                     ) && (
                       <div style={{ color: '#f1c40f', marginTop: '9px', fontSize: '0.84em' }}>
-                        {job.status === 'paused'
+                        {displayStatus === 'paused'
                           ? 'Muse2API đang bị xung đột cổng. Checkpoint vẫn an toàn; hãy đóng Muse Studio chạy ngoài Nexus rồi bấm “Tiếp tục”.'
                           : `Muse2API đang bị xung đột cổng${job.muse_recovery?.service_busy_attempt ? ` (lần ${job.muse_recovery.service_busy_attempt}/3)` : ''}; hệ thống sẽ thử lại có giới hạn.`}
                       </div>

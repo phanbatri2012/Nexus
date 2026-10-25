@@ -33,6 +33,7 @@ MUSE_API_BASE_URL = f"http://{MUSE_API_HOST}:{MUSE_API_PORT}"
 MUSE_IDLE_CLOSE_SECONDS = 60.0
 MUSE_SERVICE_PROCESS_KEY = "muse-studio-service"
 MUSE_SERVICE_STATE_PATH = DATA_DIR / "muse_studio_service.json"
+MUSE_TASK_RECOVERY_RELEASE_PATH = DATA_DIR / "muse_task_recovery_release.json"
 MUSE_STUDIO_STDOUT_PATH = LOGS_DIR / "muse-studio-ui.current.stdout.log"
 MUSE_STUDIO_STDERR_PATH = LOGS_DIR / "muse-studio-ui.current.stderr.log"
 MUSE_STUDIO_STARTUP_CHECK_SECONDS = 1.5
@@ -45,6 +46,14 @@ class MuseStudioServiceError(RuntimeError):
 
 class MuseStudioConfigurationError(MuseStudioServiceError):
     """Muse AI Studio is missing or has an incompatible layout."""
+
+
+class MuseStudioCapabilityDisabled(MuseStudioConfigurationError):
+    """A required Muse capability exists but has not been released locally."""
+
+    def __init__(self, capability: str, message: str):
+        super().__init__(message)
+        self.capability = str(capability or "").strip()
 
 
 class MuseStudioServiceBusy(MuseStudioServiceError):
@@ -478,6 +487,76 @@ def _remove_state() -> None:
         logger.warning("Không thể xóa Muse service state marker.")
 
 
+def task_recovery_release_status() -> dict:
+    """Return the sanitized local release decision for the recovery contract."""
+
+    default = {
+        "enabled": False,
+        "contract_version": 0,
+        "successful_runs": 0,
+        "verified_at": "",
+        "evidence_sha256": "",
+    }
+    try:
+        payload = json.loads(MUSE_TASK_RECOVERY_RELEASE_PATH.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return default
+    if not isinstance(payload, dict):
+        return default
+    try:
+        contract_version = max(0, int(payload.get("contract_version") or 0))
+        successful_runs = max(0, int(payload.get("successful_runs") or 0))
+    except (TypeError, ValueError):
+        return default
+    verified_at = str(payload.get("verified_at") or "").strip()
+    evidence_sha256 = str(payload.get("evidence_sha256") or "").strip().casefold()
+    evidence_valid = bool(re.fullmatch(r"[0-9a-f]{64}", evidence_sha256))
+    enabled = bool(
+        payload.get("enabled") is True
+        and contract_version >= 1
+        and successful_runs >= 3
+        and verified_at
+        and evidence_valid
+    )
+    return {
+        "enabled": enabled,
+        "contract_version": contract_version,
+        "successful_runs": successful_runs,
+        "verified_at": verified_at,
+        "evidence_sha256": evidence_sha256 if evidence_valid else "",
+    }
+
+
+def record_task_recovery_e2e_verification(
+    *,
+    successful_runs: int,
+    evidence_sha256: str,
+) -> dict:
+    """Publish recovery only after three strict start/end E2E runs passed."""
+
+    run_count = max(0, int(successful_runs))
+    evidence_digest = str(evidence_sha256 or "").strip().casefold()
+    if run_count < 3:
+        raise ValueError("Cần ít nhất 3 lượt E2E Muse start/end thành công.")
+    if not re.fullmatch(r"[0-9a-f]{64}", evidence_digest):
+        raise ValueError("Evidence digest E2E Muse không hợp lệ.")
+    payload = {
+        "enabled": True,
+        "contract_version": 1,
+        "successful_runs": run_count,
+        "verified_at": db.utc_now(),
+        "evidence_sha256": evidence_digest,
+    }
+    MUSE_TASK_RECOVERY_RELEASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = MUSE_TASK_RECOVERY_RELEASE_PATH.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(MUSE_TASK_RECOVERY_RELEASE_PATH)
+    return task_recovery_release_status()
+
+
 def _request_json(
     path: str,
     *,
@@ -545,8 +624,10 @@ def _probe_owned_service(*, timeout: float = 3.0) -> dict:
     except (TypeError, ValueError):
         task_recovery_version = 0
     if task_recovery_version < 1:
-        raise MuseStudioConfigurationError(
-            "Muse2API không hỗ trợ contract task recovery bắt buộc; hãy cập nhật Muse_AI_Studio."
+        raise MuseStudioCapabilityDisabled(
+            "task_recovery",
+            "Muse2API chưa bật contract task recovery đã phát hành; "
+            "checkpoint được giữ nguyên để tiếp tục sau khi xác minh cấu hình.",
         )
     try:
         active_media_tasks = max(0, int(ready.get("active_media_tasks") or 0))
@@ -638,6 +719,13 @@ def ensure_started(*, timeout_seconds: float = 20.0) -> dict:
             raise MuseStudioServiceBusy(
                 "Cổng Muse 18610/19210 đang do tiến trình khác sử dụng; hãy đóng Muse Studio trước."
             )
+        release_status = task_recovery_release_status()
+        if not release_status.get("enabled"):
+            raise MuseStudioCapabilityDisabled(
+                "task_recovery",
+                "Muse task recovery chưa được phát hành trên máy này vì chưa có "
+                "bằng chứng E2E start/end đạt 3 lượt.",
+            )
 
         python_executable = Path(sys.executable).resolve()
         if not python_executable.is_file():
@@ -656,6 +744,7 @@ def ensure_started(*, timeout_seconds: float = 20.0) -> dict:
                 "MUSE2API_CDP_PORT": str(MUSE_CDP_PORT),
                 "MUSE2API_KEY": _api_key,
                 "MUSE2API_CONCURRENCY": "1",
+                "MUSE2API_TASK_RECOVERY_ENABLED": "1",
                 "MUSE2API_HOME": str((studio_path / "muse2api_backend").resolve()),
                 "MUSE2API_DATA_DIR": str(_studio_data_dir(studio_path)),
                 "MUSE2API_PROFILE_ROOT": str(
@@ -733,6 +822,7 @@ def status(*, probe: bool = False) -> dict:
         process = _process
         running = bool(process is not None and process.poll() is None)
         owned = running and bool(_api_key)
+    release_status = task_recovery_release_status()
     result = {
         "configured": False,
         "studio_path": configured_path,
@@ -743,6 +833,8 @@ def status(*, probe: bool = False) -> dict:
         "browser_running": False,
         "video_start_end_frames": 0,
         "task_recovery": 0,
+        "task_recovery_released": bool(release_status.get("enabled")),
+        "task_recovery_e2e_runs": int(release_status.get("successful_runs") or 0),
         "active_media_tasks": 0,
         "runtime_id": "",
         "api_url": MUSE_API_BASE_URL,

@@ -992,6 +992,30 @@ class TestMuseStudioApiProvider(unittest.TestCase):
         release.assert_called_once()
         self.assertEqual(capacity, {})
 
+    def test_open_session_preserves_capability_disabled_error(self):
+        provider = muse_provider.MuseStudioApiProvider()
+        capability_error = muse_studio_service.MuseStudioCapabilityDisabled(
+            "task_recovery",
+            "release gate disabled",
+        )
+
+        async def run():
+            async with provider.open_session():
+                self.fail("session must not open while capability is disabled")
+
+        with (
+            patch.object(
+                muse_provider.muse_studio_service,
+                "acquire",
+                side_effect=capability_error,
+            ),
+            patch.object(muse_provider.muse_studio_service, "release") as release,
+        ):
+            with self.assertRaises(muse_studio_service.MuseStudioCapabilityDisabled):
+                asyncio.run(run())
+
+        release.assert_not_called()
+
     def test_submit_response_captures_only_sanitized_capacity_summary(self):
         provider = muse_provider.MuseStudioApiProvider()
         provider._capture_media_capacity(
@@ -1036,10 +1060,11 @@ class TestMuseStudioApiProvider(unittest.TestCase):
                         request_hash="a" * 64,
                     )
                 )
-            endpoint, payload, idempotency_key = post.call_args.args
+            endpoint, payload, idempotency_key, timeout_seconds = post.call_args.args
             self.assertEqual(endpoint, "/v1/images/tasks")
             self.assertEqual(payload["reference_image"], [str(path.resolve()) for path in references])
             self.assertEqual(idempotency_key, "a" * 64)
+            self.assertEqual(timeout_seconds, muse_provider.MUSE_ADMISSION_TIMEOUT_SECONDS)
 
     def test_video_payload_sends_explicit_start_end_and_has_idempotency_key(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1062,12 +1087,13 @@ class TestMuseStudioApiProvider(unittest.TestCase):
                         request_hash="b" * 64,
                     )
                 )
-            endpoint, payload, idempotency_key = post.call_args.args
+            endpoint, payload, idempotency_key, timeout_seconds = post.call_args.args
             self.assertEqual(endpoint, "/v1/videos")
             self.assertEqual(payload["start_image"], str(references[0].resolve()))
             self.assertEqual(payload["end_image"], str(references[1].resolve()))
             self.assertNotIn("reference_image", payload)
             self.assertEqual(idempotency_key, "b" * 64)
+            self.assertEqual(timeout_seconds, muse_provider.MUSE_ADMISSION_TIMEOUT_SECONDS)
 
     def test_image_and_idempotent_video_connection_loss_are_retryable(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3591,6 +3617,11 @@ class TestMuseStudioServiceLifecycle(unittest.TestCase):
             patch.object(muse_studio_service.subprocess, "Popen", return_value=process) as popen,
             patch.object(muse_studio_service.process_registry, "register_process"),
             patch.object(muse_studio_service, "_write_state") as write_state,
+            patch.object(
+                muse_studio_service,
+                "task_recovery_release_status",
+                return_value={"enabled": True, "successful_runs": 3},
+            ),
             patch.object(muse_studio_service, "_probe_owned_service", return_value=status),
         ):
             self.assertEqual(muse_studio_service.ensure_started(), status)
@@ -3602,6 +3633,7 @@ class TestMuseStudioServiceLifecycle(unittest.TestCase):
         self.assertEqual(environment["MUSE2API_PORT"], "18610")
         self.assertEqual(environment["MUSE2API_CDP_PORT"], "19210")
         self.assertEqual(environment["MUSE2API_CONCURRENCY"], "1")
+        self.assertEqual(environment["MUSE2API_TASK_RECOVERY_ENABLED"], "1")
         write_state.assert_called_once_with(process, Path("C:/Muse"))
 
     def test_state_marker_contains_no_credentials(self):
@@ -3615,6 +3647,62 @@ class TestMuseStudioServiceLifecycle(unittest.TestCase):
             serialized = state_path.read_text(encoding="utf-8").lower()
         for forbidden in ("api_key", "cookie", "token", "proxy", "secret"):
             self.assertNotIn(forbidden, serialized)
+
+    def test_task_recovery_release_requires_three_e2e_runs_and_evidence(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            release_path = Path(temp_dir) / "muse-task-recovery-release.json"
+            with patch.object(
+                muse_studio_service,
+                "MUSE_TASK_RECOVERY_RELEASE_PATH",
+                release_path,
+            ):
+                self.assertFalse(
+                    muse_studio_service.task_recovery_release_status()["enabled"]
+                )
+                with self.assertRaisesRegex(ValueError, "3 lượt"):
+                    muse_studio_service.record_task_recovery_e2e_verification(
+                        successful_runs=2,
+                        evidence_sha256="a" * 64,
+                    )
+                with self.assertRaisesRegex(ValueError, "digest"):
+                    muse_studio_service.record_task_recovery_e2e_verification(
+                        successful_runs=3,
+                        evidence_sha256="invalid",
+                    )
+                status = muse_studio_service.record_task_recovery_e2e_verification(
+                    successful_runs=3,
+                    evidence_sha256="b" * 64,
+                )
+
+            self.assertTrue(status["enabled"])
+            self.assertEqual(status["contract_version"], 1)
+            self.assertEqual(status["successful_runs"], 3)
+            serialized = release_path.read_text(encoding="utf-8").casefold()
+            for forbidden in ("api_key", "cookie", "token", "password", "prompt", "path"):
+                self.assertNotIn(forbidden, serialized)
+
+    def test_start_refuses_unreleased_task_recovery_without_spawning(self):
+        with (
+            patch.object(
+                muse_studio_service,
+                "_validate_studio_path",
+                return_value=Path("C:/Muse"),
+            ),
+            patch.object(muse_studio_service, "_muse_ports_available", return_value=True),
+            patch.object(
+                muse_studio_service,
+                "task_recovery_release_status",
+                return_value={"enabled": False, "successful_runs": 0},
+            ),
+            patch.object(muse_studio_service.subprocess, "Popen") as popen,
+        ):
+            with self.assertRaisesRegex(
+                muse_studio_service.MuseStudioCapabilityDisabled,
+                "E2E start/end",
+            ):
+                muse_studio_service.ensure_started()
+
+        popen.assert_not_called()
 
     def test_no_account_fails_readiness(self):
         muse_studio_service._api_key = "in-memory-only"
@@ -3677,7 +3765,7 @@ class TestMuseStudioServiceLifecycle(unittest.TestCase):
         ]
         with patch.object(muse_studio_service, "_request_json", side_effect=responses):
             with self.assertRaisesRegex(
-                muse_studio_service.MuseStudioConfigurationError,
+                muse_studio_service.MuseStudioCapabilityDisabled,
                 "task recovery",
             ):
                 muse_studio_service._probe_owned_service()
@@ -3810,6 +3898,130 @@ class TestMuseScheduledQueue(unittest.TestCase):
 
 
 class TestMuseRouting(unittest.TestCase):
+    def test_startup_pauses_muse_jobs_without_launching_provider(self):
+        legacy_history = [
+            {
+                "at": f"2026-10-24T00:00:{index:02d}Z",
+                "error_class": "MuseServiceBusy",
+                "message": "busy",
+            }
+            for index in range(20)
+        ]
+        job = {
+            "id": "muse-restart",
+            "job_type": "muse_media_generation",
+            "status": "retry_wait",
+            "video_id": 348,
+            "result": {
+                "muse_error_history": legacy_history,
+                "muse_recovery": {"recovery_epoch": 1, "wait_reason": "manual_resume"},
+            },
+        }
+        updated = {**job, "status": "paused"}
+        with (
+            patch.object(main.db, "list_system_jobs", return_value=[job]) as list_jobs,
+            patch.object(main.db, "update_system_job", return_value=updated) as update_job,
+            patch.object(main.db, "update_video_production_state") as update_video,
+            patch.object(main.muse_studio_service, "ensure_started") as ensure_started,
+        ):
+            paused = main._pause_muse_jobs_for_manual_resume_after_restart()
+
+        self.assertEqual(paused, 1)
+        list_jobs.assert_called_once_with(
+            limit=None,
+            job_type="muse_media_generation",
+            statuses={"queued", "retry_wait"},
+        )
+        updates = update_job.call_args.kwargs
+        self.assertEqual(updates["status"], "paused")
+        self.assertEqual(updates["next_retry_at"], "")
+        self.assertEqual(updates["error"], "")
+        result = updates["result_json"]
+        self.assertEqual(result["attention_required"], "muse_resume_after_restart")
+        self.assertEqual(result["muse_recovery"]["wait_reason"], "restart_resume_required")
+        self.assertEqual(len(result["muse_error_history"]), 1)
+        self.assertEqual(result["muse_error_history"][0]["repeat_count"], 20)
+        update_video.assert_called_once()
+        ensure_started.assert_not_called()
+
+    def test_legacy_muse_retry_notification_requires_manual_resume(self):
+        job = {
+            "id": "muse-stale",
+            "job_type": "muse_media_generation",
+            "status": "retry_wait",
+            "video_id": 348,
+            "progress": "Chờ tự phục hồi từ bước muse_media_generation",
+            "resume_from_step": "muse_media_generation",
+            "next_retry_at": "2026-10-24T16:35:27+00:00",
+            "result": {"muse_wait_reason": "service_busy"},
+        }
+        with patch.object(
+            main._muse_media_coordinator,
+            "status",
+            return_value={"running": False},
+        ):
+            item = main._system_job_center_item(job, None)
+
+        self.assertEqual(item["status"], "retry_wait")
+        self.assertEqual(item["display_status"], "paused")
+        self.assertEqual(item["notification"]["state"], "resume_required")
+        self.assertFalse(item["notification"]["retry_active"])
+        self.assertEqual(item["notification"]["retry_at"], "")
+        self.assertTrue(item["can_resume"])
+        self.assertTrue(item["muse_can_resume"])
+        self.assertNotIn("muse_media_generation", item["progress"])
+
+    def test_flow_retry_notification_stays_automatic(self):
+        job = {
+            "id": "flow-wait",
+            "job_type": "flow_media_generation",
+            "status": "retry_wait",
+            "video_id": 349,
+            "progress": "Chờ tự phục hồi từ bước flow_image_reconcile",
+            "resume_from_step": "flow_image_reconcile",
+            "next_retry_at": "2026-10-25T00:00:00+00:00",
+            "result": {},
+        }
+        with patch.object(
+            main._flow_media_coordinator,
+            "status",
+            return_value={"running": True},
+        ):
+            item = main._system_job_center_item(job, None)
+
+        self.assertEqual(item["display_status"], "retry_wait")
+        self.assertEqual(item["notification"]["state"], "auto_recovery")
+        self.assertTrue(item["notification"]["retry_active"])
+        self.assertIn("Google Flow tạo ảnh", item["progress"])
+        self.assertNotIn("flow_image_reconcile", item["progress"])
+
+    def test_render_status_treats_stale_muse_retry_as_paused(self):
+        job = {
+            "id": "muse-stale",
+            "job_type": "muse_media_generation",
+            "status": "retry_wait",
+            "video_id": 348,
+            "progress": "Chờ tự phục hồi từ bước muse_media_generation",
+            "resume_from_step": "muse_media_generation",
+            "next_retry_at": "2026-10-24T16:35:27+00:00",
+            "payload": {"snapshot": {"image_generation_settings": {"render_mode": "muse_ai"}}},
+            "result": {"muse_wait_reason": "service_busy"},
+        }
+        with (
+            patch.object(main.db, "get_video", return_value={"id": 348, "prompt_version": "v1"}),
+            patch.object(main.db, "get_latest_video_artifact", return_value=None),
+            patch.object(main.db, "list_system_jobs", return_value=[job]),
+            patch.object(main.video_production, "get_render_mode", return_value="muse_ai"),
+            patch.object(main._muse_media_coordinator, "status", return_value={"running": False}),
+        ):
+            response = main.get_render_status(348)
+
+        self.assertFalse(response["is_active"])
+        self.assertTrue(response["is_paused"])
+        self.assertEqual(response["state"], "paused")
+        self.assertEqual(response["job"]["display_status"], "paused")
+        self.assertEqual(response["job"]["notification"]["state"], "resume_required")
+
     def test_recreate_is_consumed_once_before_muse_pipeline_runs(self):
         job = {
             "id": "muse-recreate",
@@ -4272,6 +4484,49 @@ class TestMuseRouting(unittest.TestCase):
         self.assertEqual(
             update_video.call_args.kwargs["current_stage"],
             "muse_semantic_plan_needs_attention",
+        )
+
+    def test_unreleased_task_recovery_pauses_without_consuming_submission(self):
+        job = {
+            "id": "muse-capability-disabled",
+            "job_type": "muse_media_generation",
+            "video_id": 348,
+            "payload": {"force_new_project": False},
+            "result": {
+                "muse_recovery": {
+                    "recovery_epoch": 2,
+                    "submission_attempt": 0,
+                    "reconcile_count": 0,
+                }
+            },
+        }
+        error = muse_studio_service.MuseStudioCapabilityDisabled(
+            "task_recovery",
+            "release gate disabled",
+        )
+        with (
+            patch.object(main.db, "get_youtube_publish_workflow_by_job", return_value=None),
+            patch.object(main.db, "get_system_job", return_value=job),
+            patch.object(main.db, "schedule_system_job_recovery") as schedule,
+            patch.object(main.db, "update_system_job") as update_job,
+            patch.object(main.db, "update_video_production_state") as update_video,
+        ):
+            main._handle_production_job_error(job, error)
+
+        schedule.assert_not_called()
+        update = update_job.call_args.kwargs
+        self.assertEqual(update["status"], "paused")
+        self.assertEqual(update["error"], "")
+        self.assertEqual(update["finished_at"], "")
+        result = update["result_json"]
+        self.assertEqual(result["attention_required"], "muse_capability_disabled")
+        self.assertEqual(result["muse_wait_reason"], "capability_disabled")
+        self.assertEqual(result["muse_recovery"]["submission_attempt"], 0)
+        self.assertEqual(result["muse_recovery"]["wait_reason"], "capability_disabled")
+        self.assertIn("checkpoint", update["progress"])
+        self.assertEqual(
+            update_video.call_args.kwargs["current_stage"],
+            "muse_capability_disabled",
         )
 
     def test_confirmed_muse_quota_exhaustion_pauses_for_resume(self):

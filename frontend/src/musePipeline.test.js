@@ -44,3 +44,13 @@ test('Muse port conflicts stay visible and recoverable from checkpoint', () => {
   }
   assert.match(progressCardSource, /service_busy_attempt/)
 })
+
+test('Muse and Flow notifications share display contract but keep provider labels', () => {
+  assert.match(appSource, /job\?\.display_status/)
+  assert.match(appSource, /Chờ Muse/)
+  assert.match(appSource, /Chờ Flow/)
+  assert.doesNotMatch(appSource, /Chờ ảnh\.\.\./)
+  assert.match(jobCenterSource, /notification\?\.state === 'resume_required'/)
+  assert.match(jobCenterSource, /notification\.resume_step_label/)
+  assert.match(progressCardSource, /currentDisplayStatus/)
+})

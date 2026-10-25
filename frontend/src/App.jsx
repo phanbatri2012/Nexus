@@ -232,8 +232,10 @@ function App() {
   const [isRendering, setIsRendering] = useState(false)
   const [isCancelingRender, setIsCancelingRender] = useState(false)
 
-  const isRenderPaused = Boolean(!isRendering && (renderInfo?.is_paused || renderInfo?.job?.status === 'paused'))
-  const isRenderActive = Boolean(isRendering || renderInfo?.is_active || ['queued', 'running', 'retry_wait'].includes(renderInfo?.job?.status)) && !isRenderPaused
+  const renderJobStatus = renderInfo?.job?.display_status || renderInfo?.job?.status || ''
+  const renderNotification = renderInfo?.job?.notification || {}
+  const isRenderPaused = Boolean(!isRendering && (renderInfo?.is_paused || renderJobStatus === 'paused'))
+  const isRenderActive = Boolean(isRendering || renderInfo?.is_active || ['queued', 'running', 'retry_wait'].includes(renderJobStatus)) && !isRenderPaused
   const isRenderError = !isRenderActive && !isRenderPaused && Boolean(renderInfo?.is_error || renderInfo?.job?.status === 'error' || renderInfo?.job?.status === 'failed')
   const isRenderCanceled = !isRenderActive && !isRenderPaused && Boolean(renderInfo?.is_canceled || renderInfo?.job?.status === 'canceled')
   const hasMp4Ready = Boolean(!isRenderActive && !isRenderError && !isRenderCanceled && renderInfo?.has_mp4)
@@ -671,7 +673,8 @@ function App() {
         const data = await response.json();
         if (stopped) return;
         setRenderInfo(data);
-        const isJobActive = Boolean(data.is_active || ['queued', 'running', 'retry_wait'].includes(data.job?.status));
+        const displayStatus = data.job?.display_status || data.job?.status;
+        const isJobActive = Boolean(data.is_active || ['queued', 'running', 'retry_wait'].includes(displayStatus));
         setIsRendering(isJobActive);
       } catch (error) {
         console.error('Failed to sync render status', error);
@@ -1669,7 +1672,8 @@ function App() {
       if (statusRes.ok) {
         const statusData = await statusRes.json();
         setRenderInfo(statusData);
-        const isJobActive = Boolean(statusData.is_active || ['queued', 'running', 'retry_wait'].includes(statusData.job?.status));
+        const displayStatus = statusData.job?.display_status || statusData.job?.status;
+        const isJobActive = Boolean(statusData.is_active || ['queued', 'running', 'retry_wait'].includes(displayStatus));
         setIsRendering(isJobActive);
       }
     } catch (error) {
@@ -3673,7 +3677,7 @@ function App() {
                                         <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
                                           <span>
                                             {renderInfo?.phase === 'media_generation' ? '🎨' : '⏳'}{' '}
-                                            {renderInfo?.job?.progress || renderInfo?.production_progress || (renderInfo?.job?.status === 'running' ? (renderInfo?.render_mode === 'muse_ai' ? 'Đang tạo media Muse AI...' : 'Đang tạo ảnh Google Flow...') : 'Đang trong hàng đợi render...')}
+                                            {renderInfo?.job?.progress || renderNotification.message || renderInfo?.production_progress || (renderJobStatus === 'running' ? (renderInfo?.render_mode === 'muse_ai' ? 'Đang tạo media Muse AI...' : 'Đang tạo ảnh Google Flow...') : 'Đang trong hàng đợi render...')}
                                           </span>
                                         </div>
                                         {Boolean(renderInfo?.job?.flow_media_progress?.images_total) && (
@@ -3726,7 +3730,9 @@ function App() {
                                         }}
                                       >
                                         {renderInfo?.phase === 'media_generation'
-                                          ? (renderInfo?.job?.status === 'retry_wait' ? '⏳ Chờ ảnh...' : '⏳ Đang tạo media...')
+                                          ? (renderJobStatus === 'retry_wait'
+                                              ? (renderInfo?.render_mode === 'muse_ai' ? '⏳ Chờ Muse...' : '⏳ Chờ Flow...')
+                                              : (renderInfo?.render_mode === 'muse_ai' ? '⏳ Đang tạo Muse...' : '⏳ Đang tạo Flow...'))
                                           : '⏳ Đang dựng...'}
                                       </button>
                                       <button

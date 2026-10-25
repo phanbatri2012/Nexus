@@ -1587,11 +1587,6 @@ async def _generate_scene_image_async(
                 "aspect_ratio": str(settings.get("aspect_ratio") or "16:9"),
                 "output_count": int(settings.get("output_count") or 1),
             }
-            if pending_expired:
-                await _best_effort_cancel_flow_request(worker, request_key)
-                raise FlowGenerationTimeout(
-                    "Google Flow không trả về ảnh gắn đúng request trước thời hạn 10 phút."
-                )
             while True:
                 base_generation_prompt = safe_prompt if safe_prompt_used else clean_prompt
                 generation_prompt = (
@@ -1795,12 +1790,33 @@ async def _generate_scene_image_async(
                 "Tạo ảnh quá giống cảnh trước; dừng để tránh video lặp ảnh."
             )
     except FlowImagePending as exc:
+        if pending_expired:
+            await _best_effort_cancel_flow_request(worker, request_key)
+            db.upsert_video_artifact(
+                video_id=video_id,
+                artifact_type=artifact_type,
+                path=str(target),
+                content_hash=content_hash,
+                status="queued",
+                mime_type="image/png",
+                metadata={
+                    **checkpoint_metadata,
+                    "flow_receipt": None,
+                    "flow_submission_intent": None,
+                    "reason_code": "flow_request_expired",
+                },
+            )
+            raise FlowGenerationTimeout(
+                "Google Flow không trả về ảnh gắn đúng request trước thời hạn 10 phút."
+            )
         pending_receipt = dict(exc.receipt or {})
         if not pending_receipt and hasattr(worker, "get_last_generation_receipt"):
             worker_receipt = worker.get_last_generation_receipt()
             if isinstance(worker_receipt, dict):
                 pending_receipt = dict(worker_receipt)
-        if not pending_receipt:
+        if not pending_receipt and receipt and receipt.get("submitted_at"):
+            pending_receipt = dict(receipt)
+        elif not pending_receipt:
             pending_receipt = _fallback_flow_receipt(
                 request_key=request_key,
                 media_type="image",
@@ -2718,6 +2734,7 @@ def generate_scene_media(
         from nexus_engine.services.google_flow_worker import (
             FlowAgentSettingsError,
             FlowCreditExhausted,
+            FlowGenerationTimeout,
             FlowImageCreditExhausted,
             FlowImagePending,
             FlowMediaPending,
@@ -2960,6 +2977,120 @@ def generate_scene_media(
                 max(0.0, time.monotonic() - snapshot_started),
             )
 
+            # Phase 1A: Universal Reconciliation for all pending/in-flight scene checkpoints
+            # Collect any scenes that were already submitted and may have completed on Flow,
+            # regardless of scene index order, and without letting a failure on one scene block others.
+            for position, scene in enumerate(scenes):
+                if validated_images[position] is not None:
+                    continue
+                cancel_check()
+                scene_index = int(scene.get("index", position))
+                artifact_type = f"scene:{scene_index}"
+                current_artifact = artifact_snapshot.get(artifact_type)
+                if not current_artifact:
+                    continue
+                current_status = str(current_artifact.get("status") or "")
+                current_meta = (
+                    current_artifact.get("metadata")
+                    if isinstance(current_artifact.get("metadata"), dict)
+                    else {}
+                )
+                has_pending_token = bool(
+                    current_meta.get("flow_receipt")
+                    or current_meta.get("flow_submission_intent")
+                )
+                if current_status not in {"queued", "processing", "retry_wait"} and not has_pending_token:
+                    continue
+
+                reference_id = str(scene.get("primary_reference_id") or "").strip()
+                explicit_reference = scene.get("reference_path")
+                reference_path = (
+                    Path(explicit_reference)
+                    if explicit_reference and Path(explicit_reference).is_file()
+                    else references.get(reference_id)
+                )
+
+                try:
+                    validation_result = await _generate_scene_image_async(
+                        video_id=video_id,
+                        scene=scene,
+                        scene_count=len(scenes),
+                        profile=profile or {},
+                        settings=settings,
+                        reference_path=reference_path,
+                        reference_id=reference_id,
+                        progress=progress,
+                        cancel_check=cancel_check,
+                        worker=worker,
+                        existing_hashes=image_hashes,
+                        existing_perceptual_hashes=image_perceptual_hashes,
+                        force_new_project=False,
+                        submit_only=True,
+                        artifact_snapshot=artifact_snapshot,
+                        reference_hash_cache=reference_hash_cache,
+                        validation_counters=validation_counters,
+                        return_validation=True,
+                    )
+                    validation = (
+                        validation_result
+                        if isinstance(validation_result, ValidatedImageArtifact)
+                        else _validate_image_file(Path(validation_result))
+                    )
+                    refresh_artifact(artifact_type)
+                    image_hashes.add(validation.sha256)
+                    image_perceptual_hashes.append(validation.fingerprint)
+                    validated_images[position] = validation
+                    base_image_paths[position] = validation.path
+                    if reference_id and reference_id not in references:
+                        references[reference_id] = validation.path
+                    logger.info(
+                        "flow_reconcile media=image scene=%s state=collected path=%s",
+                        scene_index,
+                        validation.path,
+                    )
+                except FlowImagePending as exc:
+                    if getattr(exc, "reason_code", "") == "flow_image_prompt_missing":
+                        logger.info(
+                            "flow_reconcile media=image scene=%s state=prompt_missing_on_flow; clearing stale receipt to re-dispatch in Phase 1B",
+                            scene_index,
+                        )
+                        target_path = str((current_artifact or {}).get("path") or "")
+                        content_hash_val = str((current_artifact or {}).get("content_hash") or "")
+                        db.upsert_video_artifact(
+                            video_id=video_id,
+                            artifact_type=artifact_type,
+                            path=target_path,
+                            content_hash=content_hash_val,
+                            status="queued",
+                            mime_type="image/png",
+                            metadata={
+                                **current_meta,
+                                "flow_receipt": None,
+                                "flow_submission_intent": None,
+                                "reason_code": "flow_prompt_missing",
+                            },
+                        )
+                        refresh_artifact(artifact_type)
+                    else:
+                        refresh_artifact(artifact_type)
+                        append_pending(pending_images, exc, scene_index)
+                except FlowGenerationTimeout as exc:
+                    logger.info(
+                        "flow_reconcile media=image scene=%s state=reconcile_expired detail=%s; will re-dispatch in Phase 1B",
+                        scene_index,
+                        exc,
+                    )
+                    refresh_artifact(artifact_type)
+                except Exception as exc:
+                    logger.warning(
+                        "flow_reconcile media=image scene=%s state=reconcile_check_error detail=%s",
+                        scene_index,
+                        exc,
+                    )
+                    refresh_artifact(artifact_type)
+                    append_pending(pending_images, exc, scene_index)
+
+            # Phase 1B: Targeted Submission for remaining scenes that still need new prompt dispatch
             for position, scene in enumerate(scenes):
                 if validated_images[position] is not None:
                     continue
@@ -2991,6 +3122,11 @@ def generate_scene_media(
                 ):
                     pending_images.append({"scene_index": scene_index})
                     continue
+
+                # If this scene was already reconciled and marked pending with remaining retry_wait in Phase 1A, skip re-submitting in this pass
+                if any(int(item.get("scene_index", -1)) == scene_index for item in pending_images):
+                    continue
+
                 try:
                     validation_result = await _generate_scene_image_async(
                         video_id=video_id,
@@ -3016,6 +3152,18 @@ def generate_scene_media(
                     refresh_artifact(artifact_type)
                     append_pending(pending_images, exc, scene_index)
                     continue
+                except FlowCreditExhausted:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "flow_generation media=image scene=%s state=submission_isolated_error detail=%s",
+                        scene_index,
+                        exc,
+                    )
+                    refresh_artifact(artifact_type)
+                    append_pending(pending_images, exc, scene_index)
+                    continue
+
                 try:
                     validation = (
                         validation_result

@@ -401,6 +401,28 @@ class TestGoogleFlowWorkerUpload(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(_is_flow_image_credit_exhausted_error(tagged_video_err))
         self.assertTrue(_is_flow_video_credit_exhausted_error(tagged_video_err))
 
+    async def test_ensure_agent_image_settings_uses_persistent_cache(self):
+        from nexus_engine.services.google_flow_worker import _PERSISTENT_CONFIGURED_AGENT_IMAGE_PROJECTS
+        self.worker._project_id = lambda: "test-proj-123"
+        _PERSISTENT_CONFIGURED_AGENT_IMAGE_PROJECTS["test-proj-123"] = ("nano_banana_2_1", "16:9", 1)
+        self.worker._find_agent_settings_button = AsyncMock()
+
+        await self.worker.ensure_agent_image_settings({"model": "nano_banana_2_1", "aspect_ratio": "16:9", "output_count": 1})
+        self.worker._find_agent_settings_button.assert_not_called()
+
+    async def test_ensure_agent_image_settings_fallback_when_interface_active(self):
+        from nexus_engine.services.google_flow_worker import _PERSISTENT_CONFIGURED_AGENT_IMAGE_PROJECTS
+        self.worker._project_id = lambda: "test-proj-456"
+        _PERSISTENT_CONFIGURED_AGENT_IMAGE_PROJECTS.pop("test-proj-456", None)
+        self.worker._session_configured_agent_image_projects.pop("test-proj-456", None)
+
+        self.worker._find_agent_settings_button = AsyncMock(return_value=None)
+        self.worker._is_agent_interface_active = AsyncMock(return_value=True)
+
+        # Should not raise FlowAgentSettingsError because agent interface is active
+        await self.worker.ensure_agent_image_settings({"model": "nano_banana_2_1", "aspect_ratio": "16:9", "output_count": 1})
+        self.assertIn("test-proj-456", _PERSISTENT_CONFIGURED_AGENT_IMAGE_PROJECTS)
+
 
 if __name__ == "__main__":
     unittest.main()

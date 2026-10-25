@@ -22,6 +22,7 @@ from nexus_engine.services import muse_studio_service
 
 MUSE_IMAGE_TIMEOUT_SECONDS = 360
 MUSE_VIDEO_TIMEOUT_SECONDS = 900
+MUSE_ADMISSION_TIMEOUT_SECONDS = 300
 MUSE_POLL_INTERVAL_SECONDS = 2.0
 MUSE_PROVIDER_NAME = "muse_studio_api"
 MUSE_FRAME_CONTRACT_VERSION = "start_end_v1"
@@ -342,6 +343,8 @@ class MuseStudioApiProvider:
             await asyncio.to_thread(muse_studio_service.acquire)
         except muse_studio_service.MuseStudioServiceBusy as exc:
             raise MuseServiceBusy(str(exc)) from exc
+        except muse_studio_service.MuseStudioCapabilityDisabled:
+            raise
         except muse_studio_service.MuseStudioConfigurationError as exc:
             raise MuseAuthenticationError(str(exc)) from exc
         except muse_studio_service.MuseStudioServiceUnavailable as exc:
@@ -358,6 +361,8 @@ class MuseStudioApiProvider:
             return await asyncio.to_thread(muse_studio_service.verify)
         except muse_studio_service.MuseStudioServiceBusy as exc:
             raise MuseServiceBusy(str(exc)) from exc
+        except muse_studio_service.MuseStudioCapabilityDisabled:
+            raise
         except muse_studio_service.MuseStudioConfigurationError as exc:
             raise MuseAuthenticationError(str(exc)) from exc
         except muse_studio_service.MuseStudioServiceUnavailable as exc:
@@ -489,6 +494,7 @@ class MuseStudioApiProvider:
                 submit_endpoint,
                 payload,
                 idempotency_key,
+                MUSE_ADMISSION_TIMEOUT_SECONDS,
             )
         except MuseAdmissionRetry:
             raise
