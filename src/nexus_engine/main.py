@@ -104,6 +104,7 @@ from nexus_engine.services import (
     video_qc,
     video_production,
     youtube_comments,
+    youtube_pinned_comment,
     youtube_publish_workflow,
     youtube_publisher,
 )
@@ -225,9 +226,12 @@ def _normalize_thumbnail_urls(value, fallback_url: str = "") -> list[str]:
     raw_urls = value if isinstance(value, list) else []
     if not raw_urls and fallback_url:
         raw_urls = [fallback_url]
-    return list(dict.fromkeys(url for url in raw_urls if url))[
-        :MAX_THUMBNAIL_IMAGES_PER_RESPONSE
-    ]
+    return list(
+        dict.fromkeys(
+            url for url in raw_urls
+            if url and not str(url).startswith("blob:")
+        )
+    )[:MAX_THUMBNAIL_IMAGES_PER_RESPONSE]
 
 
 def _patch_thumbnail_section_in_script(
@@ -2161,6 +2165,10 @@ async def publish_video_now_endpoint(video_id: int):
 
             now_iso = db.utc_now()
             if target_pub:
+                youtube_pinned_comment.enqueue_for_publication(
+                    int(target_pub["id"]),
+                    public_at=now_iso,
+                )
                 db.update_video_publication(
                     int(target_pub["id"]),
                     privacy_status="public",
@@ -4276,12 +4284,14 @@ COMMENT_JOB_TYPES = (
     "comment_sync",
     "comment_draft",
     "comment_publish",
+    "youtube_pinned_comment",
     "comment_video_import",
 )
 COMMENT_JOB_LABELS = {
     "comment_sync": "Đồng bộ bình luận",
     "comment_draft": "Soạn trả lời bình luận",
     "comment_publish": "Đăng trả lời bình luận",
+    "youtube_pinned_comment": "Đăng & ghim bình luận",
     "comment_video_import": "Khởi tạo Chat cho video cũ",
 }
 COMMENT_DRAFT_PRE_SEND_RETRY_DELAYS_SECONDS = (60, 120, 300)
@@ -4394,6 +4404,21 @@ def _reconcile_channel_publication_states(
             changes["published_title"] = str(remote["title"])
         if remote.get("published_at"):
             changes["published_at"] = str(remote["published_at"])
+        became_public = (
+            str(publication.get("privacy_status") or "").lower() != "public"
+            and str(changes.get("privacy_status") or "").lower() == "public"
+        )
+        if became_public:
+            public_at = youtube_pinned_comment.resolve_public_at(
+                publication,
+                remote,
+                observed_at=db.utc_now(),
+            )
+            youtube_pinned_comment.enqueue_for_publication(
+                int(publication["id"]),
+                public_at=public_at,
+                reschedule_existing=True,
+            )
         if any(publication.get(key) != value for key, value in changes.items()):
             db.update_video_publication(publication["id"], **changes)
             reconciled += 1
@@ -5211,6 +5236,13 @@ def _execute_comment_publish_job(job: dict) -> None:
     )
 
 
+def _execute_youtube_pinned_comment_job(job: dict) -> None:
+    youtube_pinned_comment.execute_job(
+        job,
+        access_token_provider=_get_youtube_access_token,
+    )
+
+
 def _schedule_automatic_chatgpt_login(job_id: str, error: Exception) -> bool:
     """Enqueue a background Auto Login thread for the given incident job.
 
@@ -5398,9 +5430,14 @@ def _comment_queue_worker() -> None:
                         return
                 elif job["job_type"] == "comment_publish":
                     _execute_comment_publish_job(job)
+                elif job["job_type"] == "youtube_pinned_comment":
+                    _execute_youtube_pinned_comment_job(job)
                 elif not _execute_comment_video_import_job(job):
                     return
             except Exception as exc:
+                if job.get("job_type") == "youtube_pinned_comment":
+                    youtube_pinned_comment.handle_job_failure(job, exc)
+                    continue
                 if isinstance(exc, ChatGPTAttentionRequiredError):
                     scheduled = _schedule_automatic_chatgpt_login(job["id"], exc)
                     result_json = {
@@ -7258,6 +7295,22 @@ def _execute_youtube_publish_job(job: dict) -> None:
         resolve_publishing_settings=_get_prompt_publishing_settings,
         thumbnails_dir=THUMBNAILS_DIR,
     )
+    workflow = db.get_youtube_publish_workflow(str(result.get("workflow_id") or ""))
+    publication_id = int((workflow or {}).get("publication_id") or 0)
+    publish_stage = str(result.get("publish_stage") or result.get("stage") or "")
+    if publication_id and publish_stage == "scheduled" and result.get("scheduled_at"):
+        youtube_pinned_comment.enqueue_for_publication(
+            publication_id,
+            scheduled_at=str(result["scheduled_at"]),
+            reschedule_existing=True,
+        )
+    elif publication_id and publish_stage == "published":
+        publication = db.get_video_publication(publication_id) or {}
+        youtube_pinned_comment.enqueue_for_publication(
+            publication_id,
+            public_at=str(publication.get("published_at") or db.utc_now()),
+            reschedule_existing=True,
+        )
     db.update_system_job(
         job["id"],
         status="completed",
@@ -10460,6 +10513,11 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
         or payload.get("url", "")
     )
     job_type = str(job.get("job_type") or "")
+    pinned_comment_attention = bool(
+        job_type == "youtube_pinned_comment"
+        and status == "paused"
+        and result.get("attention_required")
+    )
     notification = _public_media_job_notification(job)
     display_status = str(notification.get("display_status") or status)
     muse_checkpoint = (
@@ -10685,9 +10743,12 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
             or (job_type in {"video_generation", "flow_media_generation", "muse_media_generation", "video_render", "video_qc", "visual_scene_plan", "competitor_scan", "youtube_upload", "youtube_publish", "fb_crosspost", "fb_crosspost_sync", "thumbnail_generation", "tiktok_publish", "trust_builder_session"} and status == "running")
         ),
         "can_retry": (
-            status in {"error", "canceled"}
-            and job_type != "comment_publish"
-            and (job_type != "muse_media_generation" or muse_can_resume)
+            pinned_comment_attention
+            or (
+                status in {"error", "canceled"}
+                and job_type not in {"comment_publish", "youtube_pinned_comment"}
+                and (job_type != "muse_media_generation" or muse_can_resume)
+            )
         ),
         "can_resume_checkpoint": bool(checkpoint_resume_step),
         "checkpoint_resume_step": checkpoint_resume_step,
@@ -10696,7 +10757,7 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
             and notification.get("state") != "resume_required"
         ),
         "can_resume": (
-            status == "paused"
+            (status == "paused" and not pinned_comment_attention)
             or (
                 job_type == "muse_media_generation"
                 and notification.get("state") == "resume_required"
@@ -11318,6 +11379,7 @@ def set_drain_mode_endpoint(req: DrainModeRequest):
                 "comment_sync",
                 "comment_draft",
                 "comment_publish",
+                "youtube_pinned_comment",
                 "trust_builder_session",
             }
         )
@@ -11509,6 +11571,8 @@ def _run_system_job_center_action(
                 )
         if str(job.get("job_type") or "") == "muse_media_generation":
             updated_job = _resume_muse_media_job(job)
+        elif str(job.get("job_type") or "") == "youtube_pinned_comment":
+            updated_job = youtube_pinned_comment.reset_manual_retry(job)
         else:
             updated_job = db.retry_system_job(job_id)
         if str(job.get("job_type")) == "video_generation":
@@ -12408,7 +12472,7 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
     else:
         v_title = "Thumbnail độc lập"
 
-    sys_job_id = f"thumb-{req.video_id or int(time.time() * 1000)}"
+    sys_job_id = f"thumb-{req.video_id or 'anon'}-{int(time.time() * 1000)}"
     try:
         db.create_system_job(
             job_id=sys_job_id,

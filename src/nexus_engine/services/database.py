@@ -1019,6 +1019,10 @@ def init_db():
             published_url TEXT NOT NULL,
             published_title TEXT DEFAULT '',
             published_at TEXT DEFAULT '',
+            pinned_comment_status TEXT NOT NULL DEFAULT '',
+            pinned_comment_id TEXT DEFAULT '',
+            pinned_comment_posted_at TEXT DEFAULT '',
+            pinned_comment_pinned_at TEXT DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY(video_id) REFERENCES videos(id) ON DELETE CASCADE,
@@ -1359,6 +1363,10 @@ def init_db():
         "processing_status TEXT NOT NULL DEFAULT 'succeeded'",
         "scheduled_at TEXT DEFAULT ''",
         "artifact_hash TEXT DEFAULT ''",
+        "pinned_comment_status TEXT NOT NULL DEFAULT ''",
+        "pinned_comment_id TEXT DEFAULT ''",
+        "pinned_comment_posted_at TEXT DEFAULT ''",
+        "pinned_comment_pinned_at TEXT DEFAULT ''",
     ):
         try:
             c.execute(f"ALTER TABLE video_publications ADD COLUMN {column_definition}")
@@ -4761,7 +4769,8 @@ def get_system_jobs_summary_counts(
         "video_generation", "fb_crosspost", "fb_crosspost_sync",
         "flow_media_generation", "muse_media_generation", "video_render",
         "video_qc", "visual_scene_plan", "competitor_scan", "comment_sync",
-        "comment_draft", "comment_publish", "comment_video_import",
+        "comment_draft", "comment_publish", "youtube_pinned_comment",
+        "comment_video_import",
         "trust_builder_session", "thumbnail_generation", "tiktok_publish",
     }:
         sys_filters.append("system_jobs.job_type = ?")
@@ -5057,6 +5066,7 @@ def delete_system_job(job_id: str) -> dict | None:
 SCHEDULED_RETRY_JOB_TYPES = frozenset(
     {
         "comment_publish",
+        "youtube_pinned_comment",
         "comment_sync",
         "comment_draft",
         "flow_media_generation",
@@ -7669,6 +7679,143 @@ def get_video_publication(publication_id: int) -> dict | None:
     return dict(row) if row else None
 
 
+def youtube_pinned_comment_job_id(publication_id: int) -> str:
+    return f"youtube-pinned-comment-{int(publication_id)}"
+
+
+def ensure_youtube_pinned_comment_job(
+    *,
+    publication_id: int,
+    run_at: str,
+    public_at: str = "",
+    scheduled_at: str = "",
+    reschedule_existing: bool = False,
+) -> tuple[dict, bool]:
+    """Atomically create one delayed pinned-comment job per publication."""
+    normalized_run_at = str(run_at or "").strip()
+    if not normalized_run_at:
+        raise ValueError("Thiếu thời điểm chạy job bình luận ghim.")
+    job_id = youtube_pinned_comment_job_id(publication_id)
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        publication = conn.execute(
+            """
+            SELECT publications.*, videos.prompt_version,
+                   COALESCE(NULLIF(videos.generated_title, ''), videos.title) AS video_title
+            FROM video_publications AS publications
+            JOIN videos ON videos.id = publications.video_id
+            WHERE publications.id = ?
+            """,
+            (int(publication_id),),
+        ).fetchone()
+        if publication is None:
+            raise ValueError("Không tìm thấy publication để hẹn bình luận ghim.")
+
+        existing = conn.execute(
+            "SELECT * FROM system_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                reschedule_existing
+                and existing["status"] in {"queued", "retry_wait"}
+                and not str(publication["pinned_comment_id"] or "").strip()
+            ):
+                try:
+                    payload = json.loads(existing["payload_json"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    payload = {}
+                if not str(payload.get("comment_text") or "").strip():
+                    payload.update(
+                        {
+                            "publication_id": int(publication_id),
+                            "channel_id": publication["youtube_channel_id"],
+                            "youtube_video_id": str(publication["youtube_video_id"] or ""),
+                            "public_at": str(public_at or payload.get("public_at") or ""),
+                            "scheduled_at": str(scheduled_at or ""),
+                            "target_run_at": normalized_run_at,
+                        }
+                    )
+                    conn.execute(
+                        """
+                        UPDATE system_jobs
+                        SET status = 'retry_wait', progress = ?, payload_json = ?,
+                            next_retry_at = ?, started_at = '', finished_at = '', updated_at = ?
+                        WHERE id = ? AND status IN ('queued', 'retry_wait')
+                        """,
+                        (
+                            "Đang chờ đủ 1 giờ sau khi video Public",
+                            json.dumps(payload, ensure_ascii=False),
+                            normalized_run_at,
+                            now,
+                            job_id,
+                        ),
+                    )
+                    existing = conn.execute(
+                        "SELECT * FROM system_jobs WHERE id = ?", (job_id,)
+                    ).fetchone()
+            conn.execute("COMMIT")
+            return _decode_system_job(existing), False
+
+        payload = {
+            "publication_id": int(publication_id),
+            "channel_id": publication["youtube_channel_id"],
+            "youtube_video_id": str(publication["youtube_video_id"] or ""),
+            "public_at": str(public_at or ""),
+            "scheduled_at": str(scheduled_at or ""),
+            "target_run_at": normalized_run_at,
+            "schedule_rebase_count": 0,
+            "comment_text": "",
+            "comment_text_hash": "",
+        }
+        conn.execute(
+            """
+            INSERT INTO system_jobs (
+                id, job_type, status, title, progress, payload_json,
+                result_json, error, video_id, prompt_version,
+                next_retry_at, created_at, updated_at
+            ) VALUES (?, 'youtube_pinned_comment', 'retry_wait', ?, ?, ?, '{}', '', ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                str(publication["video_title"] or publication["youtube_video_id"] or ""),
+                "Đang chờ đủ 1 giờ sau khi video Public",
+                json.dumps(payload, ensure_ascii=False),
+                int(publication["video_id"]),
+                str(publication["prompt_version"] or ""),
+                normalized_run_at,
+                now,
+                now,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE video_publications
+            SET pinned_comment_status = CASE
+                    WHEN pinned_comment_status = 'pinned' THEN pinned_comment_status
+                    ELSE 'waiting'
+                END,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (now, int(publication_id)),
+        )
+        created = conn.execute(
+            "SELECT * FROM system_jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        conn.execute("COMMIT")
+        return _decode_system_job(created), True
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
 def list_channel_pending_publications(channel_db_id: int) -> list[dict]:
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
@@ -7697,6 +7844,10 @@ def update_video_publication(publication_id: int, **changes) -> dict | None:
         "processing_status",
         "scheduled_at",
         "artifact_hash",
+        "pinned_comment_status",
+        "pinned_comment_id",
+        "pinned_comment_posted_at",
+        "pinned_comment_pinned_at",
     }
     invalid = set(changes) - allowed
     if invalid:

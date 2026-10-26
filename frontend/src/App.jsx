@@ -1189,7 +1189,7 @@ function App() {
             const candidates = Array.isArray(urls) && urls.length > 0
               ? urls
               : (fallbackUrl ? [fallbackUrl] : []);
-            return [...new Set(candidates.filter(Boolean))].slice(0, 2);
+            return [...new Set(candidates.filter((u) => Boolean(u) && !String(u).startsWith("blob:")))].slice(0, 2);
           };
           const patchThumbnailImages = (script, sectionTitle, imageUrls) => {
             if (imageUrls.length === 0) return script;

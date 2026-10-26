@@ -236,7 +236,11 @@ def list_gpm_restart_blockers() -> list[dict[str, Any]]:
     drain_active = drain_mode.is_drain_mode_active()
     allowed_statuses = {"running", "processing"} if drain_active else {"queued", "running", "processing"}
     blockers = []
-    for job in db.list_system_jobs(limit=500, job_type="comment_publish"):
+    jobs = [
+        *db.list_system_jobs(limit=500, job_type="comment_publish"),
+        *db.list_system_jobs(limit=500, job_type="youtube_pinned_comment"),
+    ]
+    for job in jobs:
         status = str(job.get("status") or "").strip().lower()
         if status not in allowed_statuses:
             continue
@@ -256,7 +260,10 @@ def list_gpm_restart_blockers() -> list[dict[str, Any]]:
         channel = db.get_youtube_channel(channel_id) if channel_id else None
         if not channel:
             continue
-        if str(channel.get("interaction_mode") or "").strip() != "gpm_browser":
+        if (
+            str(job.get("job_type") or "") != "youtube_pinned_comment"
+            and str(channel.get("interaction_mode") or "").strip() != "gpm_browser"
+        ):
             continue
         if not str(channel.get("gpm_profile_id") or "").strip():
             continue

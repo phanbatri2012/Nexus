@@ -33,6 +33,10 @@ class GpmAutomationError(RuntimeError):
     """Raised when an automation action fails inside a GPM browser session."""
 
 
+class GpmAutomationIdentityError(GpmAutomationError):
+    """Raised when the assigned profile is not logged into the expected channel."""
+
+
 _COMMENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 _COMMENTS_ROOT_SELECTOR = "ytd-comments, ytd-watch-flexy #comments"
 _COMMENT_RENDERER_SELECTOR = "ytd-comment-thread-renderer, ytd-comment-view-model"
@@ -398,6 +402,198 @@ async def post_comment_reply_via_gpm(
             diagnostic_hint = f" Chẩn đoán: {diagnostic_name}." if diagnostic_name else ""
             raise GpmAutomationError(
                 f"Không thể đăng bình luận qua GPM: {exc}.{diagnostic_hint}"
+            ) from exc
+        finally:
+            await cleanup_owned_page(context, page, preserve=failed)
+
+
+async def _comment_thread_is_pinned(thread: Any) -> bool:
+    badge = await thread.query_selector(
+        "#pinned-comment-badge, ytd-pinned-comment-badge-renderer, "
+        "[aria-label*='Pinned' i], [aria-label*='Đã ghim' i]"
+    )
+    if badge:
+        return True
+    try:
+        text = str(await thread.inner_text() or "").casefold()
+    except Exception:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "pinned by",
+            "được ghim bởi",
+            "đã ghim",
+        )
+    )
+
+
+async def _visible_pin_menu_action(page: Any) -> tuple[str, Any | None]:
+    items = page.locator(
+        "tp-yt-iron-dropdown:not([aria-hidden='true']) ytd-menu-service-item-renderer, "
+        "tp-yt-iron-dropdown:not([aria-hidden='true']) tp-yt-paper-item, "
+        "ytd-popup-container ytd-menu-service-item-renderer"
+    )
+    for index in range(await items.count()):
+        item = items.nth(index)
+        try:
+            if not await item.is_visible():
+                continue
+            label = re.sub(r"\s+", " ", str(await item.inner_text() or "")).strip().casefold()
+        except Exception:
+            continue
+        if label in {"unpin", "bỏ ghim"}:
+            return "unpin", item
+        if label in {"pin", "ghim"}:
+            return "pin", item
+    return "", None
+
+
+async def _open_comment_action_menu(thread: Any) -> None:
+    menu_button = await thread.query_selector(
+        "#action-menu button, ytd-menu-renderer yt-icon-button button, "
+        "button[aria-label*='Action menu' i], button[aria-label*='Thao tác' i], "
+        "button[aria-label*='Hành động' i]"
+    )
+    if not menu_button:
+        raise GpmAutomationError("Không tìm thấy menu thao tác của bình luận mục tiêu.")
+    await menu_button.click()
+    await asyncio.sleep(0.4)
+
+
+async def pin_top_level_comment_via_gpm(
+    profile_id: str,
+    *,
+    video_url: str,
+    comment_id: str,
+    expected_channel_id: str,
+    timeout_seconds: float = 30.0,
+) -> dict[str, Any]:
+    """Pin one verified top-level comment in the assigned channel profile."""
+    clean_comment_id = _validate_comment_id(comment_id)
+    if not clean_comment_id:
+        raise ValueError("Thiếu Comment ID để ghim bình luận.")
+    identity = await verify_youtube_login(
+        profile_id,
+        timeout_seconds=min(timeout_seconds, 20.0),
+        expected_channel_id=expected_channel_id,
+    )
+    if not identity.get("logged_in") or not identity.get("identity_verified"):
+        raise GpmAutomationIdentityError(
+            str(identity.get("message") or "GPM profile không đăng nhập đúng kênh YouTube.")
+        )
+
+    target_url = str(video_url or "").strip()
+    delimiter = "&" if "?" in target_url else "?"
+    if f"lc={clean_comment_id}" not in target_url:
+        target_url = f"{target_url}{delimiter}lc={clean_comment_id}"
+
+    failed = False
+    async with channel_browser_session(profile_id) as (context, _browser, _profile_meta):
+        page = await context.new_page()
+        await page.bring_to_front()
+        try:
+            await page.goto(
+                target_url,
+                wait_until="domcontentloaded",
+                timeout=int(timeout_seconds * 1000),
+            )
+            thread = await _wait_for_target_comment_thread(
+                page,
+                clean_comment_id,
+                timeout_seconds=timeout_seconds,
+            )
+            if await _comment_thread_is_pinned(thread):
+                return {
+                    "success": True,
+                    "comment_id": clean_comment_id,
+                    "pinned": True,
+                    "already_pinned": True,
+                }
+
+            await _open_comment_action_menu(thread)
+            action, menu_item = await _visible_pin_menu_action(page)
+            if action == "unpin":
+                return {
+                    "success": True,
+                    "comment_id": clean_comment_id,
+                    "pinned": True,
+                    "already_pinned": True,
+                }
+            if action != "pin" or menu_item is None:
+                raise GpmAutomationError(
+                    "Menu bình luận mục tiêu không có thao tác Ghim/Pin."
+                )
+            await menu_item.click()
+            await asyncio.sleep(0.5)
+
+            dialogs = page.locator(
+                "yt-confirm-dialog-renderer, ytd-confirm-dialog-renderer, tp-yt-paper-dialog"
+            )
+            for index in range(await dialogs.count()):
+                dialog = dialogs.nth(index)
+                try:
+                    if not await dialog.is_visible():
+                        continue
+                    dialog_text = str(await dialog.inner_text() or "").casefold()
+                except Exception:
+                    continue
+                if "pin" not in dialog_text and "ghim" not in dialog_text:
+                    continue
+                confirm = dialog.locator(
+                    "#confirm-button button, #confirm-button, "
+                    "button[aria-label*='Pin' i], button[aria-label*='Ghim' i]"
+                ).first
+                if await confirm.count() and await confirm.is_visible():
+                    await confirm.click()
+                break
+
+            await asyncio.sleep(2.0)
+            thread = await _wait_for_target_comment_thread(
+                page,
+                clean_comment_id,
+                timeout_seconds=timeout_seconds,
+            )
+            pinned = await _comment_thread_is_pinned(thread)
+            if not pinned:
+                await _open_comment_action_menu(thread)
+                action, _ = await _visible_pin_menu_action(page)
+                pinned = action == "unpin"
+            if not pinned:
+                raise GpmAutomationError(
+                    "YouTube chưa xác nhận bình luận mục tiêu đã được ghim."
+                )
+            return {
+                "success": True,
+                "comment_id": clean_comment_id,
+                "pinned": True,
+                "already_pinned": False,
+            }
+        except GpmAutomationIdentityError:
+            failed = True
+            raise
+        except Exception as exc:
+            failed = True
+            diagnostic_name = ""
+            try:
+                diagnostic = await capture_browser_diagnostics_async(
+                    page=page,
+                    service="youtube_pinned_comment",
+                    job_id=clean_comment_id,
+                    error=exc,
+                    action_name="pin_top_level_comment_via_gpm",
+                )
+                diagnostic_path = str(
+                    diagnostic.get("dom_path") or diagnostic.get("screenshot_path") or ""
+                )
+                diagnostic_name = Path(diagnostic_path).name if diagnostic_path else ""
+            except Exception as diagnostic_exc:
+                logger.warning("Không thể lưu chẩn đoán lỗi ghim bình luận: %s", diagnostic_exc)
+            hint = f" Chẩn đoán: {diagnostic_name}." if diagnostic_name else ""
+            if isinstance(exc, GpmAutomationError):
+                raise GpmAutomationError(f"{exc}{hint}") from exc
+            raise GpmAutomationError(
+                f"Không thể ghim bình luận qua GPM: {exc}.{hint}"
             ) from exc
         finally:
             await cleanup_owned_page(context, page, preserve=failed)

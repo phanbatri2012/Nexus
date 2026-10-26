@@ -357,10 +357,17 @@ def download_chatgpt_image_via_page(page: Page, chatgpt_url: str) -> str:
     )
     validate_chatgpt_image_url(str(payload.get("finalUrl") or ""))
     content_type = str(payload.get("contentType") or "").split(";", 1)[0].casefold()
-    if content_type != "image/png":
-        raise ValueError("Generated thumbnail did not return PNG content.")
+    if content_type and content_type not in ("image/png", "image/jpeg", "image/webp"):
+        raise ValueError(f"Generated thumbnail did not return supported image content: {content_type}")
     image_bytes = base64.b64decode(payload.get("base64") or "", validate=True)
     validate_image_bytes(image_bytes)
+    if not image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        import io
+        from PIL import Image
+        with Image.open(io.BytesIO(image_bytes)) as im:
+            buf = io.BytesIO()
+            im.save(buf, format="PNG")
+            image_bytes = buf.getvalue()
     THUMBNAILS_DIR.mkdir(parents=True, exist_ok=True)
     filename = f"thumb_{uuid.uuid4().hex[:12]}.png"
     destination = THUMBNAILS_DIR / filename
@@ -985,7 +992,8 @@ def wait_for_thumbnail_images(
                     }"""
                 )
             generation_active = (
-                page.locator(CHATGPT_STOP_BUTTON_SELECTOR).count() > 0
+                is_chatgpt_generation_active(page)
+                or page.locator(CHATGPT_STOP_BUTTON_SELECTOR).count() > 0
             )
             snapshot_error_logged = False
         except Exception as exc:
@@ -1016,8 +1024,8 @@ def wait_for_thumbnail_images(
         if image_urls and not generation_active:
             downloaded_urls = []
             for image_url in image_urls[:MAX_THUMBNAIL_IMAGES_PER_RESPONSE]:
-                downloaded_url = download_image(image_url) or image_url
-                if downloaded_url and downloaded_url not in downloaded_urls:
+                downloaded_url = download_image(image_url)
+                if downloaded_url and downloaded_url.startswith("/api/thumbnails/") and downloaded_url not in downloaded_urls:
                     downloaded_urls.append(downloaded_url)
             if downloaded_urls:
                 return downloaded_urls
@@ -1043,8 +1051,8 @@ def get_reusable_thumbnail_images(page: Page, download_image) -> list[str]:
         for snap in image_snapshots:
             src = snap.get("src", "")
             if src and snap.get("ready"):
-                local_url = download_image(src) or src
-                if local_url and local_url not in downloaded:
+                local_url = download_image(src)
+                if local_url and local_url.startswith("/api/thumbnails/") and local_url not in downloaded:
                     downloaded.append(local_url)
         return downloaded
     except Exception:

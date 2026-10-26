@@ -89,7 +89,12 @@ const PUBLISH_STAGE_LABELS = {
   self_certification: 'Đang tự đánh giá quảng cáo',
   navigating_tabs: 'Đang duyệt các bước',
   visibility_and_publish: 'Đang đặt chế độ hiển thị & lịch',
-  finishing_upload: 'Đang hoàn tất'
+  finishing_upload: 'Đang hoàn tất',
+  waiting_for_public: 'Chờ video Public đủ 1 giờ',
+  reconciling_comment: 'Đang đối soát bình luận',
+  posted: 'Đã đăng, đang ghim',
+  pinned: 'Đã ghim bình luận',
+  attention_required: 'Cần xử lý thủ công'
 }
 
 const CONFIGURATION_LABELS = {
@@ -685,6 +690,7 @@ function JobCenter({ onOpenVideo, refreshKey }) {
           <option value="comment_sync">Đồng bộ bình luận</option>
           <option value="comment_draft">Soạn trả lời bình luận</option>
           <option value="comment_publish">Đăng trả lời bình luận</option>
+          <option value="youtube_pinned_comment">Đăng &amp; ghim bình luận</option>
           <option value="comment_video_import">Khởi tạo Chat cho video cũ</option>
           <option value="fb_crosspost">Đăng chéo Facebook</option>
           <option value="fb_crosspost_sync">Đồng bộ video Facebook</option>
@@ -988,7 +994,7 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                   ? job.missing_configuration?.length > 0
                     ? { label: 'Cần cấu hình', color: '#f1c40f' }
                     : { label: 'Chờ tiếp tục', color: '#4dd0e1' }
-                : job.type === 'comment_publish' && job.status === 'retry_wait'
+                : ['comment_publish', 'youtube_pinned_comment'].includes(job.type) && job.status === 'retry_wait'
                 ? { label: 'Đã hẹn đăng', color: '#4dd0e1' }
                 : STATUS_META[displayStatus] || STATUS_META.error
             )
@@ -1110,7 +1116,7 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                     )}
                     {job.notification?.retry_active && job.notification?.retry_at && (
                       <div style={{ color: '#8aa', marginTop: '4px', fontSize: '0.78em' }}>
-                        {job.type === 'comment_publish' ? 'Dự kiến đăng lúc' : 'Tự chạy lại lúc'} {formatDate(job.notification.retry_at)}
+                        {['comment_publish', 'youtube_pinned_comment'].includes(job.type) ? 'Dự kiến đăng lúc' : 'Tự chạy lại lúc'} {formatDate(job.notification.retry_at)}
                       </div>
                     )}
                     {job.type === 'muse_media_generation' && job.notification?.state === 'resume_required' && (

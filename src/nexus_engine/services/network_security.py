@@ -109,8 +109,11 @@ def download_bounded(
 def validate_image_bytes(data: bytes) -> None:
     if len(data) > MAX_IMAGE_DOWNLOAD_BYTES:
         raise UnsafeRemoteResource("Generated image exceeds the configured size limit.")
-    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
-        raise UnsafeRemoteResource("Generated thumbnail is not a valid PNG image.")
+    is_png = data.startswith(b"\x89PNG\r\n\x1a\n")
+    is_jpeg = data.startswith(b"\xff\xd8\xff")
+    is_webp = data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP"
+    if not (is_png or is_jpeg or is_webp):
+        raise UnsafeRemoteResource("Generated thumbnail is not a valid image format.")
 
 
 def validate_chatgpt_image_url(url: str) -> str:

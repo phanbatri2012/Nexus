@@ -973,9 +973,23 @@ class YouTubePublishPipelineTests(unittest.TestCase):
                 channel, "access-token"
             )
         updated = database.get_video_publication(publication["id"])
+        pinned_job = database.get_system_job(
+            database.youtube_pinned_comment_job_id(publication["id"])
+        )
         self.assertEqual(reconciled, 1)
         self.assertEqual(updated["privacy_status"], "public")
         self.assertEqual(database.get_video(job["video_id"])["is_published"], 1)
+        self.assertEqual(pinned_job["status"], "retry_wait")
+        self.assertEqual(pinned_job["next_retry_at"], "2026-09-21T11:00:00+00:00")
+        self.assertEqual(
+            len(
+                database.list_system_jobs(
+                    job_type="youtube_pinned_comment",
+                    limit=None,
+                )
+            ),
+            1,
+        )
 
     def test_execute_publish_job_resolves_dynamic_publishing_settings(self):
         job, _channel = self._create_publish_job(schedule=False)

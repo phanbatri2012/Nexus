@@ -593,5 +593,36 @@ def test_history_prompt_matching_self_and_cross():
         assert history_prompt_text_matches(title_p, slug_p) is False
 
 
+def test_validate_image_bytes_formats():
+    from nexus_engine.services.network_security import validate_image_bytes, UnsafeRemoteResource
+    png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
+    jpeg_bytes = b"\xff\xd8\xff" + b"\x00" * 20
+    webp_bytes = b"RIFF\x00\x00\x00\x00WEBP" + b"\x00" * 20
+    invalid_bytes = b"INVALID_HEADER_DATA"
+
+    # Valid formats should pass without exception
+    validate_image_bytes(png_bytes)
+    validate_image_bytes(jpeg_bytes)
+    validate_image_bytes(webp_bytes)
+
+    # Invalid should raise UnsafeRemoteResource
+    with pytest.raises(UnsafeRemoteResource):
+        validate_image_bytes(invalid_bytes)
+
+
+def test_normalize_thumbnail_urls_filters_blobs():
+    from nexus_engine.main import _normalize_thumbnail_urls
+    input_urls = [
+        "blob:https://chatgpt.com/80c7e520-548b-45fb-a13e-249b602ea8a5",
+        "/api/thumbnails/thumb_valid1.png",
+        "blob:https://chatgpt.com/2afd31d8-798e-44ad-89b4-a80cd842bd98",
+        "/api/thumbnails/thumb_valid2.png",
+    ]
+    normalized = _normalize_thumbnail_urls(input_urls)
+    assert normalized == ["/api/thumbnails/thumb_valid1.png", "/api/thumbnails/thumb_valid2.png"]
+    assert not any(url.startswith("blob:") for url in normalized)
+
+
+
 
 

@@ -39,6 +39,7 @@ MAX_SYNC_COMMENTS = 1_000
 MAX_COMMENT_BATCH_SIZE = 10
 MAX_AUTO_DRAFT_COMMENTS_PER_SYNC = 100
 MAX_REPLY_CHARS = 2_000
+MAX_TOP_LEVEL_COMMENT_SCAN = 5_000
 SHORT_PRAISE_AUTO_REPLY_PERCENT = 20
 _SUSPICIOUS_COMMENT_PATTERNS = (
     re.compile(r"(?i)ignore\s+(all\s+)?(previous|prior|above)\s+instructions?"),
@@ -58,6 +59,19 @@ _SENSITIVE_REPLY_PATTERNS = (
 
 class YouTubeCommentsError(RuntimeError):
     """Raised for an actionable OAuth or YouTube API failure."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        http_status: int | None = None,
+        reason: str = "",
+        transient: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+        self.reason = str(reason or "").strip()
+        self.transient = bool(transient)
 
 
 class OAuthTokenRefreshError(YouTubeCommentsError):
@@ -374,12 +388,28 @@ def _request_json(
     except urllib.error.HTTPError as exc:
         response_text = exc.read().decode("utf-8", errors="replace")
         try:
-            detail = json.loads(response_text).get("error", {}).get("message")
+            error_payload = json.loads(response_text).get("error", {})
+            detail = error_payload.get("message")
+            errors = error_payload.get("errors") or []
+            reason = str((errors[0] if errors else {}).get("reason") or "")
         except json.JSONDecodeError:
             detail = response_text
-        raise YouTubeCommentsError(detail or f"YouTube API trả về HTTP {exc.code}.") from exc
+            reason = ""
+        transient = exc.code in {408, 425, 429, 500, 502, 503, 504} or reason in {
+            "backendError",
+            "rateLimitExceeded",
+            "userRateLimitExceeded",
+        }
+        raise YouTubeCommentsError(
+            detail or f"YouTube API trả về HTTP {exc.code}.",
+            http_status=int(exc.code),
+            reason=reason,
+            transient=transient,
+        ) from exc
     except (urllib.error.URLError, TimeoutError) as exc:
-        raise YouTubeCommentsError(f"Không thể kết nối YouTube: {exc}") from exc
+        raise YouTubeCommentsError(
+            f"Không thể kết nối YouTube: {exc}", transient=True
+        ) from exc
 
 
 def exchange_authorization_code(
@@ -448,6 +478,12 @@ def refresh_access_token(
             return json.loads(raw.decode("utf-8"))
     except urllib.error.HTTPError as exc:
         response_text = exc.read(64 * 1024).decode("utf-8", errors="replace")
+        if exc.code in {408, 425, 429, 500, 502, 503, 504}:
+            raise YouTubeCommentsError(
+                "Google tạm thời không thể làm mới quyền YouTube.",
+                http_status=int(exc.code),
+                transient=True,
+            ) from exc
         try:
             detail = json.loads(response_text)
         except json.JSONDecodeError:
@@ -457,7 +493,10 @@ def refresh_access_token(
             str(detail.get("error_description") or ""),
         ) from exc
     except (urllib.error.URLError, TimeoutError) as exc:
-        raise YouTubeCommentsError(f"Không thể kết nối Google để làm mới quyền: {exc}") from exc
+        raise YouTubeCommentsError(
+            f"Không thể kết nối Google để làm mới quyền: {exc}",
+            transient=True,
+        ) from exc
 
 
 def revoke_token(token: str, proxy: str | None = None) -> None:
@@ -537,6 +576,13 @@ def access_token_for_channel(channel: dict, persist_refreshed_token, proxy: str 
         )
         return access_token
 
+    if isinstance(last_error, YouTubeCommentsError) and last_error.transient:
+        raise YouTubeCommentsError(
+            "Google tạm thời không thể làm mới quyền YouTube qua proxy.",
+            http_status=last_error.http_status,
+            reason=last_error.reason,
+            transient=True,
+        ) from last_error
     if bound_client_id:
         raise YouTubeCommentsError(
             f"Không thể làm mới quyền cho kênh bằng OAuth Client đã liên kết. {last_error}"
@@ -778,6 +824,110 @@ def publish_reply(access_token: str, parent_comment_id: str, text: str, proxy: s
         "reply_id": payload.get("id", ""),
         "text": payload.get("snippet", {}).get("textDisplay") or text,
         "published_at": payload.get("snippet", {}).get("publishedAt", ""),
+    }
+
+
+def validate_top_level_comment(text: str) -> str:
+    value = str(text or "").strip()
+    if not value:
+        raise YouTubeCommentsError("Bình luận ghim trong metadata đang để trống.")
+    if len(value) > MAX_REPLY_CHARS:
+        raise YouTubeCommentsError(
+            f"Bình luận ghim vượt quá {MAX_REPLY_CHARS} ký tự."
+        )
+    return value
+
+
+def _normalized_comment_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def find_channel_top_level_comment(
+    access_token: str,
+    youtube_video_id: str,
+    channel_id: str,
+    text: str,
+    proxy: str | None = None,
+) -> dict | None:
+    """Find an exact own-channel top-level comment without unbounded pagination."""
+    expected_text = _normalized_comment_text(validate_top_level_comment(text))
+    page_token = ""
+    seen_tokens: set[str] = set()
+    scanned = 0
+    while scanned < MAX_TOP_LEVEL_COMMENT_SCAN:
+        params = {
+            "part": "snippet",
+            "videoId": str(youtube_video_id or "").strip(),
+            "maxResults": 100,
+            "order": "time",
+            "textFormat": "plainText",
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        payload = _request_json(
+            f"{YOUTUBE_API_BASE}/commentThreads?{urllib.parse.urlencode(params)}",
+            token=access_token,
+            proxy=proxy,
+        )
+        for item in payload.get("items") or []:
+            scanned += 1
+            top_comment = (item.get("snippet") or {}).get("topLevelComment") or {}
+            snippet = top_comment.get("snippet") or {}
+            author_id = str((snippet.get("authorChannelId") or {}).get("value") or "")
+            candidate_text = _normalized_comment_text(
+                snippet.get("textOriginal") or snippet.get("textDisplay") or ""
+            )
+            if author_id == str(channel_id or "").strip() and candidate_text == expected_text:
+                return {
+                    "thread_id": str(item.get("id") or ""),
+                    "comment_id": str(top_comment.get("id") or ""),
+                    "text": str(snippet.get("textOriginal") or snippet.get("textDisplay") or text),
+                    "published_at": str(snippet.get("publishedAt") or ""),
+                    "existing": True,
+                }
+            if scanned >= MAX_TOP_LEVEL_COMMENT_SCAN:
+                break
+        next_token = str(payload.get("nextPageToken") or "").strip()
+        if not next_token or next_token in seen_tokens:
+            return None
+        seen_tokens.add(next_token)
+        page_token = next_token
+    return None
+
+
+def publish_top_level_comment(
+    access_token: str,
+    youtube_video_id: str,
+    text: str,
+    proxy: str | None = None,
+) -> dict:
+    safe_text = validate_top_level_comment(text)
+    query = urllib.parse.urlencode({"part": "snippet"})
+    payload = _request_json(
+        f"{YOUTUBE_API_BASE}/commentThreads?{query}",
+        method="POST",
+        token=access_token,
+        data={
+            "snippet": {
+                "videoId": str(youtube_video_id or "").strip(),
+                "topLevelComment": {"snippet": {"textOriginal": safe_text}},
+            }
+        },
+        proxy=proxy,
+    )
+    top_comment = (payload.get("snippet") or {}).get("topLevelComment") or {}
+    snippet = top_comment.get("snippet") or {}
+    comment_id = str(top_comment.get("id") or "").strip()
+    if not comment_id:
+        raise YouTubeCommentsError(
+            "YouTube đã nhận yêu cầu nhưng không trả về Comment ID.", transient=True
+        )
+    return {
+        "thread_id": str(payload.get("id") or ""),
+        "comment_id": comment_id,
+        "text": str(snippet.get("textOriginal") or snippet.get("textDisplay") or safe_text),
+        "published_at": str(snippet.get("publishedAt") or ""),
+        "existing": False,
     }
 
 
