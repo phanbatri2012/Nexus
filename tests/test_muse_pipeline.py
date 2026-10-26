@@ -4649,6 +4649,165 @@ class TestMuseRouting(unittest.TestCase):
         for secret_field in ("api_key", "cookie", "token", "proxy"):
             self.assertNotIn(secret_field, serialized.lower())
 
+    def test_muse_accounts_response_exposes_sanitized_quota_states(self):
+        now = int(time.time())
+        accounts = [
+            {
+                "id": "weekly-exhausted-extra-available",
+                "label": "Account 1",
+                "cookies": {"secret_cookie": "do-not-return"},
+                "cookies_exp": {"hatch_vml": now + 3600},
+                "quota": {
+                    "found": True,
+                    "plan": "Free plan",
+                    "weekly_used_pct": 100,
+                    "weekly_reset": "Nov 2",
+                    "extra_left": "2.7B tokens left",
+                    "extra_left_value": 2_700_000_000,
+                    "checked_at": now,
+                    "raw": "authorization=secret",
+                },
+            },
+            {
+                "id": "fully-exhausted",
+                "label": "Account 2",
+                "cookies": {"secret_cookie": "do-not-return"},
+                "cookies_exp": {"hatch_vml": now + 3600},
+                "quota": {
+                    "found": True,
+                    "weekly_used_pct": 100,
+                    "extra_pool_present": True,
+                    "extra_left_value": 0,
+                    "checked_at": now,
+                },
+            },
+            {
+                "id": "stale",
+                "label": "Account 3",
+                "cookies": {"secret_cookie": "do-not-return"},
+                "quota": {
+                    "found": True,
+                    "weekly_used_pct": 10,
+                    "checked_at": now - main.MUSE_QUOTA_CACHE_TTL_SECONDS - 1,
+                },
+            },
+        ]
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(
+                main.muse_settings,
+                "load_muse_settings",
+                return_value={"muse_studio_path": temp_dir},
+            ),
+            patch.object(
+                main.muse_studio_service,
+                "_studio_data_dir",
+                return_value=Path(temp_dir),
+            ),
+        ):
+            (Path(temp_dir) / "accounts.json").write_text(
+                json.dumps(accounts),
+                encoding="utf-8",
+            )
+            response = main.get_muse_accounts_endpoint()
+
+        payload = json.loads(response.body)
+        self.assertEqual(
+            [item["media_quota_status"] for item in payload["items"]],
+            ["eligible", "exhausted", "unknown"],
+        )
+        self.assertEqual(
+            payload["items"][0]["quota"]["weekly_remaining_pct"],
+            0,
+        )
+        self.assertEqual(
+            payload["items"][0]["quota"]["extra_left_value"],
+            2_700_000_000,
+        )
+        serialized = response.body.decode("utf-8").lower()
+        self.assertNotIn("do-not-return", serialized)
+        self.assertNotIn("authorization=secret", serialized)
+        self.assertNotIn('"raw"', serialized)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+
+    def test_refresh_muse_account_quota_uses_lease_and_sanitizes_response(self):
+        now = int(time.time())
+        with (
+            patch.object(
+                main.muse_studio_service,
+                "status",
+                return_value={"active_media_tasks": 0},
+            ),
+            patch.object(main.muse_studio_service, "acquire") as acquire,
+            patch.object(main.muse_studio_service, "release") as release,
+            patch.object(
+                main.muse_provider,
+                "refresh_account_quota",
+                return_value={
+                    "found": True,
+                    "weekly_used_pct": 100,
+                    "weekly_reset": "Nov 2",
+                    "extra_pool_present": True,
+                    "extra_left_value": 0,
+                    "checked_at": now,
+                    "raw": "cookie=secret",
+                },
+            ) as refresh,
+        ):
+            response = main.refresh_muse_account_quota_endpoint("account-1")
+
+        payload = json.loads(response.body)
+        acquire.assert_called_once_with()
+        refresh.assert_called_once_with("account-1")
+        release.assert_called_once_with()
+        self.assertEqual(payload["quota"]["status"], "exhausted")
+        self.assertNotIn("raw", payload["quota"])
+
+    def test_refresh_muse_account_quota_rejects_active_media_task(self):
+        with (
+            patch.object(
+                main.muse_studio_service,
+                "status",
+                return_value={"active_media_tasks": 1},
+            ),
+            patch.object(main.muse_studio_service, "acquire") as acquire,
+        ):
+            with self.assertRaises(main.HTTPException) as raised:
+                main.refresh_muse_account_quota_endpoint("account-1")
+
+        self.assertEqual(raised.exception.status_code, 409)
+        acquire.assert_not_called()
+
+    def test_refresh_muse_account_quota_rejects_invalid_id_before_starting_service(self):
+        with (
+            patch.object(main.muse_studio_service, "status") as status,
+            patch.object(main.muse_studio_service, "acquire") as acquire,
+        ):
+            with self.assertRaises(main.HTTPException) as raised:
+                main.refresh_muse_account_quota_endpoint("../invalid")
+
+        self.assertEqual(raised.exception.status_code, 400)
+        status.assert_not_called()
+        acquire.assert_not_called()
+
+    def test_refresh_muse_account_quota_rejects_claimable_muse_job(self):
+        with (
+            patch.object(
+                main._muse_media_coordinator,
+                "status",
+                return_value={"current_job_id": ""},
+            ),
+            patch.object(main.db, "has_claimable_system_jobs", return_value=True),
+            patch.object(main.muse_studio_service, "status") as status,
+            patch.object(main.muse_studio_service, "acquire") as acquire,
+        ):
+            with self.assertRaises(main.HTTPException) as raised:
+                main.refresh_muse_account_quota_endpoint("account-1")
+
+        self.assertEqual(raised.exception.status_code, 409)
+        status.assert_not_called()
+        acquire.assert_not_called()
+
     def test_legacy_muse_profile_routes_are_removed(self):
         source = Path(main.__file__).read_text(encoding="utf-8")
         self.assertNotIn('/api/muse/profile/open', source)

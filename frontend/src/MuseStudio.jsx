@@ -5,6 +5,13 @@ import {
   normalizeMuseAliases,
   splitMuseAliasDraft
 } from './museAliases'
+import {
+  formatMuseDateTime,
+  formatMuseTokens,
+  formatMuseWeeklyReset,
+  getBrowserTimeZone,
+  summarizeMuseAccounts
+} from './museQuota'
 
 const API_BASE = 'http://127.0.0.1:8080'
 
@@ -26,6 +33,8 @@ export default function MuseStudio() {
   const [isBusy, setIsBusy] = useState(false)
   const [notice, setNotice] = useState(null)
   const [accounts, setAccounts] = useState([])
+  const [refreshingQuotaIds, setRefreshingQuotaIds] = useState([])
+  const [quotaRefreshProgress, setQuotaRefreshProgress] = useState(null)
   const [mediaItems, setMediaItems] = useState([])
   const [promptsData, setPromptsData] = useState(null)
   const [activePromptVersion, setActivePromptVersion] = useState('')
@@ -64,6 +73,55 @@ export default function MuseStudio() {
       console.warn('Không thể tải danh sách tài khoản Muse:', err)
     }
   }, [])
+
+  const refreshAccountQuota = async (accountId, { quiet = false } = {}) => {
+    setRefreshingQuotaIds(current => current.includes(accountId) ? current : [...current, accountId])
+    try {
+      const res = await fetch(`${API_BASE}/api/muse/accounts/${encodeURIComponent(accountId)}/quota/refresh`, {
+        method: 'POST'
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.detail || 'Không thể cập nhật quota tài khoản Muse.')
+      setAccounts(current => current.map(account => (
+        account.id === accountId
+          ? {
+              ...account,
+              quota: data.quota,
+              media_quota_status: data.quota?.status || 'unknown'
+            }
+          : account
+      )))
+      if (!quiet) showNotice('Đã cập nhật quota tài khoản Muse.', 'success')
+      return true
+    } catch (err) {
+      if (!quiet) showNotice(err.message, 'error')
+      return false
+    } finally {
+      setRefreshingQuotaIds(current => current.filter(id => id !== accountId))
+    }
+  }
+
+  const handleRefreshAllQuotas = async () => {
+    if (serviceStatus.active_media_tasks > 0) {
+      showNotice('Muse đang tạo media; hãy cập nhật quota sau khi tác vụ hoàn tất.', 'error')
+      return
+    }
+    if (accounts.length === 0 || quotaRefreshProgress) return
+    let succeeded = 0
+    setQuotaRefreshProgress({ completed: 0, total: accounts.length })
+    for (let index = 0; index < accounts.length; index += 1) {
+      const ok = await refreshAccountQuota(accounts[index].id, { quiet: true })
+      if (ok) succeeded += 1
+      setQuotaRefreshProgress({ completed: index + 1, total: accounts.length })
+    }
+    await refreshAccounts()
+    setQuotaRefreshProgress(null)
+    if (succeeded === accounts.length) {
+      showNotice(`Đã cập nhật quota của ${succeeded}/${accounts.length} tài khoản.`, 'success')
+    } else {
+      showNotice(`Đã cập nhật ${succeeded}/${accounts.length} tài khoản; một số tài khoản cần kiểm tra lại.`, 'error')
+    }
+  }
 
   // 3. Fetch Media
   const refreshMedia = useCallback(async () => {
@@ -213,6 +271,8 @@ export default function MuseStudio() {
   const currentReferenceSets = useMemo(() => {
     return currentVersionData?.image_generation_settings?.muse_settings?.reference_sets || []
   }, [currentVersionData])
+  const accountQuotaSummary = useMemo(() => summarizeMuseAccounts(accounts), [accounts])
+  const displayTimeZone = useMemo(() => getBrowserTimeZone(), [])
 
   const handleUpdateReferenceSets = async (newReferenceSets) => {
     if (!promptsData || !activePromptVersion) return
@@ -555,8 +615,31 @@ export default function MuseStudio() {
           <div className="muse-card-title">
             <h2>👥 Danh sách Tài khoản Muse Pool</h2>
             <div style={{ display: 'flex', gap: 10 }}>
-              <button type="button" className="muse-btn" onClick={refreshAccounts}>
-                🔄 Làm mới
+              <button
+                type="button"
+                className="muse-btn"
+                disabled={Boolean(quotaRefreshProgress)}
+                onClick={refreshAccounts}
+                title="Đọc lại dữ liệu quota đã cache, không mở trình duyệt Muse"
+              >
+                🔄 Làm mới cache
+              </button>
+              <button
+                type="button"
+                className="muse-btn success"
+                disabled={
+                  accounts.length === 0
+                  || Boolean(quotaRefreshProgress)
+                  || serviceStatus.active_media_tasks > 0
+                }
+                onClick={handleRefreshAllQuotas}
+                title={serviceStatus.active_media_tasks > 0
+                  ? 'Muse đang tạo media; cập nhật quota được khóa để tránh tranh chấp browser'
+                  : 'Mở Settings Muse và cập nhật lần lượt từng tài khoản'}
+              >
+                {quotaRefreshProgress
+                  ? `⏳ Đang kiểm tra ${quotaRefreshProgress.completed}/${quotaRefreshProgress.total}`
+                  : '⚡ Cập nhật tất cả quota'}
               </button>
               <button type="button" className="muse-btn primary" onClick={handleOpenWebAdmin}>
                 + Thêm tài khoản qua Web Admin
@@ -564,43 +647,145 @@ export default function MuseStudio() {
             </div>
           </div>
 
+          <div className="muse-quota-summary">
+            <div className="muse-quota-summary-item">
+              <span>Tổng tài khoản</span>
+              <strong>{accountQuotaSummary.total}</strong>
+            </div>
+            <div className="muse-quota-summary-item eligible">
+              <span>Có thể tạo media</span>
+              <strong>{accountQuotaSummary.eligible}</strong>
+            </div>
+            <div className="muse-quota-summary-item exhausted">
+              <span>Hết toàn bộ quota</span>
+              <strong>{accountQuotaSummary.exhausted}</strong>
+            </div>
+            <div className="muse-quota-summary-item unknown">
+              <span>Chưa rõ / dữ liệu cũ</span>
+              <strong>{accountQuotaSummary.unknown}</strong>
+            </div>
+          </div>
+
+          <div className="muse-quota-timezone-note">
+            Các mốc có giờ hiển thị theo <strong>{displayTimeZone}</strong> và luôn kèm múi giờ.
+            Ngày hồi hạn mức sẽ ghi rõ khi Muse không cung cấp giờ hoặc múi giờ.
+          </div>
+
+          {serviceStatus.active_media_tasks > 0 && (
+            <div className="muse-notice info">
+              ℹ️ Cập nhật quota đang tạm khóa vì Muse có {serviceStatus.active_media_tasks} tác vụ media đang chạy.
+            </div>
+          )}
+
           {accounts.length === 0 ? (
             <p style={{ color: '#94a3b8', textAlign: 'center', padding: '30px 0' }}>
               Chưa tìm thấy tài khoản nào trong `accounts.json`. Hãy mở Web Admin hoặc Muse Desktop để đăng nhập và lấy cookie.
             </p>
           ) : (
-            <table className="muse-table">
-              <thead>
-                <tr>
-                  <th>Mã ID</th>
-                  <th>Tên tài khoản / Email</th>
-                  <th>Số Cookies</th>
-                  <th>Trạng thái</th>
-                  <th>Hạn dùng phiên</th>
-                </tr>
-              </thead>
-              <tbody>
-                {accounts.map(acc => (
-                  <tr key={acc.id}>
-                    <td>
-                      <code>{acc.id}</code>
-                    </td>
-                    <td>
-                      <strong>{acc.label}</strong>
-                    </td>
-                    <td>{acc.cookie_count} cookies</td>
-                    <td>
-                      <span className={`muse-pill ${acc.is_expired ? 'expired' : 'active'}`}>
-                        {acc.is_expired ? 'Hết hạn' : 'Đang hoạt động'}
-                      </span>
-                    </td>
-                    <td style={{ color: '#94a3b8' }}>
-                      {acc.expires_at ? new Date(acc.expires_at * 1000).toLocaleString('vi-VN') : 'Không xác định'}
-                    </td>
+            <div className="muse-table-wrap">
+              <table className="muse-table muse-quota-table">
+                <thead>
+                  <tr>
+                    <th>Tài khoản</th>
+                    <th>Phiên đăng nhập</th>
+                    <th>Hạn mức tuần</th>
+                    <th>Token bổ sung</th>
+                    <th>Ngày hồi hạn mức</th>
+                    <th>Trạng thái quota</th>
+                    <th>Lần kiểm tra</th>
+                    <th>Thao tác</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {accounts.map(acc => {
+                    const quota = acc.quota || {}
+                    const weeklyRemaining = Number(quota.weekly_remaining_pct)
+                    const hasWeeklyQuota = quota.found && Number.isFinite(weeklyRemaining)
+                    const quotaStatus = acc.media_quota_status || 'unknown'
+                    const quotaStatusText = quotaStatus === 'eligible'
+                      ? 'Có thể dùng'
+                      : quotaStatus === 'exhausted'
+                        ? 'Hết quota'
+                        : 'Chưa xác định'
+                    const sessionText = acc.enabled === false
+                      ? 'Đã tắt'
+                      : acc.is_expired
+                        ? 'Hết hạn'
+                        : acc.session_ok === false
+                          ? 'Lỗi phiên'
+                          : 'Đang hoạt động'
+                    const sessionClass = sessionText === 'Đang hoạt động' ? 'active' : 'expired'
+                    const isRefreshing = refreshingQuotaIds.includes(acc.id)
+                    return (
+                      <tr key={acc.id}>
+                        <td>
+                          <strong>{acc.label || acc.id}</strong>
+                          <div className="muse-table-subtext">
+                            <code>{acc.id}</code> · {acc.cookie_count} cookies
+                          </div>
+                        </td>
+                        <td>
+                          <span className={`muse-pill ${sessionClass}`}>{sessionText}</span>
+                          <div className="muse-table-subtext">
+                            {acc.expires_at
+                              ? `Hết hạn: ${formatMuseDateTime(acc.expires_at, displayTimeZone)}`
+                              : 'Hạn phiên: Không xác định'}
+                          </div>
+                        </td>
+                        <td className="muse-quota-cell">
+                          {hasWeeklyQuota ? (
+                            <>
+                              <strong>Còn {Math.round(weeklyRemaining)}%</strong>
+                              <div className="muse-quota-bar" aria-label={`Hạn mức tuần còn ${weeklyRemaining}%`}>
+                                <span style={{ width: `${weeklyRemaining}%` }} />
+                              </div>
+                              <div className="muse-table-subtext">
+                                Đã dùng {Math.round(Number(quota.weekly_used_pct) || 0)}%
+                                {quota.plan ? ` · ${quota.plan}` : ''}
+                              </div>
+                            </>
+                          ) : (
+                            <span className="muse-table-subtext">Chưa kiểm tra</span>
+                          )}
+                        </td>
+                        <td>
+                          <strong>{quota.found ? formatMuseTokens(quota) : 'Chưa kiểm tra'}</strong>
+                          {quota.extra_used_pct != null && (
+                            <div className="muse-table-subtext">Đã dùng {Math.round(quota.extra_used_pct)}%</div>
+                          )}
+                        </td>
+                        <td className="muse-reset-cell">
+                          {formatMuseWeeklyReset(quota.weekly_reset)}
+                        </td>
+                        <td>
+                          <span className={`muse-pill quota-${quotaStatus}`}>{quotaStatusText}</span>
+                          {quota.stale && <div className="muse-table-subtext warning">Dữ liệu đã cũ</div>}
+                        </td>
+                        <td className="muse-checked-cell">
+                          {quota.checked_at
+                            ? formatMuseDateTime(quota.checked_at, displayTimeZone)
+                            : 'Chưa kiểm tra'}
+                        </td>
+                        <td>
+                          <button
+                            type="button"
+                            className="muse-btn"
+                            disabled={
+                              isRefreshing
+                              || Boolean(quotaRefreshProgress)
+                              || serviceStatus.active_media_tasks > 0
+                            }
+                            onClick={() => refreshAccountQuota(acc.id)}
+                          >
+                            {isRefreshing ? '⏳ Đang kiểm tra' : 'Kiểm tra quota'}
+                          </button>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
           )}
         </div>
       )}

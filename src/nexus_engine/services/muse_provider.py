@@ -255,6 +255,28 @@ def _is_connection_refused(exc: BaseException) -> bool:
     )
 
 
+def validate_account_id(account_id: str) -> str:
+    normalized = str(account_id or "").strip()
+    if not normalized or len(normalized) > 64 or not all(
+        character.isalnum() or character in {"-", "_"}
+        for character in normalized
+    ):
+        raise ValueError("Mã tài khoản Muse không hợp lệ.")
+    return normalized
+
+
+def refresh_account_quota(account_id: str) -> dict:
+    """Refresh one account's quota through the authenticated loopback service."""
+
+    normalized = validate_account_id(account_id)
+    endpoint = f"/admin/accounts/{urllib.parse.quote(normalized, safe='')}/quota"
+    return MuseStudioApiProvider._request_json(
+        "POST",
+        endpoint,
+        timeout_seconds=90.0,
+    )
+
+
 def _validate_reference_paths(paths: list[Path], *, limit: int) -> list[Path]:
     if len(paths) > limit:
         raise MuseReferenceError(f"Muse chỉ nhận tối đa {limit} ảnh reference cho request này.")

@@ -19,6 +19,7 @@ import html
 import json
 import logging
 import math
+import re
 import threading
 import urllib.parse
 
@@ -1512,6 +1513,96 @@ def restart_muse_service_endpoint():
         raise _muse_http_exception(503, exc) from exc
 
 
+MUSE_QUOTA_CACHE_TTL_SECONDS = 15 * 60
+_MUSE_TOKEN_UNITS = {"": 1, "K": 10**3, "M": 10**6, "B": 10**9, "T": 10**12}
+
+
+def _muse_token_amount(value) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    match = re.search(
+        r"(?<![\w.])(\d+(?:[.,]\d+)?)\s*([KMBT]?)\b",
+        str(value),
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    number = float(match.group(1).replace(",", "."))
+    return max(0, int(number * _MUSE_TOKEN_UNITS[match.group(2).upper()]))
+
+
+def _sanitize_muse_quota(raw_quota, *, now: float | None = None) -> dict:
+    current = float(time.time() if now is None else now)
+    quota = raw_quota if isinstance(raw_quota, dict) else {}
+    found = bool(quota.get("found"))
+
+    try:
+        checked_at = max(0, int(quota.get("checked_at") or 0))
+    except (TypeError, ValueError):
+        checked_at = 0
+    stale = checked_at <= 0 or current - checked_at > MUSE_QUOTA_CACHE_TTL_SECONDS
+
+    try:
+        weekly_used = float(quota["weekly_used_pct"])
+        weekly_used = max(0.0, min(100.0, weekly_used))
+    except (KeyError, TypeError, ValueError):
+        weekly_used = None
+    weekly_remaining = None if weekly_used is None else max(0.0, 100.0 - weekly_used)
+
+    extra_left_value = _muse_token_amount(quota.get("extra_left_value"))
+    if extra_left_value is None:
+        extra_left_value = _muse_token_amount(quota.get("extra_left"))
+    extra_known = any(
+        key in quota
+        for key in (
+            "extra_pool_present",
+            "extra_left_value",
+            "extra_left",
+            "extra_used_pct",
+        )
+    )
+
+    if not found or stale:
+        status = "unknown"
+    elif quota.get("runtime_exhausted"):
+        status = "exhausted"
+    elif weekly_used is not None and weekly_used < 100:
+        status = "eligible"
+    elif extra_left_value is not None and extra_left_value > 0:
+        status = "eligible"
+    elif weekly_used is not None and weekly_used >= 100 and extra_known and extra_left_value == 0:
+        status = "exhausted"
+    else:
+        status = "unknown"
+
+    def safe_text(name: str, limit: int = 120) -> str:
+        return str(quota.get(name) or "").strip()[:limit]
+
+    try:
+        extra_used_pct = float(quota["extra_used_pct"])
+        extra_used_pct = max(0.0, min(100.0, extra_used_pct))
+    except (KeyError, TypeError, ValueError):
+        extra_used_pct = None
+
+    return {
+        "found": found,
+        "status": status,
+        "stale": stale,
+        "plan": safe_text("plan"),
+        "weekly_used_pct": weekly_used,
+        "weekly_remaining_pct": weekly_remaining,
+        "weekly_reset": safe_text("weekly_reset"),
+        "extra_pool_present": bool(quota.get("extra_pool_present")),
+        "extra_left": safe_text("extra_left", 80),
+        "extra_left_value": extra_left_value,
+        "extra_used_pct": extra_used_pct,
+        "extra_expires": safe_text("extra_expires", 80),
+        "checked_at": checked_at,
+    }
+
+
 @app.get("/api/muse/accounts")
 def get_muse_accounts_endpoint():
     try:
@@ -1544,17 +1635,75 @@ def get_muse_accounts_endpoint():
                 except (ValueError, TypeError):
                     pass
             is_expired = bool(min_exp is not None and min_exp < now)
+            quota = _sanitize_muse_quota(acc.get("quota"), now=now)
             sanitized.append({
                 "id": str(acc.get("id") or ""),
                 "label": str(acc.get("label") or ""),
                 "cookie_count": len(cookies),
+                "enabled": bool(acc.get("enabled", True)),
+                "session_ok": acc.get("ok") if isinstance(acc.get("ok"), bool) else None,
                 "is_expired": is_expired,
                 "expires_at": min_exp,
+                "expires_estimated": bool(acc.get("expires_estimated")),
+                "media_quota_status": quota["status"],
+                "quota": quota,
             })
         return _muse_json_response({"items": sanitized})
     except Exception as exc:
         logger.warning("Không thể lấy danh sách tài khoản Muse: %s", exc)
         return _muse_json_response({"items": []})
+
+
+@app.post("/api/muse/accounts/{account_id}/quota/refresh")
+def refresh_muse_account_quota_endpoint(account_id: str):
+    acquired = False
+    try:
+        account_id = muse_provider.validate_account_id(account_id)
+        coordinator = globals().get("_muse_media_coordinator")
+        coordinator_status = coordinator.status() if coordinator is not None else {}
+        if (
+            str(coordinator_status.get("current_job_id") or "").strip()
+            or db.has_claimable_system_jobs("muse_media_generation")
+        ):
+            raise muse_provider.MuseServiceBusy(
+                "Muse có job media đang chạy hoặc sẵn sàng chạy; hãy cập nhật quota sau khi hàng đợi rảnh."
+            )
+        service = muse_studio_service.status(probe=True)
+        if int(service.get("active_media_tasks") or 0) > 0:
+            raise muse_provider.MuseServiceBusy(
+                "Muse đang tạo media; hãy cập nhật quota sau khi tác vụ hoàn tất."
+            )
+        muse_studio_service.acquire()
+        acquired = True
+        quota = muse_provider.refresh_account_quota(account_id)
+        return _muse_json_response(
+            {
+                "success": True,
+                "account_id": account_id,
+                "quota": _sanitize_muse_quota(quota),
+            }
+        )
+    except ValueError as exc:
+        raise _muse_http_exception(400, exc) from exc
+    except muse_provider.MuseAuthenticationError as exc:
+        raise _muse_http_exception(401, exc) from exc
+    except (
+        muse_provider.MuseServiceBusy,
+        muse_studio_service.MuseStudioServiceBusy,
+    ) as exc:
+        raise _muse_http_exception(409, exc) from exc
+    except muse_studio_service.MuseStudioConfigurationError as exc:
+        raise _muse_http_exception(400, exc) from exc
+    except (
+        muse_provider.MuseError,
+        muse_studio_service.MuseStudioServiceError,
+    ) as exc:
+        raise _muse_http_exception(503, exc) from exc
+    except Exception as exc:
+        raise _muse_http_exception(503, exc) from exc
+    finally:
+        if acquired:
+            muse_studio_service.release()
 
 
 @app.get("/api/muse/media")
