@@ -10448,8 +10448,13 @@ def _public_media_job_notification(job: dict) -> dict:
         elif resume_step == "muse_media_generation":
             progress = "Đang kết nối Muse AI; sẽ tự tiếp tục"
 
-    display_status = status
-    state = status or "idle"
+    status_map = {
+        "completed": "done",
+        "failed": "error",
+    }
+    canonical_status = status_map.get(status, status)
+    display_status = canonical_status
+    state = canonical_status or "idle"
     retry_active = status == "retry_wait" and (
         not provider or coordinator_running
     )
@@ -10519,7 +10524,10 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
         and result.get("attention_required")
     )
     notification = _public_media_job_notification(job)
-    display_status = str(notification.get("display_status") or status)
+    display_status = status_map.get(
+        str(notification.get("display_status") or status),
+        str(notification.get("display_status") or status),
+    )
     muse_checkpoint = (
         muse_pipeline.inspect_muse_recovery(int(video_id))
         if job_type == "muse_media_generation"

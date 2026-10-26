@@ -39,7 +39,9 @@ const STATUS_META = {
   awaiting_review: { label: 'Chờ duyệt thủ công', color: '#f5b041' },
   review_blocked: { label: 'Tự kiểm tra không đạt', color: '#ff6b6b' },
   done: { label: 'Hoàn thành', color: '#4dd0e1' },
+  completed: { label: 'Hoàn thành', color: '#4dd0e1' },
   error: { label: 'Lỗi', color: '#ff5c5c' },
+  failed: { label: 'Lỗi', color: '#ff5c5c' },
   canceled: { label: 'Đã hủy', color: '#999' }
 }
 
@@ -980,7 +982,8 @@ function JobCenter({ onOpenVideo, refreshKey }) {
           {renderPagination()}
           <div style={{ display: 'grid', gap: '12px', marginTop: '12px', marginBottom: '12px' }}>
           {filteredJobs.map(job => {
-            const displayStatus = job.display_status || job.status
+            const rawDisplayStatus = job.display_status || job.status
+            const displayStatus = rawDisplayStatus === 'completed' ? 'done' : rawDisplayStatus === 'failed' ? 'error' : rawDisplayStatus
             const status = (
               displayStatus === 'paused' && job.attention_required === 'chatgpt_verification'
                 ? job.automatic_login === 'pending'
