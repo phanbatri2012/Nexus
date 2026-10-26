@@ -188,8 +188,12 @@ class SystemCleaner:
         data_dir: Optional[Path] = None,
         omnivoice_jobs_dir: Optional[Path] = None,
         project_root: Optional[Path] = None,
+        cleanup_scope_root: Optional[Path] = None,
     ):
         self.project_root = Path(project_root or PROJECT_ROOT).resolve()
+        self.cleanup_scope_root = Path(
+            cleanup_scope_root or self.project_root.parent
+        ).resolve()
         self.data_dir = Path(data_dir or DATA_DIR).resolve()
         self.omnivoice_jobs_dir = Path(
             omnivoice_jobs_dir
@@ -204,6 +208,15 @@ class SystemCleaner:
         self.manifests_dir = self.data_dir / "cleanup_manifests"
         self.quarantine_dir = self.project_root / ".nexus-quarantine"
         self.process_lock_path = self.data_dir / ".cleanup.lock"
+        self.scope_configuration_valid = all(
+            self._path_within_scope(configured_root)
+            for configured_root in (
+                self.project_root,
+                self.data_dir,
+                self.omnivoice_jobs_dir,
+                self.omnivoice_root,
+            )
+        )
 
     def _acquire_process_lock(self) -> Any | None:
         """Acquire a non-blocking OS lock shared by CLI and service processes."""
@@ -255,6 +268,13 @@ class SystemCleaner:
             self.omnivoice_root,
         )
 
+    def _path_within_scope(self, path: Path) -> bool:
+        try:
+            path.resolve(strict=False).relative_to(self.cleanup_scope_root)
+            return True
+        except (OSError, ValueError):
+            return False
+
     def _category(
         self, summary: CleanupSummary, key: str, name: str | None = None
     ) -> CleanupCategoryResult:
@@ -279,6 +299,8 @@ class SystemCleaner:
         try:
             resolved = path.resolve(strict=False)
         except OSError:
+            return False
+        if not self._path_within_scope(resolved):
             return False
         for root in self.allowed_roots:
             try:
@@ -1149,6 +1171,7 @@ class SystemCleaner:
             timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),
             dry_run=bool(dry_run),
             policy={
+                "cleanup_scope_root": str(self.cleanup_scope_root),
                 "render_retention_days": float(render_retention_days),
                 "audio_retention_hours": float(audio_retention_hours),
                 "temp_retention_days": DEFAULT_TEMP_RETENTION_DAYS,
@@ -1159,6 +1182,10 @@ class SystemCleaner:
                 "manifest_retention_days": DEFAULT_MANIFEST_RETENTION_DAYS,
             },
         )
+        if not self.scope_configuration_valid:
+            summary.blocked = True
+            summary.verification_errors = ["cleanup_scope_configuration_invalid"]
+            return summary
         acquired = self._run_lock.acquire(blocking=False)
         if not acquired:
             summary.blocked = True

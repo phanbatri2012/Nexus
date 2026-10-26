@@ -475,6 +475,49 @@ def test_path_outside_allowlist_is_never_planned(cleaner_env, tmp_path: Path):
     assert "path_outside_allowlist" in summary.categories["expired_renders"].errors
 
 
+def test_cleanup_scope_rejects_path_even_when_broad_allowlist_includes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    scope_root = tmp_path / "Tool"
+    project_root = scope_root / "Nexus_Studio_Engine"
+    cleaner = SystemCleaner(
+        data_dir=project_root / "data",
+        omnivoice_jobs_dir=scope_root / "omnivoice" / "data" / "jobs",
+        project_root=project_root,
+        cleanup_scope_root=scope_root,
+    )
+    outside_scope = tmp_path / "outside-scope.mp4"
+    outside_scope.write_bytes(b"must remain")
+    monkeypatch.setattr(
+        SystemCleaner,
+        "allowed_roots",
+        property(lambda self: (tmp_path,)),
+    )
+
+    assert cleaner._is_allowed_path(outside_scope) is False
+    assert outside_scope.exists()
+
+
+def test_cleanup_configuration_outside_scope_is_blocked(tmp_path: Path):
+    scope_root = tmp_path / "Tool"
+    project_root = scope_root / "Nexus_Studio_Engine"
+    data_dir = project_root / "data"
+    jobs_dir = tmp_path / "outside" / "omnivoice" / "data" / "jobs"
+
+    cleaner = SystemCleaner(
+        data_dir=data_dir,
+        omnivoice_jobs_dir=jobs_dir,
+        project_root=project_root,
+        cleanup_scope_root=scope_root,
+    )
+
+    summary = cleaner.run_full_cleanup(dry_run=False)
+
+    assert summary.blocked is True
+    assert summary.verification_errors == ["cleanup_scope_configuration_invalid"]
+    assert not data_dir.exists()
+
+
 def test_cleanup_status_fails_closed_on_probe_error(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         maintenance_guard,
