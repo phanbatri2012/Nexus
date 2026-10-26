@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { parseTime24, formatTime24, formatTime12, formatDateTimeAMPM, MINUTES_15, snapTime24To15 } from './publicationTime.js'
+import { parseTime24, formatTime24, formatTime12, formatDateTimeAMPM, formatTimeZoneLabel, MINUTES_15, snapTime24To15 } from './publicationTime.js'
 
 const componentSource = readFileSync(
   new URL('./PublicationTimePicker.jsx', import.meta.url),
@@ -63,11 +63,49 @@ test('formatTime12 converts 24h string to 12h AM/PM standard', () => {
 test('formatDateTimeAMPM formats dates with 12h AM/PM standard', () => {
   assert.equal(formatDateTimeAMPM(null), '-')
   assert.equal(formatDateTimeAMPM(''), '-')
-  const d = new Date(2026, 9, 20, 14, 30, 45) // 20 Oct 2026 14:30:45
-  assert.equal(formatDateTimeAMPM(d, { includeSeconds: true }), '20/10/2026 02:30:45 PM')
-  assert.equal(formatDateTimeAMPM(d, { includeSeconds: false }), '20/10/2026 02:30 PM')
-  const morningDate = new Date(2026, 9, 20, 9, 5, 0)
-  assert.equal(formatDateTimeAMPM(morningDate, { includeSeconds: false }), '20/10/2026 09:05 AM')
+  const d = new Date('2026-10-20T07:30:45Z')
+  assert.equal(
+    formatDateTimeAMPM(d, { includeSeconds: true, timeZone: 'Asia/Ho_Chi_Minh' }),
+    '20/10/2026 02:30:45 PM · UTC+07:00 · Asia/Ho_Chi_Minh'
+  )
+  assert.equal(
+    formatDateTimeAMPM(d, { includeSeconds: false, timeZone: 'UTC' }),
+    '20/10/2026 07:30 AM · UTC+00:00 · UTC'
+  )
+})
+
+test('formatDateTimeAMPM computes DST offset at the represented instant', () => {
+  assert.equal(
+    formatDateTimeAMPM('2026-01-15T12:00:00+00:00', { timeZone: 'America/New_York' }),
+    '15/01/2026 07:00:00 AM · UTC-05:00 · America/New_York'
+  )
+  assert.equal(
+    formatDateTimeAMPM('2026-07-15T12:00:00Z', { timeZone: 'America/New_York' }),
+    '15/07/2026 08:00:00 AM · UTC-04:00 · America/New_York'
+  )
+})
+
+test('formatDateTimeAMPM supports epoch and marks timezone-less legacy timestamps', () => {
+  const epoch = Date.parse('2026-10-20T07:30:45Z') / 1000
+  assert.equal(
+    formatDateTimeAMPM(epoch, { timeZone: 'Asia/Ho_Chi_Minh' }),
+    '20/10/2026 02:30:45 PM · UTC+07:00 · Asia/Ho_Chi_Minh'
+  )
+  assert.equal(
+    formatDateTimeAMPM('2026-10-20 14:30:45', { timeZone: 'Asia/Ho_Chi_Minh' }),
+    '20/10/2026 02:30:45 PM · TZ không xác định · legacy'
+  )
+})
+
+test('timezone labels and invalid timezone errors are explicit', () => {
+  assert.equal(
+    formatTimeZoneLabel('Asia/Ho_Chi_Minh', '2026-10-20T07:30:45Z'),
+    'Asia/Ho_Chi_Minh · UTC+07:00'
+  )
+  assert.equal(
+    formatDateTimeAMPM('2026-10-20T07:30:45Z', { timeZone: 'Invalid/Timezone' }),
+    '2026-10-20T07:30:45Z · Timezone không hợp lệ · Invalid/Timezone'
+  )
 })
 
 test('12h and 24h conversions are lossless across all 1,440 minutes in a day', () => {

@@ -1247,7 +1247,11 @@ export default function TrustBuilder() {
                               </button>
                             )
                           })()}
-                          <div className="activity-time">{log.executed_at ? log.executed_at.slice(11, 19) : ''}</div>
+                          <div className="activity-time">
+                            {log.executed_at
+                              ? formatDateTimeAMPM(log.executed_at, { timeZone: targetTimezone })
+                              : ''}
+                          </div>
                         </div>
                       )
                     })
@@ -1263,7 +1267,7 @@ export default function TrustBuilder() {
                   <div className="stat-pill">Like: <b>{dailyStats.like_count}/{selectedPlan.daily_like_target}</b></div>
                   <div className="stat-pill">Comment: <b>{dailyStats.comment_count}/{selectedPlan.daily_comment_target}</b></div>
                   <div className="stat-pill">Sub: <b>{dailyStats.subscribe_count}/{selectedPlan.daily_subscribe_target}</b></div>
-                  <div className="stat-pill">Lần chạy kế tiếp: <b>{selectedPlan.next_run_at ? formatDateTimeAMPM(selectedPlan.next_run_at) : 'đang chờ lịch'}</b></div>
+                  <div className="stat-pill">Lần chạy kế tiếp: <b>{selectedPlan.next_run_at ? formatDateTimeAMPM(selectedPlan.next_run_at, { timeZone: targetTimezone }) : 'đang chờ lịch'}</b></div>
                 </div>
               )}
 
@@ -1318,7 +1322,7 @@ export default function TrustBuilder() {
               <div className="safety-sync-card">
                 <div className="safety-sync-info">
                   <div><b>URL Đồng bộ từ xa:</b> <span className="safety-url-text">{safetyConfig?.remote_sync_url || 'Mặc định (GitHub Raw)'}</span></div>
-                  <div><b>Đồng bộ lần cuối:</b> <span>{safetyConfig?.last_synced_at ? formatDateTimeAMPM(safetyConfig.last_synced_at) : 'Chưa đồng bộ'}</span></div>
+                  <div><b>Đồng bộ lần cuối:</b> <span>{safetyConfig?.last_synced_at ? formatDateTimeAMPM(safetyConfig.last_synced_at, { timeZone: targetTimezone }) : 'Chưa đồng bộ'}</span></div>
                 </div>
                 <button
                   type="button"

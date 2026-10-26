@@ -5,6 +5,7 @@ import './Settings.css'
 import OAuthGuideBox from './OAuthGuideBox'
 import MarketSelect from './MarketSelect'
 import PublicationTimePicker from './PublicationTimePicker'
+import { formatTimeZoneLabel } from './publicationTime.js'
 
 const API_BASE = 'http://127.0.0.1:8080'
 const WEEKDAYS = ['Thứ Hai', 'Thứ Ba', 'Thứ Tư', 'Thứ Năm', 'Thứ Sáu', 'Thứ Bảy', 'Chủ Nhật']
@@ -1740,14 +1741,14 @@ export default function ChannelManager({
                     />
                   </label>
                   <label style={{ color: '#aaa', display: 'flex', flexDirection: 'column', gap: 4 }}>
-                    Bắt đầu đăng
+                    Bắt đầu đăng · {formatTimeZoneLabel(channel.publication_timezone || 'Asia/Ho_Chi_Minh')}
                     <PublicationTimePicker
                       value={channel.reply_window_start || '08:00'}
                       onChange={val => changeChannel(channel.id, 'reply_window_start', val)}
                     />
                   </label>
                   <label style={{ color: '#aaa', display: 'flex', flexDirection: 'column', gap: 4 }}>
-                    Kết thúc đăng
+                    Kết thúc đăng · {formatTimeZoneLabel(channel.publication_timezone || 'Asia/Ho_Chi_Minh')}
                     <PublicationTimePicker
                       value={channel.reply_window_end || '22:00'}
                       onChange={val => changeChannel(channel.id, 'reply_window_end', val)}
@@ -1793,7 +1794,9 @@ export default function ChannelManager({
 
               {/* Video Publication Schedule */}
               <div style={{ marginTop: 18, paddingTop: 16, borderTop: '1px solid #3a3a3a' }}>
-                <strong style={{ color: '#c39bd3' }}>Lịch tự động đăng video</strong>
+                <strong style={{ color: '#c39bd3' }}>
+                  Lịch tự động đăng video · {formatTimeZoneLabel(channel.publication_timezone || 'Asia/Ho_Chi_Minh')}
+                </strong>
                 <div className="help-text" style={{ marginTop: 6 }}>
                   Chỉ dùng khi bộ prompt bật “Đặt lịch đăng”. Slot được giữ cục bộ và đối chiếu lại với YouTube.
                 </div>

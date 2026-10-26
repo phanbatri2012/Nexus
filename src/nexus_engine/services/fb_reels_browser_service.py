@@ -19,6 +19,7 @@ import logging
 import re
 from pathlib import Path
 from typing import Any, Callable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from nexus_engine.services.channel_scanner_service import channel_browser_session, cleanup_owned_page
 
@@ -270,14 +271,35 @@ class FbBrowserAutomationError(RuntimeError):
         self.can_resume = can_resume
 
 
-def _format_schedule_time(dt_val: datetime.datetime | str | int | None) -> tuple[str, str, str]:
+def _timezone_offset_at(
+    instant: datetime.datetime,
+    timezone_name: str,
+) -> datetime.timedelta | None:
+    if instant.tzinfo is None:
+        raise ValueError("Timestamp so sánh timezone phải có UTC offset")
+    try:
+        target_zone = ZoneInfo(str(timezone_name or "").strip())
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"Timezone IANA không hợp lệ: {timezone_name}") from exc
+    return instant.astimezone(datetime.timezone.utc).astimezone(target_zone).utcoffset()
+
+
+def _format_schedule_time(
+    dt_val: datetime.datetime | str | int | None,
+    timezone_name: str = "Asia/Ho_Chi_Minh",
+) -> tuple[str, str, str]:
     """Parse date/time input into (date_str_slash, date_str_iso, time_str_24h).
     
     Example: 2026-09-29 19:00 -> ('29/9/2026', '2026-09-29', '19:00')
     """
+    try:
+        publication_zone = ZoneInfo(str(timezone_name or "").strip())
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"Timezone IANA không hợp lệ: {timezone_name}") from exc
+
     dt: datetime.datetime
     if isinstance(dt_val, (int, float)):
-        dt = datetime.datetime.fromtimestamp(dt_val)
+        dt = datetime.datetime.fromtimestamp(dt_val, publication_zone)
     elif isinstance(dt_val, str):
         clean = dt_val.strip()
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%d/%m/%Y %H:%M"):
@@ -289,12 +311,27 @@ def _format_schedule_time(dt_val: datetime.datetime | str | int | None) -> tuple
         else:
             try:
                 dt = datetime.datetime.fromisoformat(clean)
-            except Exception:
-                dt = datetime.datetime.now() + datetime.timedelta(hours=2)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Thời gian đặt lịch không hợp lệ: {dt_val}") from exc
     elif isinstance(dt_val, datetime.datetime):
         dt = dt_val
     else:
-        dt = datetime.datetime.now() + datetime.timedelta(hours=2)
+        dt = datetime.datetime.now(datetime.timezone.utc).astimezone(
+            publication_zone
+        ) + datetime.timedelta(hours=2)
+
+    if dt.tzinfo is None:
+        naive_value = dt
+        dt = naive_value.replace(tzinfo=publication_zone)
+        round_trip = datetime.datetime.fromtimestamp(
+            dt.timestamp(), publication_zone
+        ).replace(tzinfo=None)
+        if round_trip != naive_value:
+            raise ValueError(
+                "Thời gian đặt lịch không tồn tại trong timezone Fanpage do chuyển DST"
+            )
+    else:
+        dt = dt.astimezone(publication_zone)
 
     date_str_slash = f"{dt.day}/{dt.month}/{dt.year}"
     date_str_iso = dt.strftime("%Y-%m-%d")
@@ -876,7 +913,10 @@ async def _verify_calendar_schedule(
         await today_button.click()
         await asyncio.sleep(0.8)
 
-    week_offset, expected_column = _calendar_week_position(expected.date())
+    week_offset, expected_column = _calendar_week_position(
+        expected.date(),
+        datetime.datetime.now(expected.tzinfo).date(),
+    )
     direction = "Right" if week_offset > 0 else "Left"
     for _ in range(abs(week_offset)):
         navigation_button = page.locator(
@@ -948,7 +988,11 @@ async def _verify_calendar_schedule(
         except ValueError:
             continue
         actual_date = target_week_start + datetime.timedelta(days=evidence["column_index"])
-        actual_datetime = datetime.datetime.combine(actual_date, actual_time)
+        actual_datetime = datetime.datetime.combine(
+            actual_date,
+            actual_time,
+            tzinfo=expected.tzinfo,
+        )
         return {
             "verified": True,
             "matches_requested": False,
@@ -981,6 +1025,7 @@ async def schedule_reel_via_gpm(
     content_title: str = "",
     page_name: str = "",
     target_page_id: str = "",
+    timezone_name: str = "Asia/Ho_Chi_Minh",
     timeout_seconds: float = 300.0,
     state_callback: Callable[[dict[str, Any]], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
@@ -1001,14 +1046,22 @@ async def schedule_reel_via_gpm(
             logger.warning("File thumbnail không tồn tại: %s. Sẽ bỏ qua upload thumbnail.", thumb_path)
             t_path = None
 
-    date_slash, date_iso, time_24h = _format_schedule_time(schedule_datetime)
+    try:
+        publication_zone = ZoneInfo(str(timezone_name or "").strip())
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"Timezone IANA không hợp lệ: {timezone_name}") from exc
+    date_slash, date_iso, time_24h = _format_schedule_time(
+        schedule_datetime,
+        timezone_name,
+    )
     expected_schedule = datetime.datetime.strptime(
         f"{date_iso} {time_24h}", "%Y-%m-%d %H:%M"
-    )
-    full_schedule_label = f"{date_slash} {time_24h}"
+    ).replace(tzinfo=publication_zone)
+    full_schedule_label = f"{date_slash} {time_24h} · {timezone_name}"
 
     current_checkpoint = "CP3_CDP_READY"
     page = None
+    browser_timezone = ""
 
     def notify(phase: str, message: str, progress: int | None = None, screenshot: str = ""):
         nonlocal current_checkpoint
@@ -1034,7 +1087,7 @@ async def schedule_reel_via_gpm(
             if not target_page or target_page.is_closed():
                 return ""
             SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-            ts = int(datetime.datetime.now().timestamp())
+            ts = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
             prefix = f"checkpoint_item_{item_id}" if item_id else f"checkpoint_profile_{clean_profile_id}"
             file_name = f"{prefix}_{ts}.png"
             dest = SCREENSHOTS_DIR / file_name
@@ -1074,6 +1127,38 @@ async def schedule_reel_via_gpm(
         try:
             # Set default timeout for individual actions
             page.set_default_timeout(25000)
+
+            if not publish_now:
+                browser_timezone = str(
+                    await page.evaluate(
+                        "Intl.DateTimeFormat().resolvedOptions().timeZone"
+                    )
+                    or ""
+                ).strip()
+                try:
+                    browser_zone = ZoneInfo(browser_timezone)
+                except (ZoneInfoNotFoundError, ValueError) as exc:
+                    raise FbBrowserAutomationError(
+                        "Không đọc được timezone IANA hợp lệ từ browser GPM; đã dừng trước khi submit",
+                        phase="CP3_CDP_READY",
+                        can_resume=True,
+                    ) from exc
+                fanpage_offset = _timezone_offset_at(
+                    expected_schedule,
+                    timezone_name,
+                )
+                browser_offset = _timezone_offset_at(
+                    expected_schedule,
+                    browser_timezone,
+                )
+                if fanpage_offset != browser_offset:
+                    raise FbBrowserAutomationError(
+                        "Timezone browser GPM không khớp Fanpage tại thời điểm đăng: "
+                        f"browser={browser_timezone} ({browser_offset}), "
+                        f"Fanpage={timezone_name} ({fanpage_offset}). Đã dừng trước khi submit.",
+                        phase="CP3_CDP_READY",
+                        can_resume=True,
+                    )
 
             # SMART RESUME: If tab is already in Step 3 (Chia sẻ) or Step 2 (Chỉnh sửa), attempt fast jump!
             if initial_stage in {STAGE_SHARE_READY, STAGE_EDIT_READY}:
@@ -1237,6 +1322,10 @@ async def schedule_reel_via_gpm(
                                 "source": "meta_calendar" if calendar_evidence else "meta_confirmation",
                                 "controls": schedule_control_evidence,
                                 "calendar": calendar_evidence,
+                                "timezone": {
+                                    "fanpage": timezone_name,
+                                    "browser": browser_timezone,
+                                },
                             },
                             "scheduled_time": full_schedule_label,
                             "scheduled_time_iso": f"{date_iso}T{time_24h}:00",
@@ -1822,6 +1911,10 @@ async def schedule_reel_via_gpm(
                     "controls": schedule_control_evidence,
                     "calendar": calendar_evidence,
                     "thumbnail": thumbnail_result,
+                    "timezone": {
+                        "fanpage": timezone_name,
+                        "browser": browser_timezone,
+                    },
                 },
                 "scheduled_time": full_schedule_label,
                 "scheduled_time_iso": f"{date_iso}T{time_24h}:00",

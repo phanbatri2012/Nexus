@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import './CompetitorRadar.css'
 import PublicationTimePicker from './PublicationTimePicker'
-import { formatDateTimeAMPM } from './publicationTime'
+import { formatDateTimeAMPM, formatTimeZoneLabel } from './publicationTime'
 
 const SERVICE = 'http://127.0.0.1:8080'
 const API = `${SERVICE}/api`
@@ -32,9 +32,9 @@ async function requestHealth() {
   return payload
 }
 
-function formatDate(value) {
+function formatDate(value, timeZone) {
   if (!value) return '—'
-  return formatDateTimeAMPM(value, { includeSeconds: true })
+  return formatDateTimeAMPM(value, { includeSeconds: true, timeZone })
 }
 
 function statusLabel(status) {
@@ -114,6 +114,12 @@ export default function CompetitorRadar({ onOpenJobCenter }) {
   }, [load])
 
   const promptOptions = useMemo(() => Object.entries(prompts.versions || {}), [prompts])
+  const formTargetChannel = useMemo(() => {
+    const selectedPrompt = prompts.versions?.[form.prompt_version]
+    const targetId = form.target_youtube_channel_id || selectedPrompt?.default_youtube_channel_id
+    return channels.find(channel => String(channel.id) === String(targetId || '')) || null
+  }, [channels, form.prompt_version, form.target_youtube_channel_id, prompts.versions])
+  const formTargetTimezone = formTargetChannel?.publication_timezone || 'Asia/Ho_Chi_Minh'
   const guestPoolOptions = useMemo(() => {
     const pools = new Map()
     voices.forEach(voice => {
@@ -320,8 +326,8 @@ export default function CompetitorRadar({ onOpenJobCenter }) {
             </select>
           </label>
           {form.window_mode === 'manual' && <>
-            <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>Bắt đầu <PublicationTimePicker value={form.start || '08:00'} onChange={val => setForm({ ...form, start: val })} /></label>
-            <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>Kết thúc <PublicationTimePicker value={form.end || '22:00'} onChange={val => setForm({ ...form, end: val })} /></label>
+            <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>Bắt đầu · {formatTimeZoneLabel(formTargetTimezone)} <PublicationTimePicker value={form.start || '08:00'} onChange={val => setForm({ ...form, start: val })} /></label>
+            <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>Kết thúc · {formatTimeZoneLabel(formTargetTimezone)} <PublicationTimePicker value={form.end || '22:00'} onChange={val => setForm({ ...form, end: val })} /></label>
           </>}
         </div>
         <div className="radar-create-footer">
@@ -341,10 +347,10 @@ export default function CompetitorRadar({ onOpenJobCenter }) {
             <dl>
               <div><dt>Baseline</dt><dd>{rule.baseline_complete ? `${rule.baseline_video_count} video dài` : 'Chưa lấy'}</dd></div>
               <div><dt>Phát hành</dt><dd>{rule.publication_mode}</dd></div>
-              <div><dt>Lần quét tới</dt><dd>{formatDate(rule.next_scan_at)}</dd></div>
+              <div><dt>Lần quét tới</dt><dd>{formatDate(rule.next_scan_at, rule.target_publication_timezone)}</dd></div>
               <div><dt>Nhịp quét</dt><dd>{rule.window_mode === 'manual' ? 'Thủ công' : 'Tự học'}</dd></div>
               <div><dt>Nguồn quét</dt><dd>{scanSourceLabel(rule.last_scan_source)}</dd></div>
-              <div><dt>RSS</dt><dd>{rule.rss_retry_after ? `Thử lại ${formatDate(rule.rss_retry_after)}` : (rule.rss_failure_count ? `${rule.rss_failure_count} lần lỗi` : 'Sẵn sàng')}</dd></div>
+              <div><dt>RSS</dt><dd>{rule.rss_retry_after ? `Thử lại ${formatDate(rule.rss_retry_after, rule.target_publication_timezone)}` : (rule.rss_failure_count ? `${rule.rss_failure_count} lần lỗi` : 'Sẵn sàng')}</dd></div>
               <div><dt>Nhóm giọng khách</dt><dd>{rule.guest_voice_pool || 'Chưa cấu hình'}</dd></div>
             </dl>
             {rule.last_error && <p className="radar-inline-error">{rule.last_error}</p>}
@@ -371,7 +377,7 @@ export default function CompetitorRadar({ onOpenJobCenter }) {
         <div className="radar-table-wrap"><table className="radar-table"><thead><tr><th>Video nguồn</th><th>Đối thủ</th><th>Prompt</th><th>Phát hiện</th><th>Trạng thái</th><th>Báo cáo</th></tr></thead>
           <tbody>{history.map(item => <tr key={item.id}>
             <td><a href={item.source_url} target="_blank" rel="noreferrer">{item.source_title || item.youtube_video_id}</a></td>
-            <td>{item.competitor_title}</td><td>{promptLabel(prompts.versions, item.prompt_version)}</td><td>{formatDate(item.created_at)}</td>
+            <td>{item.competitor_title}</td><td>{promptLabel(prompts.versions, item.prompt_version)}</td><td>{formatDate(item.created_at, item.target_publication_timezone)}</td>
             <td><span className={`radar-status ${item.status}`}>{statusLabel(item.status)}</span>{item.error && <small className="radar-row-error">{item.error}</small>}</td>
             <td><button disabled={!item.video_id || busy === `report-${item.id}`} onClick={() => openReport(item)}>Casting &amp; QC</button></td>
           </tr>)}</tbody>

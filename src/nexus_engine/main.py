@@ -5136,7 +5136,16 @@ def _next_comment_publish_time(
         lambda item: int(item.get("video_id") or 0) == int(comment.get("video_id") or 0),
     )
 
-    local_now = now.astimezone()
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    timezone_name = str(
+        channel.get("publication_timezone") or "Asia/Ho_Chi_Minh"
+    ).strip()
+    try:
+        channel_timezone = ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        channel_timezone = ZoneInfo("Asia/Ho_Chi_Minh")
+    local_now = now.astimezone(channel_timezone)
     local_day_start = datetime.datetime.combine(
         local_now.date(), datetime.time.min, local_now.tzinfo
     ).astimezone(datetime.timezone.utc)
@@ -15778,6 +15787,7 @@ class FBCrossPosterSettingsPayload(BaseModel):
     target_gpm_profile_id: str = ""
     target_access_token: str = ""
     upload_mode: str = "browser"
+    publication_timezone: str = Field(default="Asia/Ho_Chi_Minh", max_length=100)
     daily_quota: int = 2
     schedule_times: list[str] = Field(default_factory=lambda: ["11:30", "19:30"])
     lead_time_minutes: int = 60
@@ -15831,6 +15841,7 @@ class FBCrossPosterItemUpdatePayload(BaseModel):
     fb_title: Optional[str] = None
     fb_description: Optional[str] = None
     scheduled_publish_time: Optional[int] = None
+    scheduled_publish_local: Optional[str] = None
     sort_order: Optional[int] = None
     status: Optional[str] = None
 
@@ -15894,6 +15905,20 @@ def save_fb_crossposter_settings(
     target_page_id = payload.target_fb_page_id or page_id
     existing = db.get_fb_crossposter_settings(target_page_id)
     updates = payload.model_dump(exclude_unset=True)
+    requested_timezone = str(
+        updates.get("publication_timezone")
+        or existing.get("publication_timezone")
+        or "Asia/Ho_Chi_Minh"
+    )
+    try:
+        updates["publication_timezone"] = publication_scheduler.validate_timezone(
+            requested_timezone
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{exc} Timezone nhận được: {requested_timezone}",
+        ) from exc
     saved = db.save_fb_crossposter_settings(
         {**existing, **updates},
         page_id=target_page_id,
@@ -16067,6 +16092,9 @@ def recalculate_fb_crossposter_schedule(
         times_list=schedule_times,
         target_page_id=target_page_id,
         sort_order_mode=sort_order_mode,
+        timezone_name=str(
+            settings.get("publication_timezone") or "Asia/Ho_Chi_Minh"
+        ),
     )
     stats = db.get_fb_crossposter_stats(target_page_id)
     mode_label = "từ cũ đến mới" if sort_order_mode == "oldest_first" else "từ mới đến cũ"
@@ -16338,6 +16366,9 @@ def reset_fb_crossposter_errors(page_id: str = Query(default="")):
             settings.get("daily_quota", 2),
             settings.get("schedule_times", ["11:30", "19:30"]),
             target_page_id=page_id,
+            timezone_name=str(
+                settings.get("publication_timezone") or "Asia/Ho_Chi_Minh"
+            ),
         )
     stats = db.get_fb_crossposter_stats(page_id)
     return {
@@ -16351,7 +16382,40 @@ def reset_fb_crossposter_errors(page_id: str = Query(default="")):
 @app.put("/api/fb-crossposter/queue/{item_id}")
 def update_fb_crossposter_item(item_id: int, payload: FBCrossPosterItemUpdatePayload):
     """Edit metadata (title, caption, scheduled time) of a queue item."""
-    fields = {k: v for k, v in payload.model_dump().items() if v is not None}
+    supplied_fields = payload.model_dump(exclude_unset=True)
+    scheduled_local_supplied = "scheduled_publish_local" in supplied_fields
+    scheduled_local = supplied_fields.pop("scheduled_publish_local", None)
+    fields = {k: v for k, v in supplied_fields.items() if v is not None}
+    if scheduled_local_supplied:
+        item = db.get_fb_crossposter_queue_item(item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Không tìm thấy video")
+        settings = db.get_fb_crossposter_settings(item.get("target_page_id") or "")
+        timezone_name = str(
+            settings.get("publication_timezone") or "Asia/Ho_Chi_Minh"
+        )
+        try:
+            publication_scheduler.validate_timezone(timezone_name)
+            clean_local = str(scheduled_local or "").strip()
+            if not clean_local:
+                fields["scheduled_publish_time"] = 0
+            else:
+                from zoneinfo import ZoneInfo
+
+                local_value = datetime.datetime.fromisoformat(clean_local)
+                if local_value.tzinfo is not None:
+                    raise ValueError("Thời gian local không được chứa UTC offset.")
+                zoned_value = local_value.replace(tzinfo=ZoneInfo(timezone_name))
+                round_trip = datetime.datetime.fromtimestamp(
+                    zoned_value.timestamp(), ZoneInfo(timezone_name)
+                ).replace(tzinfo=None)
+                if round_trip != local_value:
+                    raise ValueError(
+                        "Thời gian đã chọn không tồn tại trong múi giờ Fanpage do chuyển DST."
+                    )
+                fields["scheduled_publish_time"] = int(zoned_value.timestamp())
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     if payload.fb_description is not None:
         fields["fb_description_source"] = "manual"
     try:

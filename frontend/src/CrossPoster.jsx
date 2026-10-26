@@ -1,7 +1,8 @@
 import { useEffect, useState, useMemo, useCallback, useRef } from 'react'
 import './CrossPoster.css'
 import PublicationTimePicker from './PublicationTimePicker'
-import { formatTime12, formatDateTimeAMPM, parseTime24, formatTime24 } from './publicationTime.js'
+import MarketSelect from './MarketSelect.jsx'
+import { formatTime12, formatDateTimeAMPM, formatTimeZoneLabel, parseTime24, formatTime24 } from './publicationTime.js'
 import { useAppRouter } from './router.js'
 import {
   normalizeYoutubeChannel,
@@ -54,6 +55,7 @@ function createDefaultSettings() {
     target_access_token: '',
     target_access_token_configured: false,
     upload_mode: 'browser',
+    publication_timezone: 'Asia/Ho_Chi_Minh',
     daily_quota: 2,
     schedule_times: ['11:30', '19:30'],
     lead_time_minutes: 60,
@@ -92,9 +94,30 @@ function formatDate(dateStr) {
   }
 }
 
-function formatTimestamp(ts) {
+function formatTimestamp(ts, timeZone) {
   if (!ts || ts <= 0) return '-'
-  return formatDateTimeAMPM(ts, { includeSeconds: false })
+  return formatDateTimeAMPM(ts, { includeSeconds: false, timeZone })
+}
+
+function formatEpochForDateTimeLocal(timestamp, timeZone) {
+  const value = Number(timestamp)
+  if (!Number.isFinite(value) || value <= 0) return ''
+  try {
+    const parts = Object.fromEntries(
+      new Intl.DateTimeFormat('en-CA', {
+        timeZone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hourCycle: 'h23'
+      }).formatToParts(new Date(value * 1000)).map(part => [part.type, part.value])
+    )
+    return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}`
+  } catch {
+    return ''
+  }
 }
 
 function formatBytes(bytes) {
@@ -216,7 +239,8 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
     gpm_profile_id: '',
     source_channel_id: '',
     source_channel_title: '',
-    daily_quota: 2
+    daily_quota: 2,
+    publication_timezone: 'Asia/Ho_Chi_Minh'
   })
 
   // Load Settings & Hub Data for active Fanpage
@@ -833,9 +857,10 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
   const handleOpenEdit = (item) => {
     let dtStr = ''
     if (item.scheduled_publish_time && item.scheduled_publish_time > 0) {
-      const d = new Date(item.scheduled_publish_time * 1000)
-      const pad = (n) => String(n).padStart(2, '0')
-      dtStr = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+      dtStr = formatEpochForDateTimeLocal(
+        item.scheduled_publish_time,
+        settings.publication_timezone || 'Asia/Ho_Chi_Minh'
+      )
     }
     setEditingItem(item)
     setEditForm({
@@ -849,17 +874,13 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
   const handleSaveEdit = async () => {
     if (!editingItem) return
     try {
-      let ts = null
-      if (editForm.scheduled_datetime_local) {
-        ts = Math.floor(new Date(editForm.scheduled_datetime_local).getTime() / 1000)
-      }
       const res = await fetch(`${API_BASE}/api/fb-crossposter/queue/${editingItem.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           fb_title: editForm.fb_title,
           fb_description: editForm.fb_description,
-          scheduled_publish_time: ts
+          scheduled_publish_local: editForm.scheduled_datetime_local || null
         })
       })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
@@ -976,6 +997,7 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
           source_channel_id: newCampaignForm.source_channel_id,
           source_channel_title: newCampaignForm.source_channel_title,
           upload_mode: mode,
+          publication_timezone: newCampaignForm.publication_timezone || 'Asia/Ho_Chi_Minh',
           daily_quota: newCampaignForm.daily_quota || 2,
           lead_time_minutes: 60
         })
@@ -1513,7 +1535,7 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
         }}>
           <div>
             <span style={{ color: '#38bdf8', fontWeight: '700' }}>⏰ Video tiếp theo sẽ xuất bản lúc: </span>
-            <span style={{ color: '#f8fafc', fontWeight: '600' }}>{formatTimestamp(stats.next_scheduled.scheduled_publish_time)}</span>
+            <span style={{ color: '#f8fafc', fontWeight: '600' }}>{formatTimestamp(stats.next_scheduled.scheduled_publish_time, settings.publication_timezone)}</span>
             <span style={{ color: '#94a3b8', marginLeft: '12px' }}>— "{stats.next_scheduled.fb_title || stats.next_scheduled.original_title}"</span>
           </div>
           <button
@@ -1571,6 +1593,16 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
 
         {isSettingsOpen && (
           <div className="fb-settings-body">
+            <div className="fb-form-group">
+              <MarketSelect
+                value={settings.publication_timezone || 'Asia/Ho_Chi_Minh'}
+                onChange={(value) => setSettings(prev => ({ ...prev, publication_timezone: value }))}
+                label="Múi giờ lịch đăng Fanpage"
+              />
+              <small style={{ color: '#94a3b8' }}>
+                {formatTimeZoneLabel(settings.publication_timezone || 'Asia/Ho_Chi_Minh')}
+              </small>
+            </div>
             {/* Row 1: Quota & Lead-Time Buffer */}
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
               <div className="fb-form-group">
@@ -1628,7 +1660,9 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
 
               <div className="fb-form-group">
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <label style={{ margin: 0 }}>Các khung giờ đăng trong ngày</label>
+                  <label style={{ margin: 0 }}>
+                    Các khung giờ đăng trong ngày · {formatTimeZoneLabel(settings.publication_timezone || 'Asia/Ho_Chi_Minh')}
+                  </label>
                   <span style={{ fontSize: '0.78rem', color: '#94a3b8' }}>
                     {(settings.schedule_times || []).length} khung giờ
                   </span>
@@ -1707,45 +1741,50 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
                   <span>Tự động quét kênh YouTube (Auto-Sync)</span>
                 </label>
                 {settings.auto_sync_enabled && (
-                  <div style={{ display: 'flex', gap: '10px', marginTop: '6px', alignItems: 'center' }}>
-                    <select
-                      className="fb-select"
-                      style={{ width: '160px' }}
-                      value={settings.auto_sync_type}
-                      onChange={(e) => setSettings(prev => ({ ...prev, auto_sync_type: e.target.value }))}
-                    >
-                      <option value="interval">Theo tần suất</option>
-                      <option value="fixed_time">Giờ cố định</option>
-                    </select>
-                    {settings.auto_sync_type === 'interval' ? (
+                  <div>
+                    <small style={{ color: '#94a3b8' }}>
+                      Giờ auto-sync · {formatTimeZoneLabel(settings.publication_timezone || 'Asia/Ho_Chi_Minh')}
+                    </small>
+                    <div style={{ display: 'flex', gap: '10px', marginTop: '6px', alignItems: 'center' }}>
                       <select
                         className="fb-select"
-                        value={settings.auto_sync_interval_hours}
-                        onChange={(e) => setSettings(prev => ({ ...prev, auto_sync_interval_hours: parseInt(e.target.value) || 6 }))}
+                        style={{ width: '160px' }}
+                        value={settings.auto_sync_type}
+                        onChange={(e) => setSettings(prev => ({ ...prev, auto_sync_type: e.target.value }))}
                       >
-                        <option value="2">Mỗi 2 giờ</option>
-                        <option value="4">Mỗi 4 giờ</option>
-                        <option value="6">Mỗi 6 giờ</option>
-                        <option value="12">Mỗi 12 giờ</option>
-                        <option value="24">Mỗi 24 giờ</option>
+                        <option value="interval">Theo tần suất</option>
+                        <option value="fixed_time">Giờ cố định</option>
                       </select>
-                    ) : (
-                      <input
-                        type="text"
-                        className="fb-input"
-                        placeholder="06:00, 18:00"
-                        value={settings.auto_sync_fixed_times?.join(', ') || ''}
-                        onChange={(e) => setSettings(prev => ({
-                          ...prev,
-                          auto_sync_fixed_times: e.target.value.split(',').map(s => s.trim()).filter(Boolean)
-                        }))}
-                      />
-                    )}
+                      {settings.auto_sync_type === 'interval' ? (
+                        <select
+                          className="fb-select"
+                          value={settings.auto_sync_interval_hours}
+                          onChange={(e) => setSettings(prev => ({ ...prev, auto_sync_interval_hours: parseInt(e.target.value) || 6 }))}
+                        >
+                          <option value="2">Mỗi 2 giờ</option>
+                          <option value="4">Mỗi 4 giờ</option>
+                          <option value="6">Mỗi 6 giờ</option>
+                          <option value="12">Mỗi 12 giờ</option>
+                          <option value="24">Mỗi 24 giờ</option>
+                        </select>
+                      ) : (
+                        <input
+                          type="text"
+                          className="fb-input"
+                          placeholder="06:00, 18:00"
+                          value={settings.auto_sync_fixed_times?.join(', ') || ''}
+                          onChange={(e) => setSettings(prev => ({
+                            ...prev,
+                            auto_sync_fixed_times: e.target.value.split(',').map(s => s.trim()).filter(Boolean)
+                          }))}
+                        />
+                      )}
+                    </div>
                   </div>
                 )}
                 {settings.last_synced_at && (
                   <span style={{ fontSize: '0.75rem', color: '#94a3b8' }}>
-                    Lần quét gần nhất: {formatTimestamp(Math.floor(new Date(settings.last_synced_at).getTime() / 1000))}
+                    Lần quét gần nhất: {formatDateTimeAMPM(settings.last_synced_at, { includeSeconds: false, timeZone: settings.publication_timezone })}
                   </span>
                 )}
               </div>
@@ -1933,10 +1972,10 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
                     {formatDate(item.youtube_upload_date)}
                   </td>
                   <td style={{ color: '#38bdf8', fontWeight: '500', whiteSpace: 'nowrap' }}>
-                    <div>{formatTimestamp(item.scheduled_publish_time)}</div>
+                    <div>{formatTimestamp(item.scheduled_publish_time, settings.publication_timezone)}</div>
                     {item.meta_scheduled_publish_time > 0 && item.meta_scheduled_publish_time !== item.scheduled_publish_time && (
                       <div style={{ color: '#fbbf24', fontSize: '0.72rem', marginTop: '3px' }}>
-                        Meta: {formatTimestamp(item.meta_scheduled_publish_time)}
+                        Meta: {formatTimestamp(item.meta_scheduled_publish_time, settings.publication_timezone)}
                       </div>
                     )}
                   </td>
@@ -2117,7 +2156,9 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
               </div>
 
               <div className="fb-form-group">
-                <label>Thời gian xuất bản dự kiến (Local Datetime)</label>
+                <label>
+                  Thời gian xuất bản dự kiến · {formatTimeZoneLabel(settings.publication_timezone || 'Asia/Ho_Chi_Minh')}
+                </label>
                 <input
                   type="datetime-local"
                   className="fb-input"
@@ -2229,6 +2270,17 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
                   value={newCampaignForm.source_channel_id}
                   onChange={(e) => setNewCampaignForm(prev => ({ ...prev, source_channel_id: e.target.value }))}
                 />
+              </div>
+
+              <div className="fb-form-group">
+                <MarketSelect
+                  value={newCampaignForm.publication_timezone || 'Asia/Ho_Chi_Minh'}
+                  onChange={(value) => setNewCampaignForm(prev => ({ ...prev, publication_timezone: value }))}
+                  label="Múi giờ lịch đăng Fanpage"
+                />
+                <small style={{ color: '#94a3b8' }}>
+                  {formatTimeZoneLabel(newCampaignForm.publication_timezone || 'Asia/Ho_Chi_Minh')}
+                </small>
               </div>
             </div>
             <div className="fb-modal-footer">

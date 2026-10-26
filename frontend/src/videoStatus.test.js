@@ -51,7 +51,7 @@ test('mp4 rendering status prioritizes active job progress over stale artifacts 
   assert.match(appSource, /isRenderActive \? \(/)
   assert.match(appSource, /renderInfo\?\.mp4_details\?\.duration_formatted/)
   assert.match(appSource, /renderInfo\?\.mp4_details\?\.size_formatted/)
-  assert.match(appSource, /renderInfo\?\.mp4_details\?\.completed_at_formatted/)
+  assert.match(appSource, /formatDateTimeAMPM\(renderInfo\.mp4_details\.completed_at\)/)
+  assert.doesNotMatch(appSource, /renderInfo\?\.mp4_details\?\.completed_at_formatted/)
 })
-
 

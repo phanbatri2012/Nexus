@@ -26,6 +26,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from PIL import Image, ImageFilter, ImageOps, UnidentifiedImageError
 from yt_dlp import YoutubeDL
@@ -53,6 +54,7 @@ MAX_CAPTION_HASHTAGS = 5
 MAX_CUSTOM_LABELS = 8
 MAX_META_CONTENT_TAGS = 10
 META_PROCESSING_STALE_SECONDS = 2 * 60 * 60
+LEGACY_CROSSPOSTER_TIMEZONE = ZoneInfo("Asia/Ho_Chi_Minh")
 MIN_REPAIR_LEAD_MINUTES = 30
 FB_BROWSER_CDP_CHECKPOINT = "CP3_CDP_READY"
 FB_BROWSER_CDP_ATTENTION = "fb_browser_cdp"
@@ -866,7 +868,9 @@ def sync_channel_public_videos(
             d = entry.get("upload_date") or entry.get("release_date") or ""
             if not d and entry.get("timestamp"):
                 try:
-                    d = datetime.datetime.fromtimestamp(entry["timestamp"]).strftime("%Y%m%d")
+                    d = datetime.datetime.fromtimestamp(
+                        entry["timestamp"], datetime.timezone.utc
+                    ).strftime("%Y%m%d")
                 except Exception:
                     d = ""
             return str(d)
@@ -932,12 +936,15 @@ def sync_channel_public_videos(
             schedule_times,
             target_page_id=target_page_id,
             sort_order_mode=sort_order_mode,
+            timezone_name=str(
+                settings.get("publication_timezone") or "Asia/Ho_Chi_Minh"
+            ),
         )
 
         # Save last synced timestamp
         db.save_fb_crossposter_settings({
             **settings,
-            "last_synced_at": datetime.datetime.now().isoformat(),
+            "last_synced_at": db.utc_now(),
         }, page_id=target_page_id)
 
         if sys_job_id:
@@ -1805,7 +1812,10 @@ def _parse_meta_iso_timestamp(value: Any) -> int:
             return int(value)
         parsed = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+            logger.warning(
+                "Legacy timezone-less Meta timestamp; assuming Asia/Ho_Chi_Minh without rewriting the database"
+            )
+            parsed = parsed.replace(tzinfo=LEGACY_CROSSPOSTER_TIMEZONE)
         return int(parsed.timestamp())
     except (TypeError, ValueError):
         return 0
@@ -2042,10 +2052,27 @@ def _meta_state_is_stale(
     try:
         since = datetime.datetime.fromisoformat(raw_since.replace("Z", "+00:00"))
         if since.tzinfo is None:
-            since = since.replace(tzinfo=datetime.timezone.utc)
+            logger.warning(
+                "Legacy timezone-less Cross Poster state timestamp; assuming Asia/Ho_Chi_Minh without rewriting the database"
+            )
+            since = since.replace(tzinfo=LEGACY_CROSSPOSTER_TIMEZONE)
         return (datetime.datetime.now(datetime.timezone.utc) - since).total_seconds() >= META_PROCESSING_STALE_SECONDS
     except ValueError:
         return False
+
+
+def _format_fanpage_schedule(epoch: int, timezone_name: str) -> str:
+    if not epoch:
+        return ""
+    clean_timezone = str(timezone_name or "").strip()
+    try:
+        zone = ZoneInfo(clean_timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        return f"{epoch} · timezone không hợp lệ: {clean_timezone}"
+    return (
+        datetime.datetime.fromtimestamp(epoch, zone).strftime("%d/%m/%Y %I:%M %p")
+        + f" · {clean_timezone}"
+    )
 
 
 def reconcile_fb_queue_item(item_id: int, *, dry_run: bool = False) -> dict[str, Any]:
@@ -2057,6 +2084,9 @@ def reconcile_fb_queue_item(item_id: int, *, dry_run: bool = False) -> dict[str,
     target_page_id = str(item.get("target_page_id") or "").strip()
     settings = db.get_fb_crossposter_runtime_settings(target_page_id)
     access_token = sanitize_fb_token(settings.get("target_access_token"))
+    publication_timezone = str(
+        settings.get("publication_timezone") or "Asia/Ho_Chi_Minh"
+    )
     requested_schedule = int(item.get("scheduled_publish_time") or 0) or None
     now_ts = int(time.time())
 
@@ -2098,7 +2128,10 @@ def reconcile_fb_queue_item(item_id: int, *, dry_run: bool = False) -> dict[str,
                     "message": f"Đã khớp với bài đăng thực tế trên Meta: {meta_post_id}",
                 }
             else:
-                sched_str = datetime.datetime.fromtimestamp(requested_schedule).strftime('%d/%m/%Y %I:%M %p') if requested_schedule else ""
+                sched_str = _format_fanpage_schedule(
+                    requested_schedule or 0,
+                    publication_timezone,
+                )
                 fields = {
                     "fb_post_id": meta_post_id,
                     "upload_video_id": meta_post_id,
@@ -2126,7 +2159,10 @@ def reconcile_fb_queue_item(item_id: int, *, dry_run: bool = False) -> dict[str,
             or item.get("status") in {"meta_scheduled", "verifying", "processing"}
         )
         if is_browser_submitted and requested_schedule and requested_schedule > (now_ts + 60):
-            sched_str = datetime.datetime.fromtimestamp(requested_schedule).strftime('%d/%m/%Y %I:%M %p')
+            sched_str = _format_fanpage_schedule(
+                requested_schedule,
+                publication_timezone,
+            )
             fields = {
                 "status": "meta_scheduled",
                 "meta_state": "scheduled",
@@ -2418,6 +2454,7 @@ def reconcile_fb_queue(
     errors: list[dict[str, Any]] = []
 
     page_meta_cache: dict[str, list[dict[str, Any]]] = {}
+    page_timezone_cache: dict[str, str] = {}
 
     for item in items:
         item_id = int(item["id"])
@@ -2432,6 +2469,9 @@ def reconcile_fb_queue(
             tok = sanitize_fb_token(s.get("target_access_token"))
             gpm_id = str(s.get("target_gpm_profile_id") or "")
             page_meta_cache[pid] = _fetch_meta_page_posts_index(pid, tok, gpm_id) if tok else []
+            page_timezone_cache[pid] = str(
+                s.get("publication_timezone") or "Asia/Ho_Chi_Minh"
+            )
 
         meta_index = page_meta_cache.get(pid) or []
         item_title = str(item.get("fb_title") or item.get("original_title") or "").strip()
@@ -2479,7 +2519,10 @@ def reconcile_fb_queue(
                 })
                 continue
             else:
-                sched_str = datetime.datetime.fromtimestamp(sched_ts).strftime('%d/%m/%Y %I:%M %p') if sched_ts else ""
+                sched_str = _format_fanpage_schedule(
+                    sched_ts,
+                    page_timezone_cache.get(pid, "Asia/Ho_Chi_Minh"),
+                )
                 update_fields = {
                     "fb_post_id": meta_post_id,
                     "upload_video_id": meta_post_id,
@@ -2510,7 +2553,10 @@ def reconcile_fb_queue(
             or item.get("status") in {"meta_scheduled", "verifying", "processing"}
         )
         if is_browser_submitted and sched_ts and sched_ts > (now_ts + 60):
-            sched_str = datetime.datetime.fromtimestamp(sched_ts).strftime('%d/%m/%Y %I:%M %p')
+            sched_str = _format_fanpage_schedule(
+                sched_ts,
+                page_timezone_cache.get(pid, "Asia/Ho_Chi_Minh"),
+            )
             update_fields = {
                 "status": "meta_scheduled",
                 "meta_state": "scheduled",
@@ -3281,6 +3327,15 @@ def process_queue_item_jit(
     source_gpm_profile_id = settings.get("source_gpm_profile_id", "")
     target_gpm_profile_id = settings.get("target_gpm_profile_id", "")
     default_tags = settings.get("default_tags", [])
+    publication_timezone = str(
+        settings.get("publication_timezone") or "Asia/Ho_Chi_Minh"
+    ).strip()
+    try:
+        ZoneInfo(publication_timezone)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(
+            f"Timezone IANA của Fanpage không hợp lệ: {publication_timezone}"
+        ) from exc
 
     # Idempotency guard: reconcile existing Meta objects instead of creating duplicates.
     existing_post_id = str(item.get("fb_post_id") or "").strip()
@@ -3612,6 +3667,7 @@ def process_queue_item_jit(
                                 content_title=title,
                                 page_name=page_name,
                                 target_page_id=page_id,
+                                timezone_name=publication_timezone,
                                 state_callback=persist_browser_state,
                                 cancel_check=cancel_check,
                             )
@@ -3630,6 +3686,7 @@ def process_queue_item_jit(
                             content_title=title,
                             page_name=page_name,
                             target_page_id=page_id,
+                            timezone_name=publication_timezone,
                             state_callback=persist_browser_state,
                             cancel_check=cancel_check,
                         )
@@ -4204,7 +4261,7 @@ def start_schedule_ahead_batch(
             "progress_percent": 0.0,
             "cancel_requested": False,
             "error": "",
-            "created_at": datetime.datetime.now().isoformat(),
+            "created_at": db.utc_now(),
         }
         _schedule_ahead_tasks[task_id] = task_record
 
@@ -4280,12 +4337,25 @@ class FbCrossPosterScheduler:
         if not campaigns:
             campaigns = [{"page_id": "", "page_name": "Default"}]
 
-        now = datetime.datetime.now()
-        now_ts = int(now.timestamp())
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        now_ts = int(now_utc.timestamp())
 
         for camp in campaigns:
             page_id = camp.get("page_id", "")
             settings = db.get_fb_crossposter_settings(page_id)
+            timezone_name = str(
+                settings.get("publication_timezone") or "Asia/Ho_Chi_Minh"
+            ).strip()
+            try:
+                publication_zone = ZoneInfo(timezone_name)
+            except (ZoneInfoNotFoundError, ValueError):
+                logger.error(
+                    "Skipping Cross Poster campaign %s because publication timezone is invalid: %s",
+                    page_id or "Default",
+                    timezone_name,
+                )
+                continue
+            local_now = now_utc.astimezone(publication_zone)
 
             last_reconcile_ts = self._last_reconcile_checks.get(page_id, 0.0)
             if now_ts - last_reconcile_ts >= 300:
@@ -4324,14 +4394,24 @@ class FbCrossPosterScheduler:
                         else:
                             try:
                                 last_dt = datetime.datetime.fromisoformat(last_synced_str)
-                                if (now - last_dt).total_seconds() >= interval_hours * 3600:
+                                if last_dt.tzinfo is None:
+                                    logger.warning(
+                                        "Legacy timezone-less last_synced_at for Fanpage %s; assuming Asia/Ho_Chi_Minh without rewriting the database",
+                                        page_id or "Default",
+                                    )
+                                    last_dt = last_dt.replace(
+                                        tzinfo=LEGACY_CROSSPOSTER_TIMEZONE
+                                    )
+                                if (
+                                    now_utc - last_dt.astimezone(datetime.timezone.utc)
+                                ).total_seconds() >= interval_hours * 3600:
                                     should_sync = True
                             except Exception:
                                 should_sync = True
 
                 elif sync_type == "fixed_time":
                     fixed_times = settings.get("auto_sync_fixed_times", ["06:00", "18:00"])
-                    current_hhmm = now.strftime("%H:%M")
+                    current_hhmm = local_now.strftime("%H:%M")
                     if current_hhmm in fixed_times and (now_ts - last_check_ts > 70):
                         should_sync = True
 

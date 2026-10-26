@@ -18,12 +18,14 @@ from nexus_engine.services.fb_reels_browser_service import (
     _schedule_values_match,
     _set_scoped_thumbnail_input,
     _thumbnail_upload_verified,
+    _timezone_offset_at,
     _upload_optional_thumbnail,
     _format_schedule_time,
     FbBrowserAutomationError,
 )
 import nexus_engine.services.fb_reels_browser_service as fb_browser
 from nexus_engine.services.fb_crossposter_service import (
+    _parse_meta_iso_timestamp,
     reset_fb_crossposter_checkpoint,
     TEMP_DOWNLOAD_DIR,
 )
@@ -31,6 +33,22 @@ import nexus_engine.services.database as db
 
 
 class TestFbReelsBrowser(unittest.TestCase):
+    def test_legacy_crossposter_timestamp_assumes_vietnam_timezone(self):
+        expected = int(
+            datetime.datetime(
+                2026,
+                10,
+                26,
+                19,
+                30,
+                tzinfo=datetime.timezone(datetime.timedelta(hours=7)),
+            ).timestamp()
+        )
+        self.assertEqual(
+            _parse_meta_iso_timestamp("2026-10-26T19:30:00"),
+            expected,
+        )
+
     def test_format_schedule_time_datetime(self):
         dt = datetime.datetime(2026, 9, 29, 19, 0)
         slash, iso, time_str = _format_schedule_time(dt)
@@ -43,6 +61,47 @@ class TestFbReelsBrowser(unittest.TestCase):
         self.assertEqual(slash, "29/9/2026")
         self.assertEqual(iso, "2026-09-29")
         self.assertEqual(time_str, "19:30")
+
+    def test_format_schedule_time_epoch_uses_fanpage_timezone(self):
+        epoch = int(
+            datetime.datetime(
+                2026,
+                9,
+                29,
+                12,
+                30,
+                tzinfo=datetime.timezone.utc,
+            ).timestamp()
+        )
+        slash, iso, time_str = _format_schedule_time(
+            epoch,
+            "Asia/Ho_Chi_Minh",
+        )
+        self.assertEqual((slash, iso, time_str), ("29/9/2026", "2026-09-29", "19:30"))
+
+    def test_format_schedule_time_rejects_nonexistent_dst_time(self):
+        with self.assertRaisesRegex(ValueError, "DST"):
+            _format_schedule_time(
+                "2026-03-08 02:30",
+                "America/New_York",
+            )
+
+    def test_browser_and_fanpage_timezone_compare_offsets_at_publish_instant(self):
+        instant = datetime.datetime(
+            2026,
+            7,
+            15,
+            12,
+            tzinfo=datetime.timezone.utc,
+        )
+        self.assertEqual(
+            _timezone_offset_at(instant, "Asia/Ho_Chi_Minh"),
+            _timezone_offset_at(instant, "Asia/Bangkok"),
+        )
+        self.assertNotEqual(
+            _timezone_offset_at(instant, "America/New_York"),
+            _timezone_offset_at(instant, "America/Los_Angeles"),
+        )
 
     def test_parse_meta_localized_date_value(self):
         self.assertEqual(

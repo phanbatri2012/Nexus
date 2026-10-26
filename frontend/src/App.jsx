@@ -3712,7 +3712,7 @@ function App() {
                                         <span style={{ color: '#a0aec0', fontSize: '0.92em' }}>
                                           ⏱️ {renderInfo?.mp4_details?.duration_formatted || (renderInfo?.mp4_artifact?.duration_seconds ? `${Math.round(renderInfo.mp4_artifact.duration_seconds)}s` : 'Chuẩn')}
                                           {renderInfo?.mp4_details?.size_formatted ? ` · 💾 ${renderInfo.mp4_details.size_formatted}` : (renderInfo?.mp4_artifact?.size_bytes ? ` · 💾 ${(renderInfo.mp4_artifact.size_bytes / (1024*1024)).toFixed(1)} MB` : '')}
-                                          {renderInfo?.mp4_details?.completed_at_formatted ? ` · 🕒 ${renderInfo.mp4_details.completed_at_formatted}` : ''}
+                                          {renderInfo?.mp4_details?.completed_at ? ` · 🕒 ${formatDateTimeAMPM(renderInfo.mp4_details.completed_at)}` : ''}
                                         </span>
                                       </div>
                                     ) : (

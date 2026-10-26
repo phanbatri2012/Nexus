@@ -3,6 +3,78 @@
 export const HOURS_12 = Array.from({ length: 12 }, (_, i) => String(i + 1).padStart(2, '0'))
 export const MINUTES_60 = Array.from({ length: 60 }, (_, i) => String(i).padStart(2, '0'))
 export const MINUTES_15 = ['00', '15', '30', '45']
+export const DEFAULT_TIME_ZONE = 'Asia/Ho_Chi_Minh'
+
+export function getBrowserTimeZone() {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone || DEFAULT_TIME_ZONE
+}
+
+function hasExplicitTimeZone(value) {
+  return /(?:Z|[+-]\d{2}:?\d{2})$/i.test(String(value || '').trim())
+}
+
+function normalizeOffsetLabel(value) {
+  const raw = String(value || '').replace(/^GMT/i, 'UTC')
+  if (raw === 'UTC') return 'UTC+00:00'
+  const match = raw.match(/^UTC([+-])(\d{1,2})(?::?(\d{2}))?$/i)
+  if (!match) return raw || 'UTC+00:00'
+  return `UTC${match[1]}${match[2].padStart(2, '0')}:${match[3] || '00'}`
+}
+
+function formatLegacyDateTime(value, includeSeconds) {
+  const match = String(value || '').trim().match(
+    /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?$/
+  )
+  if (!match) return `${String(value)} · TZ không xác định · legacy`
+  const [, year, month, day, hourText, minute, second = '00'] = match
+  let hour = Number(hourText)
+  const period = hour >= 12 ? 'PM' : 'AM'
+  hour %= 12
+  if (hour === 0) hour = 12
+  const time = includeSeconds
+    ? `${String(hour).padStart(2, '0')}:${minute}:${second} ${period}`
+    : `${String(hour).padStart(2, '0')}:${minute} ${period}`
+  return `${day}/${month}/${year} ${time} · TZ không xác định · legacy`
+}
+
+function getDateTimeParts(date, timeZone, includeSeconds) {
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    ...(includeSeconds ? { second: '2-digit' } : {}),
+    hour12: true,
+    timeZoneName: 'longOffset'
+  })
+  const parts = Object.fromEntries(
+    formatter.formatToParts(date).map(part => [part.type, part.value])
+  )
+  return {
+    day: parts.day,
+    month: parts.month,
+    year: parts.year,
+    hour: parts.hour,
+    minute: parts.minute,
+    second: parts.second,
+    period: parts.dayPeriod,
+    offset: normalizeOffsetLabel(parts.timeZoneName)
+  }
+}
+
+export function formatTimeZoneLabel(timeZone = getBrowserTimeZone(), value = Date.now()) {
+  const targetTimeZone = timeZone || getBrowserTimeZone()
+  const date = value instanceof Date ? value : new Date(value)
+  if (Number.isNaN(date.getTime())) return `Timezone không hợp lệ · ${targetTimeZone}`
+  try {
+    const { offset } = getDateTimeParts(date, targetTimeZone, false)
+    return `${targetTimeZone} · ${offset}`
+  } catch {
+    return `Timezone không hợp lệ · ${targetTimeZone}`
+  }
+}
 
 /**
  * Parse a 24-hour ("HH:MM") or 12-hour ("hh:mm AM/PM") time string into 12-hour components { hour, minute, period }.
@@ -78,7 +150,10 @@ export function formatTime12(timeStr) {
  * Format a Date, timestamp (seconds or ms), or ISO string into Vietnamese date + 12h AM/PM time.
  * Output: "DD/MM/YYYY hh:mm:ss AM/PM" or "DD/MM/YYYY hh:mm AM/PM"
  */
-export function formatDateTimeAMPM(value, { includeSeconds = true } = {}) {
+export function formatDateTimeAMPM(
+  value,
+  { includeSeconds = true, timeZone = getBrowserTimeZone() } = {}
+) {
   if (!value) return '-'
   let date
   if (value instanceof Date) {
@@ -87,28 +162,21 @@ export function formatDateTimeAMPM(value, { includeSeconds = true } = {}) {
     date = new Date(value > 1e11 ? value : value * 1000)
   } else {
     const raw = String(value).trim()
-    date = new Date(raw.endsWith('Z') || raw.includes('+') ? raw : (raw.includes('T') ? raw : raw.replace(' ', 'T')))
+    if (!hasExplicitTimeZone(raw)) {
+      return formatLegacyDateTime(raw, includeSeconds)
+    }
+    date = new Date(raw)
   }
   if (Number.isNaN(date.getTime())) return String(value)
-
-  const day = String(date.getDate()).padStart(2, '0')
-  const month = String(date.getMonth() + 1).padStart(2, '0')
-  const year = date.getFullYear()
-
-  let hours = date.getHours()
-  const minutes = String(date.getMinutes()).padStart(2, '0')
-  const seconds = String(date.getSeconds()).padStart(2, '0')
-  const period = hours >= 12 ? 'PM' : 'AM'
-
-  hours = hours % 12
-  if (hours === 0) hours = 12
-  const hour12 = String(hours).padStart(2, '0')
-
-  const timePart = includeSeconds
-    ? `${hour12}:${minutes}:${seconds} ${period}`
-    : `${hour12}:${minutes} ${period}`
-
-  return `${day}/${month}/${year} ${timePart}`
+  try {
+    const parts = getDateTimeParts(date, timeZone, includeSeconds)
+    const timePart = includeSeconds
+      ? `${parts.hour}:${parts.minute}:${parts.second} ${parts.period}`
+      : `${parts.hour}:${parts.minute} ${parts.period}`
+    return `${parts.day}/${parts.month}/${parts.year} ${timePart} · ${parts.offset} · ${timeZone}`
+  } catch {
+    return `${String(value)} · Timezone không hợp lệ · ${timeZone}`
+  }
 }
 
 /**

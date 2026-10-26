@@ -1233,6 +1233,7 @@ def init_db():
             convert_to_vertical INTEGER DEFAULT 0,
             default_tags_json TEXT DEFAULT '[]',
             upload_mode TEXT DEFAULT 'browser',
+            publication_timezone TEXT NOT NULL DEFAULT 'Asia/Ho_Chi_Minh',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT ''
         )
@@ -1297,6 +1298,7 @@ def init_db():
         "convert_to_vertical INTEGER DEFAULT 0",
         "default_tags_json TEXT DEFAULT '[]'",
         "upload_mode TEXT DEFAULT 'browser'",
+        "publication_timezone TEXT NOT NULL DEFAULT 'Asia/Ho_Chi_Minh'",
     ):
         try:
             c.execute(
@@ -2424,7 +2426,7 @@ def save_video(
         title,
         transcript,
         generated_script,
-        datetime.datetime.now().isoformat(),
+        utc_now(),
         chat_url,
         prompt_version,
         generated_title,
@@ -4451,6 +4453,31 @@ def utc_now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def _publication_zone(timezone_name: str) -> ZoneInfo:
+    clean_name = str(timezone_name or "").strip()
+    if not clean_name:
+        raise ValueError("Timezone IANA không được để trống")
+    try:
+        return ZoneInfo(clean_name)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"Timezone IANA không hợp lệ: {clean_name}") from exc
+
+
+def _local_slot_epoch(
+    target_date: datetime.date,
+    slot_time: datetime.time,
+    zone: ZoneInfo,
+) -> int | None:
+    """Return the epoch for a local wall-clock slot, or None for a DST gap."""
+    naive_value = datetime.datetime.combine(target_date, slot_time)
+    zoned_value = naive_value.replace(tzinfo=zone)
+    epoch = int(zoned_value.timestamp())
+    round_trip = datetime.datetime.fromtimestamp(epoch, zone).replace(tzinfo=None)
+    if round_trip != naive_value:
+        return None
+    return epoch
+
+
 def _decode_system_job(row: sqlite3.Row | None) -> dict | None:
     if row is None:
         return None
@@ -5589,6 +5616,9 @@ def _load_fb_crossposter_settings(page_id: str | None = None) -> dict:
         data["convert_to_vertical"] = bool(data.get("convert_to_vertical"))
         data["lead_time_minutes"] = int(data.get("lead_time_minutes") or 60)
         data["upload_mode"] = str(data.get("upload_mode") or "browser").strip() or "browser"
+        data["publication_timezone"] = str(
+            data.get("publication_timezone") or "Asia/Ho_Chi_Minh"
+        ).strip()
         return data
     finally:
         conn.close()
@@ -5654,7 +5684,7 @@ def save_fb_crossposter_settings(settings: dict, page_id: str | None = None) -> 
 
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
-    now_iso = datetime.datetime.now().isoformat()
+    now_iso = utc_now()
     target_page_id = (page_id or settings.get("target_fb_page_id") or "").strip()
     try:
         schedule_times = settings.get("schedule_times", ["11:30", "19:30"])
@@ -5724,6 +5754,7 @@ def save_fb_crossposter_settings(settings: dict, page_id: str | None = None) -> 
             1 if settings.get("convert_to_vertical") else 0,
             default_tags_json,
             upload_mode,
+            str(settings.get("publication_timezone") or "Asia/Ho_Chi_Minh").strip(),
             now_iso,
         )
 
@@ -5752,6 +5783,7 @@ def save_fb_crossposter_settings(settings: dict, page_id: str | None = None) -> 
                     convert_to_vertical = ?,
                     default_tags_json = ?,
                     upload_mode = ?,
+                    publication_timezone = ?,
                     updated_at = ?
                 WHERE id = ?
             """, (*values, existing["id"]))
@@ -5765,9 +5797,9 @@ def save_fb_crossposter_settings(settings: dict, page_id: str | None = None) -> 
                     sort_order_mode, auto_sync_enabled, auto_sync_type,
                     auto_sync_interval_hours, auto_sync_fixed_times_json,
                     last_synced_at, auto_publish_enabled, convert_to_vertical,
-                    default_tags_json, upload_mode, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, values)
+                    default_tags_json, upload_mode, publication_timezone, updated_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (*values, now_iso))
         conn.commit()
     finally:
         conn.close()
@@ -5782,7 +5814,7 @@ def upsert_fb_crossposter_queue_items(items: list[dict], target_page_id: str = "
         return {"inserted": 0, "existing": 0}
 
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
-    now_iso = datetime.datetime.now().isoformat()
+    now_iso = utc_now()
     inserted_count = 0
     existing_count = 0
     target_pid = (target_page_id or "").strip()
@@ -5995,7 +6027,7 @@ def update_fb_crossposter_queue_item(item_id: int, fields: dict) -> bool:
             return False
 
         updates.append("updated_at = ?")
-        values.append(datetime.datetime.now().isoformat())
+        values.append(utc_now())
         values.append(item_id)
 
         sql = f"UPDATE fb_crossposter_queue SET {', '.join(updates)} WHERE id = ?"
@@ -6076,7 +6108,7 @@ def append_fb_recovery_history(item_id: int, event: str, details: dict | None = 
         })
         conn.execute(
             "UPDATE fb_crossposter_queue SET repair_history_json = ?, updated_at = ? WHERE id = ?",
-            (json.dumps(history[-50:], ensure_ascii=False), datetime.datetime.now().isoformat(), item_id),
+            (json.dumps(history[-50:], ensure_ascii=False), utc_now(), item_id),
         )
         conn.commit()
     finally:
@@ -6089,6 +6121,7 @@ def reserve_next_fb_queue_slot(
     minimum_lead_minutes: int = 30,
     clear_meta_object: bool = False,
     max_horizon_days: int = 70,
+    now_utc: datetime.datetime | None = None,
 ) -> int:
     """Atomically reserve the next configured free slot for an item on its Fanpage."""
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
@@ -6124,10 +6157,18 @@ def reserve_next_fb_queue_slot(
         valid_times.sort()
         daily_quota = max(1, int((settings["daily_quota"] if settings else 0) or len(valid_times)))
         valid_times = valid_times[:daily_quota]
+        timezone_name = str(
+            settings["publication_timezone"] if settings else "Asia/Ho_Chi_Minh"
+        ).strip() or "Asia/Ho_Chi_Minh"
+        publication_zone = _publication_zone(timezone_name)
         configured_lead = int((settings["lead_time_minutes"] if settings else 0) or 0)
         lead_minutes = max(30, int(minimum_lead_minutes), configured_lead)
-        now = datetime.datetime.now()
-        earliest_ts = int((now + datetime.timedelta(minutes=lead_minutes)).timestamp())
+        now_value = now_utc or datetime.datetime.now(datetime.timezone.utc)
+        if now_value.tzinfo is None:
+            now_value = now_value.replace(tzinfo=datetime.timezone.utc)
+        now_value = now_value.astimezone(datetime.timezone.utc)
+        local_now = now_value.astimezone(publication_zone)
+        earliest_ts = int((now_value + datetime.timedelta(minutes=lead_minutes)).timestamp())
 
         occupied_rows = conn.execute(
             """
@@ -6154,9 +6195,11 @@ def reserve_next_fb_queue_slot(
         reserved_ts = 0
         horizon_limit = max(1, min(int(max_horizon_days), 366))
         for day_offset in range(horizon_limit):
-            target_date = now.date() + datetime.timedelta(days=day_offset)
+            target_date = local_now.date() + datetime.timedelta(days=day_offset)
             for slot_time in valid_times:
-                candidate_ts = int(datetime.datetime.combine(target_date, slot_time).timestamp())
+                candidate_ts = _local_slot_epoch(target_date, slot_time, publication_zone)
+                if candidate_ts is None:
+                    continue
                 if candidate_ts <= earliest_ts:
                     continue
                 if any(abs(candidate_ts - occupied_ts) < 900 for occupied_ts in occupied):
@@ -6167,9 +6210,11 @@ def reserve_next_fb_queue_slot(
                 break
         if not reserved_ts and horizon_limit < 366:
             for day_offset in range(horizon_limit, 367):
-                target_date = now.date() + datetime.timedelta(days=day_offset)
+                target_date = local_now.date() + datetime.timedelta(days=day_offset)
                 for slot_time in valid_times:
-                    candidate_ts = int(datetime.datetime.combine(target_date, slot_time).timestamp())
+                    candidate_ts = _local_slot_epoch(target_date, slot_time, publication_zone)
+                    if candidate_ts is None:
+                        continue
                     if candidate_ts <= earliest_ts:
                         continue
                     if any(abs(candidate_ts - occupied_ts) < 900 for occupied_ts in occupied):
@@ -6188,7 +6233,7 @@ def reserve_next_fb_queue_slot(
             "error_message = ''",
             "updated_at = ?",
         ]
-        values: list[object] = [reserved_ts, datetime.datetime.now().isoformat()]
+        values: list[object] = [reserved_ts, utc_now()]
         if clear_meta_object:
             assignments.extend([
                 "previous_fb_post_id = ?",
@@ -6241,7 +6286,7 @@ def adopt_fb_meta_schedule(item_id: int) -> int:
         if row is None:
             raise ValueError(f"Không tìm thấy video ID #{item_id} trong hàng đợi")
         meta_schedule = int(row["meta_scheduled_publish_time"] or 0)
-        if meta_schedule <= int(datetime.datetime.now().timestamp()):
+        if meta_schedule <= int(datetime.datetime.now(datetime.timezone.utc).timestamp()):
             raise ValueError("Meta không có lịch tương lai hợp lệ để đồng bộ")
         conn.execute(
             """
@@ -6251,7 +6296,7 @@ def adopt_fb_meta_schedule(item_id: int) -> int:
                 updated_at = ?
             WHERE id = ?
             """,
-            (meta_schedule, datetime.datetime.now().isoformat(), item_id),
+            (meta_schedule, utc_now(), item_id),
         )
         conn.commit()
         return meta_schedule
@@ -6303,7 +6348,9 @@ def recalculate_fb_queue_schedule(
     times_list: list[str],
     target_page_id: str = "",
     start_date: datetime.date | None = None,
-    sort_order_mode: str = "oldest_first"
+    sort_order_mode: str = "oldest_first",
+    timezone_name: str = "Asia/Ho_Chi_Minh",
+    now_utc: datetime.datetime | None = None,
 ) -> int:
     """Recalculate scheduled_publish_time for pending/scheduled items of a specific Fanpage with smart collision prevention."""
     if daily_quota <= 0 or not times_list:
@@ -6358,12 +6405,26 @@ def recalculate_fb_queue_schedule(
             [r[0] for r in rows],
         )
 
-        now = datetime.datetime.now()
-        now_ts = int(now.timestamp())
-        current_date = start_date or now.date()
-        time_slots = sorted(times_list)
+        publication_zone = _publication_zone(timezone_name)
+        now_value = now_utc or datetime.datetime.now(datetime.timezone.utc)
+        if now_value.tzinfo is None:
+            now_value = now_value.replace(tzinfo=datetime.timezone.utc)
+        now_value = now_value.astimezone(datetime.timezone.utc)
+        now_ts = int(now_value.timestamp())
+        local_now = now_value.astimezone(publication_zone)
+        current_date = start_date or local_now.date()
+        time_slots: list[datetime.time] = []
+        for raw_time in times_list:
+            try:
+                hour, minute = (int(part) for part in str(raw_time).split(":", 1))
+                time_slots.append(datetime.time(hour=hour, minute=minute))
+            except (TypeError, ValueError):
+                continue
+        time_slots = sorted(time_slots)[:daily_quota]
+        if not time_slots:
+            raise ValueError("Fanpage chưa có khung giờ đăng hợp lệ")
         slot_count = len(time_slots)
-        effective_slots_per_day = min(daily_quota, slot_count)
+        effective_slots_per_day = slot_count
 
         # 1. Collect all occupied slots (published, in-flight, or already uploaded to Meta Cloud with future publish time, excluding rows to be rescheduled)
         row_ids = [r[0] for r in rows]
@@ -6395,13 +6456,19 @@ def recalculate_fb_queue_schedule(
             # Find next free, non-colliding time slot
             while True:
                 target_date = current_date + datetime.timedelta(days=date_offset)
-                t_str = time_slots[slot_index % slot_count]
-                try:
-                    hour, minute = map(int, t_str.split(":"))
-                    candidate_dt = datetime.datetime.combine(target_date, datetime.time(hour, minute))
-                    candidate_ts = int(candidate_dt.timestamp())
-                except Exception:
-                    candidate_ts = int((now + datetime.timedelta(hours=2)).timestamp())
+                slot_time = time_slots[slot_index % slot_count]
+                candidate_ts = _local_slot_epoch(
+                    target_date,
+                    slot_time,
+                    publication_zone,
+                )
+
+                if candidate_ts is None:
+                    slot_index += 1
+                    if slot_index % effective_slots_per_day == 0:
+                        date_offset += 1
+                        slot_index = 0
+                    continue
 
                 # If candidate slot is in the past or < 10 mins in future, advance to next slot
                 if candidate_ts <= (now_ts + 600):
@@ -6433,7 +6500,7 @@ def recalculate_fb_queue_schedule(
                 UPDATE fb_crossposter_queue
                 SET scheduled_publish_time = ?, status = 'scheduled', updated_at = ?
                 WHERE id = ?
-            """, (scheduled_ts, datetime.datetime.now().isoformat(), item_id))
+            """, (scheduled_ts, utc_now(), item_id))
             updated_count += 1
 
         conn.commit()
@@ -6487,7 +6554,7 @@ def get_fb_crossposter_stats(target_page_id: str = "") -> dict:
 
         # Next upcoming scheduled item
         next_where = "status IN ('scheduled', 'meta_scheduled') AND scheduled_publish_time > ?"
-        next_params = [int(datetime.datetime.now().timestamp())]
+        next_params = [int(datetime.datetime.now(datetime.timezone.utc).timestamp())]
         if target_page_id and target_page_id.strip():
             next_where += " AND target_page_id = ?"
             next_params.append(target_page_id.strip())
@@ -6511,7 +6578,7 @@ def get_next_queue_items_for_pre_schedule(target_page_id: str, count: int) -> li
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
     try:
-        now_ts = int(datetime.datetime.now().timestamp())
+        now_ts = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
         where_sql = "WHERE status IN ('pending', 'scheduled', 'error', 'failed', 'missing', 'checkpoint_paused') AND (fb_post_id IS NULL OR fb_post_id = '' OR status = 'missing')"
         params: list[object] = []
         if target_page_id and target_page_id.strip():
@@ -6594,7 +6661,13 @@ def fix_fb_queue_schedule_collisions(target_page_id: str = "") -> dict:
         schedule_times = settings.get("schedule_times", ["11:30", "19:30"])
         sort_order_mode = settings.get("sort_order_mode", "oldest_first")
         updated = recalculate_fb_queue_schedule(
-            daily_quota, schedule_times, target_page_id=pid, sort_order_mode=sort_order_mode
+            daily_quota,
+            schedule_times,
+            target_page_id=pid,
+            sort_order_mode=sort_order_mode,
+            timezone_name=str(
+                settings.get("publication_timezone") or "Asia/Ho_Chi_Minh"
+            ),
         )
         total_recalculated += updated
 
@@ -7518,7 +7591,7 @@ def get_fb_items_for_meta_reconciliation(
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
     try:
-        now_ts = int(datetime.datetime.now().timestamp())
+        now_ts = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
         where_sql = """
             WHERE (
                     status IN (
@@ -9553,11 +9626,13 @@ def list_competitor_dispatches(*, rule_id: int | None = None, limit: int = 100) 
     rows = conn.execute(
         """
         SELECT d.*, s.youtube_video_id, s.url AS source_url, s.title AS source_title,
-               s.published_at, r.publication_mode, c.title AS competitor_title
+               s.published_at, r.publication_mode, c.title AS competitor_title,
+               y.publication_timezone AS target_publication_timezone
         FROM competitor_dispatches d
         JOIN competitor_source_videos s ON s.id = d.source_video_id
         JOIN competitor_watch_rules r ON r.id = d.watch_rule_id
         JOIN competitor_channels c ON c.id = r.competitor_channel_id
+        JOIN youtube_channels y ON y.id = r.target_youtube_channel_id
         """
         + where
         + " ORDER BY d.created_at DESC, d.id DESC LIMIT ?",

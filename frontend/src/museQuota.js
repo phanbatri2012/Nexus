@@ -1,26 +1,11 @@
-export function getBrowserTimeZone() {
-  return Intl.DateTimeFormat().resolvedOptions().timeZone || 'Múi giờ hệ thống'
-}
+import { formatDateTimeAMPM, getBrowserTimeZone } from './publicationTime.js'
+
+export { getBrowserTimeZone }
 
 export function formatMuseDateTime(unixSeconds, timeZone = getBrowserTimeZone()) {
   const value = Number(unixSeconds)
   if (!Number.isFinite(value) || value <= 0) return 'Không xác định'
-  try {
-    const formatted = new Intl.DateTimeFormat('vi-VN', {
-      timeZone,
-      day: '2-digit',
-      month: '2-digit',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-      hour12: false,
-      timeZoneName: 'short'
-    }).format(new Date(value * 1000))
-    return `${formatted} (${timeZone})`
-  } catch {
-    return `${new Date(value * 1000).toLocaleString('vi-VN')} (${timeZone})`
-  }
+  return formatDateTimeAMPM(value, { includeSeconds: true, timeZone })
 }
 
 export function formatMuseWeeklyReset(value) {
