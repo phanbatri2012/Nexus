@@ -15,25 +15,29 @@ _SRC_DIR = _HERE.parent / "src"
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
-from nexus_engine.services.system_cleaner import cleaner
+from nexus_engine.services.system_cleaner import (
+    DEFAULT_RENDER_RETENTION_DAYS,
+    cleaner,
+)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Nexus Studio Engine System Cleaner CLI")
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--dry-run",
         action="store_true",
         help="Scan and calculate cleanable storage without deleting any files",
     )
-    parser.add_argument(
+    mode.add_argument(
         "--safe",
         action="store_true",
-        help="Perform standard safe cleanup (OmniVoice jobs, segments, logs, cache, ghost DBs)",
+        help="Execute conservative cleanup while preserving DB backups and migration quarantine",
     )
-    parser.add_argument(
+    mode.add_argument(
         "--all",
         action="store_true",
-        help="Perform exhaustive cleanup across all categories",
+        help="Execute all policy-safe categories, including expired verified quarantine and old DB backups",
     )
     parser.add_argument(
         "--vacuum",
@@ -45,12 +49,22 @@ def main():
         action="store_true",
         help="Output results in JSON format",
     )
+    parser.add_argument(
+        "--render-retention-days",
+        type=float,
+        default=DEFAULT_RENDER_RETENTION_DAYS,
+        help="Rolling retention window for final MP4 renders (default: 7 days)",
+    )
 
     args = parser.parse_args()
 
-    # Default to safe mode if neither --safe nor --all is specified
-    is_dry_run = args.dry_run
-    run_vacuum = args.vacuum or args.all or args.safe
+    if args.render_retention_days < 0:
+        parser.error("--render-retention-days must be zero or greater")
+
+    # No mode is deliberately read-only. Destructive cleanup requires an
+    # explicit --safe or --all flag.
+    is_dry_run = args.dry_run or not (args.safe or args.all)
+    run_vacuum = bool(args.vacuum or args.all or args.safe)
 
     if not args.json:
         mode_str = "DRY RUN (Scan Only)" if is_dry_run else "EXECUTE CLEANUP"
@@ -66,8 +80,9 @@ def main():
         clean_audio=True,
         clean_cache=True,
         clean_logs=True,
-        clean_ghost_dbs=True,
+        clean_ghost_dbs=bool(args.all or is_dry_run),
         vacuum_db=run_vacuum,
+        render_retention_days=args.render_retention_days,
     )
 
     if args.json:
@@ -75,20 +90,44 @@ def main():
         return
 
     print(f"\n[+] Cleanup Category Breakdown:")
-    print(f"{'Category':<25} | {'Files':<10} | {'Dirs':<8} | {'Space Freed'}")
-    print("-" * 65)
+    print(f"{'Category':<25} | {'Planned':<10} | {'Removed':<10} | {'Space'}")
+    print("-" * 75)
 
     for key, cat in summary.categories.items():
-        size_str = f"{cat.mb_freed:,.2f} MB" if cat.mb_freed < 1024 else f"{cat.gb_freed:,.2f} GB"
-        print(f"{cat.name:<25} | {cat.files_removed:<10} | {cat.dirs_removed:<8} | {size_str}")
+        byte_count = cat.bytes_planned if is_dry_run else cat.bytes_freed
+        size_mb = byte_count / (1024 * 1024)
+        size_str = f"{size_mb:,.2f} MB" if size_mb < 1024 else f"{byte_count / (1024 ** 3):,.2f} GB"
+        print(
+            f"{cat.name:<25} | {cat.files_planned:<10} | "
+            f"{cat.files_removed:<10} | {size_str}"
+        )
 
-    print("-" * 65)
+    print("-" * 75)
+    total_bytes = summary.total_bytes_planned if is_dry_run else summary.total_bytes_freed
+    total_mb = total_bytes / (1024 * 1024)
     total_size_str = (
-        f"{summary.total_mb_freed:,.2f} MB"
-        if summary.total_mb_freed < 1024
-        else f"{summary.total_gb_freed:,.2f} GB"
+        f"{total_mb:,.2f} MB"
+        if total_mb < 1024
+        else f"{total_bytes / (1024 ** 3):,.2f} GB"
     )
-    print(f"{'TOTAL':<25} | {summary.total_files_removed:<10} | {summary.total_dirs_removed:<8} | {total_size_str}")
+    print(
+        f"{'TOTAL':<25} | {summary.total_files_planned:<10} | "
+        f"{summary.total_files_removed:<10} | {total_size_str}"
+    )
+
+    if summary.blocked:
+        print("\n[!] Cleanup was blocked by active work or an unverifiable safety probe.")
+        for reason in summary.verification_errors:
+            print(f"    - {reason}")
+        for blocker in summary.blockers[:20]:
+            print(
+                "    - "
+                f"{blocker.get('type', 'task')}:"
+                f"{blocker.get('id', '')} [{blocker.get('status', '')}]"
+            )
+
+    if summary.manifest_id:
+        print(f"\n[+] Manifest: {summary.manifest_path}")
 
     if summary.database_stats:
         db_s = summary.database_stats
@@ -101,7 +140,10 @@ def main():
         print(f"    - VACUUM executed: {vac}")
         print(f"    - DB Size: {init_mb} MB -> {fin_mb} MB")
 
-    print("\n[+] Finished successfully.")
+    if summary.blocked:
+        print("\n[!] Finished without deleting files.")
+    else:
+        print("\n[+] Finished successfully.")
 
 
 if __name__ == "__main__":

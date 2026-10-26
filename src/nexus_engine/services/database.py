@@ -6817,6 +6817,60 @@ def delete_video_artifact(artifact_id: int) -> bool:
     return cursor.rowcount > 0
 
 
+def mark_video_artifact_purged(
+    artifact_id: int,
+    *,
+    expected_path: str,
+    reason: str,
+    manifest_id: str,
+    db_path: str | Path | None = None,
+) -> bool:
+    """Mark a ready artifact as purged without discarding its audit metadata."""
+
+    now = utc_now()
+    conn = sqlite3.connect(str(db_path or DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT path, status, metadata_json FROM video_artifacts WHERE id = ?",
+            (int(artifact_id),),
+        ).fetchone()
+        if (
+            row is None
+            or str(row["status"] or "").strip().lower() != "ready"
+            or str(row["path"] or "") != str(expected_path or "")
+        ):
+            conn.rollback()
+            return False
+        metadata = _decode_json_field(row["metadata_json"], {})
+        metadata["cleanup"] = {
+            "purged_at": now,
+            "reason": str(reason or "retention_policy"),
+            "manifest_id": str(manifest_id or ""),
+        }
+        cursor = conn.execute(
+            """
+            UPDATE video_artifacts
+            SET status = 'purged', metadata_json = ?, updated_at = ?
+            WHERE id = ? AND status = 'ready' AND path = ?
+            """,
+            (
+                json.dumps(metadata, ensure_ascii=False),
+                now,
+                int(artifact_id),
+                str(expected_path or ""),
+            ),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 # ==============================================================================
 # Google Flow projects
 # ==============================================================================

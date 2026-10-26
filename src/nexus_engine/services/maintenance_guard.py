@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import subprocess
+import time
+from pathlib import Path
 from typing import Any
 
+from nexus_engine.paths import PROJECT_ROOT
 from nexus_engine.services import database as db
 from nexus_engine.services import google_flow_browser_service
 
@@ -345,6 +350,402 @@ def get_maintenance_status() -> dict[str, Any]:
             "fb_crossposts": len(fb_blockers),
             "gpm_browsers": len(gpm_blockers),
             "google_flow_generations": len(google_flow_blockers),
+        },
+        "reasons": reasons,
+    }
+
+
+def _list_cleanup_database_blockers() -> tuple[list[dict[str, Any]], list[str]]:
+    """Return all work that can mutate runtime data while cleanup is running.
+
+    Cleanup is intentionally stricter than restart maintenance. A queued job or a
+    due retry can be claimed at any time, so both must block deletion and VACUUM.
+    Database failures are returned as verification errors instead of being treated
+    as an empty queue.
+    """
+
+    blockers: list[dict[str, Any]] = []
+    errors: list[str] = []
+    try:
+        conn = sqlite3.connect(str(db.DB_PATH), timeout=5.0)
+        conn.row_factory = sqlite3.Row
+    except Exception as exc:
+        return [], [f"database_unavailable:{type(exc).__name__}"]
+
+    now = db.utc_now()
+    queries = (
+        (
+            "system_job",
+            """
+            SELECT id, job_type, status, video_id, updated_at
+            FROM system_jobs
+            WHERE status IN ('running', 'processing', 'in_progress', 'queued')
+               OR (
+                    status = 'retry_wait'
+                    AND (
+                        COALESCE(next_retry_at, '') = ''
+                        OR next_retry_at <= ?
+                    )
+               )
+            ORDER BY created_at ASC
+            """,
+            (now,),
+        ),
+        (
+            "audio_task",
+            """
+            SELECT CAST(video_id AS TEXT) AS id, 'audio_task' AS job_type,
+                   status, video_id, updated_at
+            FROM audio_tasks
+            WHERE status IN ('pending', 'queued', 'processing', 'running')
+              AND (
+                  datetime(updated_at) >= datetime('now', '-15 minutes')
+                  OR EXISTS (
+                      SELECT 1 FROM system_jobs sj
+                      WHERE sj.video_id = audio_tasks.video_id
+                        AND sj.status IN (
+                            'queued', 'running', 'processing', 'in_progress',
+                            'retry_wait'
+                        )
+                  )
+              )
+            """,
+            (),
+        ),
+        (
+            "youtube_workflow",
+            """
+            SELECT id, 'youtube_publish' AS job_type, status, video_id, updated_at
+            FROM youtube_publish_workflows
+            WHERE status IN (
+                'queued', 'running', 'processing', 'uploading', 'in_progress',
+                'retry_wait', 'ready_to_schedule'
+            )
+              AND (
+                  datetime(updated_at) >= datetime('now', '-15 minutes')
+                  OR EXISTS (
+                      SELECT 1 FROM system_jobs sj
+                      WHERE sj.id = youtube_publish_workflows.system_job_id
+                        AND sj.status IN (
+                            'queued', 'running', 'processing', 'in_progress',
+                            'retry_wait'
+                        )
+                  )
+              )
+            """,
+            (),
+        ),
+        (
+            "fb_crosspost",
+            """
+            SELECT CAST(id AS TEXT) AS id, 'fb_crosspost' AS job_type,
+                   status, NULL AS video_id, updated_at
+            FROM fb_crossposter_queue
+            WHERE status IN (
+                'queued', 'downloading', 'uploading', 'processing', 'running',
+                'retryable', 'verifying'
+            )
+              AND datetime(updated_at) >= datetime('now', '-15 minutes')
+            """,
+            (),
+        ),
+        (
+            "video_artifact",
+            """
+            SELECT CAST(id AS TEXT) AS id, artifact_type AS job_type,
+                   status, video_id, updated_at
+            FROM video_artifacts
+            WHERE status IN ('queued', 'processing', 'running', 'generating')
+              AND (
+                  datetime(updated_at) >= datetime('now', '-15 minutes')
+                  OR EXISTS (
+                      SELECT 1 FROM system_jobs sj
+                      WHERE sj.video_id = video_artifacts.video_id
+                        AND sj.status IN (
+                            'queued', 'running', 'processing', 'in_progress',
+                            'retry_wait'
+                        )
+                  )
+              )
+            """,
+            (),
+        ),
+    )
+    try:
+        for blocker_type, query, params in queries:
+            rows = conn.execute(query, params).fetchall()
+            for row in rows:
+                blockers.append(
+                    {
+                        "type": blocker_type,
+                        "id": str(row["id"] or ""),
+                        "job_type": str(row["job_type"] or ""),
+                        "status": str(row["status"] or ""),
+                        "video_id": row["video_id"],
+                        "updated_at": str(row["updated_at"] or ""),
+                    }
+                )
+    except Exception as exc:
+        errors.append(f"database_probe_failed:{type(exc).__name__}")
+    finally:
+        conn.close()
+    return blockers, errors
+
+
+def _list_omnivoice_cleanup_blockers(
+    jobs_dir: Path | None = None,
+    *,
+    recent_seconds: float = 15 * 60,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Inspect recent OmniVoice manifests without exposing request contents."""
+
+    root = jobs_dir or PROJECT_ROOT.parent / "omnivoice" / "data" / "jobs"
+    if not root.exists():
+        return [], []
+    blockers: list[dict[str, Any]] = []
+    errors: list[str] = []
+    now = time.time()
+    try:
+        job_dirs = list(root.iterdir())
+    except Exception as exc:
+        return [], [f"omnivoice_jobs_unreadable:{type(exc).__name__}"]
+
+    for job_dir in job_dirs:
+        if not job_dir.is_dir():
+            continue
+        manifest_path = job_dir / "manifest.json"
+        try:
+            folder_mtime = job_dir.stat().st_mtime
+            if not manifest_path.exists():
+                if now - folder_mtime <= recent_seconds:
+                    errors.append("omnivoice_recent_manifest_missing")
+                continue
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            status = str(manifest.get("status") or "").strip().lower()
+            updated_value = manifest.get("updated_at")
+            try:
+                updated_at = float(updated_value)
+            except (TypeError, ValueError):
+                updated_at = folder_mtime
+            if (
+                status in {"queued", "pending", "processing", "running"}
+                and now - max(updated_at, folder_mtime) <= recent_seconds
+            ):
+                blockers.append(
+                    {
+                        "type": "omnivoice_job",
+                        "id": job_dir.name,
+                        "job_type": "omnivoice_tts",
+                        "status": status,
+                        "updated_at": updated_at,
+                    }
+                )
+        except Exception as exc:
+            try:
+                is_recent = now - job_dir.stat().st_mtime <= recent_seconds
+            except OSError:
+                is_recent = True
+            if is_recent:
+                errors.append(f"omnivoice_manifest_invalid:{type(exc).__name__}")
+    return blockers, sorted(set(errors))
+
+
+def _list_open_project_gpm_profiles() -> tuple[list[dict[str, Any]], list[str]]:
+    """Detect open Chromium processes for GPM profiles assigned to this project."""
+
+    try:
+        conn = sqlite3.connect(str(db.DB_PATH), timeout=5.0)
+        profile_ids = {
+            str(row[0] or "").strip()
+            for row in conn.execute(
+                "SELECT gpm_profile_id FROM youtube_channels "
+                "WHERE COALESCE(gpm_profile_id, '') != ''"
+            ).fetchall()
+        }
+        for row in conn.execute(
+            "SELECT source_gpm_profile_id, target_gpm_profile_id "
+            "FROM fb_crossposter_settings"
+        ).fetchall():
+            profile_ids.update(str(value or "").strip() for value in row if value)
+        conn.close()
+    except Exception as exc:
+        return [], [f"gpm_profile_database_probe_failed:{type(exc).__name__}"]
+
+    profile_ids.discard("")
+    if not profile_ids:
+        return [], []
+    if os.name != "nt":
+        return [], ["gpm_profile_process_probe_unsupported"]
+
+    command = (
+        "$ErrorActionPreference='Stop'; "
+        "@(Get-CimInstance Win32_Process | "
+        "Where-Object { $_.Name -like '*chrome*' -or $_.Name -like '*gpm*' "
+        "-or $_.Name -like '*msedge*' -or $_.Name -like '*coccoc*' } | "
+        "Select-Object ProcessId, CommandLine) | ConvertTo-Json -Compress"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if result.returncode != 0:
+            return [], ["gpm_profile_process_probe_failed"]
+        parsed = json.loads(result.stdout.strip() or "[]")
+        processes = [parsed] if isinstance(parsed, dict) else parsed
+        if not isinstance(processes, list):
+            return [], ["gpm_profile_process_probe_invalid"]
+    except Exception as exc:
+        return [], [f"gpm_profile_process_probe_failed:{type(exc).__name__}"]
+
+    blockers: list[dict[str, Any]] = []
+    for profile_id in sorted(profile_ids):
+        matched = next(
+            (
+                process
+                for process in processes
+                if profile_id.lower()
+                in str((process or {}).get("CommandLine") or "").lower()
+            ),
+            None,
+        )
+        if matched is not None:
+            blockers.append(
+                {
+                    "type": "gpm_profile",
+                    "id": profile_id,
+                    "status": "open",
+                    "job_type": "gpm_browser",
+                    "process_id": matched.get("ProcessId"),
+                }
+            )
+    return blockers, []
+
+
+def _list_cleanup_runtime_blockers() -> tuple[list[dict[str, Any]], list[str]]:
+    blockers: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    try:
+        from nexus_engine.services import chatgpt_runtime
+
+        if chatgpt_runtime.is_busy():
+            blockers.append(
+                {
+                    "type": "chatgpt_playwright",
+                    "id": "chatgpt-runtime",
+                    "status": "running",
+                    "job_type": chatgpt_runtime.get_operation(),
+                }
+            )
+    except Exception as exc:
+        errors.append(f"chatgpt_runtime_probe_failed:{type(exc).__name__}")
+
+    for blocker_type, module_name in (
+        ("chatgpt_browser_session", "chatgpt_browser_service"),
+        ("google_flow_browser_session", "google_flow_browser_service"),
+    ):
+        try:
+            if module_name == "chatgpt_browser_service":
+                from nexus_engine.services import chatgpt_browser_service as browser_service
+            else:
+                browser_service = google_flow_browser_service
+            state_path = Path(browser_service.SERVICE_STATE_PATH)
+            if state_path.exists():
+                raw_state = json.loads(state_path.read_text(encoding="utf-8"))
+                if not isinstance(raw_state, dict):
+                    raise ValueError("browser state must be an object")
+            status = browser_service.get_browser_service_status()
+            if (
+                status.get("process_alive")
+                or status.get("connected")
+                or status.get("generation_active")
+            ):
+                blockers.append(
+                    {
+                        "type": blocker_type,
+                        "id": module_name,
+                        "status": "active",
+                        "job_type": "playwright_browser",
+                    }
+                )
+        except Exception as exc:
+            errors.append(f"{module_name}_probe_failed:{type(exc).__name__}")
+
+    try:
+        from nexus_engine.services import muse_studio_service
+
+        muse = muse_studio_service.status(probe=True)
+        if (
+            bool(muse.get("running"))
+            and bool(muse.get("owned"))
+            and not bool(muse.get("api_ready"))
+        ):
+            errors.append("muse_runtime_probe_unverified")
+        if int(muse.get("active_media_tasks") or 0) > 0 or bool(
+            muse.get("browser_running")
+        ):
+            blockers.append(
+                {
+                    "type": "muse_runtime",
+                    "id": "muse-studio",
+                    "status": "active",
+                    "job_type": "muse_media_generation",
+                }
+            )
+    except Exception as exc:
+        errors.append(f"muse_runtime_probe_failed:{type(exc).__name__}")
+
+    try:
+        blockers.extend(list_gpm_restart_blockers())
+    except Exception as exc:
+        errors.append(f"gpm_runtime_probe_failed:{type(exc).__name__}")
+
+    gpm_profile_blockers, gpm_profile_errors = _list_open_project_gpm_profiles()
+    blockers.extend(gpm_profile_blockers)
+    errors.extend(gpm_profile_errors)
+
+    omni_blockers, omni_errors = _list_omnivoice_cleanup_blockers()
+    blockers.extend(omni_blockers)
+    errors.extend(omni_errors)
+    return blockers, sorted(set(errors))
+
+
+def get_cleanup_status() -> dict[str, Any]:
+    """Return a fail-closed snapshot used before any destructive cleanup."""
+
+    database_blockers, database_errors = _list_cleanup_database_blockers()
+    runtime_blockers, runtime_errors = _list_cleanup_runtime_blockers()
+    blockers: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for blocker in database_blockers + runtime_blockers:
+        key = (str(blocker.get("type") or ""), str(blocker.get("id") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        blockers.append(blocker)
+
+    verification_errors = sorted(set(database_errors + runtime_errors))
+    safe = not blockers and not verification_errors
+    reasons = [
+        f"{len(blockers)} active or immediately claimable task(s)"
+    ] if blockers else []
+    if verification_errors:
+        reasons.append(
+            f"{len(verification_errors)} cleanup safety probe(s) could not be verified"
+        )
+    return {
+        "safe_to_cleanup": safe,
+        "status_verified": not verification_errors,
+        "total_blocking_jobs": len(blockers),
+        "blocking_jobs": blockers,
+        "verification_errors": verification_errors,
+        "summary": {
+            "database_tasks": len(database_blockers),
+            "runtime_tasks": len(runtime_blockers),
         },
         "reasons": reasons,
     }

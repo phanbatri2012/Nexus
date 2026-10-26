@@ -186,7 +186,7 @@ TTS_PREVIEW_MAX_CHARACTERS = 200
 TTS_PREVIEW_REQUEST_MAX_CHARACTERS = 1000
 TTS_PREVIEW_RETENTION = datetime.timedelta(hours=24)
 TTS_PREVIEW_CLEANUP_INTERVAL_SECONDS = 60 * 60
-SYSTEM_CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
+SYSTEM_CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60
 VIDEO_RECOVERY_DELAYS_SECONDS = (30, 120, 300)
 YOUTUBE_RECOVERY_DELAYS_SECONDS = (120, 300, 900)
 TRANSCRIPT_RECOVERY_DELAYS_SECONDS = (60, 300)
@@ -14711,8 +14711,15 @@ def _system_cleanup_scheduler() -> None:
         SYSTEM_CLEANUP_INTERVAL_SECONDS
     ):
         try:
-            if not process_registry.is_busy():
+            cleanup_status = maintenance_guard.get_cleanup_status()
+            if cleanup_status.get("safe_to_cleanup"):
                 system_cleaner.run_full_cleanup(dry_run=False, vacuum_db=True)
+            else:
+                logger.info(
+                    "Scheduled cleanup skipped: blockers=%s verification_errors=%s",
+                    cleanup_status.get("total_blocking_jobs", 0),
+                    len(cleanup_status.get("verification_errors") or []),
+                )
         except Exception as exc:
             print(
                 "System auto cleanup failed: "
@@ -16448,23 +16455,56 @@ async def get_system_cleanup_stats_endpoint():
     """Get breakdown of cleanable disk space and files across all categories."""
     try:
         summary = system_cleaner.run_full_cleanup(dry_run=True, vacuum_db=False)
-        return {"status": "ok", "summary": summary.to_dict()}
+        cleanup_status = maintenance_guard.get_cleanup_status()
+        return {
+            "status": "ok",
+            "policy": summary.policy,
+            "cleanup_status": cleanup_status,
+            "summary": summary.to_dict(),
+        }
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Lỗi quét dung lượng dọn rác: {exc}")
+        logger.exception(
+            "Cleanup stats scan failed: %s",
+            security_logging.redact_sensitive(exc),
+        )
+        raise HTTPException(status_code=500, detail="Không thể quét dung lượng dọn rác.")
 
 
 @app.post("/api/system/cleanup/run")
 async def run_system_cleanup_endpoint(background_tasks: BackgroundTasks, vacuum: bool = True):
     """Trigger background system cleanup to reclaim disk space."""
-    if process_registry.is_busy():
+    cleanup_status = maintenance_guard.get_cleanup_status()
+    if not cleanup_status.get("safe_to_cleanup"):
         raise HTTPException(
             status_code=409,
-            detail="Hệ thống đang bận render hoặc sản xuất video. Vui lòng thử lại khi hoàn tất.",
+            detail={
+                "message": "Hệ thống đang bận hoặc chưa thể xác minh trạng thái an toàn.",
+                "reasons": cleanup_status.get("reasons") or [],
+                "blockers": [
+                    {
+                        "type": item.get("type", ""),
+                        "id": item.get("id", ""),
+                        "status": item.get("status", ""),
+                    }
+                    for item in (cleanup_status.get("blocking_jobs") or [])[:50]
+                ],
+                "verification_errors": cleanup_status.get("verification_errors") or [],
+            },
         )
+
+    manifest_id = (
+        datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        + "-"
+        + uuid.uuid4().hex[:8]
+    )
 
     def _do_clean():
         try:
-            system_cleaner.run_full_cleanup(dry_run=False, vacuum_db=vacuum)
+            system_cleaner.run_full_cleanup(
+                dry_run=False,
+                vacuum_db=vacuum,
+                manifest_id=manifest_id,
+            )
         except Exception as exc:
             print(
                 "Manual system cleanup failed: "
@@ -16473,4 +16513,8 @@ async def run_system_cleanup_endpoint(background_tasks: BackgroundTasks, vacuum:
             )
 
     background_tasks.add_task(_do_clean)
-    return {"status": "ok", "message": "Tiến trình dọn dẹp hệ thống đã được khởi chạy trong nền."}
+    return {
+        "status": "ok",
+        "manifest_id": manifest_id,
+        "message": "Tiến trình dọn dẹp hệ thống đã được khởi chạy trong nền.",
+    }
