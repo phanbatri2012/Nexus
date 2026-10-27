@@ -154,6 +154,10 @@ STRICT_NO_FILLER = (
 )
 THUMBNAIL_IMAGE_SELECTOR = (
     'img[src*="backend-api/estuary"], '
+    'img[src*="oaiusercontent.com"], '
+    'img[src*="oaistatic.com"], '
+    'img[src*="blob.core.windows.net"], '
+    'img[src*="/file-"], '
     'img[alt*="Generated image"], '
     'img[alt*="DALL"], '
     'img[src*="files/"], '
@@ -955,25 +959,48 @@ def wait_for_thumbnail_images(
             turn = None
 
         if turn is None:
-            turn = page.locator(
-                '[data-markdown-text-style="assistant-message"], '
+            assistant_turns = page.locator(
+                'article:has([data-message-author-role="assistant"]), '
                 '[data-message-author-role="assistant"], '
                 '[data-conversation-role="assistant"]'
-            ).last
+            )
+            if assistant_turns.count() > 0:
+                turn = assistant_turns.last
+            else:
+                turn = page.locator('article, main').last
 
         if turn.count() == 0:
             time.sleep(1)
             continue
 
         images = turn.locator(THUMBNAIL_IMAGE_SELECTOR)
+        if images.count() == 0:
+            images = turn.locator('img')
 
         try:
             image_snapshots = images.evaluate_all(
                 """
-                elements => elements.map(image => ({
-                    src: image.getAttribute('src') || image.currentSrc || '',
-                    ready: image.complete && image.naturalWidth > 0,
-                }))
+                elements => elements.map(image => {
+                    const src = image.getAttribute('src') || image.currentSrc || '';
+                    const isUser = Boolean(image.closest('[data-message-author-role="user"], [data-user-message-bubble="true"], .group\\/user-message, .bg-user-message'));
+                    const isIcon = Boolean(image.closest('button:not([aria-label*="image" i]):not([aria-label*="ảnh" i]), [role="button"]:not([aria-label*="image" i]), .avatar'));
+                    const width = image.naturalWidth || image.width || 0;
+                    const height = image.naturalHeight || image.height || 0;
+                    const isThumbnailCandidate = (
+                        src.includes('oaiusercontent.com')
+                        || src.includes('backend-api/estuary')
+                        || src.includes('oaistatic.com')
+                        || src.includes('blob.core.windows.net')
+                        || src.startsWith('blob:')
+                        || (image.getAttribute('alt') || '').includes('Generated')
+                        || (image.getAttribute('alt') || '').includes('DALL')
+                        || (width >= 200 && height >= 200)
+                    );
+                    return {
+                        src: src,
+                        ready: image.complete && isThumbnailCandidate && !isUser && !isIcon,
+                    };
+                })
                 """
             )
             generation_active = (
@@ -6871,6 +6898,7 @@ def generate_thumbnails_only(
     prompt_version: str = '',
     thumbnail_type: str | None = None,
     video_id: int | None = None,
+    attach_references: bool = False,
 ) -> dict:
     """Run only thumbnail generation steps (8 & 9).
     If chat_url is provided, navigates to that session to keep context.
@@ -6884,6 +6912,7 @@ def generate_thumbnails_only(
             prompt_version,
             thumbnail_type,
             video_id,
+            attach_references=attach_references,
         )
 
     profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
@@ -6946,15 +6975,16 @@ def generate_thumbnails_only(
             prompts.get("thumb_text", ""),
             "with_text",
         )
-        saved_ref_b64 = _get_video_reference_base64(video_id)
-        thumb1_ref_b64 = saved_ref_b64 or prompts.get("thumb_text_image_base64")
+        saved_ref_b64 = _get_video_reference_base64(video_id) if attach_references else None
+        thumb1_ref_b64 = (saved_ref_b64 or prompts.get("thumb_text_image_base64")) if attach_references else None
+        prompt8 = adapt_thumbnail_prompt_for_references(prompt8, bool(thumb1_ref_b64))
         thumb1, image1_urls = send_thumbnail_prompt(
             page,
             prompt8,
             lambda image_url: _download_image(page, image_url),
             thumb1_ref_b64
         )
-        if not image1_urls:
+        if not image1_urls and is_thumbnail_generation_error_response(thumb1):
             thumb1, image1_urls = retry_thumbnail_generation(
                 page,
                 lambda image_url: _download_image(page, image_url),
@@ -6967,14 +6997,15 @@ def generate_thumbnails_only(
             prompts.get("thumb_notext", ""),
             "without_text",
         )
-        thumb2_ref_b64 = saved_ref_b64 or prompts.get("thumb_notext_image_base64")
+        thumb2_ref_b64 = (saved_ref_b64 or prompts.get("thumb_notext_image_base64")) if attach_references else None
+        prompt9 = adapt_thumbnail_prompt_for_references(prompt9, bool(thumb2_ref_b64))
         thumb2, image2_urls = send_thumbnail_prompt(
             page,
             prompt9,
             lambda image_url: _download_image(page, image_url),
             thumb2_ref_b64
         )
-        if not image2_urls:
+        if not image2_urls and is_thumbnail_generation_error_response(thumb2):
             thumb2, image2_urls = retry_thumbnail_generation(
                 page,
                 lambda image_url: _download_image(page, image_url),
@@ -6996,6 +7027,7 @@ def _generate_single_thumbnail(
     prompt_version: str,
     thumbnail_type: str,
     video_id: int | None = None,
+    attach_references: bool = False,
 ) -> dict:
     thumbnail_configs = {
         "with_text": {
@@ -7057,8 +7089,9 @@ def _generate_single_thumbnail(
         )
 
         print(f">>>> REGENERATE THUMBNAIL ({config['label']})", file=sys.stderr)
-        saved_ref_b64 = _get_video_reference_base64(video_id)
-        image_base64 = saved_ref_b64 or prompts.get(f"{config['prompt_key']}_image_base64")
+        saved_ref_b64 = _get_video_reference_base64(video_id) if attach_references else None
+        image_base64 = (saved_ref_b64 or prompts.get(f"{config['prompt_key']}_image_base64")) if attach_references else None
+        generation_prompt = adapt_thumbnail_prompt_for_references(generation_prompt, bool(image_base64))
         response_text, image_urls = send_thumbnail_prompt(
             page,
             generation_prompt,
@@ -7068,15 +7101,21 @@ def _generate_single_thumbnail(
 
         retry_succeeded = False
         if not image_urls:
-            print(
-                f">>>> THUMBNAIL {config['label']} LỖI, THỬ LẠI MỘT LẦN...",
-                file=sys.stderr,
-            )
-            retry_response_text, image_urls = retry_thumbnail_generation(
-                page,
-                download_image,
-            )
-            retry_succeeded = bool(image_urls)
+            if is_thumbnail_generation_error_response(response_text):
+                print(
+                    f">>>> THUMBNAIL {config['label']} VI PHẠM/LỖI POLICY, THỬ SỬA PROMPT...",
+                    file=sys.stderr,
+                )
+                retry_response_text, image_urls = retry_thumbnail_generation(
+                    page,
+                    download_image,
+                )
+                retry_succeeded = bool(image_urls)
+            else:
+                print(
+                    f">>>> THUMBNAIL {config['label']} KHÔNG BẮT ĐƯỢC ẢNH MỚI (KHÔNG CÓ LỖI VI PHẠM TỪ CHATGPT)",
+                    file=sys.stderr,
+                )
 
         result = {
             "thumb_text": None,

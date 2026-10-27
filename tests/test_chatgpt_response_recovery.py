@@ -623,6 +623,29 @@ def test_normalize_thumbnail_urls_filters_blobs():
     assert not any(url.startswith("blob:") for url in normalized)
 
 
+def test_validate_chatgpt_image_url_modern_hosts():
+    from nexus_engine.services.network_security import validate_chatgpt_image_url
+    assert validate_chatgpt_image_url("https://files.oaiusercontent.com/file-1234.png") == "https://files.oaiusercontent.com/file-1234.png"
+    assert validate_chatgpt_image_url("https://cdn.oaistatic.com/image.webp") == "https://cdn.oaistatic.com/image.webp"
+    assert validate_chatgpt_image_url("https://chatgpt.com/backend-api/estuary/content/img") == "https://chatgpt.com/backend-api/estuary/content/img"
+
+
+def test_adapt_thumbnail_prompt_for_references():
+    from nexus_engine.services.chatgpt_worker import adapt_thumbnail_prompt_for_references
+    prompt_with_ref = "Dựa trên kịch bản và CÁC HÌNH ẢNH TƯ LIỆU LỊCH SỬ VỪA ĐƯỢC ĐÍNH KÈM, hãy vẽ..."
+    cleaned = adapt_thumbnail_prompt_for_references(prompt_with_ref, has_references=False)
+    assert "CÁC HÌNH ẢNH TƯ LIỆU LỊCH SỬ VỪA ĐƯỢC ĐÍNH KÈM" not in cleaned
+    kept = adapt_thumbnail_prompt_for_references(prompt_with_ref, has_references=True)
+    assert "CÁC HÌNH ẢNH TƯ LIỆU LỊCH SỬ VỪA ĐƯỢC ĐÍNH KÈM" in kept
+
+
+def test_generate_thumbnails_request_default_attach_references():
+    from nexus_engine.main import GenerateThumbnailsRequest
+    req = GenerateThumbnailsRequest(script="abc", thumbnail_type="with_text")
+    assert req.attach_references is False
+
+
+
 
 
 

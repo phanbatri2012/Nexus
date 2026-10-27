@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 MAX_AUDIO_DOWNLOAD_BYTES = 128 * 1024 * 1024
 MAX_IMAGE_DOWNLOAD_BYTES = 25 * 1024 * 1024
 GENMAX_AUDIO_HOSTS = ("api.genmax.io",)
-CHATGPT_IMAGE_HOSTS = ("chatgpt.com", "openai.com", "oaiusercontent.com")
+CHATGPT_IMAGE_HOSTS = ("chatgpt.com", "openai.com", "oaiusercontent.com", "oaistatic.com")
 
 
 class UnsafeRemoteResource(ValueError):

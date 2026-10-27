@@ -12300,6 +12300,7 @@ class GenerateThumbnailsRequest(BaseModel):
     script: str
     video_id: int = None  # optional - if given, updates db record
     thumbnail_type: Literal["with_text", "without_text", "both"]
+    attach_references: bool = False
 
 
 class GenerateChaptersRequest(BaseModel):
@@ -12708,6 +12709,7 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
                 resolved_prompt_version,
                 req.thumbnail_type,
                 video_id=req.video_id,
+                attach_references=req.attach_references,
             )
 
         raw_result = await loop.run_in_executor(None, generate_requested_thumbnails)
