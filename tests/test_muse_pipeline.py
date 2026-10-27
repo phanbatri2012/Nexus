@@ -79,6 +79,43 @@ def _semantic_payload(windows: list[dict]) -> dict:
     return payload
 
 
+def _planner_windows(count: int, *, final_is_video: bool = False) -> list[dict]:
+    return [
+        {
+            "index": index,
+            "start": float(index * 10),
+            "end": float((index + 1) * 10),
+            "duration": 10.0,
+            "transcript": f"quiet narration for scene {index}",
+            "is_video": bool(final_is_video and index == count - 1),
+            "media_type": "video" if final_is_video and index == count - 1 else "image",
+        }
+        for index in range(count)
+    ]
+
+
+def _batch_payload(windows: list[dict], *, needs_terminal_frame: bool = False) -> dict:
+    payload = _semantic_payload(windows)
+    payload.pop("story_context", None)
+    if needs_terminal_frame:
+        payload["terminal_frame"]["index"] = int(windows[-1]["index"]) + 1
+    else:
+        payload.pop("terminal_frame", None)
+    return payload
+
+
+def _overview_payload() -> dict:
+    return {
+        "story_context": "A coherent documentary story with stable visual continuity.",
+        "continuity_rules": [
+            "Keep the same documentary visual language.",
+            "Preserve source-grounded places and time periods.",
+            "Carry recurring subjects forward without inventing events.",
+        ],
+        "recurring_anchors": ["documentary subject", "source location"],
+    }
+
+
 class TestMuseSettings(unittest.TestCase):
     def test_global_setting_uses_studio_path_and_drops_legacy_gpm_keys(self):
         self.assertEqual(
@@ -645,6 +682,56 @@ class TestMuseSemanticPlanner(unittest.TestCase):
                     semantic_plan_builder=None,
                 )
 
+    def test_planner_checkpoint_hash_mismatch_is_ignored_and_broken_pending_pauses(self):
+        prepared = {"plan_hash": "current-hash", "windows": _planner_windows(31)}
+        with (
+            patch.object(
+                muse_pipeline.db,
+                "get_latest_video_artifact",
+                return_value={"content_hash": "old-hash"},
+            ),
+            patch.object(muse_pipeline, "_load_json_artifact") as load_json,
+        ):
+            self.assertEqual(muse_pipeline._load_planner_checkpoint(42, prepared), {})
+        load_json.assert_not_called()
+
+        broken_pending = {
+            "plan_hash": "current-hash",
+            "execution_version": "batched_v1",
+            "batch_size": 30,
+            "batches_per_chat": 4,
+            "total_scenes": 31,
+            "total_batches": 2,
+            "chat_groups": {
+                "0": {
+                    "pending_prompt": {
+                        "step": "batch_0",
+                        "fingerprint": "fingerprint",
+                    }
+                }
+            },
+            "completed_batches": {},
+            "invalid_steps": {},
+            "failed_steps": {},
+        }
+        with (
+            patch.object(
+                muse_pipeline.db,
+                "get_latest_video_artifact",
+                return_value={"content_hash": "current-hash"},
+            ),
+            patch.object(
+                muse_pipeline,
+                "_load_json_artifact",
+                return_value=({}, broken_pending),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                muse_pipeline.MuseSemanticPlanNeedsAttention,
+                "không thể recover",
+            ):
+                muse_pipeline._load_planner_checkpoint(42, prepared)
+
     def test_chatgpt_planner_repairs_invalid_json_once(self):
         windows = [
             {
@@ -687,6 +774,319 @@ class TestMuseSemanticPlanner(unittest.TestCase):
         self.assertEqual(send.call_count, 2)
         self.assertEqual(result["semantic_plan"]["scenes"][0]["index"], 0)
         context.close.assert_called_once()
+
+    def test_global_overview_is_bounded_and_preserves_first_and_last_batch(self):
+        windows = _planner_windows(1500)
+        summaries = muse_semantic_planner.build_overview_batch_summaries(windows)
+        self.assertEqual(len(summaries), 48)
+        self.assertEqual(summaries[0]["batch_index"], 0)
+        self.assertEqual(summaries[-1]["batch_index"], 49)
+        self.assertEqual(summaries[0]["scene_start_index"], 0)
+        self.assertEqual(summaries[-1]["scene_end_index"], 1499)
+
+    def test_global_overview_rejects_prose_placeholder_and_invalid_limits(self):
+        with self.assertRaises(muse_semantic_planner.SemanticPlanValidationError):
+            muse_semantic_planner.parse_strict_planner_response(
+                "Here is the result: " + json.dumps(_overview_payload())
+            )
+        invalid = _overview_payload()
+        invalid["story_context"] = "unknown"
+        invalid["continuity_rules"] = ["only one rule"]
+        with self.assertRaises(muse_semantic_planner.SemanticPlanValidationError) as raised:
+            muse_semantic_planner.validate_global_overview(invalid)
+        self.assertIn("story_context", str(raised.exception))
+        self.assertIn("continuity_rules", str(raised.exception))
+
+    def test_batch_validation_uses_global_indices_terminal_policy_and_prior_anchors(self):
+        windows = _planner_windows(31, final_is_video=True)
+        first_payload = _batch_payload(windows[:30])
+        first = muse_semantic_planner.validate_semantic_batch(
+            first_payload,
+            windows[:30],
+            previous_visual_anchors=[],
+            needs_terminal_frame=False,
+            terminal_index=31,
+        )
+        final_payload = _batch_payload(windows[30:], needs_terminal_frame=True)
+        final = muse_semantic_planner.validate_semantic_batch(
+            final_payload,
+            windows[30:],
+            previous_visual_anchors=[scene["visual_anchor"] for scene in first["scenes"]],
+            needs_terminal_frame=True,
+            terminal_index=31,
+        )
+        self.assertEqual(final["scenes"][0]["index"], 30)
+        self.assertEqual(final["terminal_frame"]["index"], 31)
+
+        duplicate = _batch_payload(windows[30:])
+        duplicate["scenes"][0]["visual_anchor"] = first["scenes"][0]["visual_anchor"]
+        with self.assertRaisesRegex(
+            muse_semantic_planner.SemanticPlanValidationError,
+            "trùng visual_anchor",
+        ):
+            muse_semantic_planner.validate_semantic_batch(
+                duplicate,
+                windows[30:],
+                previous_visual_anchors=[first["scenes"][0]["visual_anchor"]],
+                needs_terminal_frame=False,
+                terminal_index=31,
+            )
+
+    def test_batched_worker_uses_expected_batch_and_chat_group_counts(self):
+        for scene_count, expected_batches, expected_groups in ((31, 2, 1), (360, 12, 3)):
+            with self.subTest(scene_count=scene_count):
+                windows = _planner_windows(scene_count)
+                responses = [json.dumps(_overview_payload())]
+                responses.extend(
+                    json.dumps(_batch_payload(windows[start : start + 30]))
+                    for start in range(0, scene_count, 30)
+                )
+                page = MagicMock()
+                page.url = "https://chatgpt.com/c/planner-batched"
+                context = MagicMock()
+                context.pages = [page]
+                playwright = MagicMock()
+                with (
+                    tempfile.TemporaryDirectory() as temp_dir,
+                    patch.object(chatgpt_worker, "gpt_profile_dir", return_value=Path(temp_dir)),
+                    patch.object(chatgpt_worker, "sync_playwright") as sync_playwright,
+                    patch.object(chatgpt_worker, "launch_chatgpt_context", return_value=context),
+                    patch.object(
+                        chatgpt_worker,
+                        "get_chatgpt_project_url",
+                        return_value="https://chatgpt.com/g/project",
+                    ),
+                    patch.object(chatgpt_worker, "navigate_to_chatgpt_project") as navigate,
+                    patch.object(
+                        chatgpt_worker,
+                        "is_chatgpt_conversation_url",
+                        side_effect=lambda value: "/c/" in str(value),
+                    ),
+                    patch.object(
+                        chatgpt_worker,
+                        "send_or_recover_generation_prompt",
+                        side_effect=responses,
+                    ) as send_or_recover,
+                ):
+                    sync_playwright.return_value.__enter__.return_value = playwright
+                    result = chatgpt_worker.generate_muse_scene_plan_only(
+                        title="Title",
+                        style="documentary",
+                        windows=windows,
+                        prompt_version="default",
+                        planner_state={},
+                    )
+                self.assertEqual(send_or_recover.call_count, expected_batches + 1)
+                self.assertEqual(navigate.call_count, expected_groups)
+                self.assertEqual(result["planner_batch_count"], expected_batches)
+                self.assertEqual(result["planner_chat_group_count"], expected_groups)
+                self.assertEqual(len(result["semantic_plan"]["scenes"]), scene_count)
+                self.assertEqual(result["planner_source"], "chatgpt_playwright_batched_v1")
+
+    def test_exactly_thirty_scenes_keeps_single_prompt_behavior(self):
+        windows = _planner_windows(30)
+        page = MagicMock()
+        page.url = "https://chatgpt.com/c/planner-single"
+        context = MagicMock()
+        context.pages = [page]
+        playwright = MagicMock()
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(chatgpt_worker, "gpt_profile_dir", return_value=Path(temp_dir)),
+            patch.object(chatgpt_worker, "sync_playwright") as sync_playwright,
+            patch.object(chatgpt_worker, "launch_chatgpt_context", return_value=context),
+            patch.object(
+                chatgpt_worker,
+                "get_chatgpt_project_url",
+                return_value="https://chatgpt.com/g/project",
+            ),
+            patch.object(chatgpt_worker, "navigate_to_chatgpt_project"),
+            patch.object(
+                chatgpt_worker,
+                "is_chatgpt_conversation_url",
+                side_effect=lambda value: "/c/" in str(value),
+            ),
+            patch.object(
+                chatgpt_worker,
+                "send_prompt",
+                return_value=json.dumps(_semantic_payload(windows)),
+            ) as send,
+            patch.object(chatgpt_worker, "send_or_recover_generation_prompt") as batched_send,
+        ):
+            sync_playwright.return_value.__enter__.return_value = playwright
+            result = chatgpt_worker.generate_muse_scene_plan_only(
+                title="Title",
+                style="documentary",
+                windows=windows,
+                prompt_version="default",
+            )
+        send.assert_called_once()
+        batched_send.assert_not_called()
+        self.assertEqual(result["planner_source"], "chatgpt_playwright_batch")
+
+    def test_invalid_long_batch_repairs_only_that_batch(self):
+        windows = _planner_windows(31)
+        responses = [
+            json.dumps(_overview_payload()),
+            "{}",
+            json.dumps(_batch_payload(windows[:30])),
+            json.dumps(_batch_payload(windows[30:])),
+        ]
+        page = MagicMock()
+        page.url = "https://chatgpt.com/c/planner-repair"
+        context = MagicMock()
+        context.pages = [page]
+        playwright = MagicMock()
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(chatgpt_worker, "gpt_profile_dir", return_value=Path(temp_dir)),
+            patch.object(chatgpt_worker, "sync_playwright") as sync_playwright,
+            patch.object(chatgpt_worker, "launch_chatgpt_context", return_value=context),
+            patch.object(
+                chatgpt_worker,
+                "get_chatgpt_project_url",
+                return_value="https://chatgpt.com/g/project",
+            ),
+            patch.object(chatgpt_worker, "navigate_to_chatgpt_project"),
+            patch.object(
+                chatgpt_worker,
+                "is_chatgpt_conversation_url",
+                side_effect=lambda value: "/c/" in str(value),
+            ),
+            patch.object(
+                chatgpt_worker,
+                "send_or_recover_generation_prompt",
+                side_effect=responses,
+            ) as send_or_recover,
+        ):
+            sync_playwright.return_value.__enter__.return_value = playwright
+            result = chatgpt_worker.generate_muse_scene_plan_only(
+                title="Title",
+                style="documentary",
+                windows=windows,
+                prompt_version="default",
+                planner_state={},
+            )
+        steps = [call.args[2] for call in send_or_recover.call_args_list]
+        self.assertEqual(steps, ["overview", "batch_0", "batch_0_repair", "batch_1"])
+        self.assertEqual(len(result["semantic_plan"]["scenes"]), 31)
+
+    def test_batched_worker_resume_after_five_batches_starts_at_batch_six(self):
+        windows = _planner_windows(180)
+        completed = {
+            str(batch_index): muse_semantic_planner.validate_semantic_batch(
+                _batch_payload(windows[batch_index * 30 : (batch_index + 1) * 30]),
+                windows[batch_index * 30 : (batch_index + 1) * 30],
+                previous_visual_anchors=[
+                    f"unique concrete visual anchor for scene {index}"
+                    for index in range(batch_index * 30)
+                ],
+                needs_terminal_frame=False,
+                terminal_index=180,
+            )
+            for batch_index in range(5)
+        }
+        state = {
+            "overview": _overview_payload(),
+            "completed_batches": completed,
+            "chat_groups": {"1": {"chat_url": "https://chatgpt.com/c/group-1"}},
+            "invalid_steps": {},
+            "failed_steps": {},
+        }
+        page = MagicMock()
+        page.url = "https://chatgpt.com/c/group-1"
+        context = MagicMock()
+        context.pages = [page]
+        playwright = MagicMock()
+        final_response = json.dumps(_batch_payload(windows[150:180]))
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(chatgpt_worker, "gpt_profile_dir", return_value=Path(temp_dir)),
+            patch.object(chatgpt_worker, "sync_playwright") as sync_playwright,
+            patch.object(chatgpt_worker, "launch_chatgpt_context", return_value=context),
+            patch.object(chatgpt_worker, "check_chatgpt_page_attention"),
+            patch.object(chatgpt_worker, "ensure_expected_conversation_page"),
+            patch.object(chatgpt_worker, "wait_for_conversation_history"),
+            patch.object(
+                chatgpt_worker,
+                "is_chatgpt_conversation_url",
+                side_effect=lambda value: "/c/" in str(value),
+            ),
+            patch.object(
+                chatgpt_worker,
+                "send_or_recover_generation_prompt",
+                return_value=final_response,
+            ) as send_or_recover,
+        ):
+            sync_playwright.return_value.__enter__.return_value = playwright
+            result = chatgpt_worker.generate_muse_scene_plan_only(
+                title="Title",
+                style="documentary",
+                windows=windows,
+                prompt_version="default",
+                planner_state=state,
+            )
+        self.assertEqual(send_or_recover.call_count, 1)
+        self.assertEqual(send_or_recover.call_args.args[2], "batch_5")
+        self.assertEqual(result["planner_resumed_batch_count"], 5)
+        self.assertEqual(len(result["semantic_plan"]["scenes"]), 180)
+
+    def test_pending_prompt_recovery_never_calls_send_prompt_twice(self):
+        prompt = "stable planner prompt"
+        state = {
+            "pending_prompt": {
+                "step": "batch_5",
+                "fingerprint": chatgpt_worker.get_prompt_fingerprint(prompt),
+                "status": "submitted",
+            }
+        }
+        page = MagicMock()
+        with (
+            patch.object(
+                chatgpt_worker,
+                "recover_pending_prompt_response",
+                return_value="recovered response",
+            ) as recover,
+            patch.object(chatgpt_worker, "send_prompt") as send,
+        ):
+            response = chatgpt_worker.send_or_recover_generation_prompt(
+                page,
+                state,
+                "batch_5",
+                prompt,
+                persistence_callback=MagicMock(),
+            )
+        self.assertEqual(response, "recovered response")
+        recover.assert_called_once()
+        send.assert_not_called()
+
+    def test_strict_pending_recovery_pauses_when_prompt_presence_is_unknown(self):
+        page = MagicMock()
+        with (
+            patch.object(chatgpt_worker, "wait_for_existing_assistant_response", return_value=""),
+            patch.object(chatgpt_worker, "recover_assistant_response_from_backend", return_value=""),
+            patch.object(chatgpt_worker, "recover_assistant_response_after_reload", return_value=""),
+            patch.object(chatgpt_worker, "_prompt_presence_in_conversation", return_value=None),
+            patch.object(chatgpt_worker, "send_prompt") as send,
+        ):
+            with self.assertRaises(chatgpt_worker.ChatGPTPendingPromptRecoveryError):
+                chatgpt_worker.recover_pending_prompt_response(
+                    page,
+                    "pending prompt",
+                    fail_closed_if_prompt_presence_unknown=True,
+                )
+        send.assert_not_called()
+
+    def test_three_hour_scale_has_36_batches_and_nine_chat_groups(self):
+        windows = _planner_windows(1080)
+        batches = [windows[index : index + 30] for index in range(0, len(windows), 30)]
+        self.assertEqual(len(batches), 36)
+        self.assertTrue(all(len(batch) <= 30 for batch in batches))
+        self.assertEqual((len(batches) + 3) // 4, 9)
+        self.assertEqual(
+            len(muse_semantic_planner.build_overview_batch_summaries(windows)),
+            36,
+        )
 
 
 class TestMuseReferences(unittest.TestCase):
@@ -1300,6 +1700,7 @@ class TestMuseRecovery(unittest.TestCase):
             {"id": 2, "artifact_type": "muse_scene_image:0", "path": ""},
             {"id": 3, "artifact_type": "muse_terminal_frame", "path": ""},
             {"id": 4, "artifact_type": "unrelated", "path": ""},
+            {"id": 5, "artifact_type": "muse_scene_plan_checkpoint", "path": ""},
         ]
         with (
             patch.object(muse_pipeline.db, "list_video_artifacts", return_value=artifacts),
@@ -1307,8 +1708,8 @@ class TestMuseRecovery(unittest.TestCase):
         ):
             removed = muse_pipeline.purge_muse_artifacts(42)
 
-        self.assertEqual(removed, 3)
-        self.assertEqual([call.args[0] for call in delete.call_args_list], [1, 2, 3])
+        self.assertEqual(removed, 4)
+        self.assertEqual([call.args[0] for call in delete.call_args_list], [1, 2, 3, 5])
 
     def test_partial_reset_purges_endpoint_dependencies_and_preserves_prefix(self):
         artifacts = [
@@ -1321,6 +1722,7 @@ class TestMuseRecovery(unittest.TestCase):
             {"id": 7, "artifact_type": "muse_terminal_frame", "path": ""},
             {"id": 8, "artifact_type": "muse_media_manifest", "path": ""},
             {"id": 9, "artifact_type": "final_mp4", "path": ""},
+            {"id": 10, "artifact_type": "muse_scene_plan_checkpoint", "path": ""},
         ]
         with (
             patch.object(muse_pipeline.db, "list_video_artifacts", return_value=artifacts),
@@ -1336,6 +1738,7 @@ class TestMuseRecovery(unittest.TestCase):
         self.assertNotIn(1, [call.args[0] for call in delete.call_args_list])
         self.assertNotIn(2, [call.args[0] for call in delete.call_args_list])
         self.assertNotIn(4, [call.args[0] for call in delete.call_args_list])
+        self.assertNotIn(10, [call.args[0] for call in delete.call_args_list])
 
     def test_quota_checkpoint_preserves_attempt_and_rotates_submission_hash(self):
         artifact = None
@@ -4456,6 +4859,32 @@ class TestMuseRouting(unittest.TestCase):
         result = schedule.call_args.kwargs["result_json"]
         self.assertEqual(schedule.call_args.kwargs["delay_seconds"], 30.0)
         self.assertEqual(result["muse_wait_reason"], "chatgpt_busy")
+        self.assertNotIn("muse_session_attempt", result)
+
+    def test_chatgpt_planner_transient_wait_does_not_consume_muse_attempt(self):
+        job = {
+            "id": "muse-planner-transient",
+            "job_type": "muse_media_generation",
+            "video_id": 42,
+            "payload": {},
+            "result": {},
+        }
+        with (
+            patch.object(main.db, "get_youtube_publish_workflow_by_job", return_value=None),
+            patch.object(main.db, "get_system_job", return_value=job),
+            patch.object(main.db, "schedule_system_job_recovery") as schedule,
+            patch.object(main.db, "update_system_job"),
+            patch.object(main.db, "update_video_production_state"),
+        ):
+            main._handle_production_job_error(
+                job,
+                muse_pipeline.MusePlannerTransient(
+                    "temporary", delay_seconds=120.0, consume_attempt=False
+                ),
+            )
+        result = schedule.call_args.kwargs["result_json"]
+        self.assertEqual(schedule.call_args.kwargs["delay_seconds"], 120.0)
+        self.assertEqual(result["muse_wait_reason"], "chatgpt_planner_transient")
         self.assertNotIn("muse_session_attempt", result)
 
     def test_invalid_semantic_plan_pauses_before_muse(self):

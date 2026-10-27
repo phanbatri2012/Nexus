@@ -9,6 +9,10 @@ from typing import Iterable
 
 
 PLANNER_VERSION = "semantic_v3"
+MUSE_PLANNER_BATCH_SIZE = 30
+MUSE_PLANNER_BATCHES_PER_CHAT = 4
+MUSE_PLANNER_EXECUTION_VERSION = "batched_v1"
+MUSE_PLANNER_MAX_OVERVIEW_BATCHES = 48
 
 REQUIRED_SCENE_FIELDS = (
     "subject",
@@ -135,6 +139,186 @@ def extract_source_anchors(text: str) -> list[str]:
     return anchors
 
 
+def _evenly_sample_indices(total: int, limit: int) -> list[int]:
+    if total <= 0 or limit <= 0:
+        return []
+    if total <= limit:
+        return list(range(total))
+    if limit == 1:
+        return [0]
+    return sorted(
+        {
+            round(position * (total - 1) / (limit - 1))
+            for position in range(limit)
+        }
+    )
+
+
+def build_overview_batch_summaries(
+    windows: list[dict],
+    *,
+    batch_size: int = MUSE_PLANNER_BATCH_SIZE,
+    max_batches: int = MUSE_PLANNER_MAX_OVERVIEW_BATCHES,
+) -> list[dict]:
+    """Build bounded, deterministic summaries while preserving the first/last batch."""
+
+    batches = [windows[index : index + batch_size] for index in range(0, len(windows), batch_size)]
+    summaries: list[dict] = []
+    for batch_index in _evenly_sample_indices(len(batches), max_batches):
+        batch = batches[batch_index]
+        if not batch:
+            continue
+        transcript_start = _clean_text(batch[0].get("transcript"), max_chars=520)
+        transcript_end = _clean_text(batch[-1].get("transcript"), max_chars=520)
+        anchors = extract_source_anchors(f"{transcript_start}\n{transcript_end}")[:12]
+        summaries.append(
+            {
+                "batch_index": batch_index,
+                "scene_start_index": int(batch[0]["index"]),
+                "scene_end_index": int(batch[-1]["index"]),
+                "start": round(float(batch[0]["start"]), 3),
+                "end": round(float(batch[-1]["end"]), 3),
+                "transcript_start": transcript_start,
+                "transcript_end": transcript_end,
+                "source_anchors": anchors,
+            }
+        )
+    return summaries
+
+
+def build_overview_prompt(*, title: str, style: str, windows: list[dict]) -> str:
+    summaries = build_overview_batch_summaries(windows)
+    schema = {
+        "story_context": "12-900 characters describing the global visual story",
+        "continuity_rules": ["3-12 concrete continuity rules, each at most 180 characters"],
+        "recurring_anchors": ["up to 24 recurring people, places, periods, or objects"],
+    }
+    return (
+        "Bạn là visual planner. Hãy tạo global overview ngắn để nhiều batch scene độc lập vẫn "
+        "giữ đúng mạch chuyện và continuity. Chỉ trả về đúng một JSON object hợp lệ; không "
+        "markdown, không giải thích và không thêm nội dung ngoài JSON.\n\n"
+        "QUY TẮC BẮT BUỘC:\n"
+        "- story_context dài 12-900 ký tự, cụ thể theo nguồn.\n"
+        "- continuity_rules có 3-12 chuỗi cụ thể, mỗi chuỗi tối đa 180 ký tự.\n"
+        "- recurring_anchors có tối đa 24 chuỗi, giữ tên riêng, địa danh, mốc thời gian và vật thể.\n"
+        "- Cấm placeholder như unknown, n/a, generic scene hoặc dấu ba chấm thay nội dung.\n"
+        "- Không sáng tác sự kiện, nhân vật hoặc mốc thời gian không có trong source summaries.\n\n"
+        f"TITLE: {_clean_text(title, max_chars=500)}\n"
+        f"STYLE: {_clean_text(style, max_chars=800)}\n"
+        f"TOTAL_SCENES: {len(windows)}\n"
+        f"TOTAL_BATCHES: {(len(windows) + MUSE_PLANNER_BATCH_SIZE - 1) // MUSE_PLANNER_BATCH_SIZE}\n"
+        "SAMPLED_BATCH_SUMMARIES_JSON:\n"
+        f"{json.dumps(summaries, ensure_ascii=False)}\n\n"
+        "OUTPUT_SCHEMA_EXAMPLE:\n"
+        f"{json.dumps(schema, ensure_ascii=False)}"
+    )
+
+
+def _compact_semantic_scene(scene: dict) -> dict:
+    return {
+        key: scene.get(key)
+        for key in ("index", *REQUIRED_SCENE_FIELDS)
+        if key in scene
+    }
+
+
+def build_batch_prompt(
+    *,
+    title: str,
+    style: str,
+    overview: dict,
+    windows: list[dict],
+    batch_index: int,
+    batch_count: int,
+    previous_scenes: list[dict] | None = None,
+    lookahead_windows: list[dict] | None = None,
+    recent_visual_anchors: list[str] | None = None,
+    needs_terminal_frame: bool = False,
+    terminal_index: int | None = None,
+) -> str:
+    if not windows:
+        raise ValueError("Batch planner requires at least one scene window.")
+    scene_inputs = [
+        {
+            "index": int(window["index"]),
+            "start": round(float(window["start"]), 3),
+            "end": round(float(window["end"]), 3),
+            "transcript": _clean_text(window.get("transcript"), max_chars=1800),
+        }
+        for window in windows
+    ]
+    previous = [_compact_semantic_scene(scene) for scene in (previous_scenes or [])[-2:]]
+    lookahead = [
+        {
+            "index": int(window["index"]),
+            "start": round(float(window["start"]), 3),
+            "end": round(float(window["end"]), 3),
+            "transcript": _clean_text(window.get("transcript"), max_chars=900),
+        }
+        for window in (lookahead_windows or [])[:2]
+    ]
+    expected_indices = [item["index"] for item in scene_inputs]
+    terminal_index = (
+        int(terminal_index)
+        if terminal_index is not None
+        else int(scene_inputs[-1]["index"]) + 1
+    )
+    schema: dict[str, object] = {
+        "scenes": [
+            {
+                "index": expected_indices[0],
+                "subject": "specific people/group/object",
+                "action": "one filmable action",
+                "setting": "specific source-grounded environment",
+                "era": "specific source-grounded time context",
+                "visual_anchor": "concrete unique image",
+                "safe_visual_anchor": "same meaning without active violence, injury, death, or gore",
+                "must_show": ["2-5 indispensable visible anchors"],
+                "composition": "camera framing and spatial arrangement",
+                "lighting": "specific lighting",
+                "color": "specific palette",
+                "narrative_role": "opening|setup|development|demonstration|turning_point|resolution|conclusion",
+            }
+        ]
+    }
+    if needs_terminal_frame:
+        schema["terminal_frame"] = {
+            **schema["scenes"][0],
+            "index": terminal_index,
+            "narrative_role": "conclusion",
+        }
+    start_time = round(float(windows[0]["start"]), 3)
+    end_time = round(float(windows[-1]["end"]), 3)
+    return (
+        "Bạn là visual planner cho một batch trong video dài. Prompt này tự chứa đủ context. "
+        "Chỉ trả về đúng một JSON object hợp lệ, không markdown, không giải thích.\n\n"
+        "QUY TẮC BẮT BUỘC:\n"
+        "- Chỉ lập plan cho TARGET_SCENES; PREVIOUS_SCENES và LOOKAHEAD chỉ dùng làm continuity.\n"
+        f"- Trả đúng {len(scene_inputs)} scene với chính xác các global index: {expected_indices}.\n"
+        "- Bám transcript từng scene; giữ source anchors; setting/era cụ thể; không placeholder.\n"
+        "- visual_anchor phải quay/chụp được và khác mọi RECENT_VISUAL_ANCHORS.\n"
+        "- safe_visual_anchor giữ chủ thể/địa điểm/thời gian nhưng không có bạo lực, thương tích hay gore.\n"
+        "- must_show có 2-5 anchor nhìn thấy được. Bỏ CTA và không đưa chữ/logo vào hình.\n"
+        + (
+            f"- Đây là batch cuối và scene cuối là video: bắt buộc terminal_frame index={terminal_index}, "
+            "khác action/visual_anchor scene cuối, narrative_role=conclusion, không chữ/logo/CTA.\n"
+            if needs_terminal_frame
+            else "- Không trả terminal_frame trong batch này.\n"
+        )
+        + f"\nTITLE: {_clean_text(title, max_chars=500)}\n"
+        f"STYLE: {_clean_text(style, max_chars=800)}\n"
+        f"BATCH_POSITION: {batch_index + 1}/{batch_count}\n"
+        f"BATCH_TIME_RANGE: {start_time}-{end_time}\n"
+        f"GLOBAL_OVERVIEW_JSON: {json.dumps(overview, ensure_ascii=False)}\n"
+        f"PREVIOUS_SCENES_JSON: {json.dumps(previous, ensure_ascii=False)}\n"
+        f"LOOKAHEAD_JSON: {json.dumps(lookahead, ensure_ascii=False)}\n"
+        f"RECENT_VISUAL_ANCHORS_JSON: {json.dumps((recent_visual_anchors or [])[-12:], ensure_ascii=False)}\n"
+        f"TARGET_SCENES_JSON: {json.dumps(scene_inputs, ensure_ascii=False)}\n\n"
+        "OUTPUT_SCHEMA_EXAMPLE:\n"
+        f"{json.dumps(schema, ensure_ascii=False)}"
+    )
+
+
 def build_planner_prompt(*, title: str, style: str, windows: list[dict]) -> str:
     scene_inputs = [
         {
@@ -236,6 +420,39 @@ def build_repair_prompt(
     )
 
 
+def build_overview_repair_prompt(errors: Iterable[str]) -> str:
+    concise_errors = [_clean_text(error, max_chars=240) for error in errors]
+    return (
+        "Global overview vừa trả về không đạt validation. Hãy sửa TOÀN BỘ JSON trước đó. "
+        "Chỉ trả về đúng một JSON object, không markdown, không giải thích hoặc nội dung ngoài JSON. "
+        "Object chỉ có story_context, continuity_rules và recurring_anchors. Các lỗi cần sửa: "
+        + json.dumps(concise_errors, ensure_ascii=False)
+    )
+
+
+def build_batch_repair_prompt(
+    errors: Iterable[str],
+    *,
+    expected_indices: Iterable[int],
+    needs_terminal_frame: bool,
+    terminal_index: int,
+) -> str:
+    indices = [int(index) for index in expected_indices]
+    concise_errors = [_clean_text(error, max_chars=240) for error in errors]
+    return (
+        "Batch JSON vừa trả về không đạt validation. Hãy sửa TOÀN BỘ JSON của batch trước đó "
+        "và chỉ trả về đúng một JSON object, không markdown, không giải thích. "
+        f"Phải có đúng {len(indices)} scene với global index chính xác {indices}. "
+        + (
+            f"Phải có terminal_frame top-level với index={int(terminal_index)}. "
+            if needs_terminal_frame
+            else "Không được có terminal_frame. "
+        )
+        + "Không trả story_context hay field top-level khác. Các lỗi cần sửa: "
+        + json.dumps(concise_errors, ensure_ascii=False)
+    )
+
+
 def parse_planner_response(response_text: str) -> dict:
     raw = str(response_text or "").strip()
     if raw.startswith("```"):
@@ -254,6 +471,102 @@ def parse_planner_response(response_text: str) -> dict:
         if isinstance(payload, dict):
             return payload
     raise SemanticPlanValidationError(["Phản hồi planner không chứa JSON object hợp lệ."])
+
+
+def parse_strict_planner_response(response_text: str) -> dict:
+    """Parse batched-planner output and reject markdown or prose around the JSON."""
+
+    raw = str(response_text or "").strip()
+    if not raw.startswith("{") or not raw.endswith("}"):
+        raise SemanticPlanValidationError(
+            ["Phản hồi planner phải chỉ chứa một JSON object, không có nội dung bên ngoài."]
+        )
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SemanticPlanValidationError(
+            [f"Phản hồi planner không phải JSON object hợp lệ: {exc.msg}."]
+        ) from exc
+    if not isinstance(payload, dict):
+        raise SemanticPlanValidationError(["Planner payload phải là JSON object."])
+    return payload
+
+
+_OVERVIEW_PLACEHOLDER_PATTERN = re.compile(
+    r"(?i)(?:\bunknown\b|\bn/?a\b|\bnone\b|\bgeneric\s+scene\b|"
+    r"\bplaceholder\b|\.\.\.|…{2,})"
+)
+
+
+def _validate_overview_list(
+    value: object,
+    *,
+    field: str,
+    minimum: int,
+    maximum: int,
+    item_max_chars: int,
+) -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    if not isinstance(value, list):
+        return [], [f"{field} phải là array."]
+    if not minimum <= len(value) <= maximum:
+        errors.append(f"{field} phải có {minimum}-{maximum} mục.")
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for position, item in enumerate(value):
+        text = _clean_text(item, max_chars=max(item_max_chars * 4, 720))
+        if len(text) < 2:
+            errors.append(f"{field}[{position}] bị thiếu hoặc quá ngắn.")
+        if len(text) > item_max_chars:
+            errors.append(f"{field}[{position}] vượt {item_max_chars} ký tự.")
+        if _OVERVIEW_PLACEHOLDER_PATTERN.search(text):
+            errors.append(f"{field}[{position}] chứa placeholder.")
+        key = _identity(text)
+        if key and key in seen:
+            errors.append(f"{field}[{position}] bị trùng.")
+        if key:
+            seen.add(key)
+        cleaned.append(text)
+    return cleaned, errors
+
+
+def validate_global_overview(payload: dict) -> dict:
+    errors: list[str] = []
+    if not isinstance(payload, dict):
+        raise SemanticPlanValidationError(["Global overview phải là JSON object."])
+    allowed_keys = {"story_context", "continuity_rules", "recurring_anchors"}
+    extra_keys = sorted(str(key) for key in payload if key not in allowed_keys)
+    if extra_keys:
+        errors.append("Global overview có field không hợp lệ: " + ", ".join(extra_keys))
+
+    story_context = _clean_text(payload.get("story_context"), max_chars=3600)
+    if not 12 <= len(story_context) <= 900:
+        errors.append("story_context phải dài 12-900 ký tự.")
+    if _OVERVIEW_PLACEHOLDER_PATTERN.search(story_context):
+        errors.append("story_context chứa placeholder.")
+    continuity_rules, continuity_errors = _validate_overview_list(
+        payload.get("continuity_rules"),
+        field="continuity_rules",
+        minimum=3,
+        maximum=12,
+        item_max_chars=180,
+    )
+    recurring_anchors, anchor_errors = _validate_overview_list(
+        payload.get("recurring_anchors"),
+        field="recurring_anchors",
+        minimum=0,
+        maximum=24,
+        item_max_chars=180,
+    )
+    errors.extend(continuity_errors)
+    errors.extend(anchor_errors)
+    if errors:
+        raise SemanticPlanValidationError(errors)
+    return {
+        "story_context": story_context,
+        "continuity_rules": continuity_rules,
+        "recurring_anchors": recurring_anchors,
+    }
 
 
 def _must_show_values(value: object) -> list[str]:
@@ -356,6 +669,82 @@ def _normalize_semantic_entry(
     if forbid_text_elements and _TERMINAL_TEXT_PATTERN.search(visual_fields):
         errors.append(f"{label} không được chứa chữ, caption hoặc logo.")
     return scene, errors
+
+
+def validate_semantic_batch(
+    payload: dict,
+    windows: list[dict],
+    *,
+    previous_visual_anchors: Iterable[str] = (),
+    needs_terminal_frame: bool,
+    terminal_index: int,
+) -> dict:
+    """Validate one global-index batch without inferring whole-video terminal policy."""
+
+    errors: list[str] = []
+    if not isinstance(payload, dict):
+        raise SemanticPlanValidationError(["Batch planner payload phải là JSON object."])
+    allowed_keys = {"scenes"}
+    if needs_terminal_frame:
+        allowed_keys.add("terminal_frame")
+    extra_keys = sorted(str(key) for key in payload if key not in allowed_keys)
+    if extra_keys:
+        errors.append("Batch planner có field top-level không hợp lệ: " + ", ".join(extra_keys))
+
+    supplied = payload.get("scenes")
+    if not isinstance(supplied, list) or len(supplied) != len(windows):
+        supplied_count = len(supplied) if isinstance(supplied, list) else 0
+        errors.append(f"Số scene batch sai: nhận {supplied_count}, cần {len(windows)}.")
+        raise SemanticPlanValidationError(errors)
+
+    seen_anchors = {
+        key
+        for key in (_identity(anchor) for anchor in previous_visual_anchors)
+        if key
+    }
+    normalized_scenes: list[dict] = []
+    for window, raw_scene in zip(windows, supplied):
+        expected_index = int(window["index"])
+        scene, scene_errors = _normalize_semantic_entry(
+            raw_scene,
+            window=window,
+            expected_index=expected_index,
+            seen_anchors=seen_anchors,
+            label=f"Scene {expected_index}",
+        )
+        errors.extend(scene_errors)
+        if scene is not None:
+            normalized_scenes.append(scene)
+
+    terminal_frame: dict | None = None
+    raw_terminal = payload.get("terminal_frame")
+    if needs_terminal_frame:
+        terminal_window = windows[-1] if windows else {"transcript": ""}
+        terminal_frame, terminal_errors = _normalize_semantic_entry(
+            raw_terminal,
+            window=terminal_window,
+            expected_index=int(terminal_index),
+            seen_anchors=seen_anchors,
+            label="Terminal frame",
+            forbid_text_elements=True,
+        )
+        errors.extend(terminal_errors)
+        if terminal_frame is not None:
+            if _identity(terminal_frame.get("narrative_role")) != "conclusion":
+                errors.append("Terminal frame narrative_role phải là conclusion.")
+            if normalized_scenes:
+                final_scene = normalized_scenes[-1]
+                if _identity(terminal_frame.get("action")) == _identity(final_scene.get("action")):
+                    errors.append("Terminal frame action phải là trạng thái kết thúc khác scene cuối.")
+    elif raw_terminal not in (None, {}):
+        errors.append("Chỉ batch cuối có scene video mới được trả terminal_frame.")
+
+    if errors:
+        raise SemanticPlanValidationError(errors)
+    result: dict[str, object] = {"scenes": normalized_scenes}
+    if terminal_frame is not None:
+        result["terminal_frame"] = terminal_frame
+    return result
 
 
 def validate_semantic_plan(payload: dict, windows: list[dict]) -> dict:

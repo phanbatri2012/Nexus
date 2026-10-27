@@ -13,6 +13,7 @@ from nexus_engine.services.chatgpt_worker import (
     CHATGPT_RESPONSE_TIMEOUT_SECONDS,
     CHATGPT_SEND_BUTTON_SELECTOR,
     CHATGPT_STOP_BUTTON_SELECTOR,
+    THUMBNAIL_IMAGE_SELECTOR,
     ChatGPTGenerationTimeoutError,
     THUMBNAIL_REGENERATE_PROMPT,
     THUMBNAIL_REPAIR_PROMPT,
@@ -21,6 +22,7 @@ from nexus_engine.services.chatgpt_worker import (
     ensure_expected_conversation_page,
     get_new_assistant_response,
     get_video_thumbnail_chat_url,
+    generate_thumbnails_only,
     is_thumbnail_generation_error_response,
     prompt_text_matches,
     retry_thumbnail_generation,
@@ -242,20 +244,14 @@ class ThumbnailGenerationTests(unittest.TestCase):
             )
 
     def test_both_type_generates_and_updates_both_thumbnails(self):
-        generated_with_text = {
+        generated_both = {
             "thumb_text": "Prompt mới có chữ.",
-            "thumb_notext": None,
+            "thumb_notext": "Prompt mới không chữ.",
             "image1_url": "/api/thumbnails/new_with_text.png",
             "image1_urls": [
                 "/api/thumbnails/new_with_text.png",
                 "/api/thumbnails/new_with_text_2.png",
             ],
-            "image2_url": "",
-        }
-        generated_without_text = {
-            "thumb_text": None,
-            "thumb_notext": "Prompt mới không chữ.",
-            "image1_url": "",
             "image2_url": "/api/thumbnails/new_without_text.png",
             "image2_urls": [
                 "/api/thumbnails/new_without_text.png",
@@ -281,7 +277,7 @@ class ThumbnailGenerationTests(unittest.TestCase):
             patch.object(main.db, "update_script") as update_script,
             patch(
                 "nexus_engine.services.chatgpt_worker.generate_thumbnails_only",
-                side_effect=(generated_with_text, generated_without_text),
+                return_value=generated_both,
             ) as generate_thumbnails,
         ):
             response = asyncio.run(
@@ -296,13 +292,8 @@ class ThumbnailGenerationTests(unittest.TestCase):
                     SCRIPT,
                     "https://chatgpt.com/c/test",
                     "default",
-                    "with_text",
-                ),
-                call(
-                    SCRIPT,
-                    "https://chatgpt.com/c/test",
-                    "default",
-                    "without_text",
+                    "both",
+                    video_id=38,
                 ),
             ],
         )
@@ -475,7 +466,86 @@ class ThumbnailGenerationTests(unittest.TestCase):
 
         self.assertEqual(response_text, "")
         self.assertEqual(image_urls, ["/api/thumbnails/rendered.png"])
-        wait_for_images.assert_called_once_with(page, 68, download_image)
+        wait_for_images.assert_called_once_with(
+            page,
+            68,
+            download_image,
+            exclude_identities=set(),
+        )
+
+    def test_thumbnail_wait_does_not_download_user_attachment_without_assistant_turn(self):
+        page = MagicMock()
+        download_image = MagicMock()
+
+        with (
+            patch(
+                "nexus_engine.services.chatgpt_worker.get_visible_conversation_turns",
+                return_value=[(67, "assistant"), (68, "user")],
+            ),
+            patch(
+                "nexus_engine.services.chatgpt_worker.time.time",
+                side_effect=(0, 1, 301),
+            ),
+            patch("nexus_engine.services.chatgpt_worker.time.sleep"),
+        ):
+            image_urls = wait_for_thumbnail_images(page, 68, download_image)
+
+        self.assertEqual(image_urls, [])
+        download_image.assert_not_called()
+        page.locator.assert_not_called()
+
+    def test_thumbnail_wait_never_falls_back_to_page_images(self):
+        page = MagicMock()
+        missing_turn = MagicMock()
+        missing_turn.count.return_value = 0
+        assistant_locator = MagicMock()
+        missing_assistant = MagicMock()
+        missing_assistant.count.return_value = 0
+        assistant_locator.last = missing_assistant
+        page.locator.side_effect = (missing_turn, assistant_locator)
+        download_image = MagicMock()
+
+        with (
+            patch(
+                "nexus_engine.services.chatgpt_worker.get_visible_conversation_turns",
+                return_value=[(68, "user"), (69, "assistant")],
+            ),
+            patch(
+                "nexus_engine.services.chatgpt_worker.time.time",
+                side_effect=(0, 1, 301),
+            ),
+            patch("nexus_engine.services.chatgpt_worker.time.sleep"),
+        ):
+            image_urls = wait_for_thumbnail_images(page, 68, download_image)
+
+        self.assertEqual(image_urls, [])
+        download_image.assert_not_called()
+        self.assertNotIn(
+            call(THUMBNAIL_IMAGE_SELECTOR),
+            page.locator.call_args_list,
+        )
+
+    def test_single_thumbnail_generation_forwards_video_id_for_references(self):
+        with patch(
+            "nexus_engine.services.chatgpt_worker._generate_single_thumbnail",
+            return_value={"image1_urls": ["/api/thumbnails/new.png"]},
+        ) as generate_single:
+            result = generate_thumbnails_only(
+                SCRIPT,
+                "https://chatgpt.com/c/test",
+                "default",
+                "with_text",
+                video_id=368,
+            )
+
+        self.assertEqual(result["image1_urls"], ["/api/thumbnails/new.png"])
+        generate_single.assert_called_once_with(
+            SCRIPT,
+            "https://chatgpt.com/c/test",
+            "default",
+            "with_text",
+            368,
+        )
 
     def test_two_unique_thumbnail_images_are_downloaded_from_same_response(self):
         page = MagicMock()
@@ -514,6 +584,10 @@ class ThumbnailGenerationTests(unittest.TestCase):
             patch(
                 "nexus_engine.services.chatgpt_worker.time.time",
                 side_effect=(0, 1),
+            ),
+            patch(
+                "nexus_engine.services.chatgpt_worker.is_chatgpt_generation_active",
+                return_value=False,
             ),
         ):
             image_urls = wait_for_thumbnail_images(page, 67, download_image)
@@ -559,6 +633,10 @@ class ThumbnailGenerationTests(unittest.TestCase):
                 "nexus_engine.services.chatgpt_worker.time.time",
                 side_effect=(0, 1, 2),
             ),
+            patch(
+                "nexus_engine.services.chatgpt_worker.is_chatgpt_generation_active",
+                return_value=False,
+            ),
             patch("nexus_engine.services.chatgpt_worker.time.sleep"),
         ):
             image_url = wait_for_thumbnail_image(page, 67, download_image)
@@ -598,6 +676,10 @@ class ThumbnailGenerationTests(unittest.TestCase):
             patch(
                 "nexus_engine.services.chatgpt_worker.time.time",
                 side_effect=(0, 1, 2),
+            ),
+            patch(
+                "nexus_engine.services.chatgpt_worker.is_chatgpt_generation_active",
+                return_value=False,
             ),
             patch("nexus_engine.services.chatgpt_worker.time.sleep"),
         ):

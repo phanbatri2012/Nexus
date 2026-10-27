@@ -52,6 +52,7 @@ MAX_RECONCILE_ATTEMPTS = 10
 RETRY_DELAYS_SECONDS = (60.0, 300.0)
 MUSE_PROMPT_POLICY_VERSION = "balanced_v2"
 MUSE_RECOVERY_STATE_VERSION = 2
+MUSE_PLANNER_CHECKPOINT_ARTIFACT = "muse_scene_plan_checkpoint"
 MUSE_RECOVERY_STATES = {
     "submitting",
     "reconciling",
@@ -217,6 +218,10 @@ class MuseRetryScheduled(MuseTransientError):
 
 class MusePlannerBusy(MuseRetryScheduled):
     """ChatGPT profile is busy; retry without consuming a Muse attempt."""
+
+
+class MusePlannerTransient(MuseRetryScheduled):
+    """Transient ChatGPT planner failure; resume from checkpoint without a Muse attempt."""
 
 
 class MuseRecoveryExhausted(MuseError):
@@ -857,6 +862,115 @@ def _load_json_artifact(video_id: int, artifact_type: str) -> tuple[dict, dict]:
     return artifact, payload
 
 
+def _planner_checkpoint_has_pending(payload: dict) -> bool:
+    groups = payload.get("chat_groups")
+    if not isinstance(groups, dict):
+        return False
+    return any(
+        isinstance(group, dict) and isinstance(group.get("pending_prompt"), dict)
+        for group in groups.values()
+    )
+
+
+def _load_planner_checkpoint(video_id: int, prepared: dict) -> dict:
+    artifact = db.get_latest_video_artifact(
+        video_id,
+        MUSE_PLANNER_CHECKPOINT_ARTIFACT,
+        "ready",
+    )
+    if not artifact or artifact.get("content_hash") != prepared["plan_hash"]:
+        return {}
+    metadata_pending = bool((artifact.get("metadata") or {}).get("has_pending_prompt"))
+    try:
+        _, payload = _load_json_artifact(video_id, MUSE_PLANNER_CHECKPOINT_ARTIFACT)
+    except video_production.VideoProductionError as exc:
+        if metadata_pending:
+            raise MuseSemanticPlanNeedsAttention(
+                "Checkpoint semantic planner cùng plan hash có prompt pending nhưng không đọc được; "
+                "dừng để tránh gửi trùng prompt."
+            ) from exc
+        return {}
+    expected = {
+        "plan_hash": prepared["plan_hash"],
+        "execution_version": muse_semantic_planner.MUSE_PLANNER_EXECUTION_VERSION,
+        "batch_size": muse_semantic_planner.MUSE_PLANNER_BATCH_SIZE,
+        "batches_per_chat": muse_semantic_planner.MUSE_PLANNER_BATCHES_PER_CHAT,
+        "total_scenes": len(prepared["windows"]),
+        "total_batches": math.ceil(
+            len(prepared["windows"]) / muse_semantic_planner.MUSE_PLANNER_BATCH_SIZE
+        ),
+    }
+    matches = all(payload.get(key) == value for key, value in expected.items())
+    if not matches:
+        return {}
+    structurally_valid = all(
+        isinstance(payload.get(key), dict)
+        for key in ("chat_groups", "completed_batches", "invalid_steps", "failed_steps")
+    )
+    if not structurally_valid:
+        if metadata_pending or _planner_checkpoint_has_pending(payload):
+            raise MuseSemanticPlanNeedsAttention(
+                "Checkpoint semantic planner có prompt đang chờ nhưng trạng thái bị hỏng; không gửi lại."
+            )
+        return {}
+    for group in payload["chat_groups"].values():
+        if not isinstance(group, dict):
+            if metadata_pending or _planner_checkpoint_has_pending(payload):
+                raise MuseSemanticPlanNeedsAttention(
+                    "Checkpoint semantic planner có chat group không hợp lệ; không gửi lại prompt."
+                )
+            return {}
+        pending = group.get("pending_prompt")
+        if pending is None:
+            continue
+        recoverable = bool(
+            isinstance(pending, dict)
+            and str(pending.get("step") or "")
+            and str(pending.get("fingerprint") or "")
+            and str(group.get("chat_url") or "")
+        )
+        if not recoverable:
+            raise MuseSemanticPlanNeedsAttention(
+                "Checkpoint semantic planner có prompt pending không thể recover; không gửi lại prompt."
+            )
+    return payload
+
+
+def _save_planner_checkpoint(video_id: int, prepared: dict, state: dict) -> dict:
+    state.update(
+        {
+            "plan_hash": prepared["plan_hash"],
+            "execution_version": muse_semantic_planner.MUSE_PLANNER_EXECUTION_VERSION,
+            "batch_size": muse_semantic_planner.MUSE_PLANNER_BATCH_SIZE,
+            "batches_per_chat": muse_semantic_planner.MUSE_PLANNER_BATCHES_PER_CHAT,
+            "total_scenes": len(prepared["windows"]),
+            "total_batches": math.ceil(
+                len(prepared["windows"]) / muse_semantic_planner.MUSE_PLANNER_BATCH_SIZE
+            ),
+        }
+    )
+    groups = state.get("chat_groups") if isinstance(state.get("chat_groups"), dict) else {}
+    return _save_json_artifact(
+        video_id,
+        MUSE_PLANNER_CHECKPOINT_ARTIFACT,
+        MUSE_ARTIFACTS_DIR
+        / str(video_id)
+        / f"planner_checkpoint_{prepared['plan_hash'][:16]}.json",
+        state,
+        content_hash=prepared["plan_hash"],
+        metadata={
+            "execution_version": muse_semantic_planner.MUSE_PLANNER_EXECUTION_VERSION,
+            "batch_size": muse_semantic_planner.MUSE_PLANNER_BATCH_SIZE,
+            "batches_per_chat": muse_semantic_planner.MUSE_PLANNER_BATCHES_PER_CHAT,
+            "total_scenes": len(prepared["windows"]),
+            "total_batches": state["total_batches"],
+            "completed_batch_count": len(state.get("completed_batches") or {}),
+            "chat_group_count": len(groups),
+            "has_pending_prompt": _planner_checkpoint_has_pending(state),
+        },
+    )
+
+
 def _load_or_build_plan(
     video_id: int,
     snapshot: dict,
@@ -865,6 +979,8 @@ def _load_or_build_plan(
     *,
     force_new_project: bool,
     semantic_plan_builder: Callable[[dict], dict] | None,
+    progress=None,
+    cancel_check=None,
 ) -> dict:
     if not force_new_project:
         try:
@@ -887,6 +1003,44 @@ def _load_or_build_plan(
         )
     title = str(video.get("generated_title") or video.get("title") or "").strip()
     style = str(settings.get("style_prompt") or "").strip()
+    uses_batched_planner = len(prepared["windows"]) > muse_semantic_planner.MUSE_PLANNER_BATCH_SIZE
+    planner_state: dict = {}
+    if uses_batched_planner and not force_new_project:
+        planner_state = _load_planner_checkpoint(video_id, prepared)
+    if uses_batched_planner and not planner_state:
+        planner_state = {
+            "plan_hash": prepared["plan_hash"],
+            "execution_version": muse_semantic_planner.MUSE_PLANNER_EXECUTION_VERSION,
+            "batch_size": muse_semantic_planner.MUSE_PLANNER_BATCH_SIZE,
+            "batches_per_chat": muse_semantic_planner.MUSE_PLANNER_BATCHES_PER_CHAT,
+            "total_scenes": len(prepared["windows"]),
+            "total_batches": math.ceil(
+                len(prepared["windows"]) / muse_semantic_planner.MUSE_PLANNER_BATCH_SIZE
+            ),
+            "chat_groups": {},
+            "completed_batches": {},
+            "invalid_steps": {},
+            "failed_steps": {},
+            "transient_retry_count": 0,
+        }
+
+    def save_checkpoint(state: dict) -> None:
+        _save_planner_checkpoint(video_id, prepared, state)
+
+    def planner_progress_callback(media_progress: dict) -> None:
+        if progress is None:
+            return
+        batch_number = int(media_progress.get("batch_index") or 0) + 1
+        batch_total = int(media_progress.get("total") or 0)
+        scene_start = int(media_progress.get("scene_start_index") or 0) + 1
+        scene_end = int(media_progress.get("scene_end_index") or 0) + 1
+        progress(
+            f"Đang lập semantic scene plan: batch {batch_number}/{batch_total}, "
+            f"scene {scene_start}–{scene_end}",
+            "muse_semantic_planner",
+            media_progress=media_progress,
+        )
+
     planner_request = {
         "planner_version": muse_semantic_planner.PLANNER_VERSION,
         "title": title,
@@ -895,6 +1049,15 @@ def _load_or_build_plan(
         "chat_url": str(video.get("chat_url") or ""),
         "prompt_version": str(snapshot.get("prompt_version") or snapshot.get("version") or ""),
     }
+    if uses_batched_planner:
+        planner_request.update(
+            {
+                "planner_state": planner_state,
+                "checkpoint_callback": save_checkpoint,
+                "progress_callback": planner_progress_callback,
+                "cancel_check": cancel_check,
+            }
+        )
     try:
         planner_result = semantic_plan_builder(planner_request)
         if not isinstance(planner_result, dict):
@@ -918,6 +1081,32 @@ def _load_or_build_plan(
         max(0.0, float(planner_result.get("planner_elapsed_seconds") or 0.0)),
         3,
     )
+    plan["planner_execution_version"] = str(
+        planner_result.get("planner_execution_version")
+        or ("single_prompt_v1" if not uses_batched_planner else muse_semantic_planner.MUSE_PLANNER_EXECUTION_VERSION)
+    )
+    plan["planner_batch_count"] = int(
+        planner_result.get("planner_batch_count")
+        or (
+            math.ceil(len(prepared["windows"]) / muse_semantic_planner.MUSE_PLANNER_BATCH_SIZE)
+            if prepared["windows"]
+            else 0
+        )
+    )
+    plan["planner_chat_group_count"] = int(
+        planner_result.get("planner_chat_group_count")
+        or (
+            math.ceil(
+                int(plan["planner_batch_count"])
+                / muse_semantic_planner.MUSE_PLANNER_BATCHES_PER_CHAT
+            )
+            if plan["planner_batch_count"]
+            else 0
+        )
+    )
+    plan["planner_resumed_batch_count"] = int(
+        planner_result.get("planner_resumed_batch_count") or 0
+    )
     plan["reference_snapshot"] = reference_snapshot
     _save_json_artifact(
         video_id,
@@ -935,9 +1124,16 @@ def _load_or_build_plan(
             "planner_version": muse_semantic_planner.PLANNER_VERSION,
             "planner_source": plan["planner_source"],
             "planner_elapsed_seconds": plan["planner_elapsed_seconds"],
+            "planner_execution_version": plan["planner_execution_version"],
+            "planner_batch_count": plan["planner_batch_count"],
+            "planner_chat_group_count": plan["planner_chat_group_count"],
+            "planner_resumed_batch_count": plan["planner_resumed_batch_count"],
             "anchor_coverage": plan.get("anchor_coverage") or {},
         },
     )
+    if uses_batched_planner:
+        planner_state["status"] = "completed"
+        save_checkpoint(planner_state)
     return plan
 
 
@@ -2254,6 +2450,7 @@ def purge_muse_artifacts(video_id: int) -> int:
         artifact_type = str(artifact.get("artifact_type") or "")
         if not (
             artifact_type == "muse_scene_plan"
+            or artifact_type == MUSE_PLANNER_CHECKPOINT_ARTIFACT
             or artifact_type == "muse_media_manifest"
             or artifact_type == "muse_terminal_frame"
             or artifact_type.startswith("muse_scene_image:")
@@ -2365,6 +2562,8 @@ def prepare_muse_media(
         frozen_references,
         force_new_project=force_new_project,
         semantic_plan_builder=semantic_plan_builder,
+        progress=progress,
+        cancel_check=cancel_check,
     )
     prepared_media = asyncio.run(
         _prepare_media_async(
@@ -2421,6 +2620,10 @@ def prepare_muse_media(
         "planner_source": str(plan.get("planner_source") or ""),
         "planner_cache_hit": bool(plan.get("planner_cache_hit")),
         "planner_elapsed_seconds": float(plan.get("planner_elapsed_seconds") or 0.0),
+        "planner_execution_version": str(plan.get("planner_execution_version") or ""),
+        "planner_batch_count": int(plan.get("planner_batch_count") or 0),
+        "planner_chat_group_count": int(plan.get("planner_chat_group_count") or 0),
+        "planner_resumed_batch_count": int(plan.get("planner_resumed_batch_count") or 0),
         "anchor_coverage": plan.get("anchor_coverage") or {},
     }
     generation_summary.update(planner_summary)

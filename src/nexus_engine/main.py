@@ -6929,15 +6929,53 @@ def _execute_muse_media_generation_job(job: dict) -> None:
             )
         try:
             update("Đang lập semantic scene plan qua ChatGPT", "muse_semantic_planner")
-            from nexus_engine.services.chatgpt_worker import generate_muse_scene_plan_only
-
-            return generate_muse_scene_plan_only(
-                title=str(request.get("title") or ""),
-                style=str(request.get("style") or ""),
-                windows=list(request.get("windows") or []),
-                chat_url=str(request.get("chat_url") or ""),
-                prompt_version=prompt_version,
+            from nexus_engine.services import muse_semantic_planner
+            from nexus_engine.services.chatgpt_worker import (
+                generate_muse_scene_plan_only,
+                is_generation_error_retryable,
             )
+
+            try:
+                return generate_muse_scene_plan_only(
+                    title=str(request.get("title") or ""),
+                    style=str(request.get("style") or ""),
+                    windows=list(request.get("windows") or []),
+                    chat_url=str(request.get("chat_url") or ""),
+                    prompt_version=prompt_version,
+                    planner_state=request.get("planner_state"),
+                    checkpoint_callback=request.get("checkpoint_callback"),
+                    progress_callback=request.get("progress_callback"),
+                    cancel_check=request.get("cancel_check"),
+                )
+            except (
+                ChatGPTAttentionRequiredError,
+                VideoJobCanceled,
+                muse_semantic_planner.SemanticPlanValidationError,
+            ):
+                raise
+            except Exception as exc:
+                if not is_generation_error_retryable(exc):
+                    raise muse_pipeline.MuseSemanticPlanNeedsAttention(
+                        "Semantic planner có trạng thái pending không thể recover an toàn; chưa gọi Muse."
+                    ) from exc
+                planner_state = request.get("planner_state")
+                if not isinstance(planner_state, dict):
+                    raise
+                transient_attempt = int(planner_state.get("transient_retry_count") or 0) + 1
+                planner_state["transient_retry_count"] = transient_attempt
+                checkpoint_callback = request.get("checkpoint_callback")
+                if callable(checkpoint_callback):
+                    checkpoint_callback(planner_state)
+                retry_delays = (30.0, 120.0, 300.0)
+                if transient_attempt <= len(retry_delays):
+                    raise muse_pipeline.MusePlannerTransient(
+                        "ChatGPT planner tạm thời gián đoạn; sẽ resume từ checkpoint.",
+                        delay_seconds=retry_delays[transient_attempt - 1],
+                        consume_attempt=False,
+                    ) from exc
+                raise muse_pipeline.MuseSemanticPlanNeedsAttention(
+                    "ChatGPT planner vẫn gián đoạn sau ba lần retry; hãy Resume thủ công."
+                ) from exc
         finally:
             _finish_chatgpt_operation()
 
@@ -7043,6 +7081,7 @@ def _repair_qc_thumbnail(video: dict, snapshot: dict) -> None:
                 str(video.get("chat_url") or ""),
                 prompt_version,
                 variant,
+                video_id=int(video["id"]),
             )
             or {}
         )
@@ -7942,6 +7981,7 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
         result = dict(current_job.get("result") or {})
         is_busy = isinstance(exc, muse_provider.MuseServiceBusy)
         is_planner_busy = isinstance(exc, muse_pipeline.MusePlannerBusy)
+        is_planner_transient = isinstance(exc, muse_pipeline.MusePlannerTransient)
         is_request_retry = isinstance(exc, muse_pipeline.MuseRetryScheduled)
         if is_busy:
             service_busy_attempt = int(result.get("muse_service_busy_attempt") or 0) + 1
@@ -7956,6 +7996,9 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
         elif is_planner_busy:
             delay_seconds = float(exc.delay_seconds)
             wait_reason = "chatgpt_busy"
+        elif is_planner_transient:
+            delay_seconds = float(exc.delay_seconds)
+            wait_reason = "chatgpt_planner_transient"
         elif is_request_retry:
             delay_seconds = float(exc.delay_seconds)
             wait_reason = "transient_error"
@@ -8030,7 +8073,11 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
                 else (
                     "ChatGPT đang bận; semantic planner sẽ tự tiếp tục"
                     if is_planner_busy
-                    else f"Muse AI tạm thời gián đoạn; thử lại sau {muse_delay_int}s"
+                    else (
+                        f"ChatGPT planner tạm thời gián đoạn; thử lại sau {muse_delay_int}s"
+                        if is_planner_transient
+                        else f"Muse AI tạm thời gián đoạn; thử lại sau {muse_delay_int}s"
+                    )
                 )
             )
             db.schedule_system_job_recovery(
@@ -12660,6 +12707,7 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
                 resolved_chat_url,
                 resolved_prompt_version,
                 req.thumbnail_type,
+                video_id=req.video_id,
             )
 
         raw_result = await loop.run_in_executor(None, generate_requested_thumbnails)

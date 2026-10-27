@@ -409,11 +409,16 @@ class ReferenceImageValidationError(ValueError):
     pass
 
 
+class ChatGPTPendingPromptRecoveryError(RuntimeError):
+    """An unresolved submitted prompt cannot be safely resent."""
+
+
 NON_RETRYABLE_GENERATION_EXCEPTIONS = (
     AssertionError,
     AttributeError,
     ImportError,
     NameError,
+    ChatGPTPendingPromptRecoveryError,
     ReferenceImageValidationError,
     SyntaxError,
     TypeError,
@@ -935,23 +940,32 @@ def wait_for_thumbnail_images(
                 request_turn,
             )
 
+        # A newly attached reference belongs to the user turn and can use the
+        # same image URLs/DOM attributes as a generated image.  Until the
+        # assistant turn for this request exists, there is no safe image to
+        # inspect.  Falling back to the full page here can therefore download
+        # the attachment itself or an older thumbnail from the conversation.
+        if response_turn is None:
+            time.sleep(1)
+            continue
+
         turn = None
-        if response_turn is not None:
-            turn = page.locator(f'[data-testid="conversation-turn-{response_turn}"]')
-            if turn.count() == 0:
-                turn = None
+        turn = page.locator(f'[data-testid="conversation-turn-{response_turn}"]')
+        if turn.count() == 0:
+            turn = None
 
         if turn is None:
             turn = page.locator(
                 '[data-markdown-text-style="assistant-message"], '
                 '[data-message-author-role="assistant"], '
-                '[data-turn-key]'
+                '[data-conversation-role="assistant"]'
             ).last
 
-        if turn.count() >= 1:
-            images = turn.locator(THUMBNAIL_IMAGE_SELECTOR)
-        else:
-            images = page.locator(THUMBNAIL_IMAGE_SELECTOR)
+        if turn.count() == 0:
+            time.sleep(1)
+            continue
+
+        images = turn.locator(THUMBNAIL_IMAGE_SELECTOR)
 
         try:
             image_snapshots = images.evaluate_all(
@@ -962,35 +976,6 @@ def wait_for_thumbnail_images(
                 }))
                 """
             )
-            if not image_snapshots:
-                image_snapshots = page.locator(THUMBNAIL_IMAGE_SELECTOR).evaluate_all(
-                    """
-                    elements => elements.map(image => ({
-                        src: image.getAttribute('src') || image.currentSrc || '',
-                        ready: image.complete && image.naturalWidth > 0,
-                    }))
-                    """
-                )
-            if not image_snapshots:
-                image_snapshots = page.evaluate(
-                    """() => {
-                        const imgs = Array.from(document.querySelectorAll('img')).filter(img => {
-                            const src = img.getAttribute('src') || img.currentSrc || '';
-                            const alt = img.getAttribute('alt') || '';
-                            return (
-                                src.startsWith('blob:') ||
-                                src.includes('backend-api') ||
-                                src.includes('oaiusercontent') ||
-                                alt.includes('Generated image') ||
-                                alt.includes('DALL')
-                            );
-                        });
-                        return imgs.map(img => ({
-                            src: img.getAttribute('src') || img.currentSrc || '',
-                            ready: img.complete && img.naturalWidth > 0,
-                        }));
-                    }"""
-                )
             generation_active = (
                 is_chatgpt_generation_active(page)
                 or page.locator(CHATGPT_STOP_BUTTON_SELECTOR).count() > 0
@@ -4423,7 +4408,7 @@ def _pending_prompt_matches(state: dict, step: str, prompt_text: str) -> bool:
     )
 
 
-def is_prompt_in_conversation(page: Page, expected_user_text: str) -> bool:
+def _prompt_presence_in_conversation(page: Page, expected_user_text: str) -> bool | None:
     try:
         user_texts = page.evaluate("""() => {
             const cleanNode = (el) => {
@@ -4445,7 +4430,11 @@ def is_prompt_in_conversation(page: Page, expected_user_text: str) -> bool:
             for text in user_texts
         )
     except Exception:
-        return False
+        return None
+
+
+def is_prompt_in_conversation(page: Page, expected_user_text: str) -> bool:
+    return _prompt_presence_in_conversation(page, expected_user_text) is True
 
 
 
@@ -4453,6 +4442,7 @@ def recover_pending_prompt_response(
     page: Page, 
     prompt_text: str,
     on_prompt_submitted = None,
+    fail_closed_if_prompt_presence_unknown: bool = False,
 ) -> str:
     try:
         response_text = wait_for_existing_assistant_response(
@@ -4476,10 +4466,16 @@ def recover_pending_prompt_response(
     if response_text and not _is_pure_thinking_indicator(response_text):
         return response_text
         
-    if not is_prompt_in_conversation(page, prompt_text):
+    prompt_presence = _prompt_presence_in_conversation(page, prompt_text)
+    if prompt_presence is False:
         return send_prompt(page, prompt_text, on_prompt_submitted=on_prompt_submitted)
+    if prompt_presence is None and fail_closed_if_prompt_presence_unknown:
+        raise ChatGPTPendingPromptRecoveryError(
+            "The pending ChatGPT prompt could not be verified in conversation history. "
+            "No prompt was resent."
+        )
         
-    raise RuntimeError(
+    raise ChatGPTPendingPromptRecoveryError(
         "A previously submitted ChatGPT prompt still has no readable response. "
         "The existing conversation was inspected without resending the prompt."
     )
@@ -4490,30 +4486,43 @@ def send_or_recover_generation_prompt(
     state: dict,
     step: str,
     prompt_text: str,
+    persistence_callback: Callable[[dict], None] | None = None,
+    fail_closed_pending_recovery: bool = False,
 ) -> str:
     pending_prompt = state.get("pending_prompt")
+
+    def persist_state() -> None:
+        if persistence_callback is not None:
+            persistence_callback(state)
+        else:
+            persist_generation_state(state)
+
     def mark_submitted() -> None:
         state["pending_prompt"]["status"] = "submitted"
         if is_chatgpt_conversation_url(page.url):
             state["chat_url"] = page.url
-        persist_generation_state(state)
+        persist_state()
 
     if pending_prompt:
         if not _pending_prompt_matches(state, step, prompt_text):
-            raise RuntimeError(
+            raise ChatGPTPendingPromptRecoveryError(
                 "The checkpoint contains a different unresolved ChatGPT prompt. "
                 "No new prompt was sent."
             )
-        return recover_pending_prompt_response(page, prompt_text, on_prompt_submitted=mark_submitted)
+        recovery_kwargs = {"on_prompt_submitted": mark_submitted}
+        if fail_closed_pending_recovery:
+            recovery_kwargs["fail_closed_if_prompt_presence_unknown"] = True
+        return recover_pending_prompt_response(page, prompt_text, **recovery_kwargs)
 
     def mark_prompt_submitted() -> None:
         state["pending_prompt"] = {
             "step": step,
             "fingerprint": get_prompt_fingerprint(prompt_text),
+            "status": "submitted",
         }
         if is_chatgpt_conversation_url(page.url):
             state["chat_url"] = page.url
-        persist_generation_state(state)
+        persist_state()
 
     return send_prompt(
         page,
@@ -6150,8 +6159,12 @@ def generate_muse_scene_plan_only(
     windows: list[dict],
     chat_url: str = "",
     prompt_version: str = "",
+    planner_state: dict | None = None,
+    checkpoint_callback: Callable[[dict], None] | None = None,
+    progress_callback: Callable[[dict], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> dict:
-    """Build one validated semantic scene plan through the authenticated browser."""
+    """Build a validated semantic scene plan through the authenticated browser."""
 
     from nexus_engine.services import muse_semantic_planner
 
@@ -6161,54 +6174,334 @@ def generate_muse_scene_plan_only(
             "Chưa có profile ChatGPT. Hãy chạy Auto Login trước khi lập scene plan Muse."
         )
     started = time.monotonic()
-    planner_prompt = muse_semantic_planner.build_planner_prompt(
-        title=title,
-        style=style,
-        windows=windows,
-    )
+    if len(windows) <= muse_semantic_planner.MUSE_PLANNER_BATCH_SIZE:
+        planner_prompt = muse_semantic_planner.build_planner_prompt(
+            title=title,
+            style=style,
+            windows=windows,
+        )
+        if cancel_check is not None:
+            cancel_check()
+        with sync_playwright() as p:
+            context = launch_chatgpt_context(p.chromium, profile_dir)
+            try:
+                page = context.pages[0] if context.pages else context.new_page()
+                is_original_chat = is_chatgpt_conversation_url(chat_url)
+                target_url = (
+                    chat_url if is_original_chat else get_chatgpt_project_url(prompt_version)
+                )
+                if is_original_chat:
+                    page.goto(
+                        target_url,
+                        wait_until="domcontentloaded",
+                        timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+                    )
+                    check_chatgpt_page_attention(page)
+                    ensure_expected_conversation_page(page.url, target_url)
+                    wait_for_conversation_history(page)
+                else:
+                    navigate_to_chatgpt_project(page, target_url)
+
+                response = send_prompt(page, planner_prompt).strip()
+                if cancel_check is not None:
+                    cancel_check()
+                try:
+                    payload = muse_semantic_planner.parse_planner_response(response)
+                    semantic_plan = muse_semantic_planner.validate_semantic_plan(payload, windows)
+                except muse_semantic_planner.SemanticPlanValidationError as first_error:
+                    if cancel_check is not None:
+                        cancel_check()
+                    repair_prompt = muse_semantic_planner.build_repair_prompt(
+                        first_error.errors,
+                        scene_count=len(windows),
+                        needs_terminal_frame=bool(windows and windows[-1].get("is_video")),
+                    )
+                    repaired_response = send_prompt(page, repair_prompt).strip()
+                    if cancel_check is not None:
+                        cancel_check()
+                    repaired_payload = muse_semantic_planner.parse_planner_response(
+                        repaired_response
+                    )
+                    semantic_plan = muse_semantic_planner.validate_semantic_plan(
+                        repaired_payload,
+                        windows,
+                    )
+                return {
+                    "semantic_plan": semantic_plan,
+                    "planner_source": "chatgpt_playwright_batch",
+                    "planner_elapsed_seconds": round(time.monotonic() - started, 3),
+                    "chat_url": page.url if is_chatgpt_conversation_url(page.url) else "",
+                }
+            finally:
+                context.close()
+
+    batch_size = muse_semantic_planner.MUSE_PLANNER_BATCH_SIZE
+    batches_per_chat = muse_semantic_planner.MUSE_PLANNER_BATCHES_PER_CHAT
+    batches = [windows[index : index + batch_size] for index in range(0, len(windows), batch_size)]
+    batch_count = len(batches)
+    chat_group_count = (batch_count + batches_per_chat - 1) // batches_per_chat
+    state = planner_state if isinstance(planner_state, dict) else {}
+    state.setdefault("execution_version", muse_semantic_planner.MUSE_PLANNER_EXECUTION_VERSION)
+    state.setdefault("batch_size", batch_size)
+    state.setdefault("batches_per_chat", batches_per_chat)
+    state.setdefault("total_scenes", len(windows))
+    state.setdefault("total_batches", batch_count)
+    state.setdefault("chat_groups", {})
+    state.setdefault("completed_batches", {})
+    state.setdefault("invalid_steps", {})
+    state.setdefault("failed_steps", {})
+    elapsed_base = float(state.get("planner_elapsed_seconds") or 0.0)
+    resumed_batch_count = len(state["completed_batches"])
+
+    def check_cancel() -> None:
+        if cancel_check is not None:
+            cancel_check()
+
+    def persist_state() -> None:
+        state["planner_elapsed_seconds"] = round(
+            elapsed_base + (time.monotonic() - started),
+            3,
+        )
+        if checkpoint_callback is not None:
+            checkpoint_callback(state)
+
+    def report_progress(batch_index: int, completed: int) -> None:
+        if progress_callback is None:
+            return
+        batch = batches[batch_index]
+        progress_callback(
+            {
+                "phase": "planner",
+                "completed": completed,
+                "total": batch_count,
+                "batch_index": batch_index,
+                "scene_start_index": int(batch[0]["index"]),
+                "scene_end_index": int(batch[-1]["index"]),
+                "chat_group": batch_index // batches_per_chat,
+            }
+        )
+
+    def navigate_to_group(page: Page, group_index: int) -> dict:
+        group_key = str(group_index)
+        group = state["chat_groups"].setdefault(group_key, {})
+        group_url = str(group.get("chat_url") or "")
+        if group.get("pending_prompt") and not is_chatgpt_conversation_url(group_url):
+            raise ChatGPTPendingPromptRecoveryError(
+                "Planner checkpoint has an unresolved prompt without a recoverable conversation. "
+                "No prompt was resent."
+            )
+        if is_chatgpt_conversation_url(group_url):
+            page.goto(
+                group_url,
+                wait_until="domcontentloaded",
+                timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
+            )
+            check_chatgpt_page_attention(page)
+            ensure_expected_conversation_page(page.url, group_url)
+            wait_for_conversation_history(page)
+        else:
+            navigate_to_chatgpt_project(page, get_chatgpt_project_url(prompt_version))
+        return group
+
+    def request_validated(
+        *,
+        page: Page,
+        group: dict,
+        step: str,
+        prompt: str,
+        validate_response: Callable[[str], dict],
+        repair_prompt_builder: Callable[[list[str]], str],
+    ) -> tuple[dict, str, str]:
+        failed = state["failed_steps"].get(step)
+        if isinstance(failed, dict):
+            raise muse_semantic_planner.SemanticPlanValidationError(
+                failed.get("errors") or [f"{step} đã repair một lần nhưng vẫn không hợp lệ."]
+            )
+
+        invalid = state["invalid_steps"].get(step)
+        delivered_step = step
+        delivered_prompt = prompt
+        if isinstance(invalid, dict):
+            check_cancel()
+            delivered_step = f"{step}_repair"
+            delivered_prompt = repair_prompt_builder(invalid.get("errors") or [])
+
+        response = send_or_recover_generation_prompt(
+            page,
+            group,
+            delivered_step,
+            delivered_prompt,
+            persistence_callback=lambda _group: persist_state(),
+            fail_closed_pending_recovery=True,
+        ).strip()
+        if is_chatgpt_conversation_url(page.url):
+            group["chat_url"] = page.url
+        check_cancel()
+        try:
+            validated = validate_response(response)
+        except muse_semantic_planner.SemanticPlanValidationError as error:
+            clear_pending_generation_prompt(group, delivered_step, delivered_prompt)
+            if isinstance(invalid, dict):
+                state["failed_steps"][step] = {"errors": error.errors}
+                persist_state()
+                raise
+            state["invalid_steps"][step] = {"errors": error.errors}
+            persist_state()
+            check_cancel()
+            delivered_step = f"{step}_repair"
+            delivered_prompt = repair_prompt_builder(error.errors)
+            repaired_response = send_or_recover_generation_prompt(
+                page,
+                group,
+                delivered_step,
+                delivered_prompt,
+                persistence_callback=lambda _group: persist_state(),
+                fail_closed_pending_recovery=True,
+            ).strip()
+            if is_chatgpt_conversation_url(page.url):
+                group["chat_url"] = page.url
+            check_cancel()
+            try:
+                validated = validate_response(repaired_response)
+            except muse_semantic_planner.SemanticPlanValidationError as repair_error:
+                clear_pending_generation_prompt(group, delivered_step, delivered_prompt)
+                state["failed_steps"][step] = {"errors": repair_error.errors}
+                persist_state()
+                raise
+        return validated, delivered_step, delivered_prompt
+
     with sync_playwright() as p:
         context = launch_chatgpt_context(p.chromium, profile_dir)
         try:
             page = context.pages[0] if context.pages else context.new_page()
-            is_original_chat = is_chatgpt_conversation_url(chat_url)
-            target_url = (
-                chat_url if is_original_chat else get_chatgpt_project_url(prompt_version)
-            )
-            if is_original_chat:
-                page.goto(
-                    target_url,
-                    wait_until="domcontentloaded",
-                    timeout=CHATGPT_NAVIGATION_TIMEOUT_MS,
-                )
-                check_chatgpt_page_attention(page)
-                ensure_expected_conversation_page(page.url, target_url)
-                wait_for_conversation_history(page)
-            else:
-                navigate_to_chatgpt_project(page, target_url)
+            active_group_index = -1
+            active_group: dict | None = None
 
-            response = send_prompt(page, planner_prompt).strip()
-            try:
-                payload = muse_semantic_planner.parse_planner_response(response)
-                semantic_plan = muse_semantic_planner.validate_semantic_plan(payload, windows)
-            except muse_semantic_planner.SemanticPlanValidationError as first_error:
-                repair_prompt = muse_semantic_planner.build_repair_prompt(
-                    first_error.errors,
-                    scene_count=len(windows),
-                    needs_terminal_frame=bool(windows and windows[-1].get("is_video")),
+            def activate_group(group_index: int) -> dict:
+                nonlocal active_group_index, active_group
+                if active_group_index != group_index or active_group is None:
+                    active_group = navigate_to_group(page, group_index)
+                    active_group_index = group_index
+                return active_group
+
+            if not isinstance(state.get("overview"), dict):
+                check_cancel()
+                group = activate_group(0)
+                overview_prompt = muse_semantic_planner.build_overview_prompt(
+                    title=title,
+                    style=style,
+                    windows=windows,
                 )
-                repaired_response = send_prompt(page, repair_prompt).strip()
-                repaired_payload = muse_semantic_planner.parse_planner_response(
-                    repaired_response
+                overview, delivered_step, delivered_prompt = request_validated(
+                    page=page,
+                    group=group,
+                    step="overview",
+                    prompt=overview_prompt,
+                    validate_response=lambda response: muse_semantic_planner.validate_global_overview(
+                        muse_semantic_planner.parse_strict_planner_response(response)
+                    ),
+                    repair_prompt_builder=muse_semantic_planner.build_overview_repair_prompt,
                 )
-                semantic_plan = muse_semantic_planner.validate_semantic_plan(
-                    repaired_payload,
-                    windows,
+                state["overview"] = overview
+                state["invalid_steps"].pop("overview", None)
+                clear_pending_generation_prompt(group, delivered_step, delivered_prompt)
+                state["transient_retry_count"] = 0
+                persist_state()
+            else:
+                state["overview"] = muse_semantic_planner.validate_global_overview(
+                    state["overview"]
                 )
+
+            for batch_index, batch_windows in enumerate(batches):
+                batch_key = str(batch_index)
+                if batch_key in state["completed_batches"]:
+                    continue
+                check_cancel()
+                report_progress(batch_index, len(state["completed_batches"]))
+                group_index = batch_index // batches_per_chat
+                group = activate_group(group_index)
+                completed_scenes = [
+                    scene
+                    for previous_index in range(batch_index)
+                    for scene in (
+                        state["completed_batches"].get(str(previous_index), {}).get("scenes") or []
+                    )
+                ]
+                recent_anchors = [
+                    str(scene.get("visual_anchor") or "")
+                    for scene in completed_scenes
+                    if scene.get("visual_anchor")
+                ]
+                final_batch = batch_index == batch_count - 1
+                needs_terminal_frame = bool(final_batch and windows[-1].get("is_video"))
+                terminal_index = int(windows[-1]["index"]) + 1
+                end_offset = (batch_index + 1) * batch_size
+                batch_prompt = muse_semantic_planner.build_batch_prompt(
+                    title=title,
+                    style=style,
+                    overview=state["overview"],
+                    windows=batch_windows,
+                    batch_index=batch_index,
+                    batch_count=batch_count,
+                    previous_scenes=completed_scenes[-2:],
+                    lookahead_windows=windows[end_offset : end_offset + 2],
+                    recent_visual_anchors=recent_anchors,
+                    needs_terminal_frame=needs_terminal_frame,
+                    terminal_index=terminal_index,
+                )
+                expected_indices = [int(window["index"]) for window in batch_windows]
+                batch_result, delivered_step, delivered_prompt = request_validated(
+                    page=page,
+                    group=group,
+                    step=f"batch_{batch_index}",
+                    prompt=batch_prompt,
+                    validate_response=lambda response, batch_windows=batch_windows, recent_anchors=recent_anchors, needs_terminal_frame=needs_terminal_frame, terminal_index=terminal_index: muse_semantic_planner.validate_semantic_batch(
+                        muse_semantic_planner.parse_strict_planner_response(response),
+                        batch_windows,
+                        previous_visual_anchors=recent_anchors,
+                        needs_terminal_frame=needs_terminal_frame,
+                        terminal_index=terminal_index,
+                    ),
+                    repair_prompt_builder=lambda errors, expected_indices=expected_indices, needs_terminal_frame=needs_terminal_frame, terminal_index=terminal_index: muse_semantic_planner.build_batch_repair_prompt(
+                        errors,
+                        expected_indices=expected_indices,
+                        needs_terminal_frame=needs_terminal_frame,
+                        terminal_index=terminal_index,
+                    ),
+                )
+                state["completed_batches"][batch_key] = batch_result
+                state["current_batch_index"] = batch_index + 1
+                state["invalid_steps"].pop(f"batch_{batch_index}", None)
+                clear_pending_generation_prompt(group, delivered_step, delivered_prompt)
+                state["transient_retry_count"] = 0
+                persist_state()
+                report_progress(batch_index, len(state["completed_batches"]))
+
+            merged_scenes = [
+                scene
+                for batch_index in range(batch_count)
+                for scene in state["completed_batches"][str(batch_index)]["scenes"]
+            ]
+            merged: dict[str, object] = {
+                "story_context": state["overview"]["story_context"],
+                "scenes": merged_scenes,
+            }
+            final_terminal = state["completed_batches"][str(batch_count - 1)].get(
+                "terminal_frame"
+            )
+            if isinstance(final_terminal, dict):
+                merged["terminal_frame"] = final_terminal
+            semantic_plan = muse_semantic_planner.validate_semantic_plan(merged, windows)
+            persist_state()
             return {
                 "semantic_plan": semantic_plan,
-                "planner_source": "chatgpt_playwright_batch",
-                "planner_elapsed_seconds": round(time.monotonic() - started, 3),
-                "chat_url": page.url if is_chatgpt_conversation_url(page.url) else "",
+                "planner_source": "chatgpt_playwright_batched_v1",
+                "planner_elapsed_seconds": state["planner_elapsed_seconds"],
+                "planner_execution_version": muse_semantic_planner.MUSE_PLANNER_EXECUTION_VERSION,
+                "planner_batch_count": batch_count,
+                "planner_chat_group_count": chat_group_count,
+                "planner_resumed_batch_count": resumed_batch_count,
+                "chat_url": "",
             }
         finally:
             context.close()
@@ -6577,6 +6870,7 @@ def generate_thumbnails_only(
     chat_url: str = '',
     prompt_version: str = '',
     thumbnail_type: str | None = None,
+    video_id: int | None = None,
 ) -> dict:
     """Run only thumbnail generation steps (8 & 9).
     If chat_url is provided, navigates to that session to keep context.
@@ -6589,6 +6883,7 @@ def generate_thumbnails_only(
             chat_url,
             prompt_version,
             thumbnail_type,
+            video_id,
         )
 
     profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
@@ -6651,7 +6946,7 @@ def generate_thumbnails_only(
             prompts.get("thumb_text", ""),
             "with_text",
         )
-        saved_ref_b64 = _get_video_reference_base64()
+        saved_ref_b64 = _get_video_reference_base64(video_id)
         thumb1_ref_b64 = saved_ref_b64 or prompts.get("thumb_text_image_base64")
         thumb1, image1_urls = send_thumbnail_prompt(
             page,
@@ -6700,6 +6995,7 @@ def _generate_single_thumbnail(
     chat_url: str,
     prompt_version: str,
     thumbnail_type: str,
+    video_id: int | None = None,
 ) -> dict:
     thumbnail_configs = {
         "with_text": {
@@ -6761,7 +7057,7 @@ def _generate_single_thumbnail(
         )
 
         print(f">>>> REGENERATE THUMBNAIL ({config['label']})", file=sys.stderr)
-        saved_ref_b64 = _get_video_reference_base64()
+        saved_ref_b64 = _get_video_reference_base64(video_id)
         image_base64 = saved_ref_b64 or prompts.get(f"{config['prompt_key']}_image_base64")
         response_text, image_urls = send_thumbnail_prompt(
             page,
