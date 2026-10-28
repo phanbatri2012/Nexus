@@ -511,16 +511,42 @@ def is_thumbnail_generation_error_response(response_text: str) -> bool:
     )
 
 
+def select_thumbnail_response_turn_numbers(
+    visible_turns: list[tuple[int, str]],
+    request_turn_number: int,
+) -> list[int]:
+    next_user_turn = min(
+        (
+            turn_number
+            for turn_number, role in visible_turns
+            if role == "user" and turn_number > request_turn_number
+        ),
+        default=None,
+    )
+    return [
+        turn_number
+        for turn_number, role in visible_turns
+        if (
+            role in {"assistant", "tool", ""}
+            and turn_number > request_turn_number
+            and (next_user_turn is None or turn_number < next_user_turn)
+        )
+    ]
+
+
 def select_thumbnail_response_turn_number(
     visible_turns: list[tuple[int, str]],
     request_turn_number: int,
 ) -> int | None:
-    response_turns = [
-        turn_number
-        for turn_number, role in visible_turns
-        if role == "assistant" and turn_number > request_turn_number
-    ]
-    return min(response_turns, default=None)
+    response_turns = select_thumbnail_response_turn_numbers(
+        visible_turns,
+        request_turn_number,
+    )
+    # ChatGPT can render a reasoning unit before the final image unit. Keep the
+    # newest response turn for callers that only need one turn number. Image
+    # collection uses every response turn because image generation is rendered
+    # as a tool result followed by a separate assistant text turn.
+    return max(response_turns, default=None)
 
 
 def get_visible_conversation_turns(page: Page) -> list[tuple[int, str]]:
@@ -558,13 +584,13 @@ def get_visible_conversation_turns(page: Page) -> list[tuple[int, str]]:
     try:
         raw_turns = page.evaluate("""() => {
             const units = Array.from(document.querySelectorAll(
-                '[data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"], .group\\/user-message, .bg-user-message, div.MarkdownRoot-rZKhxa, [data-message-author-role], img[alt*="Generated image"], img[alt*="DALL"]'
+                '[data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"], [class*="group/user-message"], .bg-user-message, div.MarkdownRoot-rZKhxa, [data-message-author-role], img[alt*="Generated image"], img[alt*="DALL"]'
             ));
             const results = [];
             let currentTurn = 0;
             let lastRole = null;
             for (const unit of units) {
-                const isUser = unit.matches('[data-user-message-bubble="true"], .group\\/user-message, .group\\/user-message *, .bg-user-message, .bg-user-message *')
+                const isUser = unit.matches('[data-user-message-bubble="true"], [class*="group/user-message"], [class*="group/user-message"] *, .bg-user-message, .bg-user-message *')
                     || unit.getAttribute('data-message-author-role') === 'user'
                     || (unit.getAttribute('data-conversation-role') || '') === 'user';
                 const role = isUser ? 'user' : 'assistant';
@@ -934,79 +960,90 @@ def wait_for_thumbnail_images(
 ) -> list[str]:
     excluded = exclude_identities or set()
     deadline = time.time() + THUMBNAIL_IMAGE_WAIT_TIMEOUT_SECONDS
-    response_turn = None
     snapshot_error_logged = False
     while time.time() < deadline:
         scroll_chatgpt_conversation_to_bottom(page)
-        if response_turn is None:
-            response_turn = select_thumbnail_response_turn_number(
-                get_visible_conversation_turns(page),
-                request_turn,
-            )
+        response_turns = select_thumbnail_response_turn_numbers(
+            get_visible_conversation_turns(page),
+            request_turn,
+        )
 
         # A newly attached reference belongs to the user turn and can use the
         # same image URLs/DOM attributes as a generated image.  Until the
         # assistant turn for this request exists, there is no safe image to
         # inspect.  Falling back to the full page here can therefore download
         # the attachment itself or an older thumbnail from the conversation.
-        if response_turn is None:
+        if not response_turns:
             time.sleep(1)
             continue
 
-        turn = None
-        turn = page.locator(f'[data-testid="conversation-turn-{response_turn}"]')
+        turn_selector = ", ".join(
+            f'[data-testid="conversation-turn-{turn_number}"]'
+            for turn_number in response_turns
+        )
+        turn = page.locator(turn_selector)
         if turn.count() == 0:
             turn = None
 
         if turn is None:
-            assistant_turns = page.locator(
+            response_units = page.locator(
                 'article:has([data-message-author-role="assistant"]), '
+                'article:has([data-message-author-role="tool"]), '
                 '[data-message-author-role="assistant"], '
-                '[data-conversation-role="assistant"]'
+                '[data-message-author-role="tool"], '
+                '[data-conversation-role="assistant"], '
+                '[data-conversation-role="tool"], '
+                '[data-testid="generated-image-gallery"], '
+                '[data-testid="generated-image-preview"], '
+                '[data-web-image-tile="true"]'
             )
-            if assistant_turns.count() > 0:
-                turn = assistant_turns.last
-            else:
-                turn = page.locator('article, main').last
+            if response_units.count() > 0:
+                turn = response_units
 
-        if turn.count() == 0:
+        if turn is None or turn.count() == 0:
             time.sleep(1)
             continue
 
-        images = turn.locator(THUMBNAIL_IMAGE_SELECTOR)
+        # Inspect every image inside all response units for this request.
+        # ChatGPT currently renders generated images in a role=tool unit, then
+        # appends a separate assistant text unit. Selecting only the newest
+        # assistant unit therefore misses an image that is already complete.
+        # The request/next-user boundary above keeps user attachments out.
+        # Generated previews are sometimes served from new CDN hosts and wrapped in an
+        # unlabeled button, so a URL selector or button-ancestor filter can
+        # incorrectly discard a valid large image.
+        images = turn.locator('img')
         if images.count() == 0:
-            images = turn.locator('img')
+            gallery_images = page.locator(
+                '[data-testid="generated-image-gallery"] img, '
+                '[data-testid="generated-image-preview"] img, '
+                '[data-web-image-tile="true"] img'
+            )
+            if gallery_images.count() > 0:
+                images = gallery_images
 
         try:
             image_snapshots = images.evaluate_all(
                 """
                 elements => elements.map(image => {
                     const src = image.getAttribute('src') || image.currentSrc || '';
-                    const isUser = Boolean(image.closest('[data-message-author-role="user"], [data-user-message-bubble="true"], .group\\/user-message, .bg-user-message'));
-                    const isIcon = Boolean(image.closest('button:not([aria-label*="image" i]):not([aria-label*="ảnh" i]), [role="button"]:not([aria-label*="image" i]), .avatar'));
+                    const isUser = Boolean(image.closest('[data-message-author-role="user"], [data-user-message-bubble="true"], [class*="group/user-message"], .bg-user-message'));
                     const width = image.naturalWidth || image.width || 0;
                     const height = image.naturalHeight || image.height || 0;
-                    const isThumbnailCandidate = (
-                        src.includes('oaiusercontent.com')
-                        || src.includes('backend-api/estuary')
-                        || src.includes('oaistatic.com')
-                        || src.includes('blob.core.windows.net')
-                        || src.startsWith('blob:')
-                        || (image.getAttribute('alt') || '').includes('Generated')
-                        || (image.getAttribute('alt') || '').includes('DALL')
-                        || (width >= 200 && height >= 200)
-                    );
                     return {
                         src: src,
-                        ready: image.complete && isThumbnailCandidate && !isUser && !isIcon,
+                        ready: Boolean(
+                            src
+                            && image.complete
+                            && width >= 200
+                            && height >= 200
+                            && !isUser
+                        ),
                     };
                 })
                 """
             )
-            generation_active = (
-                is_chatgpt_generation_active(page)
-                or page.locator(CHATGPT_STOP_BUTTON_SELECTOR).count() > 0
-            )
+            generation_active = is_chatgpt_generation_active(page)
             snapshot_error_logged = False
         except Exception as exc:
             if not snapshot_error_logged:
@@ -2941,19 +2978,28 @@ def is_chatgpt_generation_active(page: Page) -> bool:
     try:
         return bool(page.evaluate(
             """() => {
+                const isVisible = (element) => {
+                    if (!element) return false;
+                    const style = window.getComputedStyle(element);
+                    const rect = element.getBoundingClientRect();
+                    return style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && rect.width > 0
+                        && rect.height > 0;
+                };
+
                 // 1. Explicit stop button
-                if (document.querySelector('[data-testid="stop-button"]')) {
-                    return true;
-                }
                 const hasStopButton = [...document.querySelectorAll('button')].some((button) => {
                     const label = [
                         button.getAttribute('aria-label') || '',
                         button.getAttribute('title') || ''
                     ].join(' ').toLowerCase();
-                    return label.includes('stop streaming')
+                    const isStopButton = button.getAttribute('data-testid') === 'stop-button'
+                        || label.includes('stop streaming')
                         || label.includes('stop generating')
                         || label.includes('dừng tạo')
                         || label.includes('dừng phản hồi');
+                    return isStopButton && isVisible(button);
                 });
                 if (hasStopButton) return true;
 
@@ -2962,8 +3008,24 @@ def is_chatgpt_generation_active(page: Page) -> bool:
                     '[data-testid*="thinking"], [data-testid*="searching"], .result-thinking, [data-testid*="search-status"]'
                 )].some(el => {
                     if (el.closest('nav, [aria-label="Chat history"], [class*="sidebar"], [class*="history"]')) return false;
-                    const rect = el.getBoundingClientRect();
-                    return rect.width > 0 && rect.height > 0;
+                    if (!isVisible(el)) return false;
+                    const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+                    const markedComplete = text.startsWith('worked for ')
+                        || text.startsWith('thought for ')
+                        || text.startsWith('stopped thinking')
+                        || text.startsWith('đã suy nghĩ trong ')
+                        || text.startsWith('đã dừng suy nghĩ');
+                    if (markedComplete) return false;
+                    const explicitlyBusy = el.getAttribute('aria-busy') === 'true'
+                        || Boolean(el.querySelector('[aria-busy="true"]'));
+                    const hasActiveText = text.startsWith('thinking')
+                        || text.startsWith('searching')
+                        || text.startsWith('đang suy nghĩ')
+                        || text.startsWith('đang tìm kiếm');
+                    const hasActiveSpinner = Boolean(el.querySelector(
+                        'svg.animate-spin, [class*="animate-spin"], [class*="loading-spinner"]'
+                    ));
+                    return explicitlyBusy || hasActiveText || hasActiveSpinner;
                 });
                 if (isThinkingOrSearching) return true;
 

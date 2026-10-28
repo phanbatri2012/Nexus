@@ -23,12 +23,14 @@ from nexus_engine.services.chatgpt_worker import (
     get_new_assistant_response,
     get_video_thumbnail_chat_url,
     generate_thumbnails_only,
+    is_chatgpt_generation_active,
     is_thumbnail_generation_error_response,
     prompt_text_matches,
     retry_thumbnail_generation,
     send_prompt,
     send_thumbnail_prompt,
     select_thumbnail_response_turn_number,
+    select_thumbnail_response_turn_numbers,
     validate_prompt_text,
     wait_for_assistant_response,
     wait_for_thumbnail_image,
@@ -294,6 +296,7 @@ class ThumbnailGenerationTests(unittest.TestCase):
                     "default",
                     "both",
                     video_id=38,
+                    attach_references=False,
                 ),
             ],
         )
@@ -502,7 +505,12 @@ class ThumbnailGenerationTests(unittest.TestCase):
         missing_assistant = MagicMock()
         missing_assistant.count.return_value = 0
         assistant_locator.last = missing_assistant
-        page.locator.side_effect = (missing_turn, assistant_locator)
+        assistant_locator.count.return_value = 0
+        page.locator.side_effect = lambda selector: (
+            missing_turn
+            if selector == '[data-testid="conversation-turn-69"]'
+            else assistant_locator
+        )
         download_image = MagicMock()
 
         with (
@@ -545,6 +553,7 @@ class ThumbnailGenerationTests(unittest.TestCase):
             "default",
             "with_text",
             368,
+            attach_references=False,
         )
 
     def test_two_unique_thumbnail_images_are_downloaded_from_same_response(self):
@@ -608,7 +617,6 @@ class ThumbnailGenerationTests(unittest.TestCase):
         page = MagicMock()
         turn = MagicMock()
         images = MagicMock()
-        stop_button = MagicMock()
         download_image = MagicMock(return_value="/api/thumbnails/new.png")
 
         turn.count.return_value = 1
@@ -617,12 +625,7 @@ class ThumbnailGenerationTests(unittest.TestCase):
             "src": "https://chatgpt.com/backend-api/estuary/image",
             "ready": True,
         }]
-        stop_button.count.side_effect = (1, 0)
-        page.locator.side_effect = lambda selector: (
-            stop_button
-            if selector in (CHATGPT_STOP_BUTTON_SELECTOR, '[data-testid="stop-button"]')
-            else turn
-        )
+        page.locator.return_value = turn
 
         with (
             patch(
@@ -635,17 +638,171 @@ class ThumbnailGenerationTests(unittest.TestCase):
             ),
             patch(
                 "nexus_engine.services.chatgpt_worker.is_chatgpt_generation_active",
-                return_value=False,
+                side_effect=(True, False),
             ),
             patch("nexus_engine.services.chatgpt_worker.time.sleep"),
         ):
             image_url = wait_for_thumbnail_image(page, 67, download_image)
 
         self.assertEqual(image_url, "/api/thumbnails/new.png")
-        self.assertEqual(stop_button.count.call_count, 2)
         download_image.assert_called_once_with(
             "https://chatgpt.com/backend-api/estuary/image"
         )
+
+    def test_thumbnail_wait_accepts_large_preview_wrapped_in_button(self):
+        page = MagicMock()
+        turn = MagicMock()
+        images = MagicMock()
+        source_url = "https://images.openai.com/new-thumbnail.png"
+        download_image = MagicMock(return_value="/api/thumbnails/new.png")
+
+        turn.count.return_value = 1
+        turn.locator.return_value = images
+
+        def evaluate_images(script):
+            self.assertNotIn("isIcon", script)
+            self.assertIn("width >= 200", script)
+            return [{"src": source_url, "ready": True}]
+
+        images.evaluate_all.side_effect = evaluate_images
+        page.locator.return_value = turn
+
+        with (
+            patch(
+                "nexus_engine.services.chatgpt_worker.get_visible_conversation_turns",
+                return_value=[(67, "user"), (68, "assistant")],
+            ),
+            patch(
+                "nexus_engine.services.chatgpt_worker.time.time",
+                side_effect=(0, 1),
+            ),
+            patch(
+                "nexus_engine.services.chatgpt_worker.is_chatgpt_generation_active",
+                return_value=False,
+            ),
+        ):
+            image_urls = wait_for_thumbnail_images(page, 67, download_image)
+
+        self.assertEqual(image_urls, ["/api/thumbnails/new.png"])
+        turn.locator.assert_called_once_with("img")
+
+    def test_thumbnail_wait_scans_all_assistant_turns_for_same_request(self):
+        page = MagicMock()
+        response_turns = MagicMock()
+        response_images = MagicMock()
+        source_url = "https://images.openai.com/final-thumbnail.png"
+        download_image = MagicMock(return_value="/api/thumbnails/final.png")
+
+        response_turns.count.return_value = 2
+        response_turns.locator.return_value = response_images
+        response_images.evaluate_all.side_effect = (
+            [],
+            [{"src": source_url, "ready": True}],
+        )
+
+        def locate(selector):
+            if selector in (
+                '[data-testid="conversation-turn-68"]',
+                '[data-testid="conversation-turn-68"], '
+                '[data-testid="conversation-turn-69"]',
+            ):
+                return response_turns
+            return MagicMock()
+
+        page.locator.side_effect = locate
+
+        with (
+            patch(
+                "nexus_engine.services.chatgpt_worker.get_visible_conversation_turns",
+                side_effect=(
+                    [(67, "user"), (68, "assistant")],
+                    [(67, "user"), (68, "assistant"), (69, "assistant")],
+                ),
+            ),
+            patch(
+                "nexus_engine.services.chatgpt_worker.time.time",
+                side_effect=(0, 1, 2),
+            ),
+            patch(
+                "nexus_engine.services.chatgpt_worker.is_chatgpt_generation_active",
+                return_value=False,
+            ),
+            patch("nexus_engine.services.chatgpt_worker.time.sleep"),
+        ):
+            image_urls = wait_for_thumbnail_images(page, 67, download_image)
+
+        self.assertEqual(image_urls, ["/api/thumbnails/final.png"])
+        self.assertEqual(response_turns.locator.call_args_list, [call("img"), call("img")])
+
+    def test_thumbnail_wait_downloads_image_from_tool_result_unit(self):
+        page = MagicMock()
+        response_turns = MagicMock()
+        response_images = MagicMock()
+        source_url = "https://images.openai.com/tool-thumbnail.png"
+        download_image = MagicMock(return_value="/api/thumbnails/tool-thumbnail.png")
+
+        response_turns.count.return_value = 3
+        response_turns.locator.return_value = response_images
+        response_images.evaluate_all.return_value = [
+            {"src": source_url, "ready": True},
+        ]
+        expected_selector = (
+            '[data-testid="conversation-turn-68"], '
+            '[data-testid="conversation-turn-69"], '
+            '[data-testid="conversation-turn-70"]'
+        )
+        page.locator.side_effect = lambda selector: (
+            response_turns if selector == expected_selector else MagicMock()
+        )
+
+        with (
+            patch(
+                "nexus_engine.services.chatgpt_worker.get_visible_conversation_turns",
+                return_value=[
+                    (67, "user"),
+                    (68, "assistant"),
+                    (69, "tool"),
+                    (70, "assistant"),
+                    (71, "user"),
+                    (72, "assistant"),
+                ],
+            ),
+            patch(
+                "nexus_engine.services.chatgpt_worker.time.time",
+                side_effect=(0, 1),
+            ),
+            patch(
+                "nexus_engine.services.chatgpt_worker.is_chatgpt_generation_active",
+                return_value=False,
+            ),
+        ):
+            image_urls = wait_for_thumbnail_images(page, 67, download_image)
+
+        self.assertEqual(image_urls, ["/api/thumbnails/tool-thumbnail.png"])
+        page.locator.assert_called_once_with(expected_selector)
+        response_turns.locator.assert_called_once_with("img")
+        download_image.assert_called_once_with(source_url)
+
+    def test_generation_active_ignores_hidden_stop_button(self):
+        page = MagicMock()
+        page.evaluate.return_value = False
+
+        self.assertFalse(is_chatgpt_generation_active(page))
+        script = page.evaluate.call_args.args[0]
+        self.assertIn("isStopButton && isVisible(button)", script)
+        self.assertNotIn(
+            "if (document.querySelector('[data-testid=\"stop-button\"]'))",
+            script,
+        )
+
+    def test_generation_active_ignores_completed_reasoning_summary(self):
+        page = MagicMock()
+        page.evaluate.return_value = False
+
+        self.assertFalse(is_chatgpt_generation_active(page))
+        script = page.evaluate.call_args.args[0]
+        self.assertIn("text.startsWith('worked for ')", script)
+        self.assertIn("if (markedComplete) return false", script)
 
     def test_thumbnail_image_snapshot_retries_after_dom_rerender(self):
         page = MagicMock()
@@ -724,7 +881,11 @@ class ThumbnailGenerationTests(unittest.TestCase):
         ):
             send_prompt(page, "next prompt")
 
-        wait_for_history.assert_called_once_with(page)
+        wait_for_history.assert_called_once_with(
+            page,
+            composer_ready=True,
+            pre_send=True,
+        )
         wait_for_response.assert_called_once()
 
     def test_empty_text_response_stops_the_workflow(self):
@@ -803,11 +964,21 @@ class ThumbnailGenerationTests(unittest.TestCase):
             ),
             patch(
                 "nexus_engine.services.chatgpt_worker.get_new_assistant_response",
-                side_effect=("", "", "[PHAN]\nDàn ý", "[PHAN]\nDàn ý"),
+                side_effect=(
+                    "",
+                    "",
+                    "[PHAN]\nDàn ý",
+                    "[PHAN]\nDàn ý",
+                    "[PHAN]\nDàn ý",
+                ),
             ),
             patch(
                 "nexus_engine.services.chatgpt_worker.time.monotonic",
-                side_effect=(0, 0.5, 1, 2, 7.1),
+                side_effect=(0, 0.5, 1, 2, 7.1, 8),
+            ),
+            patch(
+                "nexus_engine.services.chatgpt_worker.is_chatgpt_render_error_present",
+                return_value=False,
             ),
             patch("nexus_engine.services.chatgpt_worker.time.sleep"),
         ):
@@ -829,6 +1000,14 @@ class ThumbnailGenerationTests(unittest.TestCase):
             patch(
                 "nexus_engine.services.chatgpt_worker.time.monotonic",
                 side_effect=(0, CHATGPT_RESPONSE_TIMEOUT_SECONDS + 1),
+            ),
+            patch(
+                "nexus_engine.services.chatgpt_worker.recover_assistant_response_from_backend",
+                return_value="",
+            ),
+            patch(
+                "nexus_engine.services.chatgpt_worker.recover_assistant_response_after_reload",
+                return_value="",
             ),
             self.assertRaises(ChatGPTGenerationTimeoutError),
         ):
@@ -933,9 +1112,19 @@ class ThumbnailGenerationTests(unittest.TestCase):
         )
         self.assertTrue(main._try_start_chatgpt_operation("video"))
         try:
-            with patch(
-                "nexus_engine.services.chatgpt_worker.generate_thumbnails_only"
-            ) as generate_thumbnails:
+            with (
+                patch.object(
+                    main.db,
+                    "get_video",
+                    return_value={
+                        "chat_url": "https://chatgpt.com/c/test",
+                        "prompt_version": "default",
+                    },
+                ),
+                patch(
+                    "nexus_engine.services.chatgpt_worker.generate_thumbnails_only"
+                ) as generate_thumbnails,
+            ):
                 response = asyncio.run(
                     main.generate_thumbnails_endpoint(
                         request,
@@ -1010,6 +1199,82 @@ class ThumbnailGenerationTests(unittest.TestCase):
         self.assertIsNone(
             select_thumbnail_response_turn_number(visible_turns[:4], 67)
         )
+
+    def test_thumbnail_selects_latest_assistant_unit_before_next_user_turn(self):
+        visible_turns = (
+            (67, "user"),
+            (68, "assistant"),
+            (69, "assistant"),
+            (70, "user"),
+            (71, "assistant"),
+        )
+
+        self.assertEqual(
+            select_thumbnail_response_turn_number(visible_turns, 67),
+            69,
+        )
+
+    def test_thumbnail_selects_tool_result_within_request_boundary(self):
+        visible_turns = (
+            (67, "user"),
+            (68, "assistant"),
+            (69, "tool"),
+            (70, "assistant"),
+            (71, "user"),
+            (72, "tool"),
+        )
+
+        self.assertEqual(
+            select_thumbnail_response_turn_numbers(visible_turns, 67),
+            [68, 69, 70],
+        )
+
+
+
+    def test_thumbnail_wait_captures_modern_generated_image_gallery(self):
+        page = MagicMock()
+        missing_turn = MagicMock()
+        missing_turn.count.return_value = 0
+        response_units = MagicMock()
+        empty_images = MagicMock()
+        empty_images.count.return_value = 0
+        response_units.count.return_value = 1
+        response_units.locator.return_value = empty_images
+
+        gallery_images = MagicMock()
+        gallery_images.count.return_value = 1
+        gallery_images.evaluate_all.return_value = [
+            {"src": "blob:https://chatgpt.com/test-thumb-uuid", "ready": True}
+        ]
+
+        def locate(selector):
+            if selector == '[data-testid="conversation-turn-68"]':
+                return missing_turn
+            if '[data-testid="generated-image-gallery"] img' in selector:
+                return gallery_images
+            return response_units
+
+        page.locator.side_effect = locate
+        download_image = MagicMock(return_value="/api/thumbnails/thumb_modern.png")
+
+        with (
+            patch(
+                "nexus_engine.services.chatgpt_worker.get_visible_conversation_turns",
+                return_value=[(67, "user"), (68, "assistant")],
+            ),
+            patch(
+                "nexus_engine.services.chatgpt_worker.time.time",
+                side_effect=(0, 1),
+            ),
+            patch(
+                "nexus_engine.services.chatgpt_worker.is_chatgpt_generation_active",
+                return_value=False,
+            ),
+        ):
+            image_urls = wait_for_thumbnail_images(page, 67, download_image)
+
+        self.assertEqual(image_urls, ["/api/thumbnails/thumb_modern.png"])
+        download_image.assert_called_once_with("blob:https://chatgpt.com/test-thumb-uuid")
 
 
 if __name__ == "__main__":
