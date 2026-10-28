@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { PIPELINE_STAGES, formatSeconds, resolveJobStage } from './videoProgressResolver.js'
+import RenderEngineBadge from './RenderEngineBadge.jsx'
 import './VideoGenerationProgressCard.css'
 
 const API_BASE = 'http://127.0.0.1:8080'
 const ACTIVE_STATUSES = ['queued', 'running', 'retry_wait', 'paused']
-const VIDEO_PIPELINE_JOB_TYPES = ['video_generation', 'muse_media_generation']
+const VIDEO_PIPELINE_JOB_TYPES = ['video_generation', 'muse_media_generation', 'flow_media_generation', 'video_render']
 const POLLING_INTERVAL_MS = 2000
 
 export default function VideoGenerationProgressCard({
@@ -212,6 +213,18 @@ export default function VideoGenerationProgressCard({
               ? 'HOÀN TẤT'
               : 'HÀNG ĐỢI'}
           </span>
+          <RenderEngineBadge
+            engine={
+              currentJob?.type === 'muse_media_generation'
+                ? 'muse_ai'
+                : currentJob?.type === 'flow_media_generation'
+                ? 'google_flow'
+                : currentJob?.type === 'video_render'
+                ? 'stock_video'
+                : 'google_flow'
+            }
+            size="small"
+          />
           <div
             className="vg-video-title"
             title={currentJob.title || currentJob.video_url || 'Đang tạo video...'}

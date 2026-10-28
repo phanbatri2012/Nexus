@@ -832,6 +832,50 @@ class TestMuseSemanticPlanner(unittest.TestCase):
                 terminal_index=31,
             )
 
+    def test_strict_planner_response_accepts_markdown_code_fences(self):
+        payload = _overview_payload()
+        wrapped = "```json\n" + json.dumps(payload, indent=2) + "\n```"
+        parsed = muse_semantic_planner.parse_strict_planner_response(wrapped)
+        self.assertEqual(parsed, payload)
+
+    def test_anchor_matching_allows_name_typo_and_multiword_overlap(self):
+        self.assertTrue(
+            muse_semantic_planner._anchor_matches(
+                "Trần Văn Chà",
+                "tuong tran van tra chi huy tai tran xuan loc",
+                "tuongtranvantrachihuytaitranxuanloc",
+            )
+        )
+        self.assertTrue(
+            muse_semantic_planner._anchor_matches(
+                "Tàu Âu",
+                "khu vuc tau o rat cang thang",
+                "khuvuctauoratcangthang",
+            )
+        )
+        self.assertFalse(
+            muse_semantic_planner._anchor_matches(
+                "Hoàn Toàn Khác",
+                "tuong tran van tra chi huy",
+                "tuongtranvantrachihuy",
+            )
+        )
+
+    def test_safe_visual_anchor_allows_benign_military_planning_phrases(self):
+        windows = _planner_windows(1)
+        batch = _batch_payload(windows)
+        batch["scenes"][0]["safe_visual_anchor"] = (
+            "Các đơn vị chiến đấu tập kết tại căn cứ, quan sát hướng tấn công trên sa bàn tác chiến."
+        )
+        validated = muse_semantic_planner.validate_semantic_batch(
+            batch,
+            windows,
+            previous_visual_anchors=[],
+            needs_terminal_frame=False,
+            terminal_index=1,
+        )
+        self.assertIn("đơn vị chiến đấu", validated["scenes"][0]["safe_visual_anchor"])
+
     def test_batched_worker_uses_expected_batch_and_chat_group_counts(self):
         for scene_count, expected_batches, expected_groups in ((31, 2, 1), (360, 12, 3)):
             with self.subTest(scene_count=scene_count):

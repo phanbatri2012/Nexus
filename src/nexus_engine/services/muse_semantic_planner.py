@@ -45,6 +45,14 @@ _CTA_PATTERN = re.compile(
 _TERMINAL_TEXT_PATTERN = re.compile(
     r"(?i)(?<!\w)(?:text|caption|logo|watermark|chữ|phụ\s*đề|biểu\s*trưng)(?!\w)"
 )
+_SAFE_MILITARY_PHRASES_PATTERN = re.compile(
+    r"(?i)\b(?:"
+    r"(?:đơn\s+vị|lực\s+lượng|sẵn\s+sàng|vị\s+trí|tinh\s+thần|ý\s+chí|nhiệm\s+vụ|thời\s+kỳ|tư\s+thế)\s+chiến\s+đấu|"
+    r"(?:hướng|mũi|kế\s+hoạch|phương\s+án|chuẩn\s+bị|sa\s+bàn|bản\s+đồ|mục\s+tiêu|sơ\s+đồ|thế\s+trận)\s+(?:tấn\s+công|tiến\s+công)|"
+    r"chiến\s+đấu\s+(?:lâu\s+năm|kiên\s+cường|bền\s+bỉ)|"
+    r"nổ\s+súng\s+(?:báo\s+hiệu|hiệu\s+lệnh)"
+    r")\b"
+)
 _UNSAFE_SAFE_ANCHOR_PATTERN = re.compile(
     r"(?i)(?<!\w)(?:"
     r"máu|đẫm\s*máu|thi\s*thể|xác\s*chết|vết\s*thương|thương\s*vong|"
@@ -107,7 +115,10 @@ def extract_source_anchors(text: str) -> list[str]:
         )
         if sentence_leading_single_word:
             return
-        if key in {"hay", "nhung", "va", "tai", "khi", "neu", "day", "do"}:
+        if key in {
+            "hay", "nhung", "va", "tai", "khi", "neu", "day", "do",
+            "viet nam", "nam", "bac", "trung",
+        }:
             return
         anchors.append(value)
         seen.add(key)
@@ -477,6 +488,9 @@ def parse_strict_planner_response(response_text: str) -> dict:
     """Parse batched-planner output and reject markdown or prose around the JSON."""
 
     raw = str(response_text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw).strip()
     if not raw.startswith("{") or not raw.endswith("}"):
         raise SemanticPlanValidationError(
             ["Phản hồi planner phải chỉ chứa một JSON object, không có nội dung bên ngoài."]
@@ -576,6 +590,23 @@ def _must_show_values(value: object) -> list[str]:
     return [item for item in cleaned if item]
 
 
+def _anchor_matches(anchor: str, combined_identity: str, compact_combined_identity: str) -> bool:
+    key = _identity(anchor)
+    if not key:
+        return False
+    if key in combined_identity:
+        return True
+    compact_key = key.replace(" ", "")
+    if len(compact_key) >= 4 and compact_key in compact_combined_identity:
+        return True
+    words = [w for w in key.split() if len(w) >= 2]
+    if len(words) >= 2:
+        matching_words = sum(1 for w in words if re.search(rf"\b{re.escape(w)}\b", combined_identity))
+        if matching_words >= 2 or (matching_words >= 1 and len(words) == 2 and len(compact_key) >= 4):
+            return True
+    return False
+
+
 def _normalize_semantic_entry(
     raw_scene: object,
     *,
@@ -619,7 +650,8 @@ def _normalize_semantic_entry(
         seen_anchors.add(anchor_key)
 
     safe_anchor = scene.get("safe_visual_anchor", "")
-    if _UNSAFE_SAFE_ANCHOR_PATTERN.search(safe_anchor):
+    inspected_safe_anchor = _SAFE_MILITARY_PHRASES_PATTERN.sub(" ", safe_anchor)
+    if _UNSAFE_SAFE_ANCHOR_PATTERN.search(inspected_safe_anchor):
         errors.append(f"{label} safe_visual_anchor vẫn chứa hành động rủi ro.")
 
     transcript = str(window.get("transcript") or "")
@@ -639,14 +671,7 @@ def _normalize_semantic_entry(
     retained = [
         anchor
         for anchor in source_anchors
-        if _identity(anchor)
-        and (
-            _identity(anchor) in combined_identity
-            or (
-                len(_identity(anchor).replace(" ", "")) >= 5
-                and _identity(anchor).replace(" ", "") in compact_combined_identity
-            )
-        )
+        if _anchor_matches(anchor, combined_identity, compact_combined_identity)
     ]
     if source_anchors and not retained:
         errors.append(

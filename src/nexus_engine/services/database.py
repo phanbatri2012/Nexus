@@ -31,6 +31,52 @@ VIDEO_STATUSES = {VIDEO_STATUS_ACTIVE, VIDEO_STATUS_ERROR}
 VIDEO_SOURCE_GENERATED = "generated"
 VIDEO_SOURCE_COMMENT_IMPORT = "comment_import"
 
+RENDER_ENGINE_GOOGLE_FLOW = "google_flow"
+RENDER_ENGINE_MUSE_AI = "muse_ai"
+RENDER_ENGINE_STOCK_VIDEO = "stock_video"
+RENDER_ENGINE_DRAFT = "draft"
+RENDER_ENGINES = {
+    RENDER_ENGINE_GOOGLE_FLOW,
+    RENDER_ENGINE_MUSE_AI,
+    RENDER_ENGINE_STOCK_VIDEO,
+    RENDER_ENGINE_DRAFT,
+}
+
+RENDER_ENGINE_CONFIG = {
+    RENDER_ENGINE_GOOGLE_FLOW: {
+        "engine": "google_flow",
+        "label": "Google Flow",
+        "icon": "⚡",
+        "color": "#38bdf8",
+        "bg": "rgba(56, 189, 248, 0.15)",
+        "border": "#38bdf8",
+    },
+    RENDER_ENGINE_MUSE_AI: {
+        "engine": "muse_ai",
+        "label": "Muse AI",
+        "icon": "🎬",
+        "color": "#c084fc",
+        "bg": "rgba(192, 132, 252, 0.15)",
+        "border": "#c084fc",
+    },
+    RENDER_ENGINE_STOCK_VIDEO: {
+        "engine": "stock_video",
+        "label": "Video có sẵn",
+        "icon": "🎞️",
+        "color": "#fbbf24",
+        "bg": "rgba(251, 191, 36, 0.15)",
+        "border": "#fbbf24",
+    },
+    RENDER_ENGINE_DRAFT: {
+        "engine": "draft",
+        "label": "Kịch bản gốc",
+        "icon": "📝",
+        "color": "#9ca3af",
+        "bg": "rgba(156, 163, 175, 0.15)",
+        "border": "#9ca3af",
+    },
+}
+
 GENERATED_TITLE_LABELS = {"TIEU DE", "TIEU DE VIDEO"}
 GENERATED_DESCRIPTION_LABELS = {"MO TA", "MO TA VIDEO", "MO TA VIDEO CHAPTERS"}
 METADATA_FIELD_LABELS = GENERATED_TITLE_LABELS | GENERATED_DESCRIPTION_LABELS | {
@@ -2443,6 +2489,118 @@ def save_video(
     conn.close()
     return video_id
 
+def resolve_video_render_engines(video_rows: list[dict], conn: sqlite3.Connection = None) -> list[dict]:
+    """Attach render_engine, label, icon, and colors to video dicts."""
+    if not video_rows:
+        return video_rows
+
+    close_conn = False
+    if conn is None:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.row_factory = sqlite3.Row
+        close_conn = True
+
+    try:
+        video_ids = [int(v["id"]) for v in video_rows if "id" in v and v["id"] is not None]
+        if not video_ids:
+            return video_rows
+
+        placeholders = ",".join("?" * len(video_ids))
+
+        # 1. Fetch relevant artifacts
+        art_rows = conn.execute(
+            f"""
+            SELECT video_id, artifact_type, content_hash
+            FROM video_artifacts
+            WHERE video_id IN ({placeholders})
+              AND (
+                artifact_type IN ('flow_media_manifest', 'muse_media_manifest', 'final_mp4')
+                OR artifact_type LIKE 'scene:%'
+                OR artifact_type LIKE 'muse_%'
+              )
+            """,
+            video_ids,
+        ).fetchall()
+        art_by_vid: dict[int, list] = {}
+        for a in art_rows:
+            art_by_vid.setdefault(a["video_id"], []).append(a)
+
+        # 2. Fetch flow projects
+        fp_rows = conn.execute(
+            f"SELECT video_id, project_url FROM flow_projects WHERE video_id IN ({placeholders})",
+            video_ids,
+        ).fetchall()
+        flow_projects_by_vid = {r["video_id"]: r["project_url"] for r in fp_rows}
+
+        # 3. Fetch recent system jobs
+        job_rows = conn.execute(
+            f"""
+            SELECT video_id, job_type FROM system_jobs
+            WHERE video_id IN ({placeholders})
+              AND job_type IN ('flow_media_generation', 'muse_media_generation', 'video_render')
+            """,
+            video_ids,
+        ).fetchall()
+        jobs_by_vid: dict[int, set[str]] = {}
+        for r in job_rows:
+            jobs_by_vid.setdefault(r["video_id"], set()).add(r["job_type"])
+
+        for v in video_rows:
+            vid = v.get("id")
+            v_arts = art_by_vid.get(vid, [])
+            art_types = {a["artifact_type"] for a in v_arts}
+            v_jobs = jobs_by_vid.get(vid, set())
+
+            is_stock = any(
+                a["artifact_type"] == "final_mp4" and str(a["content_hash"]).startswith("stock_")
+                for a in v_arts
+            )
+            has_muse = any("muse" in at for at in art_types) or ("muse_media_generation" in v_jobs)
+            has_flow = (
+                any("flow" in at for at in art_types)
+                or (vid in flow_projects_by_vid)
+                or any(at.startswith("scene:") for at in art_types)
+                or ("flow_media_generation" in v_jobs)
+            )
+
+            if is_stock:
+                engine = RENDER_ENGINE_STOCK_VIDEO
+            elif has_muse:
+                engine = RENDER_ENGINE_MUSE_AI
+            elif has_flow:
+                engine = RENDER_ENGINE_GOOGLE_FLOW
+            else:
+                engine = RENDER_ENGINE_DRAFT
+                snap_str = v.get("production_snapshot_json")
+                if snap_str:
+                    try:
+                        snap = json.loads(snap_str)
+                        mode = (
+                            snap.get("render_mode")
+                            or (snap.get("image_generation_settings") or {}).get("render_mode")
+                            or (snap.get("pipeline") or {}).get("render_mode")
+                        )
+                        if mode in RENDER_ENGINE_CONFIG:
+                            engine = mode
+                    except Exception:
+                        pass
+
+            cfg = RENDER_ENGINE_CONFIG.get(engine, RENDER_ENGINE_CONFIG[RENDER_ENGINE_DRAFT])
+            v["render_engine"] = engine
+            v["render_engine_label"] = cfg["label"]
+            v["render_engine_icon"] = cfg["icon"]
+            v["render_engine_color"] = cfg["color"]
+            v["render_engine_bg"] = cfg["bg"]
+            v["render_engine_border"] = cfg["border"]
+            if vid in flow_projects_by_vid:
+                v["flow_project_url"] = flow_projects_by_vid[vid]
+
+        return video_rows
+    finally:
+        if close_conn:
+            conn.close()
+
+
 def get_all_videos(
     limit: int = 10,
     offset: int = 0,
@@ -2450,6 +2608,7 @@ def get_all_videos(
     prompt_version: str = None,
     search_query: str = None,
     video_status: str = None,
+    render_engine: str = None,
 ) -> dict:
     if video_status is not None and video_status not in VIDEO_STATUSES:
         raise ValueError("Trạng thái video không hợp lệ.")
@@ -2475,6 +2634,16 @@ def get_all_videos(
         count_scope_params.extend(
             (f'%{normalized_query}%', f'%{normalized_query}%')
         )
+    if render_engine:
+        re_lower = render_engine.strip().lower()
+        if re_lower == RENDER_ENGINE_STOCK_VIDEO:
+            count_scope_filters.append("EXISTS (SELECT 1 FROM video_artifacts a WHERE a.video_id = videos.id AND a.artifact_type = 'final_mp4' AND a.content_hash LIKE 'stock_%')")
+        elif re_lower == RENDER_ENGINE_MUSE_AI:
+            count_scope_filters.append("(EXISTS (SELECT 1 FROM video_artifacts a WHERE a.video_id = videos.id AND a.artifact_type LIKE 'muse_%') OR EXISTS (SELECT 1 FROM system_jobs sj WHERE sj.video_id = videos.id AND sj.job_type = 'muse_media_generation'))")
+        elif re_lower == RENDER_ENGINE_GOOGLE_FLOW:
+            count_scope_filters.append("((EXISTS (SELECT 1 FROM video_artifacts a WHERE a.video_id = videos.id AND (a.artifact_type = 'flow_media_manifest' OR a.artifact_type LIKE 'scene:%')) OR EXISTS (SELECT 1 FROM flow_projects fp WHERE fp.video_id = videos.id) OR EXISTS (SELECT 1 FROM system_jobs sj WHERE sj.video_id = videos.id AND sj.job_type = 'flow_media_generation')) AND NOT EXISTS (SELECT 1 FROM video_artifacts ma WHERE ma.video_id = videos.id AND ma.artifact_type LIKE 'muse_%'))")
+        elif re_lower == RENDER_ENGINE_DRAFT:
+            count_scope_filters.append("(NOT EXISTS (SELECT 1 FROM video_artifacts a WHERE a.video_id = videos.id AND a.artifact_type = 'final_mp4' AND a.content_hash LIKE 'stock_%') AND NOT EXISTS (SELECT 1 FROM video_artifacts a WHERE a.video_id = videos.id AND a.artifact_type LIKE 'muse_%') AND NOT EXISTS (SELECT 1 FROM video_artifacts a WHERE a.video_id = videos.id AND (a.artifact_type = 'flow_media_manifest' OR a.artifact_type LIKE 'scene:%')) AND NOT EXISTS (SELECT 1 FROM flow_projects fp WHERE fp.video_id = videos.id))")
     scope_filters = list(count_scope_filters)
     scope_params = list(count_scope_params)
     if video_status is not None:
@@ -2525,7 +2694,7 @@ def get_all_videos(
         'created_at, is_published, video_status, chat_url, '
         'prompt_version, voice_id, voice_name, tts_provider_id, '
         'audio_duration_seconds, render_status, publish_status, current_stage, '
-        'production_progress, blocking_reason, '
+        'production_progress, blocking_reason, production_snapshot_json, '
         "COALESCE((SELECT status FROM audio_reviews WHERE video_id = videos.id), '') "
         'AS audio_review_status, '
         'SUBSTR(generated_script, 1, 300) as snippet, '
@@ -2557,6 +2726,8 @@ def get_all_videos(
     )
 
     rows = c.fetchall()
+    items = [dict(row) for row in rows]
+    resolve_video_render_engines(items, conn)
     conn.close()
 
     return {
@@ -2564,7 +2735,7 @@ def get_all_videos(
         "count_published": count_published,
         "count_unpublished": count_unpublished,
         "count_error": count_error,
-        "items": [dict(row) for row in rows]
+        "items": items
     }
 
 
@@ -2662,8 +2833,13 @@ def get_video(video_id: int) -> dict:
     c = conn.cursor()
     c.execute('SELECT * FROM videos WHERE id = ?', (video_id,))
     row = c.fetchone()
+    if not row:
+        conn.close()
+        return None
+    item = dict(row)
+    resolve_video_render_engines([item], conn)
     conn.close()
-    return dict(row) if row else None
+    return item
 
 
 def list_video_identity_candidates() -> list[dict]:

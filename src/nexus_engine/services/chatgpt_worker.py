@@ -6339,6 +6339,8 @@ def generate_muse_scene_plan_only(
     state.setdefault("completed_batches", {})
     state.setdefault("invalid_steps", {})
     state.setdefault("failed_steps", {})
+    state["failed_steps"] = {}
+    state["invalid_steps"] = {}
     elapsed_base = float(state.get("planner_elapsed_seconds") or 0.0)
     resumed_batch_count = len(state["completed_batches"])
 

@@ -12276,6 +12276,7 @@ def get_videos(
     prompt_version: Optional[str] = None,
     search: Optional[str] = None,
     video_status: Optional[Literal["active", "error"]] = None,
+    render_engine: Optional[str] = None,
 ):
     res = db.get_all_videos(
         limit=limit,
@@ -12284,6 +12285,7 @@ def get_videos(
         prompt_version=prompt_version,
         search_query=search,
         video_status=video_status,
+        render_engine=render_engine,
     )
     with _prompts_config_lock:
         prompt_data = _read_prompts_config()

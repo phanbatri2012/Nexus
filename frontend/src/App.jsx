@@ -20,6 +20,7 @@ import TrustBuilder from './TrustBuilder'
 import CompetitorRadar from './CompetitorRadar'
 import { openVideoStudioInGpm, openVideoWatchInGpm } from './gpmOpener'
 import UserGuideModal from './UserGuideModal'
+import RenderEngineBadge from './RenderEngineBadge.jsx'
 import { isSameVideoId, normalizeVideoId } from './videoId.js'
 
 const SECONDS_PER_MINUTE = 60
@@ -298,6 +299,7 @@ function App() {
   const [regenerateVoiceId, setRegenerateVoiceId] = useState('')
   const [publishFilter, setPublishFilter] = useState('unpublished') // 'all' | 'published' | 'unpublished' | 'error'
   const [promptVersionFilter, setPromptVersionFilter] = useState('all')
+  const [renderEngineFilter, setRenderEngineFilter] = useState('all')
   const [searchQuery, setSearchQuery] = useState('')
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('')
   const dashboardFetchRequestRef = useRef(0)
@@ -332,7 +334,8 @@ function App() {
     page = currentPage,
     filter = publishFilter,
     versionFilter = promptVersionFilter,
-    search = debouncedSearchQuery
+    search = debouncedSearchQuery,
+    engineFilter = renderEngineFilter
   ) => {
     const requestId = dashboardFetchRequestRef.current + 1
     dashboardFetchRequestRef.current = requestId
@@ -345,6 +348,7 @@ function App() {
       else if (filter === 'error') params.set('video_status', 'error');
       if (versionFilter !== 'all') params.set('prompt_version', versionFilter);
       if (search) params.set('search', search);
+      if (engineFilter && engineFilter !== 'all') params.set('render_engine', engineFilter);
       const response = await fetch(`http://127.0.0.1:8080/api/videos?${params}`);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
@@ -563,7 +567,8 @@ function App() {
         currentPage,
         publishFilter,
         promptVersionFilter,
-        debouncedSearchQuery
+        debouncedSearchQuery,
+        renderEngineFilter
       )
     }
   }, [
@@ -571,7 +576,8 @@ function App() {
     currentPage,
     publishFilter,
     promptVersionFilter,
-    debouncedSearchQuery
+    debouncedSearchQuery,
+    renderEngineFilter
   ])
 
   useEffect(() => {
@@ -2163,6 +2169,26 @@ function App() {
                       <option key={version.key} value={version.key}>{version.name}</option>
                     ))}
                   </select>
+                  <select
+                    value={renderEngineFilter}
+                    onChange={(event) => {
+                      const nextEngine = event.target.value;
+                      setRenderEngineFilter(nextEngine);
+                      setCurrentPage(1);
+                    }}
+                    style={{
+                      minWidth: '175px', padding: '7px 12px', borderRadius: '8px',
+                      border: '1px solid rgba(56, 189, 248, 0.45)',
+                      background: '#101622', color: '#eee', cursor: 'pointer', fontWeight: '600'
+                    }}
+                    aria-label="Lọc theo nguồn video"
+                  >
+                    <option value="all">🌐 Tất cả nguồn video</option>
+                    <option value="google_flow">⚡ Google Flow</option>
+                    <option value="muse_ai">🎬 Muse AI</option>
+                    <option value="stock_video">🎞️ Video có sẵn</option>
+                    <option value="draft">📝 Kịch bản gốc</option>
+                  </select>
                   {[['all', '🗂️ Tất cả'], ['published', '✅ Đã đăng'], ['unpublished', '⏳ Chưa đăng'], ['error', '❌ Lỗi']].map(([val, label]) => (
                     <button
                       key={val}
@@ -2213,16 +2239,25 @@ function App() {
                          : isPublished ? '✅ Đã đăng' : '⏳ Chưa đăng';
                     return (
                       <div key={video.id} className="result-panel" style={{ padding: '20px', display: 'flex', flexDirection: 'column', borderTop: `3px solid ${statusColor}` }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '8px' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '8px', gap: '8px' }}>
                           <h4 style={{ margin: 0, color: 'white', flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', paddingRight: '8px' }}>{video.title}</h4>
-                          <span style={{ 
-                            fontSize: '0.75em', fontWeight: 'bold', padding: '3px 8px', borderRadius: '12px', whiteSpace: 'nowrap',
-                            backgroundColor: isError ? 'rgba(231,76,60,0.15)' : isPublished ? 'rgba(76,175,80,0.15)' : 'rgba(243,156,18,0.15)',
-                            color: statusColor,
-                            border: `1px solid ${statusColor}`
-                          }}>
-                             {lifecycleLabel}
-                          </span>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexShrink: 0 }}>
+                            <RenderEngineBadge
+                              engine={video.render_engine}
+                              label={video.render_engine_label}
+                              icon={video.render_engine_icon}
+                              color={video.render_engine_color}
+                              flowProjectUrl={video.flow_project_url}
+                            />
+                            <span style={{ 
+                              fontSize: '0.75em', fontWeight: 'bold', padding: '3px 8px', borderRadius: '12px', whiteSpace: 'nowrap',
+                              backgroundColor: isError ? 'rgba(231,76,60,0.15)' : isPublished ? 'rgba(76,175,80,0.15)' : 'rgba(243,156,18,0.15)',
+                              color: statusColor,
+                              border: `1px solid ${statusColor}`
+                            }}>
+                               {lifecycleLabel}
+                            </span>
+                          </div>
                         </div>
                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', marginBottom: '8px' }}>
                           <p style={{ color: '#888', fontSize: '0.9em', margin: 0 }}>{formatDateTimeAMPM(video.created_at)}</p>
@@ -3658,7 +3693,10 @@ function App() {
                               }}>
                                 <div>
                                   <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                                    <h4 style={{ color: 'var(--accent)', margin: 0 }}>🎬 Video MP4 ({renderInfo?.render_mode === 'stock_video' ? 'Stock Video & Audio' : renderInfo?.render_mode === 'muse_ai' ? 'Muse AI & Subtitles' : 'Google Flow & Subtitles'}):</h4>
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                                      <h4 style={{ color: 'var(--accent)', margin: 0 }}>🎬 Video MP4 ({renderInfo?.render_mode === 'stock_video' ? 'Stock Video & Audio' : renderInfo?.render_mode === 'muse_ai' ? 'Muse AI & Subtitles' : 'Google Flow & Subtitles'}):</h4>
+                                      <RenderEngineBadge engine={renderInfo?.render_mode} />
+                                    </div>
                                     {hasMp4Ready && (
                                       <div className="media-badge-group">
                                         <span className="media-pill-badge">{renderInfo?.mp4_details?.resolution || '1080p FHD'}</span>
