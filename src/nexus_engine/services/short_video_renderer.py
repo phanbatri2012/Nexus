@@ -166,6 +166,38 @@ def _black_ratio(path: Path, duration: float, *, job_id: str) -> float:
     return round(black_seconds / max(duration, 0.001), 6)
 
 
+def _max_sampled_saturation(path: Path, *, job_id: str) -> float:
+    result = _run_process(
+        [
+            _ffmpeg_exe(),
+            "-hide_banner",
+            "-nostats",
+            "-i",
+            str(path),
+            "-vf",
+            "fps=1,signalstats,metadata=print",
+            "-frames:v",
+            "24",
+            "-an",
+            "-f",
+            "null",
+            "NUL" if os.name == "nt" else "/dev/null",
+        ],
+        job_id=job_id,
+        timeout=300,
+    )
+    values = [
+        float(value)
+        for value in re.findall(
+            r"lavfi\.signalstats\.SATAVG=([0-9.]+)",
+            f"{result.stdout}\n{result.stderr}",
+        )
+    ]
+    if not values:
+        raise ShortVideoRenderError("QC không đọc được độ bão hòa của video Short.")
+    return round(max(values), 6)
+
+
 def validate_render(
     path: Path,
     *,
@@ -174,6 +206,7 @@ def validate_render(
     height: int,
     fps: int,
     job_id: str,
+    monochrome: bool = False,
 ) -> dict:
     metadata = probe(path)
     streams = metadata["streams"]
@@ -199,6 +232,9 @@ def validate_render(
     black_ratio = _black_ratio(path, duration, job_id=job_id)
     if black_ratio > 0.02:
         raise ShortVideoRenderError("QC phát hiện quá nhiều khung hình đen trong video Short.")
+    max_saturation = _max_sampled_saturation(path, job_id=job_id) if monochrome else None
+    if monochrome and float(max_saturation or 0) > 2.0:
+        raise ShortVideoRenderError("QC phát hiện video Character Profile chưa hoàn toàn đen trắng.")
     return {
         "duration_seconds": round(duration, 3),
         "width": int(video.get("width") or 0),
@@ -210,10 +246,21 @@ def validate_render(
         "has_audio": True,
         "has_subtitle_stream": False,
         "text_overlay_enabled": False,
+        "monochrome_required": monochrome,
+        "monochrome_verified": bool(monochrome and float(max_saturation or 0) <= 2.0),
+        "max_sampled_saturation": max_saturation,
     }
 
 
-def _scene_filter(width: int, height: int, fps: int, duration: float, index: int) -> str:
+def _scene_filter(
+    width: int,
+    height: int,
+    fps: int,
+    duration: float,
+    index: int,
+    *,
+    monochrome: bool = False,
+) -> str:
     frames = max(1, round(duration * fps))
     direction = -1 if index % 2 else 1
     zoom_step = 0.00045 * direction
@@ -221,12 +268,15 @@ def _scene_filter(width: int, height: int, fps: int, duration: float, index: int
         zoom = f"min(zoom+{zoom_step:.5f},1.08)"
     else:
         zoom = f"if(eq(on,1),1.08,max(1.0,zoom{zoom_step:.5f}))"
-    return (
+    filters = (
         f"scale={width}:{height}:force_original_aspect_ratio=increase,"
         f"crop={width}:{height},"
         f"zoompan=z='{zoom}':x='(iw-iw/zoom)/2':y='(ih-ih/zoom)/2':"
-        f"d={frames}:s={width}x{height}:fps={fps},format=yuv420p"
+        f"d={frames}:s={width}x{height}:fps={fps}"
     )
+    if monochrome:
+        filters += ",hue=s=0"
+    return filters + ",format=yuv420p"
 
 
 def render(
@@ -238,6 +288,7 @@ def render(
     height: int,
     fps: int,
     job_id: str,
+    monochrome: bool = False,
 ) -> dict:
     if not scenes:
         raise ShortVideoRenderError("Không có scene để dựng Short Video.")
@@ -252,7 +303,14 @@ def render(
         if not media_path.is_file():
             raise ShortVideoRenderError(f"Scene {index + 1} chưa có media hợp lệ.")
         segment = work_dir / f"scene_{index:03d}.mp4"
-        filter_graph = _scene_filter(width, height, fps, duration, index)
+        filter_graph = _scene_filter(
+            width,
+            height,
+            fps,
+            duration,
+            index,
+            monochrome=monochrome,
+        )
         if scene.get("video_path"):
             input_args = ["-stream_loop", "-1", "-i", str(media_path)]
         else:
@@ -353,5 +411,6 @@ def render(
         height=height,
         fps=fps,
         job_id=job_id,
+        monochrome=monochrome,
     )
     return {"path": str(destination), "qc": qc}

@@ -1037,6 +1037,7 @@ def init_db():
             current_stage TEXT DEFAULT '',
             job_id TEXT DEFAULT '',
             manifest_json TEXT NOT NULL DEFAULT '{}',
+            options_json TEXT NOT NULL DEFAULT '{}',
             error TEXT DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -1044,6 +1045,13 @@ def init_db():
             completed_at TEXT DEFAULT ''
         )
     ''')
+    try:
+        c.execute(
+            "ALTER TABLE short_video_items "
+            "ADD COLUMN options_json TEXT NOT NULL DEFAULT '{}'"
+        )
+    except sqlite3.OperationalError:
+        pass
     c.execute(
         'CREATE INDEX IF NOT EXISTS idx_short_video_items_project_status '
         'ON short_video_items(project_key, status, created_at DESC)'
@@ -5745,6 +5753,7 @@ SHORT_VIDEO_ITEM_MUTABLE_FIELDS = frozenset(
         "current_stage",
         "job_id",
         "manifest_json",
+        "options_json",
         "error",
         "reviewed_at",
         "completed_at",
@@ -5761,6 +5770,11 @@ def _decode_short_video_item(row: sqlite3.Row | None) -> dict | None:
     except (TypeError, json.JSONDecodeError):
         item["manifest"] = {}
     item.pop("manifest_json", None)
+    try:
+        item["options"] = json.loads(item.get("options_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        item["options"] = {}
+    item.pop("options_json", None)
     return item
 
 
@@ -5775,6 +5789,7 @@ def create_short_video_item_with_job(
     job_id: str,
     payload: dict,
     voice_snapshot: dict,
+    options: dict | None = None,
 ) -> tuple[dict, dict, bool]:
     """Atomically create an idempotent Short item and its first system job."""
 
@@ -5805,15 +5820,16 @@ def create_short_video_item_with_job(
         provider_id = str(voice_snapshot.get("provider_id") or "omnivoice")
         voice_revision = max(1, int(voice_snapshot.get("voice_revision") or 1))
         manifest_json = json.dumps(manifest, ensure_ascii=False)
+        options_json = json.dumps(options or {}, ensure_ascii=False)
         payload_json = json.dumps(payload, ensure_ascii=False)
         voice_json = json.dumps(voice_snapshot, ensure_ascii=False)
         conn.execute(
             '''
             INSERT INTO short_video_items (
                 id, project_key, profile_version, title, source_text,
-                status, current_stage, job_id, manifest_json, error,
+                status, current_stage, job_id, manifest_json, options_json, error,
                 created_at, updated_at, reviewed_at, completed_at
-            ) VALUES (?, ?, ?, ?, ?, 'queued', 'queued', ?, ?, '', ?, ?, '', '')
+            ) VALUES (?, ?, ?, ?, ?, 'queued', 'queued', ?, ?, ?, '', ?, ?, '', '')
             ''',
             (
                 item_id,
@@ -5823,6 +5839,7 @@ def create_short_video_item_with_job(
                 source_text,
                 job_id,
                 manifest_json,
+                options_json,
                 now,
                 now,
             ),
@@ -5878,6 +5895,7 @@ def create_short_video_job(
     payload: dict,
     voice_snapshot: dict,
     stage: str,
+    options: dict | None = None,
 ) -> tuple[dict, dict]:
     """Atomically link a follow-up generation job to an existing Short item."""
 
@@ -5930,15 +5948,26 @@ def create_short_video_job(
                 now,
             ),
         )
-        conn.execute(
-            '''
-            UPDATE short_video_items
-            SET status = 'queued', current_stage = ?, job_id = ?, error = '',
-                updated_at = ?, completed_at = ''
-            WHERE id = ?
-            ''',
-            (stage, job_id, now, item_id),
-        )
+        if options is None:
+            conn.execute(
+                '''
+                UPDATE short_video_items
+                SET status = 'queued', current_stage = ?, job_id = ?, error = '',
+                    updated_at = ?, completed_at = ''
+                WHERE id = ?
+                ''',
+                (stage, job_id, now, item_id),
+            )
+        else:
+            conn.execute(
+                '''
+                UPDATE short_video_items
+                SET status = 'queued', current_stage = ?, job_id = ?, error = '',
+                    options_json = ?, updated_at = ?, completed_at = ''
+                WHERE id = ?
+                ''',
+                (stage, job_id, json.dumps(options, ensure_ascii=False), now, item_id),
+            )
         updated_item = conn.execute(
             "SELECT * FROM short_video_items WHERE id = ?",
             (item_id,),
@@ -6032,6 +6061,10 @@ def update_short_video_item(item_id: str, **changes) -> dict | None:
     if "manifest_json" in encoded and not isinstance(encoded["manifest_json"], str):
         encoded["manifest_json"] = json.dumps(
             encoded["manifest_json"], ensure_ascii=False
+        )
+    if "options_json" in encoded and not isinstance(encoded["options_json"], str):
+        encoded["options_json"] = json.dumps(
+            encoded["options_json"], ensure_ascii=False
         )
     encoded["updated_at"] = utc_now()
     assignments = ", ".join(f"{field} = ?" for field in encoded)

@@ -27,7 +27,10 @@ from nexus_engine.services import (
     tts_registry as tts,
 )
 from nexus_engine.services.chatgpt_runtime import ChatGPTAttentionRequiredError
-from nexus_engine.services.chatgpt_worker import generate_muse_scene_plan_only
+from nexus_engine.services.chatgpt_worker import (
+    generate_muse_scene_plan_only,
+    resolve_short_video_character_era,
+)
 from nexus_engine.services.muse_provider import (
     MusePromptBuilder,
     MuseReceipt,
@@ -88,6 +91,12 @@ def _safe_item_dir(project_key: str, item_id: str) -> Path:
         raise ShortVideoPipelineError("Namespace artifact Short Video không hợp lệ.") from exc
     target.mkdir(parents=True, exist_ok=True)
     return target
+
+
+def prepare_item_directory(project_key: str, item_id: str) -> Path:
+    """Return the validated item namespace used for immutable pre-job snapshots."""
+
+    return _safe_item_dir(project_key, item_id)
 
 
 def _resolve_artifact(item_dir: Path, relative_path: str) -> Path:
@@ -231,6 +240,163 @@ def _validate_profile(item: dict) -> tuple[dict, dict, dict]:
     if any(render.get(flag) is not False for flag in forbidden_flags):
         raise ShortVideoPipelineError("Render profile Short Video có lớp nội dung bị cấm.")
     return profile, pipeline, voice_snapshot
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _character_era(profile: dict, era_key: str) -> dict | None:
+    character = profile.get("resolved_character_profile")
+    if not isinstance(character, dict):
+        return None
+    return next(
+        (
+            era
+            for era in character.get("eras") or []
+            if str(era.get("key") or "") == str(era_key or "")
+        ),
+        None,
+    )
+
+
+def _validate_character_references(item_dir: Path, era: dict) -> None:
+    references = era.get("references") if isinstance(era, dict) else []
+    if not isinstance(references, list) or not 2 <= len(references) <= 3:
+        raise ShortVideoAttentionRequired(
+            "Thời kỳ hình ảnh chưa có đủ 2–3 ảnh tham chiếu.",
+            reason="character_references_unavailable",
+        )
+    if sum(bool(reference.get("primary")) for reference in references) != 1:
+        raise ShortVideoAttentionRequired(
+            "Thời kỳ hình ảnh không có đúng một ảnh tham chiếu primary.",
+            reason="character_references_unavailable",
+        )
+    for reference in references:
+        relative = str(reference.get("snapshot_path") or "")
+        path = _resolve_artifact(item_dir, relative)
+        expected_hash = str(reference.get("sha256") or "")
+        if not path.is_file() or not expected_hash or _file_sha256(path) != expected_hash:
+            raise ShortVideoAttentionRequired(
+                "Snapshot ảnh Character Profile không toàn vẹn.",
+                reason="character_references_unavailable",
+            )
+
+
+def _ensure_character_era(
+    *,
+    checkpoint: dict,
+    item_dir: Path,
+    job: dict,
+    item: dict,
+    profile: dict,
+) -> dict | None:
+    character = profile.get("resolved_character_profile")
+    if not isinstance(character, dict):
+        return None
+    options = item.get("options") if isinstance(item.get("options"), dict) else {}
+    requested = str(options.get("character_era") or "auto")
+    state = checkpoint.get("character_resolution")
+    expected_identity = {
+        "profile_key": character.get("key") or "",
+        "profile_version": character.get("profile_version") or 0,
+        "snapshot_hash": character.get("snapshot_hash") or "",
+        "requested_era": requested,
+    }
+    if isinstance(state, dict) and all(
+        state.get(key) == value for key, value in expected_identity.items()
+    ):
+        era = _character_era(profile, str(state.get("era_key") or ""))
+        if era is None:
+            raise ShortVideoAttentionRequired(
+                "Thời kỳ checkpoint không thuộc Character Profile.",
+                reason="character_era_invalid",
+            )
+        _validate_character_references(item_dir, era)
+        if str(state.get("source") or "") == "auto" and float(state.get("confidence") or 0) < 0.70:
+            raise ShortVideoAttentionRequired(
+                "Không đủ tự tin để tự chọn thời kỳ hình ảnh; hãy chọn thủ công.",
+                reason="character_era_low_confidence",
+            )
+        return state
+
+    era_keys = {
+        str(era.get("key") or "") for era in character.get("eras") or []
+    }
+    if requested != "auto":
+        if requested not in era_keys:
+            raise ShortVideoAttentionRequired(
+                "Thời kỳ được chọn không thuộc Character Profile.",
+                reason="character_era_invalid",
+            )
+        resolved = {
+            "era_key": requested,
+            "confidence": 1.0,
+            "reason": "Người dùng chọn thủ công thời kỳ hình ảnh.",
+            "source": "manual",
+            "planner_source": "manual_override",
+        }
+    else:
+        if not chatgpt_runtime.try_start_operation("short_video_character_era"):
+            raise ShortVideoRetryLater(
+                "Profile ChatGPT đang bận; Short Video sẽ thử chọn thời kỳ lại.",
+                delay_seconds=20,
+            )
+        try:
+            try:
+                result = resolve_short_video_character_era(
+                    title=str(item.get("title") or ""),
+                    poem=str(item.get("source_text") or ""),
+                    eras=character.get("eras") or [],
+                    cancel_check=lambda: _check_canceled(str(job["id"])),
+                )
+            except ChatGPTAttentionRequiredError as exc:
+                raise ShortVideoAttentionRequired(
+                    str(exc),
+                    reason="character_era_attention_required",
+                ) from exc
+        finally:
+            chatgpt_runtime.finish_operation()
+        resolved = {**result, "source": "auto"}
+
+    era = _character_era(profile, str(resolved.get("era_key") or ""))
+    if era is None:
+        raise ShortVideoAttentionRequired(
+            "Không xác định được thời kỳ hình ảnh hợp lệ.",
+            reason="character_era_invalid",
+        )
+    _validate_character_references(item_dir, era)
+    state = {**expected_identity, **resolved}
+    checkpoint["character_resolution"] = state
+    updated_options = dict(options)
+    updated_options.update(
+        {
+            "resolved_character_era": state["era_key"],
+            "character_era_source": state["source"],
+            "character_era_confidence": state["confidence"],
+            "character_era_reason": state["reason"],
+        }
+    )
+    item["options"] = updated_options
+    db.update_short_video_item(str(item["id"]), options_json=updated_options)
+    _save_checkpoint(
+        checkpoint,
+        item_dir=item_dir,
+        job=job,
+        item=item,
+        stage="character_era_ready",
+        progress=f"Đã chọn thời kỳ hình ảnh: {era.get('label') or state['era_key']}",
+    )
+    if state["source"] == "auto" and float(state.get("confidence") or 0) < 0.70:
+        raise ShortVideoAttentionRequired(
+            "Không đủ tự tin để tự chọn thời kỳ hình ảnh; hãy chọn thủ công.",
+            reason="character_era_low_confidence",
+        )
+    return state
 
 
 def _tts_text(item: dict) -> str:
@@ -511,6 +677,132 @@ def build_scene_windows(
     return windows
 
 
+def character_scene_count(scene_count: int, policy: dict | None = None) -> int:
+    count = max(0, int(scene_count))
+    if count <= 0:
+        return 0
+    if count <= 4:
+        return (1, 1, 2, 3)[count - 1]
+    policy = policy or {}
+    minimum = float(policy.get("min_scene_ratio") or 0.60)
+    target = float(policy.get("target_scene_ratio") or 0.70)
+    maximum = float(policy.get("max_scene_ratio") or 0.80)
+    lower = math.ceil(count * minimum)
+    upper = math.floor(count * maximum)
+    return max(lower, min(upper, round(count * target)))
+
+
+def _character_scene_score(scene: dict, era: dict, position: int, count: int) -> float:
+    text = " ".join(
+        str(scene.get(field) or "")
+        for field in (
+            "subject",
+            "action",
+            "setting",
+            "narrative_role",
+            "transcript",
+        )
+    ).casefold()
+    score = 0.0
+    for keyword in era.get("keywords") or []:
+        if str(keyword).strip().casefold() in text:
+            score += 5.0
+    for cue in ("bác", "hồ chí minh", "người", "poet", "leader", "nhân vật"):
+        if cue in text:
+            score += 2.0
+    center = (count - 1) / 2
+    score += max(0.0, 1.0 - abs(position - center) / max(count, 1))
+    return score
+
+
+def _apply_character_profile_to_plan(plan: dict, profile: dict, checkpoint: dict) -> dict:
+    character = profile.get("resolved_character_profile")
+    resolution = checkpoint.get("character_resolution")
+    if not isinstance(character, dict) or not isinstance(resolution, dict):
+        return plan
+    era = _character_era(profile, str(resolution.get("era_key") or ""))
+    if era is None:
+        raise ShortVideoPipelineError("Storyboard không có thời kỳ Character Profile hợp lệ.")
+    scenes = plan.get("scenes") or []
+    policy = character.get("appearance_policy") or {}
+    visible_count = character_scene_count(len(scenes), policy)
+    ranked = sorted(
+        (
+            (_character_scene_score(scene, era, position, len(scenes)), int(scene["index"]))
+            for position, scene in enumerate(scenes)
+        ),
+        key=lambda value: (-value[0], value[1]),
+    )
+    visible_indices = {index for _score, index in ranked[:visible_count]}
+    allowed_shots = policy.get("allowed_shots") or [
+        "medium",
+        "half_body",
+        "full_body",
+        "three_quarter",
+        "rear_view",
+    ]
+    visible_ordinal = 0
+    for scene in scenes:
+        index = int(scene["index"])
+        base_prompt = str(scene.get("prompt") or "")
+        if index in visible_indices:
+            shot_type = str(allowed_shots[visible_ordinal % len(allowed_shots)])
+            visible_ordinal += 1
+            reference_role = (
+                "full_body"
+                if shot_type == "full_body"
+                else "half_body"
+                if shot_type in {"medium", "half_body"}
+                else "primary_portrait"
+            )
+            scene.update(
+                {
+                    "character_presence": True,
+                    "shot_type": shot_type,
+                    "reference_role": reference_role,
+                    "identity_notes": character.get("identity_prompt") or "",
+                    "era_context": era.get("label") or era.get("key") or "",
+                }
+            )
+            scene["prompt"] = (
+                f"{base_prompt} Character identity: {character.get('identity_prompt') or ''}. "
+                f"Historical appearance: {era.get('appearance_prompt') or ''}. "
+                f"Historical setting: {era.get('context_prompt') or ''}. "
+                f"Use a respectful {shot_type.replace('_', ' ')} shot and preserve the identity from references. "
+                "Natural closed or resting mouth; no speech pose, no lip-sync, no tight close-up."
+            )
+        else:
+            scene.update(
+                {
+                    "character_presence": False,
+                    "shot_type": "environment",
+                    "reference_role": "",
+                    "identity_notes": "",
+                    "era_context": era.get("label") or era.get("key") or "",
+                }
+            )
+            scene["prompt"] = (
+                f"{base_prompt} Environmental scene only: landscape, architecture, objects, or atmosphere. "
+                "Do not show Ho Chi Minh or any identifiable historical person."
+            )
+        scene["prompt"] += (
+            f" Visual style: {character.get('style_prompt') or ''}. "
+            "Neutral black-and-white archival documentary image, no colorization, no sepia cast, "
+            "no written words, typography, logo, watermark, or subtitles. Vertical 9:16 composition."
+        )
+    plan["character"] = {
+        "profile_key": character.get("key") or "",
+        "profile_version": character.get("profile_version") or 0,
+        "era_key": era.get("key") or "",
+        "era_label": era.get("label") or "",
+        "source": resolution.get("source") or "",
+        "confidence": resolution.get("confidence"),
+        "visible_scene_count": visible_count,
+        "scene_count": len(scenes),
+    }
+    return plan
+
+
 def _ensure_storyboard(
     *,
     checkpoint: dict,
@@ -529,6 +821,24 @@ def _ensure_storyboard(
         if path.is_file():
             return json.loads(path.read_text(encoding="utf-8"))
     visual = profile.get("visual_profile") or {}
+    character = profile.get("resolved_character_profile")
+    resolution = checkpoint.get("character_resolution")
+    era = (
+        _character_era(profile, str((resolution or {}).get("era_key") or ""))
+        if isinstance(character, dict) and isinstance(resolution, dict)
+        else None
+    )
+    planner_style = str(visual.get("style") or "")
+    if isinstance(character, dict) and isinstance(era, dict):
+        planner_style = " ".join(
+            value
+            for value in (
+                str(character.get("style_prompt") or ""),
+                str(era.get("appearance_prompt") or ""),
+                str(era.get("context_prompt") or ""),
+            )
+            if value
+        )
     windows = build_scene_windows(
         poem=str(item.get("source_text") or ""),
         timings=timings,
@@ -544,7 +854,7 @@ def _ensure_storyboard(
     try:
         planner_result = generate_muse_scene_plan_only(
             title=str(item.get("title") or ""),
-            style=str(visual.get("style") or ""),
+            style=planner_style,
             windows=windows,
             cancel_check=lambda: _check_canceled(str(job["id"])),
         )
@@ -554,16 +864,19 @@ def _ensure_storyboard(
         planner_result["semantic_plan"],
         windows,
         title=str(item.get("title") or ""),
-        style=str(visual.get("style") or ""),
+        style=planner_style,
         aspect_ratio="9:16",
     )
-    prohibition = (
-        " Vertical 9:16 composition. No written words, typography, logo, watermark, "
-        "subtitles, lip-sync, speaking mouth, or close-up portrait. "
-        "Prefer landscapes, objects, architecture, and restrained human figures."
-    )
-    for scene in plan.get("scenes") or []:
-        scene["prompt"] = str(scene.get("prompt") or "") + prohibition
+    if isinstance(character, dict):
+        plan = _apply_character_profile_to_plan(plan, profile, checkpoint)
+    else:
+        prohibition = (
+            " Vertical 9:16 composition. No written words, typography, logo, watermark, "
+            "subtitles, lip-sync, speaking mouth, or close-up portrait. "
+            "Prefer landscapes, objects, architecture, and restrained human figures."
+        )
+        for scene in plan.get("scenes") or []:
+            scene["prompt"] = str(scene.get("prompt") or "") + prohibition
     target = item_dir / "storyboard" / "scene_manifest.json"
     _atomic_json(target, plan)
     storyboard_state.update(
@@ -616,6 +929,61 @@ def _receipt_from_state(state: dict) -> MuseReceipt | None:
     )
 
 
+def _scene_character_references(
+    *,
+    scene: dict,
+    checkpoint: dict,
+    profile: dict,
+    item_dir: Path,
+    provider: str,
+) -> list[dict]:
+    if not bool(scene.get("character_presence")):
+        return []
+    resolution = checkpoint.get("character_resolution") or {}
+    era = _character_era(profile, str(resolution.get("era_key") or ""))
+    if era is None:
+        raise ShortVideoPipelineError("Không tìm thấy reference cho thời kỳ đã resolve.")
+    references = list(era.get("references") or [])
+    primary = next((reference for reference in references if reference.get("primary")), None)
+    desired_role = str(scene.get("reference_role") or "primary_portrait")
+    matching = [
+        reference for reference in references if reference.get("role") == desired_role
+    ]
+    if provider == "google_flow":
+        selected = (matching or ([primary] if primary else []) or references)[:1]
+    else:
+        selected = []
+        for reference in [primary, *matching, *references]:
+            if reference and reference.get("id") not in {
+                value.get("id") for value in selected
+            }:
+                selected.append(reference)
+            if len(selected) >= 3:
+                break
+    if not selected:
+        raise ShortVideoAttentionRequired(
+            "Scene có Bác Hồ nhưng không có ảnh tham chiếu phù hợp.",
+            reason="character_references_unavailable",
+        )
+    result: list[dict] = []
+    for reference in selected:
+        path = _resolve_artifact(item_dir, str(reference.get("snapshot_path") or ""))
+        if not path.is_file():
+            raise ShortVideoAttentionRequired(
+                "Ảnh snapshot Character Profile không còn tồn tại.",
+                reason="character_references_unavailable",
+            )
+        result.append(
+            {
+                "id": str(reference.get("id") or ""),
+                "sha256": str(reference.get("sha256") or ""),
+                "role": str(reference.get("role") or ""),
+                "path": path,
+            }
+        )
+    return result
+
+
 async def _generate_muse_media_async(
     *,
     checkpoint: dict,
@@ -644,9 +1012,16 @@ async def _generate_muse_media_async(
             destination = item_dir / "scenes" / f"scene_{index:03d}.png"
             destination.parent.mkdir(parents=True, exist_ok=True)
             revision = int((checkpoint.get("scene_revisions") or {}).get(str(index)) or 0)
+            references = _scene_character_references(
+                scene=scene,
+                checkpoint=checkpoint,
+                profile=profile,
+                item_dir=item_dir,
+                provider="muse",
+            )
             prompt = MusePromptBuilder.image(
                 str(scene.get("prompt") or ""),
-                has_references=False,
+                has_references=bool(references),
                 aspect_ratio="9:16",
                 resolution=resolution,
             )
@@ -659,6 +1034,15 @@ async def _generate_muse_media_async(
                     "prompt": prompt,
                     "aspect_ratio": "9:16",
                     "resolution": resolution,
+                    "character_profile_version": (
+                        (profile.get("resolved_character_profile") or {}).get("profile_version")
+                    ),
+                    "character_era": (checkpoint.get("character_resolution") or {}).get("era_key"),
+                    "references": [
+                        {"id": reference["id"], "sha256": reference["sha256"]}
+                        for reference in references
+                    ],
+                    "storyboard_version": "character-profile-v1",
                 }
             )
 
@@ -689,7 +1073,7 @@ async def _generate_muse_media_async(
             if result is None:
                 result = await adapter.create_image(
                     prompt,
-                    [],
+                    [reference["path"] for reference in references],
                     destination,
                     request_hash=request_hash,
                     aspect_ratio="9:16",
@@ -704,6 +1088,7 @@ async def _generate_muse_media_async(
                     "path": result_path.relative_to(item_dir).as_posix(),
                     "status": "ready",
                     "request_hash": request_hash,
+                    "reference_asset_ids": [reference["id"] for reference in references],
                 }
             )
             _save_checkpoint(
@@ -1061,6 +1446,17 @@ async def _generate_flow_media_async(
             destination.parent.mkdir(parents=True, exist_ok=True)
             revision = int((checkpoint.get("scene_revisions") or {}).get(str(index)) or 0)
             prompt = str(scene.get("prompt") or "")
+            references = _scene_character_references(
+                scene=scene,
+                checkpoint=checkpoint,
+                profile=profile,
+                item_dir=item_dir,
+                provider="google_flow",
+            )
+            reference_ids = [reference["id"] for reference in references]
+            reference_paths = {
+                reference["id"]: str(reference["path"]) for reference in references
+            } or None
             request_hash = _canonical_hash(
                 {
                     "kind": "short_flow_image",
@@ -1070,6 +1466,15 @@ async def _generate_flow_media_async(
                     "prompt": prompt,
                     "aspect_ratio": "9:16",
                     "model": image_model,
+                    "character_profile_version": (
+                        (profile.get("resolved_character_profile") or {}).get("profile_version")
+                    ),
+                    "character_era": (checkpoint.get("character_resolution") or {}).get("era_key"),
+                    "references": [
+                        {"id": reference["id"], "sha256": reference["sha256"]}
+                        for reference in references
+                    ],
+                    "storyboard_version": "character-profile-v1",
                 }
             )
             request_key = _flow_request_key(str(item["id"]), "image", index, revision)
@@ -1089,8 +1494,8 @@ async def _generate_flow_media_async(
                 asset_url = await worker.generate_scene(
                     prompt=prompt,
                     avoid_prompt=avoid_prompt,
-                    reference_ids=[],
-                    reference_paths=None,
+                    reference_ids=reference_ids,
+                    reference_paths=reference_paths,
                     scene_index=index,
                     scene_count=len(scenes),
                     image_settings={
@@ -1128,6 +1533,7 @@ async def _generate_flow_media_async(
                     "path": destination.relative_to(item_dir).as_posix(),
                     "status": "ready",
                     "request_hash": request_hash,
+                    "reference_asset_ids": reference_ids,
                 }
             )
             _save_checkpoint(
@@ -1333,6 +1739,7 @@ def _render_artifact(
         height=int(target_profile.get("height") or (960 if kind == "draft" else 1920)),
         fps=int(target_profile.get("fps") or 30),
         job_id=str(job["id"]),
+        monochrome=isinstance(profile.get("resolved_character_profile"), dict),
     )
     checkpoint.setdefault("artifacts", {})[kind] = {
         "path": destination.relative_to(item_dir).as_posix(),
@@ -1352,6 +1759,7 @@ def _render_artifact(
 
 def _invalidate_for_audio_regeneration(checkpoint: dict) -> None:
     revision = int(checkpoint.get("audio_revision") or 0) + 1
+    character_resolution = deepcopy(checkpoint.get("character_resolution") or {})
     checkpoint.clear()
     checkpoint.update(
         {
@@ -1364,8 +1772,31 @@ def _invalidate_for_audio_regeneration(checkpoint: dict) -> None:
             "storyboard": {},
             "scenes": [],
             "artifacts": {},
+            "character_resolution": character_resolution,
         }
     )
+
+
+def _invalidate_for_visual_regeneration(checkpoint: dict) -> None:
+    revisions = dict(checkpoint.get("scene_revisions") or {})
+    for state in checkpoint.get("scenes") or []:
+        key = str(int(state.get("index") or 0))
+        revisions[key] = int(revisions.get(key) or 0) + 1
+    preserved = {
+        "version": CHECKPOINT_VERSION,
+        "stage": "regenerate_visuals",
+        "audio_revision": int(checkpoint.get("audio_revision") or 0),
+        "scene_revisions": revisions,
+        "audio": deepcopy(checkpoint.get("audio") or {}),
+        "timing": deepcopy(checkpoint.get("timing") or {}),
+        "storyboard": {},
+        "scenes": [],
+        "artifacts": {},
+    }
+    if isinstance(checkpoint.get("google_flow"), dict):
+        preserved["google_flow"] = deepcopy(checkpoint["google_flow"])
+    checkpoint.clear()
+    checkpoint.update(preserved)
 
 
 def _invalidate_scene(checkpoint: dict, scene_index: int) -> None:
@@ -1400,6 +1831,9 @@ def execute(job: dict) -> None:
         checkpoint["item_id"] = item["id"]
     elif action == "regenerate_scene":
         _invalidate_scene(checkpoint, int(payload.get("scene_index")))
+    elif action == "regenerate_visuals":
+        _invalidate_for_visual_regeneration(checkpoint)
+        checkpoint["item_id"] = item["id"]
 
     db.update_short_video_item(
         item_id,
@@ -1442,6 +1876,13 @@ def execute(job: dict) -> None:
         )
         return
 
+    _ensure_character_era(
+        checkpoint=checkpoint,
+        item_dir=item_dir,
+        job=job,
+        item=item,
+        profile=profile,
+    )
     max_duration = float(pipeline.get("max_duration_seconds") or 180)
     estimate = _estimated_duration_seconds(
         str(item.get("title") or ""),
@@ -1620,6 +2061,13 @@ def public_scene_manifest(item: dict) -> list[dict]:
                 "source_lines": scene.get("source_lines") or [],
                 "media_type": "video" if video_ready else "image",
                 "fallback_to_image": bool(state.get("fallback_to_image")),
+                "character_presence": bool(scene.get("character_presence")),
+                "shot_type": scene.get("shot_type") or "",
+                "reference_role": scene.get("reference_role") or "",
+                "reference_asset_ids": list(
+                    (state.get("image") or {}).get("reference_asset_ids") or []
+                ),
+                "era_context": scene.get("era_context") or "",
                 "image_url": (
                     f"/api/short-video/items/{item['id']}/artifacts/scene-{index}-image"
                     if image_ready

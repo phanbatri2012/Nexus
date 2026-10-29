@@ -1,0 +1,306 @@
+{
+  "key": "bac-ho",
+  "display_name": "Bác Hồ",
+  "description": "Profile nhận dạng hình ảnh Bác Hồ cho video thơ, chia theo sáu thời kỳ hoạt động cách mạng. Chỉ chuyển sang active sau khi đủ 12–18 ảnh có nguồn và quyền sử dụng rõ ràng.",
+  "status": "draft",
+  "profile_version": 1,
+  "identity_prompt": "Ho Chi Minh, a slender Vietnamese man with a high forehead and gentle attentive eyes, facial hair and grooming strictly appropriate to the selected historical era, clean-shaven in early Nguyen Ai Quoc references and sparse moustache or beard only in later-life references, calm dignified expression, modest posture, natural anatomy, historically respectful documentary realism",
+  "style_prompt": "Authentic Vietnamese archival documentary photography in neutral black and white, natural available light, restrained panchromatic film contrast, subtle film grain, realistic skin and fabric texture, historically grounded composition, no colorization, no glossy synthetic look",
+  "appearance_policy": {
+    "min_scene_ratio": 0.6,
+    "target_scene_ratio": 0.7,
+    "max_scene_ratio": 0.8,
+    "allowed_shots": [
+      "medium",
+      "half_body",
+      "full_body",
+      "three_quarter",
+      "rear_view"
+    ],
+    "forbid": [
+      "close_up_portrait",
+      "speaking_mouth",
+      "lip_sync",
+      "staged_speech",
+      "colorization",
+      "text",
+      "logo",
+      "watermark"
+    ]
+  },
+  "eras": [
+    {
+      "key": "nguyen_ai_quoc_1919_1923",
+      "label": "Nguyễn Ái Quốc tại Pháp 1919–1923",
+      "year_from": 1919,
+      "year_to": 1923,
+      "keywords": [
+        "nguyễn ái quốc",
+        "paris",
+        "pháp",
+        "yêu sách của nhân dân an nam",
+        "người cùng khổ",
+        "le paria",
+        "bản án chế độ thực dân pháp"
+      ],
+      "appearance_prompt": "Young Nguyen Ai Quoc in France between 1919 and 1923, slender clean-shaven Vietnamese man in his late twenties to early thirties, neatly combed dark hair, modest period-appropriate Western suit or worker clothing, alert and composed expression, no later-life white beard",
+      "context_prompt": "Historically plausible Paris streets, modest rented room, newspaper editorial desk, political meeting or print workshop between 1919 and 1923, accurate European clothing and objects, no later-period Vietnamese revolutionary setting",
+      "references": [
+        {
+          "id": "nguyen_ai_quoc_1919_1923_primary_portrait_7da5f7867e",
+          "file": "nguyen_ai_quoc_1919_1923/nguyen_ai_quoc_1919_1923_primary_portrait_7da5f7867e.png",
+          "role": "primary_portrait",
+          "pose": "ảnh chân dung",
+          "primary": true,
+          "source_label": "web",
+          "source_year": "1919–19203",
+          "rights_note": "công cộng"
+        },
+        {
+          "id": "nguyen_ai_quoc_1919_1923_half_body_a99fcbe1f5",
+          "file": "nguyen_ai_quoc_1919_1923/nguyen_ai_quoc_1919_1923_half_body_a99fcbe1f5.jpg",
+          "role": "half_body",
+          "pose": "ảnh chân dung",
+          "primary": false,
+          "source_label": "web",
+          "source_year": "1919–1923",
+          "rights_note": "công cộng"
+        },
+        {
+          "id": "nguyen_ai_quoc_1919_1923_profile_context_cc81b2f25b",
+          "file": "nguyen_ai_quoc_1919_1923/nguyen_ai_quoc_1919_1923_profile_context_cc81b2f25b.jpg",
+          "role": "profile_context",
+          "pose": "ảnh chân dung",
+          "primary": false,
+          "source_label": "web",
+          "source_year": "1919–1923",
+          "rights_note": "công cộng"
+        }
+      ]
+    },
+    {
+      "key": "international_1924_1940",
+      "label": "Hoạt động quốc tế 1924–1940",
+      "year_from": 1924,
+      "year_to": 1940,
+      "keywords": [
+        "quảng châu",
+        "liên xô",
+        "mát-xcơ-va",
+        "xiêm",
+        "thái lan",
+        "hồng kông",
+        "đường kách mệnh",
+        "hoạt động quốc tế"
+      ],
+      "appearance_prompt": "Nguyen Ai Quoc during international revolutionary activity from 1924 to 1940, lean adult Vietnamese man with age, hairstyle, facial hair and clothing matched to the selected reference photograph, restrained practical attire, discreet and purposeful demeanor, never borrowing features from his later presidential years",
+      "context_prompt": "Historically grounded revolutionary activity in Guangzhou, Moscow, Siam, Hong Kong or another location explicitly supported by the poem context, period-accurate streets, rooms, documents and clothing, choose one coherent location and never blend countries in one scene",
+      "references": [
+        {
+          "id": "international_1924_1940_primary_portrait_3fb8056916",
+          "file": "international_1924_1940/international_1924_1940_primary_portrait_3fb8056916.jpg",
+          "role": "primary_portrait",
+          "pose": "ảnh chân dung",
+          "primary": true,
+          "source_label": "web",
+          "source_year": "1924–1940",
+          "rights_note": "công cộng"
+        },
+        {
+          "id": "international_1924_1940_half_body_154cce9697",
+          "file": "international_1924_1940/international_1924_1940_half_body_154cce9697.jpg",
+          "role": "half_body",
+          "pose": "ảnh chân dung",
+          "primary": false,
+          "source_label": "web",
+          "source_year": "1924–1940",
+          "rights_note": "công cộng"
+        }
+      ]
+    },
+    {
+      "key": "pac_bo_1941_1942",
+      "label": "Pác Bó – Cao Bằng 1941–1942",
+      "year_from": 1941,
+      "year_to": 1942,
+      "keywords": [
+        "pác bó",
+        "cao bằng",
+        "hang",
+        "suối lê-nin",
+        "núi các-mác",
+        "tức cảnh pác bó"
+      ],
+      "appearance_prompt": "Ho Chi Minh in the early Pác Bó period, lean middle-aged appearance, simple revolutionary field clothing, calm and observant demeanor, historically appropriate grooming and age",
+      "context_prompt": "Remote limestone mountains and forest streams of Cao Bằng, sparse revolutionary shelter, humble daily work, historically plausible 1941–1942 material culture",
+      "references": [
+        {
+          "id": "pac_bo_1941_1942_profile_context_832d3839d5",
+          "file": "pac_bo_1941_1942/pac_bo_1941_1942_profile_context_832d3839d5.jpg",
+          "role": "profile_context",
+          "pose": "ảnh chân dung",
+          "primary": false,
+          "source_label": "web",
+          "source_year": "1941–1942",
+          "rights_note": "công cộng"
+        },
+        {
+          "id": "pac_bo_1941_1942_profile_context_90e34fe887",
+          "file": "pac_bo_1941_1942/pac_bo_1941_1942_profile_context_90e34fe887.jpg",
+          "role": "profile_context",
+          "pose": "ảnh chân dung",
+          "primary": false,
+          "source_label": "web",
+          "source_year": "1941–1942",
+          "rights_note": "công cộng"
+        },
+        {
+          "id": "pac_bo_1941_1942_half_body_fdbd9fde31",
+          "file": "pac_bo_1941_1942/pac_bo_1941_1942_half_body_fdbd9fde31.jpg",
+          "role": "half_body",
+          "pose": "ảnh chân dung",
+          "primary": false,
+          "source_label": "web",
+          "source_year": "1941–1942",
+          "rights_note": "công cộng"
+        }
+      ]
+    },
+    {
+      "key": "prison_1942_1943",
+      "label": "Nhật ký trong tù 1942–1943",
+      "year_from": 1942,
+      "year_to": 1943,
+      "keywords": [
+        "nhật ký trong tù",
+        "ngục",
+        "tù",
+        "quảng tây",
+        "giải đi sớm",
+        "ngắm trăng",
+        "vọng nguyệt"
+      ],
+      "appearance_prompt": "Ho Chi Minh during the 1942–1943 imprisonment period, visibly lean and fatigued yet composed, plain worn clothing, restrained expression, historically respectful and never sensationalized",
+      "context_prompt": "Sparse detention interiors, barred moonlight, rough walls, escorted travel and rural Guangxi landscape, no modern objects and no theatrical prison imagery",
+      "references": [
+        {
+          "id": "prison_1942_1943_primary_portrait_e4e29c91d2",
+          "file": "prison_1942_1943/prison_1942_1943_primary_portrait_e4e29c91d2.jpg",
+          "role": "primary_portrait",
+          "pose": "ảnh chân dung",
+          "primary": true,
+          "source_label": "web",
+          "source_year": "1942–1943",
+          "rights_note": "công cộng"
+        },
+        {
+          "id": "prison_1942_1943_half_body_818720b583",
+          "file": "prison_1942_1943/prison_1942_1943_half_body_818720b583.jpg",
+          "role": "half_body",
+          "pose": "ảnh chân dung",
+          "primary": false,
+          "source_label": "web",
+          "source_year": "1942–1943",
+          "rights_note": "công cộng"
+        }
+      ]
+    },
+    {
+      "key": "viet_bac_1944_1954",
+      "label": "Việt Bắc và kháng chiến 1944–1954",
+      "year_from": 1944,
+      "year_to": 1954,
+      "keywords": [
+        "việt bắc",
+        "kháng chiến",
+        "cảnh khuya",
+        "rằm tháng giêng",
+        "nguyên tiêu",
+        "chiến khu",
+        "thu đông"
+      ],
+      "appearance_prompt": "Ho Chi Minh in the Viet Bac resistance period, slender older revolutionary leader, simple khaki or plain field clothing, sandals when visible, focused but warm demeanor",
+      "context_prompt": "Northern Vietnamese resistance base, forest paths, timber shelters, maps and modest working spaces, historically plausible 1944–1954 objects and clothing",
+      "references": [
+        {
+          "id": "viet_bac_1944_1954_primary_portrait_c843baf3c7",
+          "file": "viet_bac_1944_1954/viet_bac_1944_1954_primary_portrait_c843baf3c7.jpg",
+          "role": "primary_portrait",
+          "pose": "ảnh chân dung",
+          "primary": true,
+          "source_label": "web",
+          "source_year": "1944–1954",
+          "rights_note": "công cộng"
+        },
+        {
+          "id": "viet_bac_1944_1954_profile_context_f15c94cb33",
+          "file": "viet_bac_1944_1954/viet_bac_1944_1954_profile_context_f15c94cb33.jpg",
+          "role": "profile_context",
+          "pose": "ảnh chân dung",
+          "primary": false,
+          "source_label": "web",
+          "source_year": "1944–1954",
+          "rights_note": "công cộng"
+        },
+        {
+          "id": "viet_bac_1944_1954_half_body_6da80ee7fc",
+          "file": "viet_bac_1944_1954/viet_bac_1944_1954_half_body_6da80ee7fc.png",
+          "role": "half_body",
+          "pose": "ảnh chân dung",
+          "primary": false,
+          "source_label": "web",
+          "source_year": "1944–1954",
+          "rights_note": "công cộng"
+        }
+      ]
+    },
+    {
+      "key": "president_1954_1969",
+      "label": "Chủ tịch nước 1954–1969",
+      "year_from": 1954,
+      "year_to": 1969,
+      "keywords": [
+        "phủ chủ tịch",
+        "nhà sàn",
+        "hà nội",
+        "chủ tịch",
+        "miền nam",
+        "tết trồng cây"
+      ],
+      "appearance_prompt": "President Ho Chi Minh in later life, recognizable high forehead and sparse white beard, simple light khaki or plain cotton clothing, sandals when visible, gentle dignified posture and natural expression",
+      "context_prompt": "Historically plausible Hanoi presidential residence, stilt house, garden, modest office or public visit between 1954 and 1969, no anachronistic objects",
+      "references": [
+        {
+          "id": "president_1954_1969_profile_context_7405213d27",
+          "file": "president_1954_1969/president_1954_1969_profile_context_7405213d27.jpg",
+          "role": "profile_context",
+          "pose": "ảnh chân dung",
+          "primary": false,
+          "source_label": "web",
+          "source_year": "1954–1969",
+          "rights_note": "công cộng"
+        },
+        {
+          "id": "president_1954_1969_primary_portrait_be3a469006",
+          "file": "president_1954_1969/president_1954_1969_primary_portrait_be3a469006.jpg",
+          "role": "primary_portrait",
+          "pose": "ảnh chân dung",
+          "primary": true,
+          "source_label": "web",
+          "source_year": "1954–1969",
+          "rights_note": "công cộng"
+        },
+        {
+          "id": "president_1954_1969_half_body_7de5299f90",
+          "file": "president_1954_1969/president_1954_1969_half_body_7de5299f90.jpg",
+          "role": "half_body",
+          "pose": "ảnh chân dung",
+          "primary": false,
+          "source_label": "web",
+          "source_year": "1954–1969",
+          "rights_note": "công cộng"
+        }
+      ]
+    }
+  ]
+}

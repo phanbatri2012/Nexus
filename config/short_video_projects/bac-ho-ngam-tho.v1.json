@@ -22,6 +22,7 @@
     "provider": "omnivoice",
     "voice_id": "66cb0b63-125b-4615-8600-e918c56a9c7d",
     "voice_name": "bac_ho_doc_tho_1",
+    "selectable": true,
     "title_pause_ms": 900,
     "single_task": true
   },
@@ -59,5 +60,10 @@
   "review_policy": {
     "draft_approval_required": true,
     "review_points": 1
+  },
+  "character_profile": {
+    "key": "bac-ho",
+    "profile_version": 1,
+    "required": false
   }
 }

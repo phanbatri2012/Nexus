@@ -394,7 +394,170 @@ def _replace_policy_phrase(value: str, source: str, replacement: str) -> str:
     )
 
 
-def _safe_scene_context(scene: dict) -> str:
+_TITLES_MILITARY = (
+    "đại tướng",
+    "thượng tướng",
+    "trung tướng",
+    "thiếu tướng",
+    "đại tá",
+    "trung tá",
+    "thiếu tá",
+    "tướng",
+    "general",
+    "commander",
+    "admiral",
+    "marshal",
+)
+_TITLES_POLITICAL = (
+    "chủ tịch",
+    "thủ tướng",
+    "tổng bí thư",
+    "phó thủ tướng",
+    "phó chủ tịch",
+    "bộ trưởng",
+    "thứ trưởng",
+    "đồng chí",
+    "bác",
+    "cố vấn",
+    "president",
+    "prime minister",
+)
+_ALL_TITLES = _TITLES_MILITARY + _TITLES_POLITICAL
+_TITLES_REGEX = "|".join(re.escape(t) for t in _ALL_TITLES)
+_VN_UPPER = "A-ZÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬÈÉẺẼẸÊỀẾỂỄỆÌÍỈĨỊÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢÙÚỦŨỤƯỪỨỬỮỰỲÝỶỸỴĐ"
+_VN_LOWER = "a-zàáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ"
+_CAP_WORD = rf"(?!(?i:{_TITLES_REGEX})\b)[{_VN_UPPER}][{_VN_LOWER}]+"
+_TITLED_PERSONA_PATTERN = re.compile(
+    rf"(?i:\b({_TITLES_REGEX}))\s+({_CAP_WORD}(?:\s+{_CAP_WORD}){{0,3}})"
+)
+
+
+def neutralize_persona_names(
+    text: str,
+    *,
+    selected_references: list[dict] | None = None,
+    all_references: list[dict] | None = None,
+    is_anchor: bool = False,
+    scene: dict | None = None,
+) -> str:
+    """Neutralize real-world military/political figure names in Muse prompts.
+
+    Prevents moderation refusals on real public/military figures while preserving
+    visual anchor context and enabling Muse to generate faces via attached reference images.
+    """
+    if not text:
+        return text
+
+    selected = selected_references or []
+    all_refs = all_references or []
+
+    selected_norm = {
+        prompt_assets.strip_accents(str(item.get("set_name") or ""))
+        for item in selected
+        if str(item.get("set_name") or "").strip()
+    }
+    for item in selected:
+        for alias in item.get("aliases") or []:
+            if str(alias).strip():
+                selected_norm.add(prompt_assets.strip_accents(str(alias)))
+
+    # Discover personas from titles in text AND scene context if provided
+    discovered: dict[str, bool] = {}
+    scan_sources = [text]
+    if isinstance(scene, dict):
+        scan_sources.extend([
+            str(scene.get("subject") or ""),
+            str(scene.get("prompt") or ""),
+            str(scene.get("visual_anchor") or ""),
+            str(scene.get("transcript") or ""),
+        ])
+        for m in scene.get("must_show") or []:
+            scan_sources.append(str(m))
+
+    for source in scan_sources:
+        for match in _TITLED_PERSONA_PATTERN.finditer(source):
+            title = match.group(1).lower()
+            name = match.group(2).strip()
+            is_mil = any(t in title for t in _TITLES_MILITARY)
+            discovered[prompt_assets.strip_accents(name)] = is_mil
+
+    def _replace_titled(m: re.Match) -> str:
+        title = m.group(1).lower()
+        name = m.group(2).strip()
+        norm = prompt_assets.strip_accents(name)
+        is_attached = (norm in selected_norm) or any(
+            (norm in s or s in norm) for s in selected_norm if s
+        )
+        is_mil = any(t in title for t in _TITLES_MILITARY)
+        if is_attached:
+            if is_anchor:
+                return (
+                    "Senior military commander matching reference image"
+                    if is_mil
+                    else "Senior historical leader matching reference image"
+                )
+            return (
+                "the referenced senior military commander"
+                if is_mil
+                else "the referenced senior historical leader"
+            )
+        else:
+            if is_anchor:
+                return (
+                    "Accompanying military officer"
+                    if is_mil
+                    else "Accompanying historical official"
+                )
+            return (
+                "the accompanying military officer"
+                if is_mil
+                else "the accompanying historical official"
+            )
+
+    neutralized = _TITLED_PERSONA_PATTERN.sub(_replace_titled, text)
+
+    # Collect all standalone names to replace
+    standalone_names = set()
+    for ref in all_refs:
+        s_name = str(ref.get("set_name") or "").strip()
+        if len(s_name) >= 3:
+            standalone_names.add(s_name)
+        for a in ref.get("aliases") or []:
+            a_str = str(a).strip()
+            if len(a_str) >= 3:
+                standalone_names.add(a_str)
+
+    for source in scan_sources:
+        for m in _TITLED_PERSONA_PATTERN.finditer(source):
+            name_str = m.group(2).strip()
+            if len(name_str) >= 3:
+                standalone_names.add(name_str)
+
+    sorted_names = sorted(standalone_names, key=len, reverse=True)
+
+    for name in sorted_names:
+        norm = prompt_assets.strip_accents(name)
+        is_attached = (norm in selected_norm) or any(
+            (norm in s or s in norm) for s in selected_norm if s
+        )
+        is_mil = discovered.get(norm, True)
+        if is_attached:
+            repl = "the referenced commander" if is_mil else "the referenced leader"
+        else:
+            repl = "the accompanying commander" if is_mil else "the accompanying figure"
+
+        pattern = rf"(?i)\b{re.escape(name)}\b"
+        neutralized = re.sub(pattern, repl, neutralized)
+
+    return neutralized
+
+
+def _safe_scene_context(
+    scene: dict,
+    *,
+    selected_references: list[dict] | None = None,
+    all_references: list[dict] | None = None,
+) -> str:
     context = str(
         scene.get("safe_visual_anchor")
         or scene.get("visual_anchor")
@@ -403,6 +566,12 @@ def _safe_scene_context(scene: dict) -> str:
     ).strip()
     for source, replacement in _RISK_REPLACEMENTS:
         context = _replace_policy_phrase(context, source, replacement)
+    context = neutralize_persona_names(
+        context,
+        selected_references=selected_references,
+        all_references=all_references,
+        scene=scene,
+    )
     context = re.sub(r"\s+", " ", context).strip(" .,:;-–—")
     if len(context) > 320:
         shortened = context[:320]
@@ -423,14 +592,33 @@ def _safe_scene_context(scene: dict) -> str:
     return context
 
 
-def _required_semantic_anchors(scene: dict) -> tuple[str, str, str, list[str]]:
+def _required_semantic_anchors(
+    scene: dict,
+    *,
+    selected_references: list[dict] | None = None,
+    all_references: list[dict] | None = None,
+) -> tuple[str, str, str, list[str]]:
     setting = str(scene.get("setting") or "").strip()
     era = str(scene.get("era") or "").strip()
-    safe_context = _safe_scene_context(scene)
-    must_show = [
+    safe_context = _safe_scene_context(
+        scene,
+        selected_references=selected_references,
+        all_references=all_references,
+    )
+    raw_must_show = [
         re.sub(r"\s+", " ", str(item or "")).strip()
         for item in (scene.get("must_show") or [])
         if str(item or "").strip()
+    ]
+    must_show = [
+        neutralize_persona_names(
+            item,
+            selected_references=selected_references,
+            all_references=all_references,
+            is_anchor=True,
+            scene=scene,
+        )
+        for item in raw_must_show
     ]
     generic = {"cinematic scene", "contemporary", "historical documentary setting"}
     if not setting or setting.casefold() in generic or not era or era.casefold() in generic:
@@ -449,6 +637,7 @@ def _prepare_balanced_submission(
     expected: str,
     prompt: str,
     references: list[dict],
+    all_references: list[dict] | None = None,
 ) -> tuple[str, list[dict], dict]:
     risk = classify_scene_risk(scene)
     metadata = {
@@ -456,19 +645,34 @@ def _prepare_balanced_submission(
         **risk,
         "prompt_strategy": "original",
     }
+    shielded_prompt = neutralize_persona_names(
+        prompt,
+        selected_references=references,
+        all_references=all_references,
+        scene=scene,
+    )
+    if shielded_prompt != prompt:
+        metadata["prompt_strategy"] = "persona_shielded"
+
     if risk["risk_level"] != "high":
-        return prompt, references, metadata
+        return shielded_prompt, references, metadata
 
     metadata["prompt_strategy"] = "risk_rewritten"
     if expected == "video":
-        safe_prompt, safe_references = _build_refusal_fallback(scene, expected, references)
+        safe_prompt, safe_references = _build_refusal_fallback(
+            scene, expected, references, all_references=all_references
+        )
         return safe_prompt, safe_references, metadata
 
     composition = str(scene.get("composition") or "wide 16:9 cinematic framing").strip()
     lighting = str(scene.get("lighting") or "natural atmospheric light").strip()
     color = str(scene.get("color") or "natural tones").strip()
     style = str(scene.get("style") or "cinematic photorealism").strip()
-    setting, era, safe_context, must_show = _required_semantic_anchors(scene)
+    setting, era, safe_context, must_show = _required_semantic_anchors(
+        scene,
+        selected_references=references,
+        all_references=all_references,
+    )
     safe_prompt = MusePromptBuilder.image(
         (
             f"Create a non-graphic visual scene in {setting}, during {era}, matching the source "
@@ -489,6 +693,7 @@ def _build_refusal_fallback(
     scene: dict,
     expected: str,
     references: list[dict],
+    all_references: list[dict] | None = None,
 ) -> tuple[str, list[dict]]:
     """Build one deterministic, non-graphic fallback after a terminal refusal."""
 
@@ -512,7 +717,11 @@ def _build_refusal_fallback(
     lighting = str(scene.get("lighting") or "natural atmospheric light").strip()
     color = str(scene.get("color") or "natural tones").strip()
     style = str(scene.get("style") or "cinematic photorealism").strip()
-    setting, era, safe_context, must_show = _required_semantic_anchors(scene)
+    setting, era, safe_context, must_show = _required_semantic_anchors(
+        scene,
+        selected_references=references,
+        all_references=all_references,
+    )
     prompt = MusePromptBuilder.image(
         (
             f"Create a neutral, non-graphic visual scene in {setting}, during {era}, matching "
@@ -1417,6 +1626,7 @@ async def _generate_request(
     cancel_check: Callable[[], None],
     policy_metadata: dict | None = None,
     recovery_epoch: int = 0,
+    all_references: list[dict] | None = None,
 ) -> dict:
     if expected == "video" and len(references) != 2:
         raise MuseReferenceError(
@@ -1687,6 +1897,7 @@ async def _generate_request(
                 scene,
                 expected,
                 references,
+                all_references=all_references,
             )
             base_submission_hash = _json_hash(
                 {
@@ -1862,6 +2073,7 @@ async def _generate_request(
                         scene,
                         expected,
                         references,
+                        all_references=all_references,
                     )
                     submission_hash = _json_hash(
                         {
@@ -2198,6 +2410,7 @@ async def _prepare_media_async(
                 "image",
                 original_prompt,
                 selected,
+                all_references=references,
             )
             submitted_hashes = {item["sha256"] for item in submission_references}
             policy_omitted = [
@@ -2254,6 +2467,7 @@ async def _prepare_media_async(
                 cancel_check=cancel_check,
                 policy_metadata=policy_metadata,
                 recovery_epoch=recovery_epoch,
+                all_references=references,
             )
             if is_terminal:
                 terminal_frame_artifact = image_artifact
@@ -2312,6 +2526,7 @@ async def _prepare_media_async(
                 "video",
                 original_prompt,
                 video_references,
+                all_references=references,
             )
             if len(submission_references) != 2:
                 raise MuseReferenceError(
@@ -2378,7 +2593,10 @@ async def _prepare_media_async(
         "quota_preflight": quota_preflight,
         "planned_media_count": len(outcomes),
         "original_count": sum(
-            meta.get("prompt_strategy") == "original" for meta in outcome_metadata
+            meta.get("prompt_strategy") in {"original", "persona_shielded"} for meta in outcome_metadata
+        ),
+        "persona_shielded_count": sum(
+            meta.get("prompt_strategy") == "persona_shielded" for meta in outcome_metadata
         ),
         "risk_rewritten_count": sum(
             meta.get("prompt_strategy") == "risk_rewritten" for meta in outcome_metadata

@@ -21,6 +21,10 @@ from pydantic import (
 
 from nexus_engine.paths import SHORT_VIDEO_PROJECTS_CONFIG_DIR
 from nexus_engine.services import voice_config
+from nexus_engine.services.short_video_character_profiles import (
+    ShortVideoCharacterProfileRegistry,
+    character_profile_registry,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -77,6 +81,7 @@ class VoiceProfile(BaseModel):
     provider: Literal["omnivoice"]
     voice_id: str = Field(min_length=1, max_length=200)
     voice_name: str = Field(min_length=1, max_length=200)
+    selectable: bool = False
     title_pause_ms: int = Field(ge=0, le=5000)
     single_task: Literal[True]
 
@@ -139,6 +144,14 @@ class ReviewPolicy(BaseModel):
     review_points: Literal[1]
 
 
+class CharacterProfileDependency(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = Field(min_length=1, max_length=80)
+    profile_version: int = Field(ge=1, le=10000)
+    required: bool = True
+
+
 class ShortVideoProjectManifest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -154,6 +167,7 @@ class ShortVideoProjectManifest(BaseModel):
     visual_profile: VisualProfile
     render_profile: RenderProfile
     review_policy: ReviewPolicy
+    character_profile: CharacterProfileDependency | None = None
 
     @field_validator("key")
     @classmethod
@@ -191,7 +205,10 @@ def _find_secret_field(value: Any, path: tuple[str, ...] = ()) -> str:
     return ""
 
 
-def _dependency_status(manifest: ShortVideoProjectManifest) -> tuple[bool, list[dict]]:
+def _dependency_status(
+    manifest: ShortVideoProjectManifest,
+    character_profiles: ShortVideoCharacterProfileRegistry,
+) -> tuple[bool, list[dict], dict | None]:
     dependencies: list[dict] = []
     pipeline_ok = manifest.pipeline_profile.id in SUPPORTED_PIPELINES
     dependencies.append(
@@ -210,14 +227,32 @@ def _dependency_status(manifest: ShortVideoProjectManifest) -> tuple[bool, list[
         )
         provider_id = str(voice.get("provider_id") or "").casefold()
         actual_name = str(voice.get("name") or "")
-        voice_ok = (
-            provider_id == manifest.voice_profile.provider
-            and actual_name == manifest.voice_profile.voice_name
+        voice_ok = provider_id == manifest.voice_profile.provider and (
+            manifest.voice_profile.selectable
+            or actual_name == manifest.voice_profile.voice_name
         )
         if not voice_ok:
             voice_detail = "Giọng không đúng provider hoặc tên đã khai báo."
     except ValueError as exc:
-        voice_detail = str(exc)
+        if manifest.voice_profile.selectable:
+            try:
+                selectable_voices = [
+                    voice
+                    for voice in voice_config.load_voice_config().get("voices") or []
+                    if voice.get("status") == "active"
+                    and str(voice.get("provider_id") or "").casefold()
+                    == manifest.voice_profile.provider
+                ]
+                voice_ok = bool(selectable_voices)
+                voice_detail = (
+                    f"{len(selectable_voices)} giọng OmniVoice đang hoạt động."
+                    if voice_ok
+                    else "Không có giọng OmniVoice đang hoạt động."
+                )
+            except Exception:
+                voice_detail = "Không thể kiểm tra danh sách giọng OmniVoice."
+        else:
+            voice_detail = str(exc)
     except Exception as exc:
         logger.warning(
             "Short Video voice dependency check failed for project %s: %s",
@@ -245,24 +280,56 @@ def _dependency_status(manifest: ShortVideoProjectManifest) -> tuple[bool, list[
                 ),
             }
         )
-    return all(bool(item["available"]) for item in dependencies), dependencies
+    character_summary = None
+    character_dependency = manifest.character_profile
+    if character_dependency is not None:
+        character_summary = character_profiles.get(
+            character_dependency.key,
+            character_dependency.profile_version,
+        )
+        profile_ready = bool(character_summary and character_summary.get("available"))
+        dependency_ready = profile_ready or not character_dependency.required
+        dependencies.append(
+            {
+                "id": "character_profile",
+                "available": dependency_ready,
+                "detail": (
+                    f"{character_dependency.key} v{character_dependency.profile_version}"
+                    if profile_ready
+                    else "Character Profile chưa active hoặc chưa đủ ảnh hợp lệ."
+                ),
+            }
+        )
+    return (
+        all(bool(item["available"]) for item in dependencies),
+        dependencies,
+        character_summary,
+    )
 
 
 class ShortVideoProjectRegistry:
-    def __init__(self, directory: Path = SHORT_VIDEO_PROJECTS_CONFIG_DIR) -> None:
+    def __init__(
+        self,
+        directory: Path = SHORT_VIDEO_PROJECTS_CONFIG_DIR,
+        character_profiles: ShortVideoCharacterProfileRegistry = character_profile_registry,
+    ) -> None:
         self.directory = Path(directory)
+        self.character_profiles = character_profiles
         self._lock = threading.RLock()
         self._signature: tuple[tuple[str, int, int], ...] = ()
         self._entries: list[dict] = []
 
     def _current_signature(self) -> tuple[tuple[str, int, int], ...]:
-        if not self.directory.is_dir():
-            return ()
-        return tuple(
+        project_signature = tuple(
             (path.name, path.stat().st_mtime_ns, path.stat().st_size)
             for path in sorted(self.directory.glob("*.json"))
             if path.is_file()
+        ) if self.directory.is_dir() else ()
+        character_signature = tuple(
+            (f"character:{name}", mtime, size)
+            for name, mtime, size in self.character_profiles.revision_signature()
         )
+        return (*project_signature, *character_signature)
 
     def _load(self) -> None:
         signature = self._current_signature()
@@ -271,6 +338,8 @@ class ShortVideoProjectRegistry:
         entries: list[dict] = []
         by_key: dict[str, list[dict]] = {}
         for path_name, _mtime, _size in signature:
+            if path_name.startswith("character:"):
+                continue
             path = self.directory / path_name
             fallback_key = path.stem.split(".v", 1)[0]
             try:
@@ -283,7 +352,10 @@ class ShortVideoProjectRegistry:
                         f"Manifest không được chứa trường bí mật: {secret_path}"
                     )
                 manifest = ShortVideoProjectManifest.model_validate(raw)
-                available, dependencies = _dependency_status(manifest)
+                available, dependencies, character_summary = _dependency_status(
+                    manifest,
+                    self.character_profiles,
+                )
                 errors = [] if available else [
                     "Một hoặc nhiều dependency chưa sẵn sàng."
                 ]
@@ -291,6 +363,7 @@ class ShortVideoProjectRegistry:
                     **manifest.model_dump(mode="json"),
                     "available": available,
                     "dependencies": dependencies,
+                    "character_profile_summary": character_summary,
                     "errors": errors,
                     "source": path.name,
                 }
@@ -304,6 +377,7 @@ class ShortVideoProjectRegistry:
                     "profile_version": "",
                     "available": False,
                     "dependencies": [],
+                    "character_profile_summary": None,
                     "errors": [str(exc)],
                     "source": path.name,
                 }
@@ -342,7 +416,13 @@ class ShortVideoProjectRegistry:
                 return None
             return deepcopy(matches[0])
 
-    def snapshot_for_create(self, key: str, *, visual_provider: str = "") -> dict:
+    def snapshot_for_create(
+        self,
+        key: str,
+        *,
+        visual_provider: str = "",
+        voice_id: str = "",
+    ) -> dict:
         entry = self.get(key)
         if entry is None:
             raise KeyError("Dự án không khả dụng.")
@@ -350,16 +430,31 @@ class ShortVideoProjectRegistry:
             raise ValueError("Dự án hiện không nhận video mới.")
         if not entry.get("available"):
             raise ValueError("Dependency của dự án chưa sẵn sàng.")
-        voice = voice_config.get_voice(
-            str((entry.get("voice_profile") or {}).get("voice_id") or ""),
-            include_inactive=False,
-        )
-        if str(voice.get("provider_id") or "").casefold() != "omnivoice":
+        configured_voice = entry.get("voice_profile") or {}
+        selected_voice_id = str(
+            voice_id or configured_voice.get("voice_id") or ""
+        ).strip()
+        if voice_id and not configured_voice.get("selectable"):
+            if selected_voice_id != str(configured_voice.get("voice_id") or ""):
+                raise ValueError("Project này không cho phép thay đổi giọng đọc.")
+        voice = voice_config.get_voice(selected_voice_id, include_inactive=False)
+        if (
+            str(voice.get("provider_id") or "").casefold()
+            != str(configured_voice.get("provider") or "").casefold()
+        ):
             raise ValueError("Giọng dự án phải thuộc provider OmniVoice.")
+        if not voice_config.voice_allows_usage(voice, "single_narrator"):
+            raise ValueError("Giọng đã chọn không được phép dùng cho video một người đọc.")
         snapshot = {
             key: deepcopy(value)
             for key, value in entry.items()
-            if key not in {"available", "dependencies", "errors", "source"}
+            if key not in {
+                "available",
+                "dependencies",
+                "errors",
+                "source",
+                "character_profile_summary",
+            }
         }
         visual = snapshot.get("visual_profile") or {}
         selected_provider = str(
@@ -373,6 +468,11 @@ class ShortVideoProjectRegistry:
             raise ValueError("Engine hình ảnh không được project này hỗ trợ.")
         visual["provider"] = selected_provider
         snapshot["visual_profile"] = visual
+        snapshot["voice_profile"] = {
+            **(snapshot.get("voice_profile") or {}),
+            "voice_id": str(voice.get("id") or ""),
+            "voice_name": str(voice.get("name") or ""),
+        }
         voice_snapshot = voice_config.build_voice_snapshot(voice)
         voice_snapshot["config"] = {
             **(voice_snapshot.get("config") or {}),
@@ -382,6 +482,70 @@ class ShortVideoProjectRegistry:
         }
         snapshot["resolved_voice_snapshot"] = voice_snapshot
         return snapshot
+
+    def snapshot_character_profile(self, snapshot: dict, item_dir: Path) -> dict:
+        dependency = snapshot.get("character_profile")
+        if not isinstance(dependency, dict):
+            return snapshot
+        profile = self.character_profiles.get(
+            str(dependency.get("key") or ""),
+            int(dependency.get("profile_version") or 0),
+        )
+        if not profile or not profile.get("available"):
+            if dependency.get("required"):
+                raise ValueError("Character Profile bắt buộc chưa sẵn sàng.")
+            snapshot.pop("character_profile", None)
+            return snapshot
+        profile_snapshot = self.character_profiles.snapshot_for_item(
+            str(dependency.get("key") or ""),
+            int(dependency.get("profile_version") or 0),
+            item_dir,
+        )
+        snapshot["resolved_character_profile"] = profile_snapshot
+        return snapshot
+
+    def character_profile_for_project(self, key: str) -> dict | None:
+        entry = self.get(key)
+        dependency = (entry or {}).get("character_profile")
+        if not isinstance(dependency, dict):
+            return None
+        return self.character_profiles.get(
+            str(dependency.get("key") or ""),
+            int(dependency.get("profile_version") or 0),
+        )
+
+    def character_profile_asset_path(self, key: str, asset_id: str) -> Path | None:
+        entry = self.get(key)
+        dependency = (entry or {}).get("character_profile")
+        if not isinstance(dependency, dict):
+            return None
+        return self.character_profiles.asset_path(
+            str(dependency.get("key") or ""),
+            int(dependency.get("profile_version") or 0),
+            asset_id,
+        )
+
+    def add_character_profile_asset(self, key: str, **asset: Any) -> dict:
+        entry = self.get(key)
+        dependency = (entry or {}).get("character_profile")
+        if not isinstance(dependency, dict):
+            raise ValueError("Project chưa khai báo Character Profile.")
+        return self.character_profiles.add_reference_asset(
+            str(dependency.get("key") or ""),
+            int(dependency.get("profile_version") or 0),
+            **asset,
+        )
+
+    def remove_character_profile_asset(self, key: str, asset_id: str) -> dict:
+        entry = self.get(key)
+        dependency = (entry or {}).get("character_profile")
+        if not isinstance(dependency, dict):
+            raise ValueError("Project chưa khai báo Character Profile.")
+        return self.character_profiles.remove_reference_asset(
+            str(dependency.get("key") or ""),
+            int(dependency.get("profile_version") or 0),
+            asset_id,
+        )
 
 
 registry = ShortVideoProjectRegistry()

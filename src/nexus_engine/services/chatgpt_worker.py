@@ -6241,6 +6241,103 @@ def run(transcript: str) -> dict:
         }
 
 
+def resolve_short_video_character_era(
+    *,
+    title: str,
+    poem: str,
+    eras: list[dict],
+    cancel_check: Callable[[], None] | None = None,
+) -> dict:
+    """Resolve one character era through the authenticated ChatGPT browser session."""
+
+    from nexus_engine.services import muse_semantic_planner
+
+    allowed = {
+        str(era.get("key") or ""): {
+            "label": str(era.get("label") or ""),
+            "year_from": era.get("year_from"),
+            "year_to": era.get("year_to"),
+            "keywords": [str(value) for value in era.get("keywords") or []],
+        }
+        for era in eras
+        if str(era.get("key") or "")
+    }
+    if not allowed:
+        raise ChatGPTAttentionRequiredError("Character Profile không có thời kỳ hợp lệ.")
+
+    def validate(payload: dict) -> dict:
+        if not isinstance(payload, dict):
+            raise ValueError("Kết quả phải là JSON object.")
+        era_key = str(payload.get("era_key") or "").strip()
+        if era_key not in allowed:
+            raise ValueError("era_key không thuộc danh sách cho phép.")
+        try:
+            confidence = float(payload.get("confidence"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("confidence phải là số từ 0 đến 1.") from exc
+        if confidence < 0 or confidence > 1:
+            raise ValueError("confidence phải nằm trong khoảng 0 đến 1.")
+        reason = re.sub(r"\s+", " ", str(payload.get("reason") or "")).strip()
+        if len(reason) < 12 or len(reason) > 600:
+            raise ValueError("reason phải dài từ 12 đến 600 ký tự.")
+        return {"era_key": era_key, "confidence": round(confidence, 4), "reason": reason}
+
+    choices = json.dumps(allowed, ensure_ascii=False, indent=2)
+    prompt = f"""Bạn là chuyên gia phân loại bối cảnh thơ Hồ Chí Minh.
+Chọn đúng MỘT thời kỳ hình ảnh cho toàn bộ video dựa duy nhất vào tên và nội dung bài thơ.
+Không tra cứu web. Không suy đoán confidence cao nếu không có bằng chứng rõ trong văn bản.
+
+Các lựa chọn hợp lệ:
+{choices}
+
+Tên bài thơ: {str(title or '').strip()}
+Nội dung:
+{str(poem or '').strip()[:12000]}
+
+Chỉ trả về JSON thuần, không markdown:
+{{"era_key":"one_allowed_key","confidence":0.0,"reason":"lý do ngắn gọn dựa trên văn bản"}}
+"""
+    profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
+    if not profile_dir.exists():
+        raise ChatGPTAttentionRequiredError(
+            "Chưa có profile ChatGPT. Hãy chạy Auto Login trước khi chọn thời kỳ hình ảnh."
+        )
+    if cancel_check is not None:
+        cancel_check()
+    with sync_playwright() as playwright:
+        context = launch_chatgpt_context(playwright.chromium, profile_dir)
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            navigate_to_chatgpt_project(page, get_chatgpt_project_url(""))
+            response = send_prompt(page, prompt).strip()
+            if cancel_check is not None:
+                cancel_check()
+            try:
+                result = validate(muse_semantic_planner.parse_planner_response(response))
+            except Exception as first_error:
+                repair_prompt = (
+                    "Kết quả trước không hợp lệ: "
+                    f"{type(first_error).__name__}. Hãy trả lại đúng một JSON object với "
+                    f"era_key thuộc {sorted(allowed)}, confidence từ 0 đến 1 và reason ngắn gọn."
+                )
+                repaired = send_prompt(page, repair_prompt).strip()
+                if cancel_check is not None:
+                    cancel_check()
+                try:
+                    result = validate(muse_semantic_planner.parse_planner_response(repaired))
+                except Exception as repair_error:
+                    raise ChatGPTAttentionRequiredError(
+                        "ChatGPT không trả về kết quả chọn thời kỳ hợp lệ."
+                    ) from repair_error
+            return {
+                **result,
+                "planner_source": "chatgpt_playwright_character_era_v1",
+                "chat_url": page.url if is_chatgpt_conversation_url(page.url) else "",
+            }
+        finally:
+            context.close()
+
+
 def generate_muse_scene_plan_only(
     *,
     title: str,

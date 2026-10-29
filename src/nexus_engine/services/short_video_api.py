@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import uuid
+from copy import deepcopy
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -15,6 +16,8 @@ from nexus_engine.services.short_video_registry import registry
 
 
 router = APIRouter(prefix="/api/short-video", tags=["short-video"])
+CHARACTER_ERA_PATTERN = r"^(?:auto|[a-z0-9]+(?:_[a-z0-9]+)*)$"
+MAX_CHARACTER_IMAGE_BYTES = 20 * 1024 * 1024
 
 
 class CreateShortVideoRequest(BaseModel):
@@ -22,6 +25,69 @@ class CreateShortVideoRequest(BaseModel):
     poem: str = Field(min_length=1, max_length=50000)
     client_request_id: str = Field(min_length=8, max_length=200)
     visual_provider: Literal["muse", "google_flow"] | None = None
+    voice_id: str | None = Field(default=None, min_length=1, max_length=200)
+    character_era: str = Field(
+        default="auto",
+        min_length=1,
+        max_length=100,
+        pattern=CHARACTER_ERA_PATTERN,
+    )
+
+
+class CharacterEraRequest(BaseModel):
+    era_key: str = Field(
+        min_length=1,
+        max_length=100,
+        pattern=CHARACTER_ERA_PATTERN,
+    )
+
+
+def _public_profile_snapshot(profile: dict) -> dict:
+    safe = deepcopy(profile) if isinstance(profile, dict) else {}
+    character = safe.get("resolved_character_profile")
+    if isinstance(character, dict):
+        for era in character.get("eras") or []:
+            for asset in era.get("references") or []:
+                asset.pop("snapshot_path", None)
+                asset.pop("sha256", None)
+    return safe
+
+
+def _public_character_state(item: dict) -> dict | None:
+    profile = item.get("manifest") if isinstance(item.get("manifest"), dict) else {}
+    character = profile.get("resolved_character_profile")
+    if not isinstance(character, dict):
+        return None
+    options = item.get("options") if isinstance(item.get("options"), dict) else {}
+    return {
+        "profile_key": character.get("key") or "",
+        "profile_version": character.get("profile_version") or 0,
+        "requested_era": options.get("character_era") or "auto",
+        "resolved_era": options.get("resolved_character_era") or "",
+        "source": options.get("character_era_source") or "",
+        "confidence": options.get("character_era_confidence"),
+        "reason": options.get("character_era_reason") or "",
+        "eras": [
+            {
+                "key": era.get("key") or "",
+                "label": era.get("label") or "",
+                "year_from": era.get("year_from"),
+                "year_to": era.get("year_to"),
+            }
+            for era in character.get("eras") or []
+        ],
+    }
+
+
+def _profile_with_asset_urls(project_key: str, profile: dict) -> dict:
+    public = deepcopy(profile)
+    for era in public.get("eras") or []:
+        for asset in era.get("assets") or []:
+            asset["asset_url"] = (
+                f"/api/short-video/projects/{project_key}/character-profile/assets/"
+                f"{asset.get('id') or ''}"
+            )
+    return public
 
 
 def _public_item(item: dict, *, detail: bool = False) -> dict:
@@ -43,10 +109,11 @@ def _public_item(item: dict, *, detail: bool = False) -> dict:
             "draft": f"/api/short-video/items/{item['id']}/artifacts/draft",
             "final": f"/api/short-video/items/{item['id']}/artifacts/final",
         },
+        "character": _public_character_state(item),
     }
     if detail:
         public["source_text"] = item.get("source_text") or ""
-        public["profile"] = item.get("manifest") or {}
+        public["profile"] = _public_profile_snapshot(item.get("manifest") or {})
         public["scenes"] = short_video_pipeline.public_scene_manifest(item)
         job = db.get_system_job(str(item.get("job_id") or ""))
         public["job"] = (
@@ -105,6 +172,78 @@ def list_short_video_projects(
     }
 
 
+@router.get("/projects/{key}/character-profile")
+def get_short_video_character_profile(key: str):
+    normalized_key = str(key or "").strip().casefold()
+    profile = registry.character_profile_for_project(normalized_key)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="Project chưa khai báo Character Profile.")
+    return _profile_with_asset_urls(normalized_key, profile)
+
+
+@router.post("/projects/{key}/character-profile/assets", status_code=201)
+async def upload_short_video_character_profile_asset(
+    key: str,
+    era_key: str = Form(min_length=1, max_length=100, pattern=CHARACTER_ERA_PATTERN),
+    role: Literal["primary_portrait", "half_body", "full_body", "profile_context"] = Form(),
+    pose: str = Form(min_length=1, max_length=300),
+    source_label: str = Form(min_length=1, max_length=500),
+    source_year: str = Form(min_length=1, max_length=100),
+    rights_note: str = Form(min_length=1, max_length=1000),
+    image: UploadFile = File(),
+):
+    normalized_key = str(key or "").strip().casefold()
+    try:
+        content = await image.read(MAX_CHARACTER_IMAGE_BYTES + 1)
+    finally:
+        await image.close()
+    try:
+        profile = registry.add_character_profile_asset(
+            normalized_key,
+            era_key=era_key,
+            original_filename=image.filename or "",
+            content=content,
+            role=role,
+            pose=pose,
+            source_label=source_label,
+            source_year=source_year,
+            rights_note=rights_note,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _profile_with_asset_urls(normalized_key, profile)
+
+
+@router.delete("/projects/{key}/character-profile/assets/{asset_id}")
+def remove_short_video_character_profile_asset(key: str, asset_id: str):
+    normalized_key = str(key or "").strip().casefold()
+    try:
+        profile = registry.remove_character_profile_asset(normalized_key, asset_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _profile_with_asset_urls(normalized_key, profile)
+
+
+@router.get("/projects/{key}/character-profile/assets/{asset_id}")
+def get_short_video_character_profile_asset(key: str, asset_id: str):
+    normalized_key = str(key or "").strip().casefold()
+    path = registry.character_profile_asset_path(normalized_key, asset_id)
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=404, detail="Ảnh Character Profile không khả dụng.")
+    mime_type = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+    }.get(path.suffix.casefold(), "application/octet-stream")
+    return FileResponse(
+        path,
+        media_type=mime_type,
+        filename=f"{asset_id}{path.suffix.casefold()}",
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
 @router.get("/summary")
 def get_short_video_summary():
     summary = db.get_short_video_summary()
@@ -145,16 +284,6 @@ def list_short_video_items(
 @router.post("/projects/{key}/items", status_code=202)
 def create_short_video_item(key: str, request: CreateShortVideoRequest):
     normalized_key = str(key or "").strip().casefold()
-    try:
-        snapshot = registry.snapshot_for_create(
-            normalized_key,
-            visual_provider=str(request.visual_provider or ""),
-        )
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Dự án không khả dụng.") from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    title, poem = _validate_create_input(snapshot, request.title, request.poem)
     client_request_id = request.client_request_id.strip()
     item_uuid = uuid.uuid5(
         uuid.NAMESPACE_URL,
@@ -162,6 +291,47 @@ def create_short_video_item(key: str, request: CreateShortVideoRequest):
     )
     item_id = str(item_uuid)
     job_id = f"short-video-{item_uuid}"
+    existing = db.get_short_video_item(item_id)
+    if existing is not None:
+        existing_job = db.get_system_job(str(existing.get("job_id") or job_id)) or {}
+        return {
+            "created": False,
+            "item": _public_item(existing, detail=True),
+            "job": {
+                "id": existing_job.get("id") or job_id,
+                "status": existing_job.get("status") or "queued",
+            },
+        }
+    try:
+        snapshot = registry.snapshot_for_create(
+            normalized_key,
+            visual_provider=str(request.visual_provider or ""),
+            voice_id=str(request.voice_id or ""),
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Dự án không khả dụng.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    title, poem = _validate_create_input(snapshot, request.title, request.poem)
+    if isinstance(snapshot.get("character_profile"), dict):
+        try:
+            item_dir = short_video_pipeline.prepare_item_directory(normalized_key, item_id)
+            snapshot = registry.snapshot_character_profile(snapshot, item_dir)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        era_keys = {
+            str(era.get("key") or "")
+            for era in (snapshot.get("resolved_character_profile") or {}).get("eras") or []
+        }
+        if request.character_era != "auto" and request.character_era not in era_keys:
+            raise HTTPException(status_code=422, detail="Thời kỳ hình ảnh không thuộc Character Profile.")
+    elif request.character_era != "auto":
+        raise HTTPException(status_code=422, detail="Project chưa kích hoạt Character Profile.")
+    options = {
+        "visual_provider": str((snapshot.get("visual_profile") or {}).get("provider") or "muse"),
+        "voice_id": str((snapshot.get("resolved_voice_snapshot") or {}).get("voice_id") or ""),
+        "character_era": request.character_era,
+    }
     voice_snapshot = snapshot["resolved_voice_snapshot"]
     payload = {
         "short_video_id": item_id,
@@ -180,6 +350,7 @@ def create_short_video_item(key: str, request: CreateShortVideoRequest):
         job_id=job_id,
         payload=payload,
         voice_snapshot=voice_snapshot,
+        options=options,
     )
     if created:
         short_video_worker.kick()
@@ -219,6 +390,7 @@ def _create_follow_up_job(
     action: str,
     stage: str,
     scene_index: int | None = None,
+    options: dict | None = None,
 ) -> dict:
     snapshot = item.get("manifest") or {}
     voice_snapshot = snapshot.get("resolved_voice_snapshot") or {}
@@ -240,6 +412,7 @@ def _create_follow_up_job(
             payload=payload,
             voice_snapshot=voice_snapshot,
             stage=stage,
+            options=options,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -297,4 +470,37 @@ def regenerate_short_video_scene(item_id: str, index: int):
         action="regenerate_scene",
         stage=f"regenerate_scene_{index}",
         scene_index=index,
+    )
+
+
+@router.post("/items/{item_id}/character-era", status_code=202)
+def update_short_video_character_era(item_id: str, request: CharacterEraRequest):
+    item = _get_item_or_404(item_id)
+    if item.get("status") not in {
+        "awaiting_review",
+        "needs_attention",
+        "error",
+        "completed",
+    }:
+        raise HTTPException(status_code=409, detail="Không thể đổi thời kỳ hình ảnh lúc này.")
+    character = (item.get("manifest") or {}).get("resolved_character_profile")
+    if not isinstance(character, dict):
+        raise HTTPException(status_code=409, detail="Video này không có Character Profile.")
+    era_keys = {str(era.get("key") or "") for era in character.get("eras") or []}
+    if request.era_key != "auto" and request.era_key not in era_keys:
+        raise HTTPException(status_code=422, detail="Thời kỳ hình ảnh không thuộc snapshot của video.")
+    options = dict(item.get("options") or {})
+    options["character_era"] = request.era_key
+    for field in (
+        "resolved_character_era",
+        "character_era_source",
+        "character_era_confidence",
+        "character_era_reason",
+    ):
+        options.pop(field, None)
+    return _create_follow_up_job(
+        item,
+        action="regenerate_visuals",
+        stage="regenerate_visuals",
+        options=options,
     )
