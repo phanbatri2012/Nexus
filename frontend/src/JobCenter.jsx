@@ -990,6 +990,10 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                 ? job.automatic_login === 'pending'
                   ? { label: 'Đang Auto Login', color: '#4dd0e1' }
                   : { label: 'Cần xác minh ChatGPT', color: '#f1c40f' }
+                : displayStatus === 'paused' && job.attention_required === 'muse_login_required'
+                  ? job.automatic_muse_login === 'pending'
+                    ? { label: 'Đang tự đăng nhập Muse', color: '#4dd0e1' }
+                    : { label: 'Cần đăng nhập Muse', color: '#f1c40f' }
                 : displayStatus === 'paused' && ['youtube_browser_cdp', 'fb_browser_cdp'].includes(job.attention_required)
                   ? { label: 'Chờ Profile CDP', color: '#f1c40f' }
                 : displayStatus === 'paused' && job.attention_required === 'fb_browser_review'
@@ -1157,6 +1161,17 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                           : ['failed', 'cooldown', 'interrupted'].includes(job.automatic_login)
                             ? 'Auto Login tự động không hoàn tất. Hãy kiểm tra tài khoản hoặc mở Open Profile để xác minh, sau đó bấm “Tiếp tục”.'
                             : 'ChatGPT đang yêu cầu CAPTCHA/Cloudflare hoặc xác minh thủ công. Mở Auto Login hoặc Open Profile, xác minh xong rồi bấm “Tiếp tục”.'}
+                      </div>
+                    )}
+                    {job.attention_required === 'muse_login_required' && (
+                      <div style={{ color: '#f1c40f', marginTop: '9px', fontSize: '0.84em' }}>
+                        {job.automatic_muse_login === 'pending'
+                          ? 'Muse đã hết phiên. Hệ thống đang tự đăng nhập lại và sẽ tiếp tục đúng checkpoint khi thành công.'
+                          : job.automatic_muse_login === 'missing_credentials'
+                            ? 'Thiếu cấu hình auto-login Muse. Hãy cấu hình tài khoản trong Muse AI Studio rồi bấm “Tiếp tục từ checkpoint”.'
+                            : job.automatic_muse_login === 'loop_guard'
+                              ? 'Muse tiếp tục mất phiên sau khi đã khôi phục; job đã dừng để tránh lặp.'
+                              : 'Auto-login Muse không hoàn tất. Checkpoint vẫn được giữ nguyên; hãy kiểm tra tài khoản rồi bấm “Tiếp tục từ checkpoint”.'}
                       </div>
                     )}
                     {job.status === 'paused' && job.attention_required?.startsWith('youtube_') && (

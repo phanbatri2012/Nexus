@@ -853,6 +853,20 @@ class TestMuseSemanticPlanner(unittest.TestCase):
                 "khuvuctauoratcangthang",
             )
         )
+        self.assertTrue(
+            muse_semantic_planner._anchor_matches(
+                "Campo Chia",
+                "binh linh viet nam tai chien truong campuchia",
+                "binhlinhvietnamtaichientruongcampuchia",
+            )
+        )
+        self.assertTrue(
+            muse_semantic_planner._anchor_matches(
+                "Phanong Pinh",
+                "chinh quyen tai thu do phnom penh duoc viet nam hau thuan",
+                "chinhquyentaithudophnompenhduocvietnamhauthuam",
+            )
+        )
         self.assertFalse(
             muse_semantic_planner._anchor_matches(
                 "Hoàn Toàn Khác",
@@ -4561,6 +4575,8 @@ class TestMuseRouting(unittest.TestCase):
                 "muse_session_attempt": 3,
                 "muse_service_busy_attempt": 3,
                 "attention_required": "muse_service_unstable",
+                "automatic_muse_login": "loop_guard",
+                "muse_auto_login": {"recovery_epoch": 2, "attempt": 1},
                 "muse_error_history": [{"message": "redacted"}],
             },
         }
@@ -4588,6 +4604,8 @@ class TestMuseRouting(unittest.TestCase):
                 self.assertNotIn("muse_session_attempt", result)
                 self.assertNotIn("muse_service_busy_attempt", result)
                 self.assertNotIn("attention_required", result)
+                self.assertNotIn("automatic_muse_login", result)
+                self.assertNotIn("muse_auto_login", result)
 
     def test_muse_routes_to_independent_media_job(self):
         expected = ({"id": "muse-job", "job_type": "muse_media_generation"}, True)
@@ -5084,6 +5102,12 @@ class TestMuseRouting(unittest.TestCase):
         }
         with (
             patch.object(main.db, "get_youtube_publish_workflow_by_job", return_value=None),
+            patch.object(main.db, "get_system_job", return_value=job),
+            patch.object(
+                main,
+                "_run_muse_auto_login_cycle",
+                return_value={"status": "missing_credentials", "attempted": 0},
+            ),
             patch.object(main, "_pause_youtube_publish_job") as pause_youtube,
             patch.object(main.db, "update_system_job") as update_job,
             patch.object(main.db, "update_video_production_state"),
@@ -5093,7 +5117,11 @@ class TestMuseRouting(unittest.TestCase):
             )
 
         pause_youtube.assert_not_called()
-        self.assertEqual(update_job.call_args.kwargs["status"], "error")
+        self.assertEqual(update_job.call_args.kwargs["status"], "paused")
+        self.assertEqual(
+            update_job.call_args.kwargs["result_json"]["attention_required"],
+            "muse_login_required",
+        )
 
     def test_provider_source_has_no_playwright_or_gpm_fallback(self):
         source = Path(muse_provider.__file__).read_text(encoding="utf-8")

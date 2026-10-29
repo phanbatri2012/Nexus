@@ -12,8 +12,20 @@ import {
   getBrowserTimeZone,
   summarizeMuseAccounts
 } from './museQuota'
+import {
+  buildMuseAutoLoginPayload,
+  getMuseBulkReloginCandidates,
+  shouldShowMuseRelogin
+} from './museAutoLogin'
 
 const API_BASE = 'http://127.0.0.1:8080'
+const EMPTY_LOGIN_FORM = {
+  email: '',
+  method: 'password',
+  password: '',
+  two_factor_secret: '',
+  mailbox_url: ''
+}
 
 export default function MuseStudio() {
   const [activeTab, setActiveTab] = useState('characters')
@@ -27,6 +39,7 @@ export default function MuseStudio() {
     accounts: 0,
     active_media_tasks: 0,
     task_recovery_released: false,
+    account_relogin: 0,
     api_url: 'http://127.0.0.1:18610'
   })
   const [studioPath, setStudioPath] = useState('E:\\yt\\Tool\\Muse_AI_Studio')
@@ -39,6 +52,12 @@ export default function MuseStudio() {
   const [promptsData, setPromptsData] = useState(null)
   const [activePromptVersion, setActivePromptVersion] = useState('')
   const [previewMedia, setPreviewMedia] = useState(null)
+  const [loginModalAccount, setLoginModalAccount] = useState(null)
+  const [loginForm, setLoginForm] = useState(EMPTY_LOGIN_FORM)
+  const [loginBusyId, setLoginBusyId] = useState('')
+  const [loginStates, setLoginStates] = useState({})
+  const [loginErrors, setLoginErrors] = useState({})
+  const [bulkReloginProgress, setBulkReloginProgress] = useState(null)
 
   const showNotice = (text, type = 'info') => {
     setNotice({ text, type })
@@ -120,6 +139,148 @@ export default function MuseStudio() {
       showNotice(`Đã cập nhật quota của ${succeeded}/${accounts.length} tài khoản.`, 'success')
     } else {
       showNotice(`Đã cập nhật ${succeeded}/${accounts.length} tài khoản; một số tài khoản cần kiểm tra lại.`, 'error')
+    }
+  }
+
+  const setAccountLoginState = (accountId, state, error = '') => {
+    setLoginStates(current => ({ ...current, [accountId]: state }))
+    setLoginErrors(current => ({ ...current, [accountId]: error }))
+  }
+
+  const closeLoginModal = () => {
+    setLoginModalAccount(null)
+    setLoginForm(EMPTY_LOGIN_FORM)
+  }
+
+  const openLoginModal = account => {
+    setLoginModalAccount(account)
+    setLoginForm({
+      ...EMPTY_LOGIN_FORM,
+      email: account.login_email || '',
+      method: account.auto_login_method === 'mailbox' ? 'mailbox' : 'password'
+    })
+  }
+
+  const refreshMuseAccountState = async () => {
+    await Promise.all([refreshAccounts(), refreshStatus()])
+  }
+
+  const requestMuseRelogin = async account => {
+    const res = await fetch(`${API_BASE}/api/muse/accounts/${encodeURIComponent(account.id)}/relogin`, {
+      method: 'POST'
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.detail || 'Không thể đăng nhập lại tài khoản Muse.')
+    return data
+  }
+
+  const handleRelogin = async account => {
+    setLoginBusyId(account.id)
+    setAccountLoginState(account.id, 'running')
+    try {
+      await requestMuseRelogin(account)
+      setAccountLoginState(account.id, 'recovered')
+      showNotice('Đã khôi phục phiên Muse và tải lại trạng thái tài khoản.', 'success')
+      await refreshMuseAccountState()
+    } catch (err) {
+      setAccountLoginState(account.id, 'failed', err.message)
+      showNotice(err.message, 'error')
+    } finally {
+      setLoginBusyId('')
+    }
+  }
+
+  const handleReloginAll = async () => {
+    if (serviceStatus.active_media_tasks > 0) {
+      showNotice('Muse đang tạo media; hãy đăng nhập lại sau khi tác vụ hoàn tất.', 'error')
+      return
+    }
+    const needingRelogin = accounts.filter(shouldShowMuseRelogin)
+    const candidates = getMuseBulkReloginCandidates(accounts)
+    const missingConfiguration = needingRelogin.length - candidates.length
+    if (candidates.length === 0) {
+      showNotice(
+        missingConfiguration > 0
+          ? `${missingConfiguration} tài khoản cần đăng nhập lại nhưng chưa cấu hình auto-login.`
+          : 'Không có tài khoản Muse nào cần đăng nhập lại.',
+        missingConfiguration > 0 ? 'error' : 'info'
+      )
+      return
+    }
+
+    let succeeded = 0
+    let failed = 0
+    setBulkReloginProgress({ completed: 0, total: candidates.length })
+    for (let index = 0; index < candidates.length; index += 1) {
+      const account = candidates[index]
+      setLoginBusyId(account.id)
+      setAccountLoginState(account.id, 'running')
+      try {
+        await requestMuseRelogin(account)
+        succeeded += 1
+        setAccountLoginState(account.id, 'recovered')
+      } catch (err) {
+        failed += 1
+        setAccountLoginState(account.id, 'failed', err.message)
+      }
+      setBulkReloginProgress({ completed: index + 1, total: candidates.length })
+    }
+    setLoginBusyId('')
+    setBulkReloginProgress(null)
+    await refreshMuseAccountState()
+
+    const parts = [`đã khôi phục ${succeeded}/${candidates.length}`]
+    if (failed > 0) parts.push(`${failed} thất bại`)
+    if (missingConfiguration > 0) parts.push(`${missingConfiguration} thiếu cấu hình`)
+    showNotice(
+      `Đăng nhập lại Muse: ${parts.join(' · ')}.`,
+      failed > 0 || missingConfiguration > 0 ? 'error' : 'success'
+    )
+  }
+
+  const handleConfigureAutoLogin = async event => {
+    event.preventDefault()
+    const account = loginModalAccount
+    if (!account) return
+    const payload = buildMuseAutoLoginPayload(loginForm)
+    setLoginBusyId(account.id)
+    setAccountLoginState(account.id, 'running')
+    try {
+      const res = await fetch(`${API_BASE}/api/muse/accounts/${encodeURIComponent(account.id)}/auto-login`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.detail || 'Không thể xác minh cấu hình đăng nhập Muse.')
+      setAccountLoginState(account.id, 'recovered')
+      showNotice('Credential đã được xác minh, mã hóa DPAPI và phiên Muse đã được khôi phục.', 'success')
+      await refreshMuseAccountState()
+    } catch (err) {
+      setAccountLoginState(account.id, 'failed', err.message)
+      showNotice(err.message, 'error')
+    } finally {
+      setLoginBusyId('')
+      closeLoginModal()
+    }
+  }
+
+  const handleDeleteAutoLogin = async account => {
+    if (!window.confirm(`Xóa cấu hình auto-login đã lưu cho ${account.label || account.id}?`)) return
+    setLoginBusyId(account.id)
+    try {
+      const res = await fetch(`${API_BASE}/api/muse/accounts/${encodeURIComponent(account.id)}/auto-login`, {
+        method: 'DELETE'
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.detail || 'Không thể xóa cấu hình auto-login Muse.')
+      setAccountLoginState(account.id, account.needs_relogin ? 'missing' : '')
+      showNotice('Đã xóa credential Muse đã mã hóa.', 'success')
+      await refreshAccounts()
+    } catch (err) {
+      showNotice(err.message, 'error')
+    } finally {
+      setLoginBusyId('')
     }
   }
 
@@ -614,7 +775,7 @@ export default function MuseStudio() {
         <div className="muse-card">
           <div className="muse-card-title">
             <h2>👥 Danh sách Tài khoản Muse Pool</h2>
-            <div style={{ display: 'flex', gap: 10 }}>
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
               <button
                 type="button"
                 className="muse-btn"
@@ -630,6 +791,8 @@ export default function MuseStudio() {
                 disabled={
                   accounts.length === 0
                   || Boolean(quotaRefreshProgress)
+                  || Boolean(loginBusyId)
+                  || Boolean(bulkReloginProgress)
                   || serviceStatus.active_media_tasks > 0
                 }
                 onClick={handleRefreshAllQuotas}
@@ -641,6 +804,24 @@ export default function MuseStudio() {
                   ? `⏳ Đang kiểm tra ${quotaRefreshProgress.completed}/${quotaRefreshProgress.total}`
                   : '⚡ Cập nhật tất cả quota'}
               </button>
+              {accounts.some(shouldShowMuseRelogin) && (
+                <button
+                  type="button"
+                  className="muse-btn warning"
+                  disabled={
+                    Boolean(loginBusyId)
+                    || Boolean(bulkReloginProgress)
+                    || Boolean(quotaRefreshProgress)
+                    || serviceStatus.active_media_tasks > 0
+                  }
+                  onClick={handleReloginAll}
+                  title="Đăng nhập tuần tự các tài khoản cần khôi phục và đã lưu credential"
+                >
+                  {bulkReloginProgress
+                    ? `⏳ Đang đăng nhập ${bulkReloginProgress.completed}/${bulkReloginProgress.total}`
+                    : `🔐 Đăng nhập lại tất cả (${accounts.filter(shouldShowMuseRelogin).length})`}
+                </button>
+              )}
               <button type="button" className="muse-btn primary" onClick={handleOpenWebAdmin}>
                 + Thêm tài khoản qua Web Admin
               </button>
@@ -711,9 +892,13 @@ export default function MuseStudio() {
                       ? 'Đã tắt'
                       : acc.is_expired
                         ? 'Hết hạn'
-                        : acc.session_ok === false
+                        : acc.verification_state === 'unverified'
+                          ? 'Chưa xác minh'
+                          : acc.session_ok === false
                           ? 'Lỗi phiên'
-                          : 'Đang hoạt động'
+                          : acc.needs_relogin
+                            ? 'Cần đăng nhập lại'
+                            : 'Đang hoạt động'
                     const sessionClass = sessionText === 'Đang hoạt động' ? 'active' : 'expired'
                     const isRefreshing = refreshingQuotaIds.includes(acc.id)
                     return (
@@ -730,6 +915,26 @@ export default function MuseStudio() {
                             {acc.expires_at
                               ? `Hết hạn: ${formatMuseDateTime(acc.expires_at, displayTimeZone)}`
                               : 'Hạn phiên: Không xác định'}
+                          </div>
+                          <div className="muse-account-login-status">
+                            {acc.auto_login_configured ? (
+                              <span className="muse-pill auto-login-configured">
+                                Auto-login: {acc.auto_login_method === 'mailbox' ? 'Hộp thư' : 'Mật khẩu'}
+                              </span>
+                            ) : acc.needs_relogin ? (
+                              <span className="muse-pill auto-login-missing">Thiếu cấu hình</span>
+                            ) : null}
+                            {loginStates[acc.id] === 'running' && (
+                              <div className="muse-table-subtext login-running">Đang tự đăng nhập…</div>
+                            )}
+                            {loginStates[acc.id] === 'recovered' && (
+                              <div className="muse-table-subtext login-recovered">Đã khôi phục</div>
+                            )}
+                            {loginStates[acc.id] === 'failed' && (
+                              <div className="muse-table-subtext warning">
+                                {loginErrors[acc.id] || 'Đăng nhập thất bại'}
+                              </div>
+                            )}
                           </div>
                         </td>
                         <td className="muse-quota-cell">
@@ -767,18 +972,50 @@ export default function MuseStudio() {
                             : 'Chưa kiểm tra'}
                         </td>
                         <td>
-                          <button
-                            type="button"
-                            className="muse-btn"
-                            disabled={
-                              isRefreshing
-                              || Boolean(quotaRefreshProgress)
-                              || serviceStatus.active_media_tasks > 0
-                            }
-                            onClick={() => refreshAccountQuota(acc.id)}
-                          >
-                            {isRefreshing ? '⏳ Đang kiểm tra' : 'Kiểm tra quota'}
-                          </button>
+                          <div className="muse-account-actions">
+                            <button
+                              type="button"
+                              className="muse-btn"
+                              disabled={
+                                isRefreshing
+                                || Boolean(quotaRefreshProgress)
+                                || serviceStatus.active_media_tasks > 0
+                                || Boolean(loginBusyId)
+                                || Boolean(bulkReloginProgress)
+                              }
+                              onClick={() => refreshAccountQuota(acc.id)}
+                            >
+                              {isRefreshing ? '⏳ Đang kiểm tra' : 'Kiểm tra quota'}
+                            </button>
+                            {shouldShowMuseRelogin(acc) && (
+                              <button
+                                type="button"
+                                className="muse-btn warning"
+                                disabled={
+                                  serviceStatus.active_media_tasks > 0
+                                  || Boolean(loginBusyId)
+                                  || Boolean(bulkReloginProgress)
+                                }
+                                onClick={() => acc.auto_login_configured ? handleRelogin(acc) : openLoginModal(acc)}
+                              >
+                                {loginBusyId === acc.id
+                                  ? '⏳ Đang tự đăng nhập'
+                                  : acc.auto_login_configured
+                                    ? 'Đăng nhập lại ngay'
+                                    : 'Cấu hình đăng nhập lại'}
+                              </button>
+                            )}
+                            {acc.auto_login_configured && (
+                              <button
+                                type="button"
+                                className="muse-link-danger"
+                                disabled={Boolean(loginBusyId) || Boolean(bulkReloginProgress)}
+                                onClick={() => handleDeleteAutoLogin(acc)}
+                              >
+                                Xóa credential đã lưu
+                              </button>
+                            )}
+                          </div>
                         </td>
                       </tr>
                     )
@@ -833,6 +1070,95 @@ export default function MuseStudio() {
               ))}
             </div>
           )}
+        </div>
+      )}
+
+      {/* Muse auto-login configuration modal */}
+      {loginModalAccount && (
+        <div className="muse-login-modal-backdrop" onClick={closeLoginModal}>
+          <form className="muse-login-modal" onSubmit={handleConfigureAutoLogin} onClick={event => event.stopPropagation()}>
+            <div className="muse-login-modal-header">
+              <div>
+                <h2>Cấu hình đăng nhập lại Muse</h2>
+                <p>{loginModalAccount.label || loginModalAccount.id}</p>
+              </div>
+              <button type="button" className="muse-modal-close" onClick={closeLoginModal}>✕</button>
+            </div>
+
+            <label className="muse-login-field">
+              <span>Email Muse</span>
+              <input
+                type="email"
+                value={loginForm.email}
+                onChange={event => setLoginForm(current => ({ ...current, email: event.target.value }))}
+                autoComplete="username"
+                required
+              />
+            </label>
+
+            <div className="muse-login-methods" role="group" aria-label="Phương thức đăng nhập Muse">
+              <button
+                type="button"
+                className={loginForm.method === 'password' ? 'active' : ''}
+                onClick={() => setLoginForm(current => ({ ...current, method: 'password' }))}
+              >
+                Mật khẩu + TOTP
+              </button>
+              <button
+                type="button"
+                className={loginForm.method === 'mailbox' ? 'active' : ''}
+                onClick={() => setLoginForm(current => ({ ...current, method: 'mailbox' }))}
+              >
+                Link hộp thư
+              </button>
+            </div>
+
+            {loginForm.method === 'password' ? (
+              <>
+                <label className="muse-login-field">
+                  <span>Mật khẩu</span>
+                  <input
+                    type="password"
+                    value={loginForm.password}
+                    onChange={event => setLoginForm(current => ({ ...current, password: event.target.value }))}
+                    autoComplete="current-password"
+                    required
+                  />
+                </label>
+                <label className="muse-login-field">
+                  <span>Secret TOTP (nếu tài khoản có 2FA)</span>
+                  <input
+                    type="password"
+                    value={loginForm.two_factor_secret}
+                    onChange={event => setLoginForm(current => ({ ...current, two_factor_secret: event.target.value }))}
+                    autoComplete="off"
+                  />
+                </label>
+              </>
+            ) : (
+              <label className="muse-login-field">
+                <span>Mailbox URL</span>
+                <input
+                  type="url"
+                  value={loginForm.mailbox_url}
+                  onChange={event => setLoginForm(current => ({ ...current, mailbox_url: event.target.value }))}
+                  autoComplete="off"
+                  placeholder="https://..."
+                  required
+                />
+              </label>
+            )}
+
+            <div className="muse-login-security-note">
+              Credential chỉ được gửi qua loopback để xác minh, sau đó lưu bằng DPAPI và không được trả lại giao diện.
+            </div>
+            <div className="muse-login-modal-actions">
+              <button type="button" className="muse-btn" onClick={closeLoginModal}>Hủy</button>
+              <button type="submit" className="muse-btn success" disabled={loginBusyId === loginModalAccount.id}>
+                {loginBusyId === loginModalAccount.id ? 'Đang xác minh…' : 'Xác minh & lưu an toàn'}
+              </button>
+            </div>
+          </form>
         </div>
       )}
 

@@ -630,6 +630,14 @@ def _probe_owned_service(*, timeout: float = 3.0) -> dict:
             "checkpoint được giữ nguyên để tiếp tục sau khi xác minh cấu hình.",
         )
     try:
+        account_relogin_version = int(
+            capabilities.get("account_relogin")
+            if isinstance(capabilities, dict)
+            else 0
+        )
+    except (TypeError, ValueError):
+        account_relogin_version = 0
+    try:
         active_media_tasks = max(0, int(ready.get("active_media_tasks") or 0))
     except (TypeError, ValueError) as exc:
         raise MuseStudioServiceUnavailable(
@@ -646,6 +654,7 @@ def _probe_owned_service(*, timeout: float = 3.0) -> dict:
         "browser_running": bool(ready.get("browser_running")),
         "video_start_end_frames": start_end_version,
         "task_recovery": task_recovery_version,
+        "account_relogin": account_relogin_version,
         "active_media_tasks": active_media_tasks,
         "runtime_id": runtime_id,
         "api_url": MUSE_API_BASE_URL,
@@ -835,6 +844,7 @@ def status(*, probe: bool = False) -> dict:
         "browser_running": False,
         "video_start_end_frames": 0,
         "task_recovery": 0,
+        "account_relogin": 0,
         "task_recovery_released": bool(release_status.get("enabled")),
         "task_recovery_e2e_runs": int(release_status.get("successful_runs") or 0),
         "active_media_tasks": 0,
@@ -1031,4 +1041,3 @@ def manual_restart_service(*, timeout_seconds: float = 20.0) -> dict:
     ensure_started(timeout_seconds=timeout_seconds)
     _cancel_idle_timer()
     return status(probe=True)
-

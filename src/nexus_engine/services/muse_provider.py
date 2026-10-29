@@ -64,6 +64,10 @@ class MuseAuthenticationError(MuseError):
     """Muse AI Studio has no usable account or rejected local authentication."""
 
 
+class MuseRequestError(MuseError):
+    """Muse2API rejected a caller-controlled request before doing work."""
+
+
 class MuseRefusalError(MuseError):
     """Muse refused the prompt instead of producing media."""
 
@@ -97,9 +101,27 @@ _REFERENCE_ERROR_TOKENS = (
     "tệp ảnh",
     "không đọc được ảnh",
 )
-_AUTH_ERROR_TOKENS = ("auth", "login", "cookie", "session", "account")
+_AUTH_ERROR_TOKENS = (
+    "auth",
+    "login",
+    "cookie",
+    "session",
+    "account",
+    "relogin",
+    "đăng nhập lại",
+    "hết hạn session",
+    "hết hạn cookie",
+    "chưa đăng nhập",
+    "không có tài khoản",
+    "phiên đăng nhập",
+    "重新登录",
+    "未找到可用媒体账号",
+    "没有可用账号",
+    "会话不可用",
+)
 _QUOTA_ERROR_TOKENS = (
     "media_quota_exhausted",
+    "quota_exhausted",
     "账号额度不足",
     "媒体额度已耗尽",
     "媒体额度均已耗尽",
@@ -110,6 +132,8 @@ _QUOTA_ERROR_TOKENS = (
     "token limit",
     "hết quota",
     "hết hạn mức",
+    "cạn hạn mức",
+    "hết lượt tạo",
 )
 _TASK_WAIT_LIMIT_ERROR_TOKENS = (
     "total task wait limit reached",
@@ -295,6 +319,25 @@ def refresh_account_quota(account_id: str) -> dict:
         "POST",
         endpoint,
         timeout_seconds=90.0,
+    )
+
+
+def relogin_account(account_id: str, credentials: dict) -> dict:
+    """Replace one Muse session through the authenticated loopback service."""
+
+    normalized = validate_account_id(account_id)
+    endpoint = f"/admin/accounts/{urllib.parse.quote(normalized, safe='')}/relogin"
+    return MuseStudioApiProvider._request_json(
+        "POST",
+        endpoint,
+        payload={
+            "email": str(credentials.get("email") or ""),
+            "method": str(credentials.get("method") or ""),
+            "password": str(credentials.get("password") or ""),
+            "two_factor_secret": str(credentials.get("two_factor_secret") or ""),
+            "mailbox_url": str(credentials.get("mailbox_url") or ""),
+        },
+        timeout_seconds=210.0,
     )
 
 
@@ -638,7 +681,11 @@ class MuseStudioApiProvider:
         retryable = bool(task.get("retryable"))
         if error_code == "service_restart_interrupted":
             error = MuseServiceInterrupted(message)
-        elif retryable:
+        elif error_code in {"authentication_failed", "auth_failed"}:
+            error = MuseAuthenticationError(message)
+        elif error_code in {"media_quota_exhausted", "quota_exhausted"}:
+            error = MuseQuotaUnavailable(message)
+        elif retryable or error_code in {"timeout", "transient_failure"}:
             error = MuseTaskTransientFailure(message)
         else:
             error = classify_muse_failure(message)(message)
@@ -700,8 +747,10 @@ class MuseStudioApiProvider:
                 if classify_muse_failure(detail) is MuseQuotaUnavailable:
                     raise MuseQuotaUnavailable(detail) from exc
                 raise MuseAdmissionRetry(detail) from exc
-            if exc.code in {400, 404, 409, 422}:
-                raise MuseError(detail) from exc
+            if exc.code == 409:
+                raise MuseServiceBusy(detail) from exc
+            if exc.code in {400, 404, 422}:
+                raise MuseRequestError(detail) from exc
             raise MuseTransientError(detail) from exc
         except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError, OSError) as exc:
             raise MuseTransientError("Không thể kết nối ổn định tới Muse2API.") from exc

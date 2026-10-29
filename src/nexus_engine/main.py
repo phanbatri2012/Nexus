@@ -10,6 +10,8 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, ConfigDict, Field
@@ -98,6 +100,7 @@ from nexus_engine.services import (
     publication_scheduler,
     production_coordinator as production_coordinator_service,
     muse_pipeline,
+    muse_account_auth,
     muse_provider,
     muse_settings,
     muse_studio_service,
@@ -593,6 +596,17 @@ app = FastAPI(
 app.include_router(short_video_api.router)
 
 
+@app.exception_handler(RequestValidationError)
+async def handle_request_validation_error(request: Request, exc: RequestValidationError):
+    if re.fullmatch(r"/api/muse/accounts/[^/]+/auto-login", request.url.path):
+        return JSONResponse(
+            {"detail": "Dữ liệu cấu hình Muse auto-login không hợp lệ."},
+            status_code=422,
+            headers={"Cache-Control": "no-store"},
+        )
+    return await request_validation_exception_handler(request, exc)
+
+
 @app.exception_handler(Exception)
 async def handle_unexpected_error(_request: Request, exc: Exception):
     error_id = security_logging.report_exception("unhandled_api_error", exc)
@@ -906,6 +920,14 @@ class GpmConfigRequest(BaseModel):
 
 class MuseSettingsData(BaseModel):
     muse_studio_path: str = Field(default="", max_length=1024)
+
+
+class MuseAutoLoginData(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    method: Literal["password", "mailbox"]
+    password: str = Field(default="", max_length=1024)
+    two_factor_secret: str = Field(default="", max_length=256)
+    mailbox_url: str = Field(default="", max_length=2048)
 
 
 class GpmProfileStartRequest(BaseModel):
@@ -1606,55 +1628,281 @@ def _sanitize_muse_quota(raw_quota, *, now: float | None = None) -> dict:
     }
 
 
+def _load_sanitized_muse_accounts() -> list[dict]:
+    """Read Muse accounts without ever exposing cookies or stored credentials."""
+
+    settings = muse_settings.load_muse_settings()
+    configured = str(settings.get("muse_studio_path") or "").strip()
+    if not configured:
+        return []
+    studio_path = Path(configured).expanduser().resolve()
+    data_dir = muse_studio_service._studio_data_dir(studio_path)
+    accounts_file = data_dir / "accounts.json"
+    if not accounts_file.is_file():
+        return []
+    raw = json.loads(accounts_file.read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        return []
+    try:
+        credential_statuses = muse_account_auth.list_statuses()
+    except Exception as exc:
+        logger.warning(
+            "Không thể đọc trạng thái Muse auto-login: %s", type(exc).__name__
+        )
+        credential_statuses = {}
+
+    sanitized = []
+    now = time.time()
+    for acc in raw:
+        if not isinstance(acc, dict):
+            continue
+        account_id = str(acc.get("id") or "")
+        label = str(acc.get("label") or "")
+        cookies = acc.get("cookies") if isinstance(acc.get("cookies"), dict) else {}
+        cookies_exp = (
+            acc.get("cookies_exp")
+            if isinstance(acc.get("cookies_exp"), dict)
+            else {}
+        )
+        expires_at = acc.get("expires_at")
+        try:
+            expires_at = float(expires_at)
+            if expires_at <= 0:
+                expires_at = None
+        except (TypeError, ValueError):
+            expires_at = None
+        try:
+            real_vml_expiry = float(cookies_exp.get("hatch_vml") or 0)
+            if real_vml_expiry <= 0:
+                real_vml_expiry = None
+        except (TypeError, ValueError):
+            real_vml_expiry = None
+        if expires_at is None:
+            expires_at = real_vml_expiry
+        session_ok = acc.get("ok") if isinstance(acc.get("ok"), bool) else None
+        try:
+            session_verified_at = max(0, int(acc.get("session_verified_at") or 0))
+        except (TypeError, ValueError):
+            session_verified_at = 0
+        enabled = bool(acc.get("enabled", True))
+        is_expired = bool(expires_at is not None and expires_at <= now)
+        session_verified = bool(
+            session_ok is True and (session_verified_at > 0 or real_vml_expiry is not None)
+        )
+        needs_relogin = enabled and (
+            not cookies or is_expired or not session_verified
+        )
+        verification_state = (
+            "verified"
+            if session_verified
+            else ("failed" if session_ok is False else "unverified")
+        )
+        quota = _sanitize_muse_quota(acc.get("quota"), now=now)
+        auth_status = credential_statuses.get(account_id) or {
+            "auto_login_configured": False,
+            "auto_login_method": "",
+            "login_email": "",
+            "totp_configured": False,
+        }
+        login_email = str(
+            auth_status.get("login_email") or acc.get("login_email") or ""
+        ).strip()
+        if not login_email and muse_account_auth.EMAIL_PATTERN.fullmatch(label):
+            login_email = label
+        sanitized.append(
+            {
+                "id": account_id,
+                "label": label,
+                "cookie_count": len(cookies),
+                "enabled": enabled,
+                "session_ok": session_ok,
+                "session_verified": session_verified,
+                "session_verified_at": session_verified_at,
+                "verification_state": verification_state,
+                "is_expired": is_expired,
+                "needs_relogin": needs_relogin,
+                "expires_at": expires_at,
+                "expires_estimated": real_vml_expiry is None,
+                "media_quota_status": quota["status"],
+                "quota": quota,
+                "auto_login_configured": bool(
+                    auth_status.get("auto_login_configured")
+                ),
+                "auto_login_method": str(
+                    auth_status.get("auto_login_method") or ""
+                ),
+                "login_email": login_email,
+                "totp_configured": bool(auth_status.get("totp_configured")),
+            }
+        )
+    return sanitized
+
+
+def _get_sanitized_muse_account(account_id: str) -> dict | None:
+    return next(
+        (item for item in _load_sanitized_muse_accounts() if item["id"] == account_id),
+        None,
+    )
+
+
 @app.get("/api/muse/accounts")
 def get_muse_accounts_endpoint():
     try:
-        settings = muse_settings.load_muse_settings()
-        configured = str(settings.get("muse_studio_path") or "").strip()
-        if not configured:
-            return _muse_json_response({"items": []})
-        studio_path = Path(configured).expanduser().resolve()
-        data_dir = muse_studio_service._studio_data_dir(studio_path)
-        accounts_file = data_dir / "accounts.json"
-        if not accounts_file.is_file():
-            return _muse_json_response({"items": []})
-        raw = json.loads(accounts_file.read_text(encoding="utf-8"))
-        if not isinstance(raw, list):
-            return _muse_json_response({"items": []})
-        # Sanitize: Rule 8 Credential Security - NEVER return raw cookies!
-        sanitized = []
-        now = time.time()
-        for acc in raw:
-            if not isinstance(acc, dict):
-                continue
-            cookies = acc.get("cookies") if isinstance(acc.get("cookies"), dict) else {}
-            cookies_exp = acc.get("cookies_exp") if isinstance(acc.get("cookies_exp"), dict) else {}
-            min_exp = None
-            for exp in cookies_exp.values():
-                try:
-                    exp_float = float(exp)
-                    if min_exp is None or exp_float < min_exp:
-                        min_exp = exp_float
-                except (ValueError, TypeError):
-                    pass
-            is_expired = bool(min_exp is not None and min_exp < now)
-            quota = _sanitize_muse_quota(acc.get("quota"), now=now)
-            sanitized.append({
-                "id": str(acc.get("id") or ""),
-                "label": str(acc.get("label") or ""),
-                "cookie_count": len(cookies),
-                "enabled": bool(acc.get("enabled", True)),
-                "session_ok": acc.get("ok") if isinstance(acc.get("ok"), bool) else None,
-                "is_expired": is_expired,
-                "expires_at": min_exp,
-                "expires_estimated": bool(acc.get("expires_estimated")),
-                "media_quota_status": quota["status"],
-                "quota": quota,
-            })
-        return _muse_json_response({"items": sanitized})
+        return _muse_json_response({"items": _load_sanitized_muse_accounts()})
     except Exception as exc:
-        logger.warning("Không thể lấy danh sách tài khoản Muse: %s", exc)
+        logger.warning("Không thể lấy danh sách tài khoản Muse: %s", type(exc).__name__)
         return _muse_json_response({"items": []})
+
+
+def _relogin_muse_account(
+    account_id: str,
+    credentials: dict,
+    *,
+    reject_claimable_jobs: bool,
+) -> dict:
+    account_id = muse_provider.validate_account_id(account_id)
+    if not muse_account_auth.acquire_login_slot():
+        raise muse_provider.MuseServiceBusy("Một lượt đăng nhập Muse khác đang chạy.")
+    acquired = False
+    try:
+        if reject_claimable_jobs:
+            coordinator = globals().get("_muse_media_coordinator")
+            coordinator_status = coordinator.status() if coordinator is not None else {}
+            if (
+                str(coordinator_status.get("current_job_id") or "").strip()
+                or db.has_claimable_system_jobs("muse_media_generation")
+            ):
+                raise muse_provider.MuseServiceBusy(
+                    "Muse có job media đang chạy hoặc sẵn sàng chạy."
+                )
+        service = muse_studio_service.acquire()
+        acquired = True
+        if int(service.get("account_relogin") or 0) < 2:
+            raise muse_studio_service.MuseStudioConfigurationError(
+                "Muse2API chưa hỗ trợ account_relogin v2; hãy cập nhật Muse_AI_Studio."
+            )
+        if int(service.get("active_media_tasks") or 0) > 0:
+            raise muse_provider.MuseServiceBusy(
+                "Muse đang tạo media; chưa thể đăng nhập lại."
+            )
+        result = muse_provider.relogin_account(account_id, credentials)
+        if not result.get("ok"):
+            raise muse_provider.MuseAuthenticationError(
+                "Muse2API không xác nhận phiên đăng nhập mới."
+            )
+        return result
+    finally:
+        if acquired:
+            muse_studio_service.release()
+        muse_account_auth.release_login_slot()
+
+
+@app.put("/api/muse/accounts/{account_id}/auto-login")
+def configure_muse_account_auto_login(
+    account_id: str,
+    request: MuseAutoLoginData,
+):
+    try:
+        account_id = muse_provider.validate_account_id(account_id)
+        if _get_sanitized_muse_account(account_id) is None:
+            raise ValueError("Tài khoản Muse không tồn tại.")
+        credentials = muse_account_auth.validate_credentials(request.model_dump())
+        _relogin_muse_account(
+            account_id,
+            credentials,
+            reject_claimable_jobs=True,
+        )
+        auth_status = muse_account_auth.save_credentials(account_id, credentials)
+        return _muse_json_response(
+            {
+                "success": True,
+                "account": _get_sanitized_muse_account(account_id),
+                "auto_login": auth_status,
+            }
+        )
+    except (ValueError, muse_provider.MuseRequestError) as exc:
+        raise _muse_http_exception(400, exc) from exc
+    except muse_provider.MuseAuthenticationError as exc:
+        raise _muse_http_exception(401, exc) from exc
+    except (
+        muse_provider.MuseServiceBusy,
+        muse_studio_service.MuseStudioServiceBusy,
+    ) as exc:
+        raise _muse_http_exception(409, exc) from exc
+    except muse_studio_service.MuseStudioConfigurationError as exc:
+        raise _muse_http_exception(400, exc) from exc
+    except SecretStorageError as exc:
+        raise _muse_http_exception(503, exc) from exc
+    except (
+        muse_provider.MuseError,
+        muse_studio_service.MuseStudioServiceError,
+    ) as exc:
+        raise _muse_http_exception(503, exc) from exc
+    except Exception as exc:
+        raise _muse_http_exception(503, exc) from exc
+
+
+@app.delete("/api/muse/accounts/{account_id}/auto-login")
+def delete_muse_account_auto_login(account_id: str):
+    try:
+        account_id = muse_provider.validate_account_id(account_id)
+        if _get_sanitized_muse_account(account_id) is None:
+            raise ValueError("Tài khoản Muse không tồn tại.")
+        muse_account_auth.delete_credentials(account_id)
+        return _muse_json_response(
+            {
+                "success": True,
+                "account_id": account_id,
+                "auto_login": muse_account_auth.get_status(account_id),
+            }
+        )
+    except ValueError as exc:
+        raise _muse_http_exception(400, exc) from exc
+    except Exception as exc:
+        raise _muse_http_exception(503, exc) from exc
+
+
+@app.post("/api/muse/accounts/{account_id}/relogin")
+def relogin_muse_account_endpoint(account_id: str):
+    try:
+        account_id = muse_provider.validate_account_id(account_id)
+        if _get_sanitized_muse_account(account_id) is None:
+            raise ValueError("Tài khoản Muse không tồn tại.")
+        credentials = muse_account_auth.load_credentials(account_id)
+        if not credentials:
+            raise ValueError("Tài khoản Muse chưa cấu hình auto-login.")
+        _relogin_muse_account(
+            account_id,
+            credentials,
+            reject_claimable_jobs=True,
+        )
+        muse_account_auth.clear_recovery_failure()
+        return _muse_json_response(
+            {
+                "success": True,
+                "account": _get_sanitized_muse_account(account_id),
+            }
+        )
+    except (ValueError, muse_provider.MuseRequestError) as exc:
+        raise _muse_http_exception(400, exc) from exc
+    except muse_provider.MuseAuthenticationError as exc:
+        raise _muse_http_exception(401, exc) from exc
+    except (
+        muse_provider.MuseServiceBusy,
+        muse_studio_service.MuseStudioServiceBusy,
+    ) as exc:
+        raise _muse_http_exception(409, exc) from exc
+    except muse_studio_service.MuseStudioConfigurationError as exc:
+        raise _muse_http_exception(400, exc) from exc
+    except SecretStorageError as exc:
+        raise _muse_http_exception(503, exc) from exc
+    except (
+        muse_provider.MuseError,
+        muse_studio_service.MuseStudioServiceError,
+    ) as exc:
+        raise _muse_http_exception(503, exc) from exc
+    except Exception as exc:
+        raise _muse_http_exception(503, exc) from exc
 
 
 @app.post("/api/muse/accounts/{account_id}/quota/refresh")
@@ -7729,6 +7977,84 @@ def _append_muse_error_history(result: dict, exc: Exception, message: str) -> li
     return compacted[-MUSE_ERROR_HISTORY_LIMIT:]
 
 
+def _run_muse_auto_login_cycle() -> dict:
+    cooldown = muse_account_auth.recovery_cooldown_remaining()
+    if cooldown > 0:
+        return {
+            "status": "cooldown",
+            "attempted": 0,
+            "cooldown_seconds": int(math.ceil(cooldown)),
+        }
+    try:
+        accounts = _load_sanitized_muse_accounts()
+    except Exception as exc:
+        logger.warning("Không thể đọc account Muse để auto-login: %s", type(exc).__name__)
+        return {"status": "missing_credentials", "attempted": 0}
+    candidates = [
+        account
+        for account in accounts
+        if account.get("enabled")
+        and account.get("needs_relogin")
+        and account.get("auto_login_configured")
+    ]
+    candidates.sort(
+        key=lambda account: (
+            account.get("session_ok") is not False,
+            float(account.get("expires_at") or math.inf),
+            str(account.get("id") or ""),
+        )
+    )
+    attempted = 0
+    failures: list[dict] = []
+    for account in candidates:
+        account_id = str(account.get("id") or "")
+        try:
+            credentials = muse_account_auth.load_credentials(account_id)
+        except Exception as exc:
+            failures.append(
+                {"account_id": account_id, "error_class": type(exc).__name__}
+            )
+            continue
+        if not credentials:
+            continue
+        attempted += 1
+        try:
+            _relogin_muse_account(
+                account_id,
+                credentials,
+                reject_claimable_jobs=False,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Muse auto-login failed account_id=%s error_type=%s",
+                account_id,
+                type(exc).__name__,
+            )
+            failures.append(
+                {"account_id": account_id, "error_class": type(exc).__name__}
+            )
+            continue
+        muse_account_auth.clear_recovery_failure()
+        return {
+            "status": "success",
+            "attempted": attempted,
+            "account_id": account_id,
+            "failures": failures,
+        }
+    if attempted > 0:
+        muse_account_auth.record_recovery_failure()
+        return {
+            "status": "failed",
+            "attempted": attempted,
+            "failures": failures,
+        }
+    return {
+        "status": "missing_credentials",
+        "attempted": 0,
+        "failures": failures,
+    }
+
+
 def _handle_production_job_error(job: dict, exc: Exception) -> None:
     safe_error = security_logging.redact_sensitive(str(exc))
     workflow = db.get_youtube_publish_workflow_by_job(job["id"])
@@ -7793,6 +8119,127 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
         FlowMediaPending,
         FlowVideoCreditExhausted,
     )
+
+    if (
+        isinstance(exc, muse_provider.MuseAuthenticationError)
+        and str(job.get("job_type") or "") == "muse_media_generation"
+    ):
+        current_job = db.get_system_job(job["id"]) or job
+        result = dict(current_job.get("result") or {})
+        recovery_epoch = max(0, int(result.get("recovery_epoch") or 0))
+        previous = (
+            dict(result.get("muse_auto_login") or {})
+            if isinstance(result.get("muse_auto_login"), dict)
+            else {}
+        )
+        try:
+            previous_recovery_epoch = int(previous.get("recovery_epoch", -1))
+        except (TypeError, ValueError):
+            previous_recovery_epoch = -1
+        already_attempted = (
+            previous_recovery_epoch == recovery_epoch
+            and int(previous.get("attempt") or 0) >= 1
+        )
+        if already_attempted:
+            outcome = {"status": "loop_guard", "attempted": 0}
+        else:
+            result["automatic_muse_login"] = "pending"
+            result["muse_auto_login"] = {
+                "recovery_epoch": recovery_epoch,
+                "attempt": 1,
+                "state": "running",
+                "started_at": db.utc_now(),
+            }
+            db.update_system_job(
+                job["id"],
+                progress="Muse cần xác thực; đang tự đăng nhập lại an toàn",
+                result_json=result,
+                error=safe_error,
+            )
+            outcome = _run_muse_auto_login_cycle()
+
+        state = str(outcome.get("status") or "failed")
+        auto_login = dict(result.get("muse_auto_login") or {})
+        auto_login.update(
+            {
+                "recovery_epoch": recovery_epoch,
+                "attempt": max(1, int(auto_login.get("attempt") or 0)),
+                "state": state,
+                "attempted_accounts": int(outcome.get("attempted") or 0),
+                "finished_at": db.utc_now(),
+            }
+        )
+        if outcome.get("account_id"):
+            auto_login["recovered_account_id"] = str(outcome["account_id"])
+        if outcome.get("cooldown_seconds"):
+            auto_login["cooldown_seconds"] = int(outcome["cooldown_seconds"])
+        result["muse_auto_login"] = auto_login
+        result["muse_error_history"] = _append_muse_error_history(
+            result,
+            exc,
+            safe_error,
+        )
+
+        if state == "success":
+            result["automatic_muse_login"] = "succeeded"
+            result.pop("attention_required", None)
+            result["muse_wait_reason"] = "auto_login_recovered"
+            recovery = dict(result.get("muse_recovery") or {})
+            recovery["wait_reason"] = "auto_login_recovered"
+            result["muse_recovery"] = recovery
+            db.update_system_job(
+                job["id"],
+                status="queued",
+                progress="Đã tự đăng nhập lại Muse; tiếp tục từ checkpoint",
+                result_json=result,
+                error="",
+                next_retry_at="",
+                cancel_requested=0,
+                finished_at="",
+            )
+            if job.get("video_id"):
+                db.update_video_production_state(
+                    int(job["video_id"]),
+                    render_status="media_generation",
+                    current_stage="muse_auto_login_recovered",
+                    production_progress="Đã khôi phục phiên Muse; tiếp tục từ checkpoint",
+                    blocking_reason="",
+                )
+            return
+
+        result["automatic_muse_login"] = state
+        result["attention_required"] = "muse_login_required"
+        result["muse_wait_reason"] = "login_required"
+        recovery = dict(result.get("muse_recovery") or {})
+        recovery["wait_reason"] = "login_required"
+        result["muse_recovery"] = recovery
+        if state == "missing_credentials":
+            message = "Muse cần đăng nhập lại; hãy cấu hình auto-login trong Muse AI Studio."
+        elif state == "cooldown":
+            message = "Muse auto-login đang cooldown sau lần thất bại; checkpoint được giữ nguyên."
+        elif state == "loop_guard":
+            message = "Muse tiếp tục mất phiên sau một lượt auto-login; đã dừng để tránh lặp vô hạn."
+        else:
+            message = "Tự đăng nhập lại Muse thất bại; hãy kiểm tra credential rồi Resume."
+        db.update_system_job(
+            job["id"],
+            status="paused",
+            progress=message,
+            result_json=result,
+            error=safe_error,
+            next_retry_at="",
+            cancel_requested=0,
+            finished_at="",
+        )
+        if job.get("video_id"):
+            db.update_video_production_state(
+                int(job["video_id"]),
+                render_status="paused",
+                current_stage="muse_login_required",
+                production_progress=message,
+                blocking_reason=safe_error,
+            )
+        return
 
     if (
         isinstance(exc, ChatGPTAttentionRequiredError)
@@ -9918,6 +10365,8 @@ def _resume_muse_media_job(
         "muse_session_error_class",
         "muse_service_busy_attempt",
         "muse_wait_reason",
+        "muse_auto_login",
+        "automatic_muse_login",
     ):
         result.pop(key, None)
 
@@ -10932,6 +11381,21 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
             )
             if key in (result.get("muse_recovery") or {})
         },
+        "muse_auto_login": {
+            key: (result.get("muse_auto_login") or {}).get(key)
+            for key in (
+                "recovery_epoch",
+                "attempt",
+                "state",
+                "attempted_accounts",
+                "recovered_account_id",
+                "cooldown_seconds",
+                "started_at",
+                "finished_at",
+            )
+            if key in (result.get("muse_auto_login") or {})
+        },
+        "automatic_muse_login": str(result.get("automatic_muse_login") or ""),
         "muse_artifacts": {
             key: (result.get("muse_artifacts") or {}).get(key)
             for key in (

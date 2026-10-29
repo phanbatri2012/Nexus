@@ -6508,6 +6508,26 @@ def generate_muse_scene_plan_only(
                 if batch_key in state["completed_batches"]:
                     continue
                 check_cancel()
+                step_name = f"batch_{batch_index}"
+                failed_entry = state.get("failed_steps", {}).get(step_name)
+                if failed_entry:
+                    batch_retry_counts = state.setdefault("batch_retry_counts", {})
+                    retries = int(batch_retry_counts.get(step_name, 0))
+                    if retries >= 2:
+                        raise muse_semantic_planner.SemanticPlanValidationError(
+                            failed_entry.get("errors")
+                            or [f"{step_name} đã vượt quá giới hạn thử lại (2 lần). Dừng để tránh lặp vô hạn."]
+                        )
+                    batch_retry_counts[step_name] = retries + 1
+                    state["failed_steps"].pop(step_name, None)
+                    state["invalid_steps"].pop(step_name, None)
+                    group_str = str(batch_index // batches_per_chat)
+                    if group_str in state.get("chat_groups", {}):
+                        state["chat_groups"][group_str].pop("chat_url", None)
+                        active_group = None
+                        active_group_index = -1
+                    persist_state()
+
                 report_progress(batch_index, len(state["completed_batches"]))
                 group_index = batch_index // batches_per_chat
                 group = activate_group(group_index)
@@ -6563,6 +6583,7 @@ def generate_muse_scene_plan_only(
                 state["completed_batches"][batch_key] = batch_result
                 state["current_batch_index"] = batch_index + 1
                 state["invalid_steps"].pop(f"batch_{batch_index}", None)
+                state.get("failed_steps", {}).pop(step_name, None)
                 clear_pending_generation_prompt(group, delivered_step, delivered_prompt)
                 state["transient_retry_count"] = 0
                 persist_state()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 import re
 import unicodedata
@@ -590,6 +591,18 @@ def _must_show_values(value: object) -> list[str]:
     return [item for item in cleaned if item]
 
 
+_HISTORICAL_ANCHOR_ALIASES: dict[str, str] = {
+    "campo chia": "campuchia",
+    "campochia": "campuchia",
+    "phanong pinh": "phnom penh",
+    "phanongpinh": "phnom penh",
+    "pon pot": "pol pot",
+    "ponpot": "pol pot",
+    "si ha nuc": "sihanouk",
+    "sihanuc": "sihanouk",
+}
+
+
 def _anchor_matches(anchor: str, combined_identity: str, compact_combined_identity: str) -> bool:
     key = _identity(anchor)
     if not key:
@@ -599,11 +612,36 @@ def _anchor_matches(anchor: str, combined_identity: str, compact_combined_identi
     compact_key = key.replace(" ", "")
     if len(compact_key) >= 4 and compact_key in compact_combined_identity:
         return True
+
+    alias = _HISTORICAL_ANCHOR_ALIASES.get(key) or _HISTORICAL_ANCHOR_ALIASES.get(compact_key)
+    if alias:
+        alias_key = _identity(alias)
+        compact_alias = alias_key.replace(" ", "")
+        if alias_key in combined_identity or (
+            len(compact_alias) >= 4 and compact_alias in compact_combined_identity
+        ):
+            return True
+
     words = [w for w in key.split() if len(w) >= 2]
     if len(words) >= 2:
         matching_words = sum(1 for w in words if re.search(rf"\b{re.escape(w)}\b", combined_identity))
         if matching_words >= 2 or (matching_words >= 1 and len(words) == 2 and len(compact_key) >= 4):
             return True
+
+    # Bounded token fuzzy match: O(K) bounded, prevents CPU hang and matches slight ASR phonetic typos
+    if len(compact_key) >= 5:
+        target_tokens = [t for t in combined_identity.split() if len(t) >= 4]
+        for token in target_tokens:
+            if abs(len(token) - len(compact_key)) <= 2:
+                if difflib.SequenceMatcher(None, compact_key, token).ratio() >= 0.82:
+                    return True
+        if len(words) >= 2 and len(target_tokens) >= 2:
+            for i in range(len(target_tokens) - 1):
+                pair = f"{target_tokens[i]}{target_tokens[i+1]}"
+                if abs(len(pair) - len(compact_key)) <= 2:
+                    if difflib.SequenceMatcher(None, compact_key, pair).ratio() >= 0.82:
+                        return True
+
     return False
 
 
