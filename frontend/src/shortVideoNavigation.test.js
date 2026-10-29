@@ -1,0 +1,27 @@
+import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
+import test from 'node:test'
+
+
+test('wires dynamic Short Video navigation and project screens', async () => {
+  const appSource = await readFile(new URL('./App.jsx', import.meta.url), 'utf8')
+  const menuSource = await readFile(new URL('./ShortVideoMenu.jsx', import.meta.url), 'utf8')
+  const viewSource = await readFile(new URL('./ShortVideo.jsx', import.meta.url), 'utf8')
+
+  assert.match(appSource, /import ShortVideo from ['"]\.\/ShortVideo['"]/)
+  assert.match(appSource, /<ShortVideoMenu/)
+  assert.match(appSource, /activeView === ['"]shortvideo['"][\s\S]*<ShortVideo/)
+  assert.match(menuSource, /api\/short-video\/projects/)
+  assert.match(menuSource, /event\.stopPropagation\(\)/)
+  assert.match(menuSource, /project\.status === ['"]paused['"]/)
+  assert.doesNotMatch(menuSource, /include_archived=true/)
+  assert.match(viewSource, /Tên bài thơ/)
+  assert.match(viewSource, /Nội dung bài thơ/)
+  assert.match(viewSource, /Engine tạo hình/)
+  assert.match(viewSource, /Google Flow/)
+  assert.match(viewSource, /visual_provider: visualProvider/)
+  assert.match(viewSource, /Tạo video/)
+  assert.doesNotMatch(viewSource, /subtitle|phụ đề/i)
+  assert.match(viewSource, /Dự án không khả dụng/)
+  assert.match(viewSource, /Dự án đã archive/)
+})

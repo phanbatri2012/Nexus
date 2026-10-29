@@ -838,13 +838,20 @@ def _style_summary(style: str) -> str:
     )
 
 
-def _compile_still_prompt(semantic: dict, *, style_text: str, terminal: bool = False) -> str:
+def _compile_still_prompt(
+    semantic: dict,
+    *,
+    style_text: str,
+    terminal: bool = False,
+    aspect_ratio: str = "16:9",
+) -> str:
     must_show = ", ".join(semantic["must_show"])
     opening = (
         "Create the distinct final still reached after the last video transition. "
         if terminal
         else "Create a coherent cinematic still for this video scene. "
     )
+    framing = "vertical portrait composition" if aspect_ratio == "9:16" else "widescreen composition"
     return _clean_text(
         opening
         + f"Subject: {semantic['subject']}. Action: {semantic['action']}. "
@@ -852,7 +859,7 @@ def _compile_still_prompt(semantic: dict, *, style_text: str, terminal: bool = F
         f"Visual anchor: {semantic['visual_anchor']}. Must show: {must_show}. "
         f"Composition: {semantic['composition']}. Lighting: {semantic['lighting']}. "
         f"Color palette: {semantic['color']}. Style: {style_text}. "
-        "Photorealistic 16:9 widescreen image, no text, no captions, no logo.",
+        f"Photorealistic {aspect_ratio} {framing}, no text, no captions, no logo.",
         max_chars=1800,
     )
 
@@ -863,6 +870,7 @@ def compile_muse_scene_plan(
     *,
     title: str,
     style: str,
+    aspect_ratio: str = "16:9",
 ) -> dict:
     """Compile validated semantic fields into prompts without another model call."""
 
@@ -870,7 +878,11 @@ def compile_muse_scene_plan(
     compiled: list[dict] = []
     style_text = _style_summary(style)
     for window, semantic in zip(windows, validated["scenes"]):
-        prompt = _compile_still_prompt(semantic, style_text=style_text)
+        prompt = _compile_still_prompt(
+            semantic,
+            style_text=style_text,
+            aspect_ratio=aspect_ratio,
+        )
         compiled.append(
             {
                 **window,
@@ -909,6 +921,7 @@ def compile_muse_scene_plan(
                 terminal_frame,
                 style_text=style_text,
                 terminal=True,
+                aspect_ratio=aspect_ratio,
             ),
             "style": style_text,
             "primary_reference_id": "",

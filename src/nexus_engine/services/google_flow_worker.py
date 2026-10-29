@@ -397,6 +397,7 @@ class GoogleFlowWorker:
         self._rejected_image_urls: set[str] = set()
         self._inspected_detail_keys: set[str] = set()
         self._last_invalid_image_size: tuple[int, int] | None = None
+        self._expected_image_aspect_ratio = "16:9"
         self._validated_image_payload: tuple[str, bytes] | None = None
         self._last_generated_image_identity: dict[str, str] = {}
         self._last_reference_identity: dict[str, object] = {}
@@ -2663,9 +2664,11 @@ class GoogleFlowWorker:
                 self._project_id(),
                 exc,
             )
-            return {"state": "missing", "source": ""}
+            return {"state": "scan_failed", "source": ""}
 
-        if not isinstance(result, dict) or not result.get("promptFound"):
+        if not isinstance(result, dict):
+            return {"state": "scan_failed", "source": ""}
+        if not result.get("promptFound"):
             return {"state": "missing", "source": ""}
         error_text = str(result.get("error") or "").strip()
         if error_text and _is_valid_flow_error_text(error_text):
@@ -4985,10 +4988,18 @@ class GoogleFlowWorker:
             )
             return False
 
+        actual_ratio = width / max(1, height)
+        expected_aspect = self._expected_image_aspect_ratio
+        if expected_aspect in {"9:16", "3:4"}:
+            invalid_orientation = height / max(1, width) < MIN_GENERATED_IMAGE_ASPECT_RATIO
+        elif expected_aspect == "1:1":
+            invalid_orientation = abs(actual_ratio - 1.0) > 0.15
+        else:
+            invalid_orientation = actual_ratio < MIN_GENERATED_IMAGE_ASPECT_RATIO
         if (
             width < MIN_GENERATED_IMAGE_WIDTH
             or height < MIN_GENERATED_IMAGE_HEIGHT
-            or width / max(1, height) < MIN_GENERATED_IMAGE_ASPECT_RATIO
+            or invalid_orientation
         ):
             self._rejected_image_urls.add(variant_key)
             self._last_invalid_image_size = (width, height)
@@ -5620,6 +5631,12 @@ class GoogleFlowWorker:
         deadline_seconds: float = AGENT_IMAGE_GENERATION_TIMEOUT_SECONDS,
     ) -> str:
         self._last_generation_receipt = {}
+        requested_aspect = str((image_settings or {}).get("aspect_ratio") or "16:9").strip()
+        self._expected_image_aspect_ratio = (
+            requested_aspect
+            if requested_aspect in {"16:9", "4:3", "1:1", "3:4", "9:16"}
+            else "16:9"
+        )
         self._set_active_reference_filenames(reference_ids, reference_paths)
         self._reset_image_candidate_state()
         await self._ensure_project_canvas()
@@ -6101,6 +6118,7 @@ class GoogleFlowWorker:
         video_settings: dict | None = None,
         scene_index: int | None = None,
         reconcile_only: bool = False,
+        submit_if_prompt_missing: bool = False,
         video_error_count_before_submit: int | None = None,
         video_tile_count_before_submit: int | None = None,
         request_key: str = "",
@@ -6119,6 +6137,7 @@ class GoogleFlowWorker:
                 video_settings=video_settings,
                 scene_index=scene_index,
                 reconcile_only=reconcile_only,
+                submit_if_prompt_missing=submit_if_prompt_missing,
                 video_error_count_before_submit=video_error_count_before_submit,
                 video_tile_count_before_submit=video_tile_count_before_submit,
                 request_key=request_key,
@@ -6140,6 +6159,7 @@ class GoogleFlowWorker:
         video_settings: dict | None = None,
         scene_index: int | None = None,
         reconcile_only: bool = False,
+        submit_if_prompt_missing: bool = False,
         video_error_count_before_submit: int | None = None,
         video_tile_count_before_submit: int | None = None,
         request_key: str = "",
@@ -6179,16 +6199,17 @@ class GoogleFlowWorker:
             if existing_state == "completed" and existing_source:
                 self._record_video_timing("playable_url_seen")
                 return existing_source
-            await self._raise_latest_video_error(
-                full_prompt,
-                existing_result,
-                video_error_count_before_submit=video_error_count_before_submit,
-                video_tile_count_before_submit=video_tile_count_before_submit,
-            )
-            raise FlowVideoPending(
-                "Google Flow đã nhận yêu cầu video và chưa có file tải xuống; "
-                "sẽ tiếp tục đối soát mà không gửi lại prompt."
-            )
+            if not (submit_if_prompt_missing and existing_state == "missing"):
+                await self._raise_latest_video_error(
+                    full_prompt,
+                    existing_result,
+                    video_error_count_before_submit=video_error_count_before_submit,
+                    video_tile_count_before_submit=video_tile_count_before_submit,
+                )
+                raise FlowVideoPending(
+                    "Google Flow đã nhận yêu cầu video và chưa có file tải xuống; "
+                    "sẽ tiếp tục đối soát mà không gửi lại prompt."
+                )
 
         await self._ensure_agent_session_ready()
         editor = await self.wait_for_editor(timeout=25.0)

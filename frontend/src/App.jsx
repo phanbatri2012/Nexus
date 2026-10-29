@@ -7,6 +7,8 @@ import AutoLogin from './AutoLogin'
 import GoogleFlowLogin from './GoogleFlowLogin'
 import AudioReviewPanel from './AudioReviewPanel'
 import JobCenter from './JobCenter'
+import ShortVideo from './ShortVideo'
+import ShortVideoMenu from './ShortVideoMenu'
 import Settings from './Settings'
 import ChannelManager from './ChannelManager'
 import VideoQueuePanel from './VideoQueuePanel'
@@ -1996,6 +1998,11 @@ function App() {
           </li>
           <li className={`nav-item ${activeView === 'trustbuilder' ? 'active' : ''}`} data-view="trustbuilder" onClick={() => setActiveView('trustbuilder')}>Trust Builder</li>
           <li className={`nav-item ${activeView === 'crossposter' ? 'active' : ''}`} data-view="crossposter" onClick={() => setActiveView('crossposter')}>Cross-Poster</li>
+          <ShortVideoMenu
+            activeView={activeView}
+            subPath={router.subPath}
+            navigate={router.navigate}
+          />
           <li className={`nav-item ${activeView === 'fetcher' ? 'active' : ''}`} data-view="fetcher" onClick={() => setActiveView('fetcher')}>Video Fetcher</li>
           <li
             className={`nav-item ${activeView === 'downloader' ? 'active' : ''}`}
@@ -2083,6 +2090,12 @@ function App() {
             <TrustBuilder />
           ) : activeView === 'crossposter' ? (
             <CrossPoster />
+          ) : activeView === 'shortvideo' ? (
+            <ShortVideo
+              subPath={router.subPath}
+              query={router.query}
+              navigate={router.navigate}
+            />
           ) : activeView === 'settings' ? (
             <Settings
               lockedPromptVersion={chatGptStatus.promptVersion}

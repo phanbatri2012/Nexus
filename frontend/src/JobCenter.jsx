@@ -678,6 +678,7 @@ function JobCenter({ onOpenVideo, refreshKey }) {
         >
           <option value="all">Mọi loại job</option>
           <option value="video_generation">Tạo video</option>
+          <option value="short_video_generation">Tạo Short Video</option>
           <option value="audio_review">Kiểm duyệt audio</option>
           <option value="audio">Tạo audio</option>
           <option value="visual_scene_plan">Lập kế hoạch cảnh</option>

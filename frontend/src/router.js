@@ -55,6 +55,12 @@ export const ROUTE_REGISTRY = {
     aliases: ['/cross-poster', '/crossposter', '/cross_poster', '/syndication'],
     title: 'Cross-Poster'
   },
+  shortvideo: {
+    id: 'shortvideo',
+    canonicalPath: '/short-video',
+    aliases: ['/short-video', '/shorts'],
+    title: 'Short Video'
+  },
   fetcher: {
     id: 'fetcher',
     canonicalPath: '/fetcher',

@@ -8,6 +8,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 CONFIG_DIR = PROJECT_ROOT / "config"
+SHORT_VIDEO_PROJECTS_CONFIG_DIR = CONFIG_DIR / "short_video_projects"
 DATA_DIR = Path(
     os.environ.get("NEXUS_DATA_DIR")
     or os.environ.get("AUTO_YT_DATA_DIR")
@@ -32,6 +33,7 @@ SEGMENTS_DIR = VIDEO_ARTIFACTS_DIR / "segments"
 FLOW_ARTIFACTS_DIR = VIDEO_ARTIFACTS_DIR / "flow"
 FLOW_REFERENCE_STAGING_DIR = FLOW_ARTIFACTS_DIR / "staging"
 MUSE_ARTIFACTS_DIR = VIDEO_ARTIFACTS_DIR / "muse"
+SHORT_VIDEO_DIR = DATA_DIR / "short_video"
 PROMPT_ASSETS_DIR = DATA_DIR / "prompt_assets"
 BACKGROUND_VIDEOS_DIR = DATA_DIR / "background_videos"
 ANIMATED_ICONS_DIR = DATA_DIR / "animated_icons"

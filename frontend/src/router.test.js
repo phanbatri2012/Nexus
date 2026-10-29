@@ -9,10 +9,10 @@ import {
   stringifyQueryParams
 } from './router.js'
 
-test('registers all 14 primary modules in ROUTE_REGISTRY', () => {
+test('registers all 15 primary modules in ROUTE_REGISTRY', () => {
   const expectedKeys = [
     'dashboard', 'jobs', 'competitors', 'comments', 'channels', 'trustbuilder', 'crossposter',
-    'fetcher', 'downloader', 'autologin', 'flowlogin', 'tts', 'muse', 'settings'
+    'shortvideo', 'fetcher', 'downloader', 'autologin', 'flowlogin', 'tts', 'muse', 'settings'
   ]
   for (const key of expectedKeys) {
     assert.ok(ROUTE_REGISTRY[key], `Missing registry entry for ${key}`)
@@ -38,7 +38,7 @@ test('parses query strings and formats them back reliably', () => {
   assert.equal(formatted, '?status=failed&limit=10')
 })
 
-test('parses primary routes across all 14 menus correctly', () => {
+test('parses primary routes across all 15 menus correctly', () => {
   const expectedMappings = [
     { url: '/', viewId: 'dashboard' },
     { url: '/dashboard', viewId: 'dashboard' },
@@ -54,6 +54,8 @@ test('parses primary routes across all 14 menus correctly', () => {
     { url: '/Cross-Poster', viewId: 'crossposter' },
     { url: '/cross-poster', viewId: 'crossposter' },
     { url: '/crossposter', viewId: 'crossposter' },
+    { url: '/short-video', viewId: 'shortvideo' },
+    { url: '/shorts', viewId: 'shortvideo' },
     { url: '/fetcher', viewId: 'fetcher' },
     { url: '/video-fetcher', viewId: 'fetcher' },
     { url: '/downloader', viewId: 'downloader' },
@@ -72,6 +74,15 @@ test('parses primary routes across all 14 menus correctly', () => {
     const parsed = parseRoute(item.url)
     assert.equal(parsed.viewId, item.viewId, `Expected ${item.url} to resolve to ${item.viewId}`)
   }
+})
+
+test('parses and builds Short Video project deep links', () => {
+  const parsed = parseRoute('/short-video/bac-ho-ngam-tho/review')
+  assert.equal(parsed.viewId, 'shortvideo')
+  assert.equal(parsed.subPath, 'bac-ho-ngam-tho/review')
+  assert.deepEqual(parsed.segments, ['bac-ho-ngam-tho', 'review'])
+  assert.equal(buildPath('shortvideo', 'bac-ho-ngam-tho/outputs'), '/short-video/bac-ho-ngam-tho/outputs')
+  assert.equal(buildPath('shortvideo', '', { tab: 'jobs' }), '/short-video?tab=jobs')
 })
 
 test('parses deep sub-paths for Cross-Poster (/Cross-Poster/abc/xyz)', () => {

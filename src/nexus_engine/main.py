@@ -101,6 +101,8 @@ from nexus_engine.services import (
     muse_provider,
     muse_settings,
     muse_studio_service,
+    short_video_api,
+    short_video_worker,
     source_voice_analyzer,
     video_qc,
     video_production,
@@ -588,6 +590,7 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,
 )
+app.include_router(short_video_api.router)
 
 
 @app.exception_handler(Exception)
@@ -4492,6 +4495,7 @@ AUTOMATION_JOB_LABELS = {
 }
 ALL_JOB_LABELS = {
     "video_generation": "Tạo video",
+    "short_video_generation": "Tạo Short Video",
     **COMMENT_JOB_LABELS,
     **FLOW_MEDIA_JOB_LABELS,
     **MUSE_MEDIA_JOB_LABELS,
@@ -5851,6 +5855,12 @@ def resume_background_jobs() -> None:
             "Paused %d Muse media job(s) for explicit checkpoint resume after restart.",
             paused_muse_jobs,
         )
+    paused_short_jobs = short_video_worker.pause_after_restart()
+    if paused_short_jobs:
+        logger.info(
+            "Paused %d Short Video job(s) for explicit checkpoint resume after restart.",
+            paused_short_jobs,
+        )
     migrated_flow_jobs = _migrate_legacy_google_flow_render_jobs()
     if migrated_flow_jobs:
         logger.info(
@@ -5945,6 +5955,7 @@ def stop_video_queue_wakeup_timer() -> None:
         _production_coordinator.stop()
     if _publish_coordinator is not None:
         _publish_coordinator.stop()
+    short_video_worker.stop()
     if _radar_coordinator is not None:
         _radar_coordinator.stop()
     chatgpt_browser_service.stop_browser_service()
@@ -10953,7 +10964,7 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
         ),
         "can_cancel": (
             status in {"queued", "retry_wait", "paused"}
-            or (job_type in {"video_generation", "flow_media_generation", "muse_media_generation", "video_render", "video_qc", "visual_scene_plan", "competitor_scan", "youtube_upload", "youtube_publish", "fb_crosspost", "fb_crosspost_sync", "thumbnail_generation", "tiktok_publish", "trust_builder_session"} and status == "running")
+            or (job_type in {"video_generation", "short_video_generation", "flow_media_generation", "muse_media_generation", "video_render", "video_qc", "visual_scene_plan", "competitor_scan", "youtube_upload", "youtube_publish", "fb_crosspost", "fb_crosspost_sync", "thumbnail_generation", "tiktok_publish", "trust_builder_session"} and status == "running")
         ),
         "can_retry": (
             pinned_comment_attention
@@ -11372,6 +11383,7 @@ def _job_matches_video_search(item: dict, query: str) -> bool:
 JOB_CENTER_ACTIONS = ("retry", "pause", "resume", "cancel", "force_stop")
 JOB_CENTER_SYSTEM_JOB_TYPES = (
     "video_generation",
+    "short_video_generation",
     *COMMENT_JOB_TYPES,
     *FLOW_MEDIA_JOB_TYPES,
     *MUSE_MEDIA_JOB_TYPES,
@@ -11704,6 +11716,8 @@ class JobCenterActionNotAllowedError(ValueError):
 def _kick_job_queues(job_types: set[str]) -> None:
     if "video_generation" in job_types:
         _kick_video_queue()
+    if "short_video_generation" in job_types:
+        short_video_worker.kick()
     if any(job_type in COMMENT_JOB_TYPES for job_type in job_types):
         _kick_comment_queue()
     if any(job_type in FLOW_MEDIA_JOB_TYPES for job_type in job_types):
@@ -11834,6 +11848,30 @@ def _run_system_job_center_action(
                 pass
     if not updated_job:
         raise JobCenterItemNotFoundError("Không tìm thấy job.")
+    if str(job.get("job_type") or "") == "short_video_generation":
+        short_item = db.get_short_video_item_by_job(job_id)
+        if short_item:
+            if action in {"cancel", "force_stop"}:
+                db.update_short_video_item(
+                    str(short_item["id"]),
+                    status="canceled",
+                    current_stage="canceled",
+                    error="",
+                )
+            elif action == "pause":
+                db.update_short_video_item(
+                    str(short_item["id"]),
+                    status="needs_attention",
+                    current_stage="paused",
+                    error="",
+                )
+            elif action in {"resume", "retry"}:
+                db.update_short_video_item(
+                    str(short_item["id"]),
+                    status="queued",
+                    current_stage=str(updated_job.get("resume_from_step") or "queued"),
+                    error="",
+                )
     if str(job.get("job_type")) in {"youtube_upload", "youtube_publish"}:
         workflow = db.get_youtube_publish_workflow_by_job(job_id)
         if workflow:
@@ -12134,6 +12172,7 @@ def update_video_job(job_id: str, request: UpdateVideoJobRequest):
 
 @app.delete("/api/jobs/{job_id}")
 def delete_job(job_id: str):
+    short_item = db.get_short_video_item_by_job(job_id)
     try:
         deleted_job = db.delete_system_job(job_id)
     except ValueError as exc:
@@ -12142,6 +12181,14 @@ def delete_job(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     with _jobs_lock:
         _jobs.pop(job_id, None)
+    if short_item:
+        db.update_short_video_item(
+            str(short_item["id"]),
+            status="needs_attention",
+            current_stage="job_deleted",
+            job_id="",
+            error="Job điều phối đã bị xóa; artifact hiện có vẫn được giữ lại.",
+        )
     _kick_job_queues({str(deleted_job.get("job_type") or "video_generation")})
     return {"success": True}
 

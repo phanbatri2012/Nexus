@@ -309,6 +309,8 @@ def submit_tts_task(
     text: str,
     voice_id: str,
     voice_snapshot: dict | None = None,
+    *,
+    request_hash: str = "",
 ) -> dict:
     if voice_snapshot:
         voice = _voice_for_hash(voice_id, voice_snapshot)
@@ -319,7 +321,7 @@ def submit_tts_task(
     return provider.submit(
         text,
         voice,
-        get_request_hash(text, voice_id, voice_snapshot),
+        request_hash or get_request_hash(text, voice_id, voice_snapshot),
     )
 
 

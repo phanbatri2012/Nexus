@@ -179,6 +179,8 @@ class MuseProvider(Protocol):
         destination: Path,
         *,
         request_hash: str = "",
+        aspect_ratio: str = "16:9",
+        resolution: str = "",
         on_submitted: Callable[[MuseReceipt], None] | None = None,
         cancel_check: Callable[[], None] | None = None,
     ) -> dict: ...
@@ -191,6 +193,9 @@ class MuseProvider(Protocol):
         destination: Path,
         *,
         request_hash: str = "",
+        aspect_ratio: str = "16:9",
+        resolution: str = "1920x1080",
+        duration_seconds: float = 10.0,
         on_submitted: Callable[[MuseReceipt], None] | None = None,
         cancel_check: Callable[[], None] | None = None,
     ) -> dict: ...
@@ -206,27 +211,43 @@ class MuseProvider(Protocol):
 
 class MusePromptBuilder:
     @staticmethod
-    def image(prompt: str, *, has_references: bool) -> str:
+    def image(
+        prompt: str,
+        *,
+        has_references: bool,
+        aspect_ratio: str = "16:9",
+        resolution: str = "1920x1080",
+    ) -> str:
         prefix = (
             "Use only the reference images attached to this request as canonical visual "
             "references. Preserve each referenced character's identity and appearance."
             if has_references
             else "Create a completely new image from text; do not use images from chat history."
         )
+        framing = "vertical portrait" if aspect_ratio == "9:16" else "widescreen"
         return (
-            f"{prefix}\nCreate one 16:9 widescreen image at 1920x1080. {prompt.strip()}\n"
+            f"{prefix}\nCreate one {aspect_ratio} {framing} image at {resolution}. "
+            f"{prompt.strip()}\n"
             "Clean cinematic frame, no text, subtitles, watermark, signature, border, or logo."
         )
 
     @staticmethod
-    def video(prompt: str, *, duration_seconds: float = 10.0) -> str:
+    def video(
+        prompt: str,
+        *,
+        duration_seconds: float = 10.0,
+        aspect_ratio: str = "16:9",
+        resolution: str = "1920x1080",
+    ) -> str:
         mapping = (
             "@Image1 is the required first frame and @Image2 is the required final frame. "
             "Create one continuous, physically coherent transition from @Image1 to @Image2. "
             "Do not reinterpret either endpoint as a character or turnaround reference."
         )
+        framing = "vertical portrait" if aspect_ratio == "9:16" else "widescreen"
         return (
-            f"{mapping}\nGenerate one 16:9 widescreen image-to-video clip at 1920x1080, "
+            f"{mapping}\nGenerate one {aspect_ratio} {framing} image-to-video clip "
+            f"at {resolution}, "
             f"approximately {max(1, min(10, round(duration_seconds)))} seconds. {prompt.strip()}\n"
             "Natural cinematic motion, no text, subtitles, watermark, signature, border, or logo."
         )
@@ -397,6 +418,8 @@ class MuseStudioApiProvider:
         destination: Path,
         *,
         request_hash: str = "",
+        aspect_ratio: str = "16:9",
+        resolution: str = "",
         on_submitted: Callable[[MuseReceipt], None] | None = None,
         cancel_check: Callable[[], None] | None = None,
     ) -> dict:
@@ -404,11 +427,13 @@ class MuseStudioApiProvider:
         payload = {
             "prompt": prompt.strip(),
             "model": "muse-image",
-            "aspect_ratio": "16:9",
+            "aspect_ratio": aspect_ratio,
             "response_format": "url",
             "timeout": MUSE_IMAGE_TIMEOUT_SECONDS,
             "reference_image": [str(path) for path in references] or None,
         }
+        if resolution:
+            payload["resolution"] = resolution
         return await self._submit_and_wait(
             submit_endpoint="/v1/images/tasks",
             status_prefix="/v1/images/tasks",
@@ -429,6 +454,9 @@ class MuseStudioApiProvider:
         destination: Path,
         *,
         request_hash: str = "",
+        aspect_ratio: str = "16:9",
+        resolution: str = "1920x1080",
+        duration_seconds: float = 10.0,
         on_submitted: Callable[[MuseReceipt], None] | None = None,
         cancel_check: Callable[[], None] | None = None,
     ) -> dict:
@@ -441,9 +469,9 @@ class MuseStudioApiProvider:
         payload = {
             "prompt": prompt.strip(),
             "model": "muse-video",
-            "aspect_ratio": "16:9",
-            "resolution": "1920x1080",
-            "duration": 10,
+            "aspect_ratio": aspect_ratio,
+            "resolution": resolution,
+            "duration": max(1, min(10, round(duration_seconds))),
             "timeout": MUSE_VIDEO_TIMEOUT_SECONDS,
             "start_image": str(references[0]),
             "end_image": str(references[1]),

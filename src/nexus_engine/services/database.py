@@ -1027,6 +1027,32 @@ def init_db():
         'ON system_jobs(video_id)'
     )
     c.execute('''
+        CREATE TABLE IF NOT EXISTS short_video_items (
+            id TEXT PRIMARY KEY,
+            project_key TEXT NOT NULL,
+            profile_version TEXT NOT NULL,
+            title TEXT NOT NULL,
+            source_text TEXT NOT NULL,
+            status TEXT NOT NULL,
+            current_stage TEXT DEFAULT '',
+            job_id TEXT DEFAULT '',
+            manifest_json TEXT NOT NULL DEFAULT '{}',
+            error TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            reviewed_at TEXT DEFAULT '',
+            completed_at TEXT DEFAULT ''
+        )
+    ''')
+    c.execute(
+        'CREATE INDEX IF NOT EXISTS idx_short_video_items_project_status '
+        'ON short_video_items(project_key, status, created_at DESC)'
+    )
+    c.execute(
+        'CREATE INDEX IF NOT EXISTS idx_short_video_items_job '
+        'ON short_video_items(job_id)'
+    )
+    c.execute('''
         CREATE TABLE IF NOT EXISTS youtube_channels (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             channel_id TEXT NOT NULL UNIQUE,
@@ -5711,6 +5737,357 @@ def get_system_job_queue_position(job_id: str) -> int | None:
     position = int(c.fetchone()[0])
     conn.close()
     return position
+
+
+SHORT_VIDEO_ITEM_MUTABLE_FIELDS = frozenset(
+    {
+        "status",
+        "current_stage",
+        "job_id",
+        "manifest_json",
+        "error",
+        "reviewed_at",
+        "completed_at",
+    }
+)
+
+
+def _decode_short_video_item(row: sqlite3.Row | None) -> dict | None:
+    if row is None:
+        return None
+    item = dict(row)
+    try:
+        item["manifest"] = json.loads(item.get("manifest_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        item["manifest"] = {}
+    item.pop("manifest_json", None)
+    return item
+
+
+def create_short_video_item_with_job(
+    *,
+    item_id: str,
+    project_key: str,
+    profile_version: str,
+    title: str,
+    source_text: str,
+    manifest: dict,
+    job_id: str,
+    payload: dict,
+    voice_snapshot: dict,
+) -> tuple[dict, dict, bool]:
+    """Atomically create an idempotent Short item and its first system job."""
+
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT * FROM short_video_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        if existing is not None:
+            linked_job_id = str(existing["job_id"] or job_id)
+            job_row = conn.execute(
+                "SELECT * FROM system_jobs WHERE id = ?",
+                (linked_job_id,),
+            ).fetchone()
+            conn.execute("COMMIT")
+            return (
+                _decode_short_video_item(existing),
+                _decode_system_job(job_row) or {},
+                False,
+            )
+
+        voice_id = str(voice_snapshot.get("voice_id") or "")
+        voice_name = str(voice_snapshot.get("voice_name") or "")
+        provider_id = str(voice_snapshot.get("provider_id") or "omnivoice")
+        voice_revision = max(1, int(voice_snapshot.get("voice_revision") or 1))
+        manifest_json = json.dumps(manifest, ensure_ascii=False)
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        voice_json = json.dumps(voice_snapshot, ensure_ascii=False)
+        conn.execute(
+            '''
+            INSERT INTO short_video_items (
+                id, project_key, profile_version, title, source_text,
+                status, current_stage, job_id, manifest_json, error,
+                created_at, updated_at, reviewed_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, 'queued', 'queued', ?, ?, '', ?, ?, '', '')
+            ''',
+            (
+                item_id,
+                project_key,
+                profile_version,
+                title,
+                source_text,
+                job_id,
+                manifest_json,
+                now,
+                now,
+            ),
+        )
+        conn.execute(
+            '''
+            INSERT INTO system_jobs (
+                id, job_type, status, title, progress, payload_json,
+                result_json, error, video_id, prompt_version, voice_id,
+                voice_name, tts_provider_id, voice_revision,
+                voice_snapshot_json, created_at, updated_at
+            ) VALUES (
+                ?, 'short_video_generation', 'queued', ?,
+                'Đang chờ tạo Short Video', ?, '{}', '', NULL, '', ?, ?, ?, ?, ?, ?, ?
+            )
+            ''',
+            (
+                job_id,
+                title,
+                payload_json,
+                voice_id,
+                voice_name,
+                provider_id,
+                voice_revision,
+                voice_json,
+                now,
+                now,
+            ),
+        )
+        item_row = conn.execute(
+            "SELECT * FROM short_video_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        job_row = conn.execute(
+            "SELECT * FROM system_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        conn.execute("COMMIT")
+        return _decode_short_video_item(item_row), _decode_system_job(job_row), True
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def create_short_video_job(
+    *,
+    item_id: str,
+    job_id: str,
+    title: str,
+    payload: dict,
+    voice_snapshot: dict,
+    stage: str,
+) -> tuple[dict, dict]:
+    """Atomically link a follow-up generation job to an existing Short item."""
+
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        item_row = conn.execute(
+            "SELECT * FROM short_video_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        if item_row is None:
+            raise ValueError("Không tìm thấy Short Video.")
+        active = conn.execute(
+            '''
+            SELECT id FROM system_jobs
+            WHERE id = ? AND status IN ('queued', 'running', 'retry_wait', 'paused')
+            ''',
+            (str(item_row["job_id"] or ""),),
+        ).fetchone()
+        if active is not None:
+            raise ValueError("Short Video đang có một job chưa kết thúc.")
+        voice_id = str(voice_snapshot.get("voice_id") or "")
+        voice_name = str(voice_snapshot.get("voice_name") or "")
+        provider_id = str(voice_snapshot.get("provider_id") or "omnivoice")
+        voice_revision = max(1, int(voice_snapshot.get("voice_revision") or 1))
+        conn.execute(
+            '''
+            INSERT INTO system_jobs (
+                id, job_type, status, title, progress, payload_json,
+                result_json, error, video_id, prompt_version, voice_id,
+                voice_name, tts_provider_id, voice_revision,
+                voice_snapshot_json, created_at, updated_at
+            ) VALUES (
+                ?, 'short_video_generation', 'queued', ?,
+                'Đang chờ xử lý Short Video', ?, '{}', '', NULL, '', ?, ?, ?, ?, ?, ?, ?
+            )
+            ''',
+            (
+                job_id,
+                title,
+                json.dumps(payload, ensure_ascii=False),
+                voice_id,
+                voice_name,
+                provider_id,
+                voice_revision,
+                json.dumps(voice_snapshot, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+        conn.execute(
+            '''
+            UPDATE short_video_items
+            SET status = 'queued', current_stage = ?, job_id = ?, error = '',
+                updated_at = ?, completed_at = ''
+            WHERE id = ?
+            ''',
+            (stage, job_id, now, item_id),
+        )
+        updated_item = conn.execute(
+            "SELECT * FROM short_video_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        job_row = conn.execute(
+            "SELECT * FROM system_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        conn.execute("COMMIT")
+        return _decode_short_video_item(updated_item), _decode_system_job(job_row)
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def get_short_video_item(item_id: str) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM short_video_items WHERE id = ?",
+        (item_id,),
+    ).fetchone()
+    conn.close()
+    return _decode_short_video_item(row)
+
+
+def get_short_video_item_by_job(job_id: str) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM short_video_items WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    conn.close()
+    return _decode_short_video_item(row)
+
+
+def list_short_video_items(
+    *,
+    project_key: str = "",
+    status: str = "",
+    limit: int = 50,
+    offset: int = 0,
+) -> dict:
+    filters: list[str] = []
+    params: list[object] = []
+    if project_key:
+        filters.append("project_key = ?")
+        params.append(project_key)
+    if status:
+        statuses = [part.strip() for part in status.split(",") if part.strip()]
+        if statuses:
+            filters.append("status IN (" + ",".join("?" for _ in statuses) + ")")
+            params.extend(statuses)
+    where = " WHERE " + " AND ".join(filters) if filters else ""
+    normalized_limit = max(1, min(200, int(limit)))
+    normalized_offset = max(0, int(offset))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    total = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM short_video_items" + where,
+            params,
+        ).fetchone()[0]
+    )
+    rows = conn.execute(
+        "SELECT * FROM short_video_items"
+        + where
+        + " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+        (*params, normalized_limit, normalized_offset),
+    ).fetchall()
+    conn.close()
+    return {
+        "items": [_decode_short_video_item(row) for row in rows],
+        "total": total,
+        "limit": normalized_limit,
+        "offset": normalized_offset,
+    }
+
+
+def update_short_video_item(item_id: str, **changes) -> dict | None:
+    invalid = set(changes) - SHORT_VIDEO_ITEM_MUTABLE_FIELDS
+    if invalid:
+        raise ValueError(f"Unsupported Short Video fields: {sorted(invalid)}")
+    if not changes:
+        return get_short_video_item(item_id)
+    encoded = dict(changes)
+    if "manifest_json" in encoded and not isinstance(encoded["manifest_json"], str):
+        encoded["manifest_json"] = json.dumps(
+            encoded["manifest_json"], ensure_ascii=False
+        )
+    encoded["updated_at"] = utc_now()
+    assignments = ", ".join(f"{field} = ?" for field in encoded)
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.execute(
+        f"UPDATE short_video_items SET {assignments} WHERE id = ?",
+        (*encoded.values(), item_id),
+    )
+    conn.commit()
+    conn.close()
+    return get_short_video_item(item_id)
+
+
+def get_short_video_summary() -> dict:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        '''
+        SELECT project_key,
+               SUM(CASE WHEN status IN ('queued', 'processing', 'rendering') THEN 1 ELSE 0 END) AS running,
+               SUM(CASE WHEN status = 'awaiting_review' THEN 1 ELSE 0 END) AS awaiting_review,
+               SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
+               SUM(CASE WHEN status IN ('error', 'needs_attention') THEN 1 ELSE 0 END) AS errors,
+               COUNT(*) AS total
+        FROM short_video_items
+        GROUP BY project_key
+        ORDER BY project_key
+        '''
+    ).fetchall()
+    recent_errors = conn.execute(
+        '''
+        SELECT * FROM short_video_items
+        WHERE status IN ('error', 'needs_attention')
+        ORDER BY updated_at DESC LIMIT 10
+        '''
+    ).fetchall()
+    conn.close()
+    projects = {
+        str(row["project_key"]): {
+            "running": int(row["running"] or 0),
+            "awaiting_review": int(row["awaiting_review"] or 0),
+            "completed": int(row["completed"] or 0),
+            "errors": int(row["errors"] or 0),
+            "total": int(row["total"] or 0),
+        }
+        for row in rows
+    }
+    totals = {
+        key: sum(project.get(key, 0) for project in projects.values())
+        for key in ("running", "awaiting_review", "completed", "errors", "total")
+    }
+    return {
+        "projects": projects,
+        "totals": totals,
+        "recent_errors": [_decode_short_video_item(row) for row in recent_errors],
+    }
 
 # Initialize tables when module is imported
 init_db()

@@ -1,0 +1,63 @@
+{
+  "key": "bac-ho-ngam-tho",
+  "display_name": "Bác Hồ ngâm thơ",
+  "description": "Tạo video dọc từ một bài thơ do Bác Hồ sáng tác, dùng giọng OmniVoice đã định danh.",
+  "status": "active",
+  "order": 10,
+  "profile_version": "1.0.0",
+  "pipeline_profile": {
+    "id": "poem_to_short_v1",
+    "max_duration_seconds": 180,
+    "scene_target_seconds": 7,
+    "scene_min_seconds": 5,
+    "scene_max_seconds": 8,
+    "max_scenes": 24
+  },
+  "input_schema": {
+    "required": ["title", "poem"],
+    "title_max_length": 300,
+    "poem_max_length": 12000
+  },
+  "voice_profile": {
+    "provider": "omnivoice",
+    "voice_id": "66cb0b63-125b-4615-8600-e918c56a9c7d",
+    "voice_name": "bac_ho_doc_tho_1",
+    "title_pause_ms": 900,
+    "single_task": true
+  },
+  "visual_profile": {
+    "provider": "muse",
+    "available_providers": ["muse", "google_flow"],
+    "mode": "hybrid",
+    "aspect_ratio": "9:16",
+    "image_resolution": "1080x1920",
+    "max_video_scenes": 3,
+    "google_flow_image_model": "nano_banana_2_1",
+    "google_flow_video_model": "omni_1_1_flash",
+    "style": "Vietnamese cinematic ink-wash painting, restrained historical atmosphere, poetic natural landscapes, soft paper texture, elegant brushwork, respectful and contemplative, vertical composition",
+    "forbid": ["text", "logo", "watermark", "lip_sync", "close_up_portrait"]
+  },
+  "render_profile": {
+    "draft": {
+      "width": 540,
+      "height": 960,
+      "fps": 30
+    },
+    "final": {
+      "width": 1080,
+      "height": 1920,
+      "fps": 30,
+      "video_codec": "h264",
+      "audio_codec": "aac"
+    },
+    "subtitles": false,
+    "title_card": false,
+    "credits": false,
+    "music": false,
+    "ambience": false
+  },
+  "review_policy": {
+    "draft_approval_required": true,
+    "review_points": 1
+  }
+}
