@@ -68,6 +68,7 @@ FLOW_VIDEO_RECONCILIATION_TTL_SECONDS = 900.0
 FLOW_MEDIA_RECONCILIATION_POLL_SECONDS = 30.0
 FLOW_IMAGE_TRANSIENT_RETRY_DELAYS_SECONDS = (30.0, 60.0, 120.0)
 FLOW_REMOTE_MAX_IN_FLIGHT = 4
+MAX_FLOW_IMAGE_SUBMISSION_ATTEMPTS = 5
 IMAGE_VALIDATION_VERSION = 1
 PERCEPTUAL_RETRY_DIRECTIONS = (
     "Use a substantially different camera distance, viewpoint, and subject arrangement",
@@ -1487,6 +1488,11 @@ async def _generate_scene_image_async(
     generation_attempt = int(existing_metadata.get("generation_attempt") or 0)
     if not is_reconciliation_checkpoint and not is_intent_reconciliation:
         generation_attempt += 1
+        if generation_attempt > MAX_FLOW_IMAGE_SUBMISSION_ATTEMPTS:
+            raise FlowGenerationError(
+                f"Cảnh {scene.get('index', 0) + 1} đã vượt quá giới hạn thử tối đa "
+                f"({MAX_FLOW_IMAGE_SUBMISSION_ATTEMPTS} lần). Dừng lại để tránh vòng lặp và bảo vệ quota Google Flow."
+            )
     generation_attempt = max(1, generation_attempt)
     request_key = (
         str(
@@ -2729,6 +2735,7 @@ def generate_scene_media(
 
     async def _run_batch() -> dict:
         from nexus_engine.services.google_flow_worker import (
+            FlowAgentLimitReached,
             FlowAgentSettingsError,
             FlowCreditExhausted,
             FlowGenerationTimeout,
@@ -2738,6 +2745,10 @@ def generate_scene_media(
             FlowModeError,
             FlowVideoCreditExhausted,
             FlowVideoPending,
+        )
+        from nexus_engine.services.chatgpt_projects import (
+            FLOW_IMAGE_FALLBACK_CHAIN,
+            FLOW_VIDEO_FALLBACK_CHAIN,
         )
 
         def bounded_setting(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -2749,6 +2760,107 @@ def generate_scene_media(
 
         image_limit = bounded_setting("flow_image_max_in_flight", 2, 1, 4)
         video_limit = bounded_setting("intro_video_max_in_flight", 4, 1, 12)
+
+        exhausted_image_models: set[str] = set()
+        active_image_model = str(settings.get("model") or "nano_banana_2_1")
+        agent_limit_retried = False
+
+        exhausted_video_models: set[str] = set()
+        active_video_model = str(settings.get("video_model") or "omni_1_1_flash")
+
+        async def _submit_scene_image_with_model_fallback(
+            scene_dict: dict,
+            ref_path: Path | None,
+            ref_id: str,
+        ):
+            nonlocal active_image_model, agent_limit_retried
+            while True:
+                cancel_check()
+                settings["model"] = active_image_model
+                try:
+                    return await _generate_scene_image_async(
+                        video_id=video_id,
+                        scene=scene_dict,
+                        scene_count=len(scenes),
+                        profile=profile or {},
+                        settings=settings,
+                        reference_path=ref_path,
+                        reference_id=ref_id,
+                        progress=progress,
+                        cancel_check=cancel_check,
+                        worker=worker,
+                        existing_hashes=image_hashes,
+                        existing_perceptual_hashes=image_perceptual_hashes,
+                        force_new_project=False,
+                        submit_only=True,
+                        artifact_snapshot=artifact_snapshot,
+                        reference_hash_cache=reference_hash_cache,
+                        validation_counters=validation_counters,
+                        return_validation=True,
+                    )
+                except FlowImageCreditExhausted as exc:
+                    exhausted_image_models.add(active_image_model)
+                    available_models = [m for m in FLOW_IMAGE_FALLBACK_CHAIN if m not in exhausted_image_models]
+                    if not available_models:
+                        logger.warning(
+                            "Tất cả model tạo ảnh trong fallback chain đã hết quota: %s",
+                            exhausted_image_models,
+                        )
+                        raise
+                    next_model = available_models[0]
+                    prev_model = active_image_model
+                    active_image_model = next_model
+                    settings["model"] = next_model
+                    logger.warning(
+                        "flow_image model %s exhausted; rotating to %s",
+                        prev_model,
+                        next_model,
+                    )
+                    progress(
+                        f"Google Flow: Model ảnh {prev_model} đã hết hạn mức; tự động chuyển sang {next_model}...",
+                        f"flow_image_model_rotation {int(scene_dict.get('index', 0)) + 1}/{len(scenes)}",
+                    )
+                    await worker.ensure_agent_image_settings(
+                        {
+                            "model": next_model,
+                            "aspect_ratio": str(settings.get("aspect_ratio") or "16:9"),
+                            "output_count": int(settings.get("output_count") or 1),
+                        },
+                        force=True,
+                    )
+                    continue
+                except FlowAgentLimitReached as exc:
+                    exhausted_image_models.add(active_image_model)
+                    available_models = [m for m in FLOW_IMAGE_FALLBACK_CHAIN if m not in exhausted_image_models]
+                    if not available_models or agent_limit_retried:
+                        logger.warning(
+                            "Flow Agent interaction limit reached; stopping cleanly at checkpoint: %s",
+                            exc,
+                        )
+                        raise
+                    agent_limit_retried = True
+                    next_model = available_models[0]
+                    prev_model = active_image_model
+                    active_image_model = next_model
+                    settings["model"] = next_model
+                    logger.warning(
+                        "flow_image agent limit reached; trying model switch to %s once",
+                        next_model,
+                    )
+                    progress(
+                        f"Google Flow: Chạm giới hạn tác nhân; thử chuyển sang {next_model}...",
+                        "flow_agent_limit_retry",
+                    )
+                    await worker.ensure_agent_image_settings(
+                        {
+                            "model": next_model,
+                            "aspect_ratio": str(settings.get("aspect_ratio") or "16:9"),
+                            "output_count": int(settings.get("output_count") or 1),
+                        },
+                        force=True,
+                    )
+                    continue
+
         snapshot_started = time.monotonic()
         artifact_snapshot = db.list_latest_video_artifacts(
             video_id,
@@ -3008,25 +3120,10 @@ def generate_scene_media(
                 )
 
                 try:
-                    validation_result = await _generate_scene_image_async(
-                        video_id=video_id,
-                        scene=scene,
-                        scene_count=len(scenes),
-                        profile=profile or {},
-                        settings=settings,
-                        reference_path=reference_path,
-                        reference_id=reference_id,
-                        progress=progress,
-                        cancel_check=cancel_check,
-                        worker=worker,
-                        existing_hashes=image_hashes,
-                        existing_perceptual_hashes=image_perceptual_hashes,
-                        force_new_project=False,
-                        submit_only=True,
-                        artifact_snapshot=artifact_snapshot,
-                        reference_hash_cache=reference_hash_cache,
-                        validation_counters=validation_counters,
-                        return_validation=True,
+                    validation_result = await _submit_scene_image_with_model_fallback(
+                        scene,
+                        reference_path,
+                        reference_id,
                     )
                     validation = (
                         validation_result
@@ -3046,9 +3143,15 @@ def generate_scene_media(
                         validation.path,
                     )
                 except FlowImagePending as exc:
-                    if getattr(exc, "reason_code", "") == "flow_image_prompt_missing":
+                    receipt = (current_meta or {}).get("flow_receipt")
+                    deadline_passed = bool(
+                        isinstance(receipt, dict)
+                        and receipt.get("deadline_at")
+                        and _seconds_until(receipt.get("deadline_at")) <= 0
+                    )
+                    if getattr(exc, "reason_code", "") == "flow_image_prompt_missing" and deadline_passed:
                         logger.info(
-                            "flow_reconcile media=image scene=%s state=prompt_missing_on_flow; clearing stale receipt to re-dispatch in Phase 1B",
+                            "flow_reconcile media=image scene=%s state=prompt_missing_and_deadline_passed; clearing stale receipt to re-dispatch in Phase 1B",
                             scene_index,
                         )
                         target_path = str((current_artifact or {}).get("path") or "")
@@ -3125,25 +3228,10 @@ def generate_scene_media(
                     continue
 
                 try:
-                    validation_result = await _generate_scene_image_async(
-                        video_id=video_id,
-                        scene=scene,
-                        scene_count=len(scenes),
-                        profile=profile or {},
-                        settings=settings,
-                        reference_path=reference_path,
-                        reference_id=reference_id,
-                        progress=progress,
-                        cancel_check=cancel_check,
-                        worker=worker,
-                        existing_hashes=image_hashes,
-                        existing_perceptual_hashes=image_perceptual_hashes,
-                        force_new_project=False,
-                        submit_only=True,
-                        artifact_snapshot=artifact_snapshot,
-                        reference_hash_cache=reference_hash_cache,
-                        validation_counters=validation_counters,
-                        return_validation=True,
+                    validation_result = await _submit_scene_image_with_model_fallback(
+                        scene,
+                        reference_path,
+                        reference_id,
                     )
                 except FlowImagePending as exc:
                     refresh_artifact(artifact_type)
@@ -3318,78 +3406,121 @@ def generate_scene_media(
                 ):
                     pending_videos.append({"scene_index": scene_index})
                     continue
-                try:
-                    video_path = await _generate_scene_video_async(
-                        video_id=video_id,
-                        scene=scene,
-                        scene_count=len(scenes),
-                        start_frame_path=start_frame,
-                        end_frame_path=end_frame,
-                        profile=profile or {},
-                        settings=settings,
-                        progress=progress,
-                        cancel_check=cancel_check,
-                        worker=worker,
-                        force_new_project=False,
-                        submit_only=True,
-                        existing_video_hashes=video_hashes,
-                        video_number=video_ordinal[index],
-                        video_count=len(requested_positions),
-                        artifact_snapshot=artifact_snapshot,
-                        start_frame_hash=(validated_images[index].sha256 if validated_images[index] else ""),
-                        end_frame_hash=(
-                            validated_images[index + 1].sha256
-                            if index + 1 < len(validated_images)
-                            and validated_images[index + 1]
-                            else ""
-                        ),
-                    )
-                    refresh_artifact(artifact_type)
-                    video_paths[index] = video_path
-                    video_hashes.add(_sha256_file(video_path))
-                    summary["generated_count"] += 1
-                except Exception as exc:
-                    if isinstance(exc, FlowVideoPending):
+                while True:
+                    cancel_check()
+                    settings["video_model"] = active_video_model
+                    try:
+                        video_path = await _generate_scene_video_async(
+                            video_id=video_id,
+                            scene=scene,
+                            scene_count=len(scenes),
+                            start_frame_path=start_frame,
+                            end_frame_path=end_frame,
+                            profile=profile or {},
+                            settings=settings,
+                            progress=progress,
+                            cancel_check=cancel_check,
+                            worker=worker,
+                            force_new_project=False,
+                            submit_only=True,
+                            existing_video_hashes=video_hashes,
+                            video_number=video_ordinal[index],
+                            video_count=len(requested_positions),
+                            artifact_snapshot=artifact_snapshot,
+                            start_frame_hash=(validated_images[index].sha256 if validated_images[index] else ""),
+                            end_frame_hash=(
+                                validated_images[index + 1].sha256
+                                if index + 1 < len(validated_images)
+                                and validated_images[index + 1]
+                                else ""
+                            ),
+                        )
                         refresh_artifact(artifact_type)
-                        append_pending(pending_videos, exc, scene_index)
-                        continue
-                    if isinstance(exc, (FlowVideoCreditExhausted, FlowCreditExhausted)):
-                        logger.warning(
-                            "flow_video credits are explicitly exhausted (%s); "
-                            "falling back all remaining video scenes to base images.",
-                            exc,
-                        )
-                        flow_video_credit_exhausted = True
-                        progress(
-                            "Google Flow đã hết credit video; "
-                            "chuyển các cảnh video còn lại sang dùng ảnh tĩnh",
-                            "flow_video_credit_exhausted",
-                        )
-                    is_system_unsupported = isinstance(
-                        exc, (FlowModeError, FlowAgentSettingsError)
-                    ) or "không hỗ trợ" in str(exc).lower()
+                        video_paths[index] = video_path
+                        video_hashes.add(_sha256_file(video_path))
+                        summary["generated_count"] += 1
+                        break
+                    except Exception as exc:
+                        if isinstance(exc, FlowVideoPending):
+                            refresh_artifact(artifact_type)
+                            append_pending(pending_videos, exc, scene_index)
+                            break
+                        if isinstance(exc, (FlowVideoCreditExhausted, FlowCreditExhausted)):
+                            exhausted_video_models.add(active_video_model)
+                            avail_video_models = [m for m in FLOW_VIDEO_FALLBACK_CHAIN if m not in exhausted_video_models]
+                            if avail_video_models:
+                                next_v_model = avail_video_models[0]
+                                prev_v_model = active_video_model
+                                active_video_model = next_v_model
+                                settings["video_model"] = next_v_model
+                                logger.warning(
+                                    "flow_video model %s quota exhausted; rotating to %s",
+                                    prev_v_model,
+                                    next_v_model,
+                                )
+                                progress(
+                                    f"Google Flow: Model video {prev_v_model} hết hạn mức; chuyển sang {next_v_model}...",
+                                    "flow_video_model_rotation",
+                                )
+                                try:
+                                    await worker.ensure_agent_video_settings(
+                                        {
+                                            "video_model": next_v_model,
+                                            "video_aspect_ratio": str(settings.get("video_aspect_ratio") or "16:9"),
+                                            "video_output_count": int(settings.get("video_output_count") or 1),
+                                        },
+                                        force=True,
+                                    )
+                                    continue
+                                except Exception as set_err:
+                                    logger.warning("Failed to configure fallback video model %s: %s", next_v_model, set_err)
+                            logger.warning(
+                                "flow_video credits are explicitly exhausted for all models (%s); "
+                                "falling back all remaining video scenes to base images.",
+                                exc,
+                            )
+                            flow_video_credit_exhausted = True
+                            progress(
+                                "Google Flow đã hết credit video (tất cả model); "
+                                "chuyển các cảnh video còn lại sang dùng ảnh tĩnh",
+                                "flow_video_credit_exhausted",
+                            )
+                            failure_details = _video_failure_details(exc)
+                            summary["fallback_scenes"].append(
+                                {
+                                    "scene_index": int(scene.get("index", index)),
+                                    **failure_details,
+                                }
+                            )
+                            refresh_artifact(artifact_type)
+                            break
+                        is_system_unsupported = isinstance(
+                            exc, (FlowModeError, FlowAgentSettingsError)
+                        ) or "không hỗ trợ" in str(exc).lower()
 
-                    if flow_video_credit_exhausted:
-                        pass
-                    elif is_system_unsupported:
-                        logger.warning(
-                            "flow_video is unsupported by account/interface (%s); remaining requested scenes will use base images.",
-                            _safe_reason_code(exc),
+                        if flow_video_credit_exhausted:
+                            pass
+                        elif is_system_unsupported:
+                            logger.warning(
+                                "flow_video is unsupported by account/interface (%s); remaining requested scenes will use base images.",
+                                _safe_reason_code(exc),
+                            )
+                            flow_video_unsupported = True
+                        else:
+                            logger.warning(
+                                "flow_video generation failed for scene %s (%s); using the base image and continuing.",
+                                scene.get("index"),
+                                _safe_reason_code(exc),
+                            )
+                        failure_details = _video_failure_details(exc)
+                        summary["fallback_scenes"].append(
+                            {
+                                "scene_index": int(scene.get("index", index)),
+                                **failure_details,
+                            }
                         )
-                        flow_video_unsupported = True
-                    else:
-                        logger.warning(
-                            "flow_video generation failed for scene %s (%s); using the base image and continuing.",
-                            scene.get("index"),
-                            _safe_reason_code(exc),
-                        )
-                    failure_details = _video_failure_details(exc)
-                    summary["fallback_scenes"].append(
-                        {
-                            "scene_index": int(scene.get("index", index)),
-                            **failure_details,
-                        }
-                    )
+                        refresh_artifact(artifact_type)
+                        break
             if flow_video_credit_exhausted or flow_video_unsupported:
                 for item in list(pending_videos):
                     s_idx = int(item["scene_index"])

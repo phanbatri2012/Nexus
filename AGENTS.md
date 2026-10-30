@@ -20,6 +20,7 @@
 - Prefer simple code and existing project patterns. Avoid premature abstractions; extract constants or configuration only for repeated or domain-significant values.
 - Remove only imports, variables, functions, and files made obsolete by the current change. Mention unrelated dead code without deleting it.
 - Validate external inputs early. Never silently swallow exceptions; log enough context to diagnose the failure without exposing secrets.
+- **Anti-infinite loop and bounded execution**: All loops (`while`, polling, background workers, retry mechanisms, and browser automation waits) must have strict upper bounds (`max_iterations`, `max_retries`) and explicit timeouts. Never write unconstrained `while True` or busy-wait loops without intervals/exponential backoff. In browser/CDP waiting or job claiming, enforce deadlines and fail closed with descriptive logs if a timeout occurs instead of hanging indefinitely.
 - Fix root causes rather than adding video-specific or conversation-specific workarounds.
 - Define verifiable success criteria. Add or update regression tests for bugs and behavior changes when practical, then run checks proportional to the risk.
 - Report any verification that could not be completed and why.

@@ -3,7 +3,7 @@ import './ShortVideo.css'
 
 const API_BASE = 'http://127.0.0.1:8080'
 const ACTIVE_PREVIEW_STATUSES = new Set(['queued', 'processing'])
-const VOICE_PREVIEW_MAX_CHARACTERS = 1000
+const AUDIO_PREVIEW_MAX_CHARACTERS = 1000
 const PROJECT_TABS = [
   ['create', 'Tạo video'],
   ['jobs', 'Công việc'],
@@ -53,38 +53,21 @@ function EmptyState({ children }) {
 
 function previewStatusLabel(preview) {
   if (!preview) return ''
-  if (preview.status === 'queued') return 'Đang chờ OmniVoice'
-  if (preview.status === 'processing') return preview.provider_state === 'loading' ? 'Đang nạp model' : 'Đang tạo audio'
+  if (preview.status === 'queued') return 'Đang chờ VieNeu-TTS'
+  if (preview.status === 'processing') return 'Đang tạo giọng ngâm'
+  if (preview.status === 'paused') return 'Đã tạm dừng sau khi Nexus khởi động lại · bấm Nghe thử lại để tiếp tục'
   if (preview.status === 'completed') return 'Nghe thử đã sẵn sàng'
   if (preview.status === 'canceled') return 'Đã hủy'
   return preview.error || 'Không tạo được bản nghe thử'
 }
 
-function buildVoicePreviewText(title, poem) {
-  const normalizedTitle = String(title || '').trim().replace(/[ \t]+/g, ' ')
-  const titleLine = normalizedTitle && !/[.!?…]$/.test(normalizedTitle)
-    ? `${normalizedTitle}.`
-    : normalizedTitle
-  const normalizedPoem = String(poem || '')
+function buildAudioPreviewText(poem) {
+  const lines = String(poem || '')
     .split(/\r?\n/)
     .map(line => line.trim().replace(/[ \t]+/g, ' '))
-    .join('\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim()
-  const fullSample = [titleLine, normalizedPoem].filter(Boolean).join('\n\n')
-  if (!fullSample) return 'Đây là bản nghe thử giọng đọc cho video thơ.'
-  if (fullSample.length <= VOICE_PREVIEW_MAX_CHARACTERS) return fullSample
-
-  const lines = fullSample.split('\n')
-  const selectedLines = []
-  let selectedLength = 0
-  for (const line of lines) {
-    const addition = line.length + (selectedLines.length ? 1 : 0)
-    if (selectedLength + addition > VOICE_PREVIEW_MAX_CHARACTERS) break
-    selectedLines.push(line)
-    selectedLength += addition
-  }
-  return selectedLines.join('\n').trim() || fullSample.slice(0, VOICE_PREVIEW_MAX_CHARACTERS)
+    .filter(Boolean)
+    .slice(0, 4)
+  return lines.join('\n').slice(0, AUDIO_PREVIEW_MAX_CHARACTERS).trim()
 }
 
 function ItemRow({ item, onOpen }) {
@@ -123,6 +106,78 @@ function ProjectNav({ project, tab, navigate, readOnly, canCreate }) {
   )
 }
 
+function AudioPreviewPanel({ project, poem }) {
+  const audioProfile = project.audio_profile || {}
+  const [preview, setPreview] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  const refreshPreview = useCallback(async previewId => {
+    try {
+      const result = await api(`/api/short-video/audio-previews/${previewId}`)
+      setPreview(result)
+      return result
+    } catch (loadError) {
+      setError(loadError.message)
+      return null
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!preview || !ACTIVE_PREVIEW_STATUSES.has(preview.status)) return undefined
+    const timer = setInterval(() => refreshPreview(preview.id), 2000)
+    return () => clearInterval(timer)
+  }, [preview, refreshPreview])
+
+  const createPreview = async () => {
+    const sample = buildAudioPreviewText(poem)
+    if (!audioProfile.profile_id || !sample || busy || ACTIVE_PREVIEW_STATUSES.has(preview?.status)) return
+    setBusy(true)
+    setError('')
+    try {
+      const result = await api(`/api/short-video/projects/${encodeURIComponent(project.key)}/audio-previews`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          poem: sample,
+          audio_profile_id: audioProfile.profile_id,
+          client_request_id: crypto.randomUUID()
+        })
+      })
+      setPreview(result.preview)
+    } catch (previewError) {
+      setError(previewError.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <section className="short-voice-choice">
+      <div className="short-voice-row">
+        <label>
+          <span>Giọng ngâm</span>
+          <select value={audioProfile.profile_id || ''} disabled>
+            <option value={audioProfile.profile_id || ''}>
+              {audioProfile.display_name || 'Không có giọng ngâm khả dụng'}
+            </option>
+          </select>
+        </label>
+        <button
+          type="button"
+          disabled={!audioProfile.profile_id || !buildAudioPreviewText(poem) || busy || ACTIVE_PREVIEW_STATUSES.has(preview?.status)}
+          onClick={createPreview}
+        >{busy ? 'Đang gửi…' : preview ? 'Nghe thử lại' : 'Nghe thử'}</button>
+      </div>
+      {preview && <small className={`short-preview-status ${preview.status}`}>{previewStatusLabel(preview)}</small>}
+      {preview?.status === 'completed' && preview.audio_url && (
+        <audio key={preview.audio_url} controls preload="metadata" src={artifactUrl(preview.audio_url)} />
+      )}
+      {error && <div className="short-error">{error}</div>}
+    </section>
+  )
+}
+
 function CreateView({ project, onCreated }) {
   const [title, setTitle] = useState('')
   const [poem, setPoem] = useState('')
@@ -134,74 +189,9 @@ function CreateView({ project, onCreated }) {
   const characterProfile = project.character_profile_summary
   const characterEras = Array.isArray(characterProfile?.eras) ? characterProfile.eras : []
   const [characterEra, setCharacterEra] = useState('auto')
-  const voiceProfile = project.voice_profile || {}
-  const voiceSelectable = Boolean(voiceProfile.selectable)
-  const [voices, setVoices] = useState([])
-  const [voiceId, setVoiceId] = useState(voiceProfile.voice_id || '')
-  const [voiceError, setVoiceError] = useState('')
-  const [preview, setPreview] = useState(null)
-  const [previewBusy, setPreviewBusy] = useState(false)
+  const audioProfile = project.audio_profile || {}
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState('')
-
-  useEffect(() => {
-    if (!voiceSelectable) {
-      setVoices([{ id: voiceProfile.voice_id, name: voiceProfile.voice_name }].filter(voice => voice.id))
-      setVoiceId(voiceProfile.voice_id || '')
-      return
-    }
-    let active = true
-    api('/api/tts/voices?provider_id=omnivoice&status=active')
-      .then(data => {
-        if (!active) return
-        const available = (Array.isArray(data.items) ? data.items : []).filter(voice => {
-          const modes = voice.casting_profile?.usage_modes
-          return !Array.isArray(modes) || modes.includes('single_narrator')
-        })
-        setVoices(available)
-        setVoiceId(current => available.some(voice => voice.id === current)
-          ? current
-          : (available.find(voice => voice.id === voiceProfile.voice_id)?.id || available[0]?.id || ''))
-        setVoiceError(available.length ? '' : 'Chưa có giọng OmniVoice đang hoạt động.')
-      })
-      .catch(error => active && setVoiceError(error.message))
-    return () => { active = false }
-  }, [voiceProfile.voice_id, voiceProfile.voice_name, voiceSelectable])
-
-  const refreshPreview = useCallback(async previewId => {
-    try {
-      const result = await api(`/api/tts/previews/${previewId}`)
-      setPreview(result)
-      return result
-    } catch (error) {
-      setVoiceError(error.message)
-      return null
-    }
-  }, [])
-
-  useEffect(() => {
-    if (!preview || !ACTIVE_PREVIEW_STATUSES.has(preview.status)) return undefined
-    const timer = setInterval(() => refreshPreview(preview.id), 2000)
-    return () => clearInterval(timer)
-  }, [preview, refreshPreview])
-
-  const createVoicePreview = async () => {
-    if (!voiceId || previewBusy || (preview && ACTIVE_PREVIEW_STATUSES.has(preview.status))) return
-    const sample = buildVoicePreviewText(title, poem)
-    setPreviewBusy(true)
-    setVoiceError('')
-    try {
-      setPreview(await api('/api/tts/previews', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ voice_id: voiceId, text: sample })
-      }))
-    } catch (error) {
-      setVoiceError(error.message)
-    } finally {
-      setPreviewBusy(false)
-    }
-  }
 
   const submit = async event => {
     event.preventDefault()
@@ -217,7 +207,7 @@ function CreateView({ project, onCreated }) {
           poem: poem.trim(),
           client_request_id: crypto.randomUUID(),
           visual_provider: visualProvider,
-          voice_id: voiceId || null,
+          audio_profile_id: audioProfile.profile_id || null,
           character_era: characterEra
         })
       })
@@ -242,35 +232,7 @@ function CreateView({ project, onCreated }) {
         <span>Nội dung bài thơ</span>
         <textarea value={poem} onChange={event => setPoem(event.target.value)} required rows={16} maxLength={12000} />
       </label>
-      <section className="short-voice-choice">
-        <div className="short-voice-row">
-          <label>
-            <span>Giọng đọc OmniVoice</span>
-            <select
-              value={voiceId}
-              disabled={!voiceSelectable || (preview && ACTIVE_PREVIEW_STATUSES.has(preview.status))}
-              onChange={event => {
-                setVoiceId(event.target.value)
-                setPreview(null)
-                setVoiceError('')
-              }}
-            >
-              {!voices.length && <option value="">Không có giọng khả dụng</option>}
-              {voices.map(voice => <option key={voice.id} value={voice.id}>{voice.name}</option>)}
-            </select>
-          </label>
-          <button
-            type="button"
-            disabled={!voiceId || previewBusy || (preview && ACTIVE_PREVIEW_STATUSES.has(preview.status))}
-            onClick={createVoicePreview}
-          >{previewBusy ? 'Đang gửi…' : preview ? 'Nghe thử lại' : 'Nghe thử'}</button>
-        </div>
-        {preview && <small className={`short-preview-status ${preview.status}`}>{previewStatusLabel(preview)}</small>}
-        {preview?.status === 'completed' && preview.audio_url && (
-          <audio key={preview.audio_url} controls preload="metadata" src={preview.audio_url} />
-        )}
-        {voiceError && <div className="short-error">{voiceError}</div>}
-      </section>
+      <AudioPreviewPanel project={project} poem={poem} />
       <div className="short-provider-choice" role="group" aria-label="Engine tạo hình">
         <span>Engine tạo hình</span>
         <div>
@@ -300,7 +262,7 @@ function CreateView({ project, onCreated }) {
           </label>
         </details>
       )}
-      <button type="submit" className="short-primary" disabled={busy || !title.trim() || !poem.trim() || !voiceId}>
+      <button type="submit" className="short-primary" disabled={busy || !title.trim() || !poem.trim() || !audioProfile.create_ready}>
         {busy ? 'Đang tạo…' : 'Tạo video'}
       </button>
       {message && <div className="short-form-message">{message}</div>}
@@ -595,6 +557,9 @@ function SettingsView({ project }) {
   const [profile, setProfile] = useState(null)
   const [error, setError] = useState('')
   const [removing, setRemoving] = useState('')
+  const [audioSample, setAudioSample] = useState(
+    'Sáng ra bờ suối, tối vào hang,\nCháo bẹ, rau măng vẫn sẵn sàng.\nBàn đá chông chênh dịch sử Đảng,\nCuộc đời cách mạng thật là sang.'
+  )
 
   const loadProfile = useCallback(async () => {
     if (!project.character_profile) return
@@ -630,6 +595,34 @@ function SettingsView({ project }) {
         <h2>Cấu hình project</h2>
         <pre className="short-settings-json">{JSON.stringify(project, null, 2)}</pre>
       </section>
+      {project.audio_profile && (
+        <section className="short-audio-profile">
+          <h2>Audio Profile</h2>
+          <p>
+            <strong>{project.audio_profile.display_name}</strong> · v{project.audio_profile.profile_version} · {project.audio_profile.status}
+          </p>
+          <p className="short-profile-note">
+            Runtime {project.audio_profile.runtime_ready ? 'sẵn sàng' : 'chưa sẵn sàng'} · reference {project.audio_profile.reference_ready ? 'sẵn sàng' : 'chưa sẵn sàng'} · backend ONNX CPU FP32 · 48 kHz
+          </p>
+          {project.audio_profile.status === 'draft' && (
+            <div className="short-profile-warning">Profile đang benchmark; chỉ mở nghe thử, chưa cho tạo video mới.</div>
+          )}
+          <label>
+            <span>Nội dung nghe thử (tối đa bốn dòng đầu)</span>
+            <textarea
+              value={audioSample}
+              onChange={event => setAudioSample(event.target.value)}
+              rows={6}
+              maxLength={12000}
+            />
+          </label>
+          <AudioPreviewPanel project={project} poem={audioSample} />
+          <details>
+            <summary>Model revision</summary>
+            <pre className="short-settings-json">{JSON.stringify(project.audio_profile.model_revision || {}, null, 2)}</pre>
+          </details>
+        </section>
+      )}
       {project.character_profile && (
         <section>
           <h2>Character Profile</h2>

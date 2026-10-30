@@ -1061,6 +1061,31 @@ def init_db():
         'ON short_video_items(job_id)'
     )
     c.execute('''
+        CREATE TABLE IF NOT EXISTS short_video_audio_previews (
+            id TEXT PRIMARY KEY,
+            project_key TEXT NOT NULL,
+            profile_id TEXT NOT NULL,
+            request_hash TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL,
+            poem_excerpt TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            audio_filename TEXT DEFAULT '',
+            duration_seconds REAL,
+            error TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )
+    ''')
+    c.execute(
+        'CREATE INDEX IF NOT EXISTS idx_short_video_audio_previews_expiry '
+        'ON short_video_audio_previews(expires_at)'
+    )
+    c.execute(
+        'CREATE INDEX IF NOT EXISTS idx_short_video_audio_previews_job '
+        'ON short_video_audio_previews(job_id)'
+    )
+    c.execute('''
         CREATE TABLE IF NOT EXISTS youtube_channels (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             channel_id TEXT NOT NULL UNIQUE,
@@ -4632,6 +4657,160 @@ def delete_expired_tts_previews(now: str | None = None) -> list[dict]:
         raise
     finally:
         conn.close()
+
+
+SHORT_VIDEO_AUDIO_PREVIEW_MUTABLE_FIELDS = {
+    "status",
+    "audio_filename",
+    "duration_seconds",
+    "error",
+    "expires_at",
+}
+
+
+def _decode_short_video_audio_preview(row: sqlite3.Row | None) -> dict | None:
+    return dict(row) if row is not None else None
+
+
+def get_short_video_audio_preview(preview_id: str) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM short_video_audio_previews WHERE id = ?",
+        (str(preview_id),),
+    ).fetchone()
+    conn.close()
+    return _decode_short_video_audio_preview(row)
+
+
+def get_short_video_audio_preview_by_job(job_id: str) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM short_video_audio_previews WHERE job_id = ?",
+        (str(job_id),),
+    ).fetchone()
+    conn.close()
+    return _decode_short_video_audio_preview(row)
+
+
+def update_short_video_audio_preview(preview_id: str, **changes) -> dict | None:
+    invalid_fields = set(changes) - SHORT_VIDEO_AUDIO_PREVIEW_MUTABLE_FIELDS
+    if invalid_fields:
+        raise ValueError(
+            f"Unsupported Short Video audio preview fields: {sorted(invalid_fields)}"
+        )
+    if not changes:
+        return get_short_video_audio_preview(preview_id)
+    changes["updated_at"] = utc_now()
+    assignments = ", ".join(f"{field} = ?" for field in changes)
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.execute(
+        f"UPDATE short_video_audio_previews SET {assignments} WHERE id = ?",
+        (*changes.values(), str(preview_id)),
+    )
+    conn.commit()
+    conn.close()
+    return get_short_video_audio_preview(preview_id)
+
+
+def create_short_video_audio_preview_with_job(
+    *,
+    preview_id: str,
+    project_key: str,
+    profile_id: str,
+    request_hash: str,
+    poem_excerpt: str,
+    job_id: str,
+    payload: dict,
+    expires_at: str,
+    voice_snapshot: dict,
+) -> tuple[dict, dict, bool]:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "DELETE FROM short_video_audio_previews WHERE expires_at <= ?",
+            (now,),
+        )
+        existing = conn.execute(
+            "SELECT * FROM short_video_audio_previews WHERE request_hash = ?",
+            (str(request_hash),),
+        ).fetchone()
+        if existing is not None:
+            job = conn.execute(
+                "SELECT * FROM system_jobs WHERE id = ?",
+                (str(existing["job_id"]),),
+            ).fetchone()
+            conn.execute("COMMIT")
+            return (
+                _decode_short_video_audio_preview(existing),
+                _decode_system_job(job) or {},
+                False,
+            )
+        voice_id = str(voice_snapshot.get("voice_id") or profile_id)
+        voice_name = str(voice_snapshot.get("voice_name") or profile_id)
+        provider_id = str(voice_snapshot.get("provider_id") or "vieneu_v3_turbo")
+        voice_revision = max(1, int(voice_snapshot.get("voice_revision") or 1))
+        voice_snapshot_json = json.dumps(voice_snapshot, ensure_ascii=False)
+        conn.execute(
+            '''
+            INSERT INTO short_video_audio_previews (
+                id, project_key, profile_id, request_hash, status,
+                poem_excerpt, job_id, audio_filename, duration_seconds,
+                error, created_at, updated_at, expires_at
+            ) VALUES (?, ?, ?, ?, 'queued', ?, ?, '', NULL, '', ?, ?, ?)
+            ''',
+            (
+                str(preview_id),
+                str(project_key),
+                str(profile_id),
+                str(request_hash),
+                str(poem_excerpt),
+                str(job_id),
+                now,
+                now,
+                str(expires_at),
+            ),
+        )
+        conn.execute(
+            '''
+            INSERT INTO system_jobs (
+                id, job_type, status, title, progress, payload_json,
+                result_json, error, prompt_version, voice_id, voice_name,
+                tts_provider_id, voice_revision, voice_snapshot_json,
+                created_at, updated_at
+            ) VALUES (?, 'short_video_audio_preview', 'queued', ?,
+                'Đang chờ tạo bản nghe thử', ?, '{}', '', ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                str(job_id),
+                f"Nghe thử giọng ngâm: {project_key}",
+                json.dumps(payload, ensure_ascii=False),
+                str((payload.get("audio_profile") or {}).get("profile_version") or "1"),
+                voice_id,
+                voice_name,
+                provider_id,
+                voice_revision,
+                voice_snapshot_json,
+                now,
+                now,
+            ),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+    return (
+        get_short_video_audio_preview(preview_id) or {},
+        get_system_job(job_id) or {},
+        True,
+    )
 
 
 SYSTEM_JOB_JSON_FIELDS = {"payload_json", "result_json"}

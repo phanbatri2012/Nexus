@@ -14,6 +14,12 @@ from nexus_engine.services.google_flow_worker import (
     _is_flow_credit_exhausted_error,
     _is_flow_image_credit_exhausted_error,
     _is_flow_video_credit_exhausted_error,
+    _is_flow_agent_limit_error,
+    FlowAgentLimitReached,
+)
+from nexus_engine.services.chatgpt_projects import (
+    FLOW_IMAGE_FALLBACK_CHAIN,
+    FLOW_VIDEO_FALLBACK_CHAIN,
 )
 
 
@@ -352,6 +358,43 @@ class TestGoogleFlowWorkerUpload(unittest.IsolatedAsyncioTestCase):
         # Generic quota tile without video cues should not be blocked from image classification
         self.assertTrue(_is_flow_credit_exhausted_error(image_quota_err))
 
+    def test_flow_agent_limit_error_detection(self):
+        agent_err = (
+            "Bạn đã đạt đến hạn mức sử dụng tác nhân Flow. "
+            "Hãy chuyển sang chế độ ra lệnh thủ công hoặc quay lại vào ngày mai để trò chuyện thêm!"
+        )
+        self.assertTrue(_is_flow_agent_limit_error(agent_err))
+        self.assertTrue(_is_flow_credit_exhausted_error(agent_err))
+        self.assertFalse(_is_flow_agent_limit_error("Credit quota exceeded."))
+        self.assertFalse(_is_flow_agent_limit_error(""))
+
+        # Test exception class properties
+        exc = FlowAgentLimitReached("test agent limit")
+        self.assertEqual(exc.reason_code, "flow_agent_limit_reached")
+
+    def test_fallback_chains_definition_and_completeness(self):
+        self.assertEqual(
+            FLOW_IMAGE_FALLBACK_CHAIN,
+            ("nano_banana_2_1", "nano_banana_2_lite", "nano_banana_pro"),
+        )
+        self.assertEqual(
+            FLOW_VIDEO_FALLBACK_CHAIN,
+            ("omni_1_1_flash", "veo_3_1_lite", "veo_3_1_fast", "veo_3_1_quality"),
+        )
+
+    def test_force_flag_clears_settings_cache(self):
+        page_mock = MagicMock()
+        page_mock.url = "https://flow.google.com/project/proj-123"
+        worker = GoogleFlowWorker(page_mock)
+        
+        # Populate session cache
+        worker._session_configured_agent_image_projects["proj-123"] = ("nano_banana_2_1", "16:9", 1)
+        self.assertIn("proj-123", worker._session_configured_agent_image_projects)
+
+        # Force reconfigure clears the cache entry
+        GoogleFlowWorker._session_configured_agent_image_projects.pop("proj-123", None)
+        self.assertNotIn("proj-123", GoogleFlowWorker._session_configured_agent_image_projects)
+
     def test_request_marker_format(self):
         marker = GoogleFlowWorker._request_marker("8fedd269baa4985a7960")
         self.assertIn("AYT-8fedd269baa4985a7960", marker)
@@ -422,6 +465,31 @@ class TestGoogleFlowWorkerUpload(unittest.IsolatedAsyncioTestCase):
         # Should not raise FlowAgentSettingsError because agent interface is active
         await self.worker.ensure_agent_image_settings({"model": "nano_banana_2_1", "aspect_ratio": "16:9", "output_count": 1})
         self.assertIn("test-proj-456", _PERSISTENT_CONFIGURED_AGENT_IMAGE_PROJECTS)
+
+    async def test_find_completed_image_for_prompt_finds_canvas_tiles(self):
+        sample_url = "https://flow.google.com/asb/test_image_123"
+        self.worker.page.evaluate = AsyncMock(return_value={
+            "promptFound": True,
+            "hasPending": False,
+            "candidates": [{
+                "src": sample_url,
+                "urls": [sample_url],
+                "assetId": "asset-123",
+                "labelText": "",
+                "turnRole": "canvas"
+            }],
+            "error": ""
+        })
+        self.worker._validate_image_candidate = AsyncMock(return_value=sample_url)
+        self.worker._remember_generated_image_identity = MagicMock()
+
+        result = await self.worker._find_completed_image_for_prompt("Generate exactly one 16:9 still image for Scene 1/70.")
+        self.assertEqual(result, sample_url)
+        self.assertTrue(self.worker._last_image_prompt_found)
+
+    def test_circuit_breaker_max_attempts_defined(self):
+        from nexus_engine.services.video_production import MAX_FLOW_IMAGE_SUBMISSION_ATTEMPTS
+        self.assertEqual(MAX_FLOW_IMAGE_SUBMISSION_ATTEMPTS, 5)
 
 
 if __name__ == "__main__":

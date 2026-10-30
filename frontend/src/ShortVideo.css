@@ -66,6 +66,8 @@
 .short-settings-json { white-space: pre-wrap; max-height: 70vh; overflow: auto; border: 1px solid rgba(148, 163, 184, .2); border-radius: 12px; padding: 18px; background: #0f172a; color: #c4b5fd; }
 .short-settings { display: grid; gap: 18px; }
 .short-settings > section { border: 1px solid rgba(148, 163, 184, .2); border-radius: 14px; padding: 18px; background: rgba(15, 23, 42, .68); }
+.short-audio-profile > label { display: grid; gap: 7px; margin: 14px 0; color: #cbd5e1; }
+.short-audio-profile textarea { box-sizing: border-box; width: 100%; resize: vertical; border: 1px solid #475569; border-radius: 10px; background: rgba(15, 23, 42, .85); color: #f8fafc; padding: 12px; font: inherit; line-height: 1.55; }
 .short-profile-warning { margin: 8px 0; padding: 9px 11px; border-radius: 8px; color: #fde68a; background: rgba(161, 98, 7, .18); }
 .short-profile-note { color: #94a3b8; }
 .short-profile-note code { color: #a5f3fc; word-break: break-all; }

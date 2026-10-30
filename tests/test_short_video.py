@@ -32,6 +32,21 @@ CHARACTER_MANIFEST_PATH = (
 
 
 def manifest_data():
+    data = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    data.pop("audio_profile", None)
+    data["profile_version"] = "1.0.0"
+    data["voice_profile"] = {
+        "provider": "omnivoice",
+        "voice_id": "66cb0b63-125b-4615-8600-e918c56a9c7d",
+        "voice_name": "bac_ho_doc_tho_1",
+        "selectable": True,
+        "title_pause_ms": 900,
+        "single_task": True,
+    }
+    return data
+
+
+def vieneu_manifest_data():
     return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
 
 
@@ -580,6 +595,7 @@ class ShortVideoStoreAndApiTests(unittest.TestCase):
             "bac-ho-ngam-tho",
             visual_provider="",
             voice_id=snapshot["resolved_voice_snapshot"]["voice_id"],
+            audio_profile_id="",
         )
         jobs = db.list_system_jobs(limit=None, job_type="short_video_generation")
         self.assertEqual(len(jobs), 1)

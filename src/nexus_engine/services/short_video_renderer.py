@@ -22,7 +22,7 @@ def _ffmpeg_exe() -> str:
     return imageio_ffmpeg.get_ffmpeg_exe()
 
 
-def _ffprobe_exe() -> str:
+def _ffprobe_exe() -> str | None:
     ffmpeg = Path(_ffmpeg_exe())
     sibling = ffmpeg.with_name("ffprobe.exe" if ffmpeg.suffix.casefold() == ".exe" else "ffprobe")
     if sibling.is_file():
@@ -30,7 +30,7 @@ def _ffprobe_exe() -> str:
     located = shutil.which("ffprobe")
     if located:
         return located
-    raise ShortVideoRenderError("Không tìm thấy ffprobe để kiểm tra media Short Video.")
+    return None
 
 
 def _run_process(
@@ -94,10 +94,221 @@ def normalize_audio(source: Path, destination: Path, *, job_id: str) -> Path:
     return destination
 
 
-def probe(path: Path) -> dict:
+def assemble_poem_audio(
+    *,
+    lines: list[tuple[Path, int]],
+    source_destination: Path,
+    final_destination: Path,
+    job_id: str,
+) -> tuple[Path, Path]:
+    if not lines:
+        raise ShortVideoRenderError("Không có line audio để ghép.")
+    work_dir = source_destination.parent / ".audio-assembly"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    silence_files: dict[int, Path] = {}
+    concat_entries: list[Path] = []
+    for index, (line_path, gap_ms) in enumerate(lines):
+        duration = probe_duration(line_path)
+        faded = work_dir / f"line_{index:03d}.wav"
+        fade_start = max(0.0, duration - 0.012)
+        _run_process(
+            [
+                _ffmpeg_exe(),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(line_path),
+                "-af",
+                f"afade=t=out:st={fade_start:.6f}:d=0.012",
+                "-ar",
+                "48000",
+                "-ac",
+                "1",
+                "-c:a",
+                "pcm_s16le",
+                str(faded),
+            ],
+            job_id=job_id,
+            timeout=300,
+        )
+        concat_entries.append(faded)
+        normalized_gap = int(gap_ms)
+        silence = silence_files.get(normalized_gap)
+        if silence is None:
+            silence = work_dir / f"silence_{normalized_gap}.wav"
+            _run_process(
+                [
+                    _ffmpeg_exe(),
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anullsrc=r=48000:cl=mono",
+                    "-t",
+                    f"{normalized_gap / 1000.0:.3f}",
+                    "-c:a",
+                    "pcm_s16le",
+                    str(silence),
+                ],
+                job_id=job_id,
+                timeout=120,
+            )
+            silence_files[normalized_gap] = silence
+        concat_entries.append(silence)
+
+    concat_file = work_dir / "audio_concat.txt"
+    concat_file.write_text(
+        "\n".join(
+            "file '" + path.resolve().as_posix().replace("'", "'\\''") + "'"
+            for path in concat_entries
+        ),
+        encoding="utf-8",
+    )
+    source_destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_source = source_destination.with_name(
+        source_destination.stem + ".tmp" + source_destination.suffix
+    )
+    temporary_source.unlink(missing_ok=True)
+    _run_process(
+        [
+            _ffmpeg_exe(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_file),
+            "-ar",
+            "48000",
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_s16le",
+            str(temporary_source),
+        ],
+        job_id=job_id,
+        timeout=600,
+    )
+    os.replace(temporary_source, source_destination)
+
+    final_destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_final = final_destination.with_name(
+        final_destination.stem + ".tmp" + final_destination.suffix
+    )
+    temporary_final.unlink(missing_ok=True)
+    reverb_and_master = (
+        "asplit=2[dry][wet];"
+        "[wet]aecho=0.8:0.9:25|1100:0.35|0.15[echo];"
+        "[dry][echo]amix=inputs=2:weights='0.92 0.08':normalize=0,"
+        "loudnorm=I=-15:TP=-1:LRA=11"
+    )
+    _run_process(
+        [
+            _ffmpeg_exe(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(source_destination),
+            "-filter_complex",
+            reverb_and_master,
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-c:a",
+            "pcm_s16le",
+            str(temporary_final),
+        ],
+        job_id=job_id,
+        timeout=600,
+    )
+    os.replace(temporary_final, final_destination)
+    return source_destination, final_destination
+
+
+def _probe_with_ffmpeg(path: Path) -> dict:
     result = subprocess.run(
         [
-            _ffprobe_exe(),
+            _ffmpeg_exe(),
+            "-hide_banner",
+            "-i",
+            str(path),
+            "-f",
+            "null",
+            "NUL" if os.name == "nt" else "/dev/null",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+        check=False,
+    )
+    output = f"{result.stdout or ''}\n{result.stderr or ''}"
+    duration_match = re.search(
+        r"Duration:\s*(\d+):(\d+):([0-9.]+)",
+        output,
+        flags=re.IGNORECASE,
+    )
+    if not duration_match:
+        raise ShortVideoRenderError("FFmpeg không đọc được duration artifact Short Video.")
+    duration = (
+        int(duration_match.group(1)) * 3600
+        + int(duration_match.group(2)) * 60
+        + float(duration_match.group(3))
+    )
+    streams: list[dict] = []
+    for line in output.splitlines():
+        if line.strip().casefold().startswith("stream mapping:"):
+            break
+        if "Stream #" not in line:
+            continue
+        video_match = re.search(r"Video:\s*([^,\s]+)", line, flags=re.IGNORECASE)
+        if video_match:
+            dimensions = re.search(r"(?<![0-9])(\d{2,5})x(\d{2,5})(?![0-9])", line)
+            fps_match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*fps\b", line)
+            stream = {
+                "index": len(streams),
+                "codec_type": "video",
+                "codec_name": video_match.group(1).casefold(),
+                "width": int(dimensions.group(1)) if dimensions else 0,
+                "height": int(dimensions.group(2)) if dimensions else 0,
+                "r_frame_rate": f"{fps_match.group(1)}/1" if fps_match else "0/1",
+            }
+            streams.append(stream)
+            continue
+        audio_match = re.search(r"Audio:\s*([^,\s]+)", line, flags=re.IGNORECASE)
+        if audio_match:
+            streams.append(
+                {
+                    "index": len(streams),
+                    "codec_type": "audio",
+                    "codec_name": audio_match.group(1).casefold(),
+                }
+            )
+    if duration <= 0 or not streams:
+        raise ShortVideoRenderError("Metadata FFmpeg của artifact Short Video không hợp lệ.")
+    return {"duration_seconds": duration, "streams": streams}
+
+
+def probe(path: Path) -> dict:
+    ffprobe = _ffprobe_exe()
+    if not ffprobe:
+        return _probe_with_ffmpeg(path)
+    result = subprocess.run(
+        [
+            ffprobe,
             "-v",
             "error",
             "-show_entries",

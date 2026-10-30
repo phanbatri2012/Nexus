@@ -1,10 +1,10 @@
 {
   "key": "bac-ho-ngam-tho",
   "display_name": "Bác Hồ ngâm thơ",
-  "description": "Tạo video dọc từ một bài thơ do Bác Hồ sáng tác, dùng giọng OmniVoice đã định danh.",
+  "description": "Tạo video dọc từ một bài thơ do Bác Hồ sáng tác, dùng giọng ngâm VieNeu-TTS từ reference gốc.",
   "status": "active",
   "order": 10,
-  "profile_version": "1.0.0",
+  "profile_version": "1.1.0",
   "pipeline_profile": {
     "id": "poem_to_short_v1",
     "max_duration_seconds": 180,
@@ -18,13 +18,18 @@
     "title_max_length": 300,
     "poem_max_length": 12000
   },
-  "voice_profile": {
-    "provider": "omnivoice",
-    "voice_id": "66cb0b63-125b-4615-8600-e918c56a9c7d",
-    "voice_name": "bac_ho_doc_tho_1",
-    "selectable": true,
-    "title_pause_ms": 900,
-    "single_task": true
+  "audio_profile": {
+    "provider": "vieneu_v3_turbo",
+    "profile_id": "bac-ho-ngam-tho-v1",
+    "display_name": "Bác Hồ ngâm thơ · VieNeu v1",
+    "profile_version": 1,
+    "status": "draft",
+    "backend": "onnx",
+    "precision": "fp32",
+    "sample_rate": 48000,
+    "use_ref_codes": true,
+    "denoise_reference": false,
+    "apply_watermark": true
   },
   "visual_profile": {
     "provider": "muse",

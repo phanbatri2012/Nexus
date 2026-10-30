@@ -1,4 +1,4 @@
-"""Checkpointed poem-to-Short pipeline using OmniVoice and selectable visual engines."""
+"""Checkpointed poem-to-Short pipeline with versioned audio and visual providers."""
 
 from __future__ import annotations
 
@@ -23,8 +23,10 @@ from nexus_engine.services import (
     database as db,
     muse_semantic_planner,
     security_logging,
+    short_video_audio,
     short_video_renderer,
     tts_registry as tts,
+    vieneu_tts,
 )
 from nexus_engine.services.chatgpt_runtime import ChatGPTAttentionRequiredError
 from nexus_engine.services.chatgpt_worker import (
@@ -192,6 +194,12 @@ def _check_canceled(job_id: str) -> None:
 
 
 def _estimated_duration_seconds(title: str, poem: str, voice_snapshot: dict) -> float:
+    provider_id = str((voice_snapshot or {}).get("provider_id") or "")
+    if provider_id == vieneu_tts.SUPPORTED_PROVIDER:
+        lines = short_video_audio.prepare_poem_lines(poem)
+        words = sum(len(re.findall(r"\S+", line["source_text"])) for line in lines)
+        gaps = sum(int(line["gap_ms"]) for line in lines) / 1000.0
+        return words / 95.0 * 60.0 + gaps
     text = f"{title} {poem}"
     words = len(re.findall(r"\S+", text))
     settings = voice_snapshot.get("config") if isinstance(voice_snapshot, dict) else {}
@@ -210,18 +218,33 @@ def _estimated_duration_seconds(title: str, poem: str, voice_snapshot: dict) -> 
 def _validate_profile(item: dict) -> tuple[dict, dict, dict]:
     profile = item.get("manifest") if isinstance(item.get("manifest"), dict) else {}
     pipeline = profile.get("pipeline_profile") or {}
-    voice_profile = profile.get("voice_profile") or {}
     voice_snapshot = profile.get("resolved_voice_snapshot") or {}
     if pipeline.get("id") != "poem_to_short_v1":
         raise ShortVideoPipelineError("Pipeline profile Short Video không được hỗ trợ.")
-    if voice_profile.get("provider") != "omnivoice":
-        raise ShortVideoPipelineError("Short Video này bắt buộc dùng OmniVoice.")
-    if voice_snapshot.get("provider_id") != "omnivoice":
-        raise ShortVideoPipelineError("Voice snapshot không thuộc OmniVoice.")
-    if voice_snapshot.get("voice_id") != voice_profile.get("voice_id"):
-        raise ShortVideoPipelineError("Voice snapshot không khớp manifest.")
-    if voice_snapshot.get("voice_name") != voice_profile.get("voice_name"):
-        raise ShortVideoPipelineError("Tên giọng snapshot không khớp manifest.")
+    audio_profile = profile.get("audio_profile")
+    if isinstance(audio_profile, dict):
+        resolved_audio = profile.get("resolved_audio_profile") or {}
+        if audio_profile.get("provider") != vieneu_tts.SUPPORTED_PROVIDER:
+            raise ShortVideoPipelineError("Audio Profile VieNeu không được hỗ trợ.")
+        if voice_snapshot.get("provider_id") != vieneu_tts.SUPPORTED_PROVIDER:
+            raise ShortVideoPipelineError("Voice snapshot không thuộc VieNeu-TTS.")
+        if voice_snapshot.get("voice_id") != audio_profile.get("profile_id"):
+            raise ShortVideoPipelineError("Voice snapshot VieNeu không khớp manifest.")
+        if resolved_audio.get("profile_id") != audio_profile.get("profile_id"):
+            raise ShortVideoPipelineError("Snapshot Audio Profile không khớp manifest.")
+        reference = resolved_audio.get("reference") or {}
+        if not reference.get("path") or not reference.get("sha256"):
+            raise ShortVideoPipelineError("Snapshot Audio Profile thiếu reference.")
+    else:
+        voice_profile = profile.get("voice_profile") or {}
+        if voice_profile.get("provider") != "omnivoice":
+            raise ShortVideoPipelineError("Short Video cũ không có provider audio hợp lệ.")
+        if voice_snapshot.get("provider_id") != "omnivoice":
+            raise ShortVideoPipelineError("Voice snapshot không thuộc OmniVoice.")
+        if voice_snapshot.get("voice_id") != voice_profile.get("voice_id"):
+            raise ShortVideoPipelineError("Voice snapshot không khớp manifest.")
+        if voice_snapshot.get("voice_name") != voice_profile.get("voice_name"):
+            raise ShortVideoPipelineError("Tên giọng snapshot không khớp manifest.")
     visual = profile.get("visual_profile") or {}
     visual_provider = str(visual.get("provider") or "muse")
     available_providers = visual.get("available_providers") or [visual_provider]
@@ -405,15 +428,355 @@ def _tts_text(item: dict) -> str:
     return f"{title}.\n\n{poem}"
 
 
+def _vieneu_audio_input_lines(item: dict) -> list[dict]:
+    return short_video_audio.prepare_poem_lines(str(item.get("source_text") or ""))
+
+
+def _ensure_vieneu_audio(
+    *,
+    checkpoint: dict,
+    item_dir: Path,
+    job: dict,
+    item: dict,
+    profile: dict,
+    max_duration: float,
+) -> float:
+    audio_state = checkpoint.setdefault("audio", {})
+    normalized_relative = str(audio_state.get("normalized_path") or "")
+    if normalized_relative:
+        normalized = _resolve_artifact(item_dir, normalized_relative)
+        if normalized.is_file():
+            duration = short_video_renderer.probe_duration(normalized)
+            audio_state["duration_seconds"] = round(duration, 3)
+            return duration
+
+    resolved = profile.get("resolved_audio_profile") or {}
+    reference = resolved.get("reference") or {}
+    reference_path = _resolve_artifact(item_dir, str(reference.get("path") or ""))
+    if (
+        not reference_path.is_file()
+        or not reference.get("sha256")
+        or _file_sha256(reference_path) != str(reference.get("sha256") or "")
+    ):
+        raise ShortVideoAttentionRequired(
+            "Snapshot reference VieNeu không toàn vẹn.",
+            reason="vieneu_reference_invalid",
+        )
+    runtime = vieneu_tts.runtime_status()
+    if not runtime.get("available"):
+        raise ShortVideoAttentionRequired(
+            str(runtime.get("detail") or "Runtime VieNeu-TTS chưa sẵn sàng."),
+            reason="vieneu_runtime_unavailable",
+        )
+    if str(runtime.get("lock_sha256") or "") != str(
+        resolved.get("runtime_lock_sha256") or ""
+    ):
+        raise ShortVideoAttentionRequired(
+            "Runtime VieNeu-TTS đã đổi so với snapshot item; cần kiểm tra thủ công.",
+            reason="vieneu_runtime_revision_changed",
+        )
+
+    lines = _vieneu_audio_input_lines(item)
+    if not lines:
+        raise ShortVideoPipelineError("Bài thơ không có dòng hợp lệ để ngâm.")
+    audio_revision = int(checkpoint.get("audio_revision") or 0)
+    request_hash = _canonical_hash(
+        {
+            "item_id": item["id"],
+            "audio_revision": audio_revision,
+            "poem": str(item.get("source_text") or ""),
+            "profile_id": resolved.get("profile_id"),
+            "profile_version": resolved.get("profile_version"),
+            "runtime_revision": resolved.get("runtime_revision"),
+            "model_revision": resolved.get("model_revision"),
+            "reference_sha256": reference.get("sha256"),
+            "qc_version": short_video_audio.QC_VERSION,
+        }
+    )
+    existing_request_hash = str(audio_state.get("request_hash") or "")
+    if existing_request_hash and existing_request_hash != request_hash:
+        raise ShortVideoAttentionRequired(
+            "Checkpoint audio VieNeu không khớp nội dung/profile hiện tại.",
+            reason="vieneu_checkpoint_mismatch",
+        )
+    audio_state.update(
+        {
+            "provider": vieneu_tts.SUPPORTED_PROVIDER,
+            "profile_id": resolved.get("profile_id") or "",
+            "profile_version": int(resolved.get("profile_version") or 1),
+            "request_hash": request_hash,
+            "single_subprocess": True,
+            "lines": audio_state.get("lines") if isinstance(audio_state.get("lines"), dict) else {},
+        }
+    )
+    line_states: dict = audio_state["lines"]
+    reference_metrics = short_video_audio.analyze_wav(reference_path)
+
+    def selected_path(line: dict, state: dict) -> Path | None:
+        selected = int(state.get("selected_variant") or 0)
+        candidate = (state.get("candidates") or {}).get(str(selected)) or {}
+        relative = str(candidate.get("path") or "")
+        if not selected or not relative:
+            return None
+        path = _resolve_artifact(item_dir, relative)
+        expected_hash = str(candidate.get("sha256") or "")
+        if not path.is_file() or not expected_hash or _file_sha256(path) != expected_hash:
+            return None
+        return path
+
+    needs_generation = any(
+        selected_path(line, line_states.get(str(line["index"])) or {}) is None
+        for line in lines
+    )
+    session_context = (
+        vieneu_tts.VieNeuGenerationSession(
+            job_id=str(job["id"]),
+            reference_path=reference_path,
+            work_dir=item_dir / "audio",
+            timeout_seconds=TTS_TIMEOUT_SECONDS,
+        )
+        if needs_generation
+        else None
+    )
+
+    try:
+        session = session_context.__enter__() if session_context is not None else None
+        for line in lines:
+            _check_canceled(str(job["id"]))
+            line_key = str(line["index"])
+            state = line_states.setdefault(
+                line_key,
+                {
+                    "index": line["index"],
+                    "source_text": line["source_text"],
+                    "synthesis_text": line["synthesis_text"],
+                    "gap_ms": line["gap_ms"],
+                    "candidates": {},
+                },
+            )
+            if selected_path(line, state) is not None:
+                continue
+            candidates = state.setdefault("candidates", {})
+
+            def evaluate(variant: int) -> dict:
+                candidate_path = (
+                    item_dir
+                    / "audio"
+                    / f"line_{int(line['index']):03d}_candidate_{variant}.wav"
+                )
+                candidate = candidates.get(str(variant)) or {}
+                valid_existing = bool(
+                    candidate_path.is_file()
+                    and candidate.get("sha256")
+                    and _file_sha256(candidate_path) == str(candidate.get("sha256"))
+                )
+                if not valid_existing:
+                    if session is None:
+                        raise ShortVideoPipelineError("VieNeu session không sẵn sàng để tạo candidate.")
+                    seed = short_video_audio.deterministic_seed(
+                        item_id=str(item["id"]),
+                        audio_revision=audio_revision,
+                        line_index=int(line["index"]),
+                        variant=variant,
+                    )
+                    receipt = session.generate(
+                        text=str(line["synthesis_text"]),
+                        seed=seed,
+                        output_path=candidate_path,
+                    )
+                    candidate = {
+                        "variant": variant,
+                        "path": candidate_path.relative_to(item_dir).as_posix(),
+                        "sha256": receipt.get("sha256") or _file_sha256(candidate_path),
+                        "seed": seed,
+                        "engine_receipt": {
+                            key: receipt.get(key)
+                            for key in (
+                                "provider",
+                                "backend",
+                                "precision",
+                                "sample_rate",
+                                "duration_seconds",
+                                "elapsed_seconds",
+                                "use_ref_codes",
+                                "denoise",
+                                "apply_watermark",
+                                "request_hash",
+                            )
+                        },
+                    }
+                if not candidate.get("quality"):
+                    metrics = short_video_audio.analyze_wav(candidate_path)
+                    transcript = " ".join(
+                        segment.get("text") or ""
+                        for segment in _transcribe_audio(candidate_path)
+                    ).strip()
+                    quality = short_video_audio.score_candidate(
+                        expected_text=str(line["source_text"]),
+                        transcript=transcript,
+                        metrics=metrics,
+                        reference_metrics=reference_metrics,
+                    )
+                    candidate.update(
+                        {
+                            "metrics": metrics,
+                            "transcript": transcript,
+                            "quality": quality,
+                        }
+                    )
+                candidates[str(variant)] = candidate
+                _save_checkpoint(
+                    checkpoint,
+                    item_dir=item_dir,
+                    job=job,
+                    item=item,
+                    stage=f"vieneu_line_{line['index']}_candidate_{variant}",
+                    progress=(
+                        f"Đã kiểm tra candidate {variant}/3 cho dòng "
+                        f"{int(line['index']) + 1}/{len(lines)}"
+                    ),
+                )
+                return candidate
+
+            first_candidates = [evaluate(variant) for variant in (1, 2)]
+            accepted = [
+                candidate
+                for candidate in first_candidates
+                if (candidate.get("quality") or {}).get("accepted")
+            ]
+            if not accepted:
+                third = evaluate(3)
+                if (third.get("quality") or {}).get("accepted"):
+                    accepted.append(third)
+            if not accepted:
+                state["attention_required"] = "all_candidates_failed_qc"
+                _save_checkpoint(
+                    checkpoint,
+                    item_dir=item_dir,
+                    job=job,
+                    item=item,
+                    stage=f"vieneu_line_{line['index']}_needs_attention",
+                    progress=f"Không có candidate đạt QC cho dòng {int(line['index']) + 1}",
+                )
+                raise ShortVideoAttentionRequired(
+                    f"Không có candidate VieNeu đạt QC cho dòng {int(line['index']) + 1}.",
+                    reason="vieneu_candidate_qc_failed",
+                )
+            winner = max(
+                accepted,
+                key=lambda value: float((value.get("quality") or {}).get("score") or 0),
+            )
+            state["selected_variant"] = int(winner["variant"])
+            state["completed_at"] = db.utc_now()
+            _save_checkpoint(
+                checkpoint,
+                item_dir=item_dir,
+                job=job,
+                item=item,
+                stage=f"vieneu_line_{line['index']}_ready",
+                progress=f"Đã chọn giọng ngâm cho dòng {int(line['index']) + 1}/{len(lines)}",
+            )
+    except vieneu_tts.VieNeuRuntimeError as exc:
+        raise ShortVideoAttentionRequired(
+            security_logging.redact_sensitive(exc),
+            reason="vieneu_runtime_failed",
+        ) from exc
+    finally:
+        if session_context is not None:
+            session_context.__exit__(None, None, None)
+
+    selected_lines: list[tuple[Path, int]] = []
+    for line in lines:
+        state = line_states.get(str(line["index"])) or {}
+        path = selected_path(line, state)
+        if path is None:
+            raise ShortVideoAttentionRequired(
+                "Checkpoint VieNeu thiếu candidate đã chọn.",
+                reason="vieneu_checkpoint_incomplete",
+            )
+        selected_lines.append((path, int(line["gap_ms"])))
+
+    source_path = item_dir / "audio" / f"narration_r{audio_revision}.source.wav"
+    normalized_path = item_dir / "audio" / f"narration_r{audio_revision}.wav"
+    short_video_renderer.assemble_poem_audio(
+        lines=selected_lines,
+        source_destination=source_path,
+        final_destination=normalized_path,
+        job_id=str(job["id"]),
+    )
+    duration = short_video_renderer.probe_duration(normalized_path)
+    qc_path = item_dir / "audio" / f"prosody_qc_r{audio_revision}.json"
+    receipt_path = item_dir / "audio" / f"engine_receipt_r{audio_revision}.json"
+    _atomic_json(
+        qc_path,
+        {
+            "weights": {"transcript": 0.60, "prosody": 0.25, "technical": 0.15},
+            "reference_metrics": reference_metrics,
+            "lines": [line_states[str(line["index"])] for line in lines],
+        },
+    )
+    _atomic_json(
+        receipt_path,
+        {
+            "provider": vieneu_tts.SUPPORTED_PROVIDER,
+            "profile_id": resolved.get("profile_id") or "",
+            "profile_version": resolved.get("profile_version") or 1,
+            "runtime_revision": resolved.get("runtime_revision") or "",
+            "model_revision": resolved.get("model_revision") or {},
+            "reference_sha256": reference.get("sha256") or "",
+            "request_hash": request_hash,
+            "audio_revision": audio_revision,
+            "qc_version": short_video_audio.QC_VERSION,
+            "line_count": len(lines),
+            "single_subprocess": True,
+            "completed_at": db.utc_now(),
+        },
+    )
+    audio_state.update(
+        {
+            "source_path": source_path.relative_to(item_dir).as_posix(),
+            "normalized_path": normalized_path.relative_to(item_dir).as_posix(),
+            "qc_path": qc_path.relative_to(item_dir).as_posix(),
+            "receipt_path": receipt_path.relative_to(item_dir).as_posix(),
+            "duration_seconds": round(duration, 3),
+            "completed_at": db.utc_now(),
+        }
+    )
+    _save_checkpoint(
+        checkpoint,
+        item_dir=item_dir,
+        job=job,
+        item=item,
+        stage="audio_ready",
+        progress=f"Đã tạo giọng ngâm VieNeu {duration:.1f} giây",
+    )
+    if duration > max_duration + 0.05:
+        raise ShortVideoAttentionRequired(
+            f"Giọng ngâm dài {duration:.1f} giây, vượt giới hạn {max_duration:.0f} giây; hệ thống không cắt hoặc tăng tốc.",
+            reason="duration_exceeded",
+        )
+    return duration
+
+
 def _ensure_audio(
     *,
     checkpoint: dict,
     item_dir: Path,
     job: dict,
     item: dict,
+    profile: dict,
     voice_snapshot: dict,
     max_duration: float,
 ) -> float:
+    if isinstance(profile.get("resolved_audio_profile"), dict):
+        return _ensure_vieneu_audio(
+            checkpoint=checkpoint,
+            item_dir=item_dir,
+            job=job,
+            item=item,
+            profile=profile,
+            max_duration=max_duration,
+        )
     audio_state = checkpoint.setdefault("audio", {})
     normalized_relative = str(audio_state.get("normalized_path") or "")
     if normalized_relative:
@@ -1890,7 +2253,13 @@ def execute(job: dict) -> None:
         voice_snapshot,
     )
     checkpoint["estimated_duration_seconds"] = round(estimate, 3)
-    if not (checkpoint.get("audio") or {}).get("provider_task_id") and estimate > max_duration:
+    audio_checkpoint = checkpoint.get("audio") or {}
+    audio_started = bool(
+        audio_checkpoint.get("provider_task_id")
+        or audio_checkpoint.get("request_hash")
+        or audio_checkpoint.get("normalized_path")
+    )
+    if not audio_started and estimate > max_duration:
         _save_checkpoint(
             checkpoint,
             item_dir=item_dir,
@@ -1908,6 +2277,7 @@ def execute(job: dict) -> None:
         item_dir=item_dir,
         job=job,
         item=item,
+        profile=profile,
         voice_snapshot=voice_snapshot,
         max_duration=max_duration,
     )

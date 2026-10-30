@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import datetime
+import hashlib
+import json
 import uuid
 from copy import deepcopy
 from typing import Literal
@@ -11,7 +14,12 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from nexus_engine.services import database as db
-from nexus_engine.services import security_logging, short_video_pipeline, short_video_worker
+from nexus_engine.services import (
+    security_logging,
+    short_video_audio_preview,
+    short_video_pipeline,
+    short_video_worker,
+)
 from nexus_engine.services.short_video_registry import registry
 
 
@@ -26,6 +34,7 @@ class CreateShortVideoRequest(BaseModel):
     client_request_id: str = Field(min_length=8, max_length=200)
     visual_provider: Literal["muse", "google_flow"] | None = None
     voice_id: str | None = Field(default=None, min_length=1, max_length=200)
+    audio_profile_id: str | None = Field(default=None, min_length=1, max_length=200)
     character_era: str = Field(
         default="auto",
         min_length=1,
@@ -42,6 +51,12 @@ class CharacterEraRequest(BaseModel):
     )
 
 
+class AudioPreviewRequest(BaseModel):
+    poem: str = Field(min_length=1, max_length=12000)
+    audio_profile_id: str | None = Field(default=None, min_length=1, max_length=200)
+    client_request_id: str | None = Field(default=None, min_length=8, max_length=200)
+
+
 def _public_profile_snapshot(profile: dict) -> dict:
     safe = deepcopy(profile) if isinstance(profile, dict) else {}
     character = safe.get("resolved_character_profile")
@@ -50,7 +65,48 @@ def _public_profile_snapshot(profile: dict) -> dict:
             for asset in era.get("references") or []:
                 asset.pop("snapshot_path", None)
                 asset.pop("sha256", None)
+    audio_profile = safe.get("resolved_audio_profile")
+    if isinstance(audio_profile, dict):
+        reference = audio_profile.get("reference")
+        if isinstance(reference, dict):
+            reference.pop("path", None)
+        audio_profile.pop("runtime_lock_sha256", None)
     return safe
+
+
+def _public_project(project: dict) -> dict:
+    public = deepcopy(project)
+    summary = public.pop("audio_profile_summary", None)
+    if isinstance(summary, dict):
+        public["audio_profile"] = summary
+    public.pop("source", None)
+    public["errors"] = [
+        security_logging.redact_sensitive(error)
+        for error in public.get("errors") or []
+    ]
+    return public
+
+
+def _public_audio_preview(preview: dict) -> dict:
+    completed = preview.get("status") == "completed" and bool(
+        preview.get("audio_filename")
+    )
+    return {
+        "id": preview.get("id") or "",
+        "project_key": preview.get("project_key") or "",
+        "profile_id": preview.get("profile_id") or "",
+        "status": preview.get("status") or "",
+        "duration_seconds": preview.get("duration_seconds"),
+        "error": security_logging.redact_sensitive(preview.get("error") or ""),
+        "created_at": preview.get("created_at") or "",
+        "updated_at": preview.get("updated_at") or "",
+        "expires_at": preview.get("expires_at") or "",
+        "audio_url": (
+            f"/api/short-video/audio-previews/{preview.get('id')}/audio"
+            if completed
+            else ""
+        ),
+    }
 
 
 def _public_character_state(item: dict) -> dict | None:
@@ -167,7 +223,10 @@ def list_short_video_projects(
     include_archived: bool = Query(default=False),
 ):
     return {
-        "items": registry.list_projects(include_archived=include_archived),
+        "items": [
+            _public_project(project)
+            for project in registry.list_projects(include_archived=include_archived)
+        ],
         "reload_mode": "mtime",
     }
 
@@ -281,6 +340,127 @@ def list_short_video_items(
     return page
 
 
+@router.post("/projects/{key}/audio-previews", status_code=202)
+def create_short_video_audio_preview(key: str, request: AudioPreviewRequest):
+    normalized_key = str(key or "").strip().casefold()
+    lines = [line.strip() for line in str(request.poem or "").splitlines() if line.strip()]
+    excerpt = "\n".join(lines[:4]).strip()
+    if not excerpt:
+        raise HTTPException(status_code=422, detail="Cần ít nhất một dòng thơ để nghe thử.")
+    try:
+        profile = registry.audio_profile_for_preview(
+            normalized_key,
+            str(request.audio_profile_id or ""),
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Dự án không khả dụng.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    request_hash = hashlib.sha256(
+        json.dumps(
+            {
+                "project_key": normalized_key,
+                "profile_id": profile.get("profile_id"),
+                "profile_version": profile.get("profile_version"),
+                "poem_excerpt": excerpt,
+                "reference_sha256": profile.get("reference_sha256"),
+                "runtime_lock_sha256": profile.get("runtime_lock_sha256"),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    preview_uuid = uuid.uuid5(uuid.NAMESPACE_URL, f"nexus-short-video-preview:{request_hash}")
+    preview_id = str(preview_uuid)
+    job_id = f"short-video-audio-preview-{preview_uuid}"
+    voice_snapshot = {
+        "voice_id": profile["profile_id"],
+        "voice_name": profile["display_name"],
+        "provider_id": profile["provider"],
+        "voice_revision": int(profile.get("profile_version") or 1),
+        "config": {
+            "backend": profile.get("backend"),
+            "precision": profile.get("precision"),
+            "sample_rate": profile.get("sample_rate"),
+        },
+    }
+    expires_at = (
+        datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=24)
+    ).isoformat()
+    preview, job, created = db.create_short_video_audio_preview_with_job(
+        preview_id=preview_id,
+        project_key=normalized_key,
+        profile_id=str(profile["profile_id"]),
+        request_hash=request_hash,
+        poem_excerpt=excerpt,
+        job_id=job_id,
+        payload={
+            "preview_id": preview_id,
+            "project_key": normalized_key,
+            "audio_profile": profile,
+        },
+        expires_at=expires_at,
+        voice_snapshot=voice_snapshot,
+    )
+    if str(job.get("status") or "") in {"paused", "failed", "canceled"}:
+        job = db.update_system_job(
+            str(job.get("id") or job_id),
+            status="queued",
+            progress="Đang chờ tạo lại bản nghe thử",
+            error="",
+            cancel_requested=0,
+            next_retry_at="",
+            started_at="",
+            finished_at="",
+        ) or job
+        preview = db.update_short_video_audio_preview(
+            preview_id,
+            status="queued",
+            error="",
+        ) or preview
+    if str(job.get("status") or "") in {"queued", "retry_wait", "running"}:
+        short_video_worker.kick()
+    return {
+        "created": created,
+        "preview": _public_audio_preview(preview),
+        "job": {"id": job.get("id") or job_id, "status": job.get("status") or "queued"},
+    }
+
+
+@router.get("/audio-previews/{preview_id}")
+def get_short_video_audio_preview(preview_id: str):
+    try:
+        normalized = str(uuid.UUID(str(preview_id)))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Không tìm thấy bản nghe thử.") from exc
+    preview = db.get_short_video_audio_preview(normalized)
+    if preview is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy bản nghe thử.")
+    return _public_audio_preview(preview)
+
+
+@router.get("/audio-previews/{preview_id}/audio")
+def get_short_video_audio_preview_audio(preview_id: str):
+    try:
+        normalized = str(uuid.UUID(str(preview_id)))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Không tìm thấy bản nghe thử.") from exc
+    preview = db.get_short_video_audio_preview(normalized)
+    if preview is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy bản nghe thử.")
+    try:
+        path = short_video_audio_preview.audio_path(preview)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(
+        path,
+        media_type="audio/wav",
+        filename="preview.wav",
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
 @router.post("/projects/{key}/items", status_code=202)
 def create_short_video_item(key: str, request: CreateShortVideoRequest):
     normalized_key = str(key or "").strip().casefold()
@@ -307,18 +487,30 @@ def create_short_video_item(key: str, request: CreateShortVideoRequest):
             normalized_key,
             visual_provider=str(request.visual_provider or ""),
             voice_id=str(request.voice_id or ""),
+            audio_profile_id=str(request.audio_profile_id or ""),
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Dự án không khả dụng.") from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     title, poem = _validate_create_input(snapshot, request.title, request.poem)
-    if isinstance(snapshot.get("character_profile"), dict):
+    if isinstance(snapshot.get("audio_profile"), dict) or isinstance(
+        snapshot.get("character_profile"), dict
+    ):
         try:
             item_dir = short_video_pipeline.prepare_item_directory(normalized_key, item_id)
+            snapshot = registry.snapshot_audio_profile(snapshot, item_dir)
             snapshot = registry.snapshot_character_profile(snapshot, item_dir)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            safe_error = security_logging.safe_user_error(
+                "short_video_profile_snapshot",
+                exc,
+                "Không thể snapshot profile cho Short Video.",
+            )
+            raise HTTPException(status_code=409, detail=safe_error) from exc
+    if isinstance(snapshot.get("character_profile"), dict):
         era_keys = {
             str(era.get("key") or "")
             for era in (snapshot.get("resolved_character_profile") or {}).get("eras") or []
@@ -330,6 +522,7 @@ def create_short_video_item(key: str, request: CreateShortVideoRequest):
     options = {
         "visual_provider": str((snapshot.get("visual_profile") or {}).get("provider") or "muse"),
         "voice_id": str((snapshot.get("resolved_voice_snapshot") or {}).get("voice_id") or ""),
+        "audio_profile_id": str((snapshot.get("audio_profile") or {}).get("profile_id") or ""),
         "character_era": request.character_era,
     }
     voice_snapshot = snapshot["resolved_voice_snapshot"]

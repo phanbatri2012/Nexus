@@ -122,6 +122,12 @@ class FlowVideoCreditExhausted(FlowCreditExhausted):
     reason_code = "flow_video_credit_exhausted"
 
 
+class FlowAgentLimitReached(FlowCreditExhausted):
+    """Raised when Google Flow limits daily conversational interactions with Flow Agent."""
+
+    reason_code = "flow_agent_limit_reached"
+
+
 class FlowGenerationStartError(RuntimeError):
     """Raised when Flow never shows progress or a new result after submission."""
 
@@ -365,6 +371,27 @@ def _is_flow_video_credit_exhausted_error(text: str) -> bool:
     if ("nano banana" in lower or "image generation failed" in lower) and "video" not in lower:
         return False
     return True
+
+
+def _is_flow_agent_limit_error(text: str) -> bool:
+    """Return True if the error indicates Flow Agent turn limit has been reached."""
+    if not text:
+        return False
+    import unicodedata
+    normalized = unicodedata.normalize(
+        "NFKD", str(text).replace("Đ", "D").replace("đ", "d")
+    )
+    normalized = normalized.encode("ASCII", "ignore").decode("utf-8").casefold()
+    explicit_cues = (
+        "han muc su dung tac nhan flow",
+        "tac nhan flow",
+        "che do ra lenh thu cong",
+        "quay lai vao ngay mai de tro chuyen",
+        "flow agent limit",
+        "limit for flow agent",
+        "usage limit for flow agent",
+    )
+    return any(cue in normalized for cue in explicit_cues)
 
 
 def _upgrade_google_cdn_image_url(url: str) -> str:
@@ -1209,7 +1236,12 @@ class GoogleFlowWorker:
                 return None
             await asyncio.sleep(0.2)
 
-    async def ensure_agent_image_settings(self, image_settings: dict | None = None) -> None:
+    async def ensure_agent_image_settings(
+        self,
+        image_settings: dict | None = None,
+        *,
+        force: bool = False,
+    ) -> None:
         """Persist deterministic Agent image defaults once for the active Flow project."""
         settings = image_settings if isinstance(image_settings, dict) else {}
         aspect_ratio = str(settings.get("aspect_ratio") or "16:9").strip()
@@ -1237,7 +1269,10 @@ class GoogleFlowWorker:
 
         project_id = self._project_id()
         settings_signature = (model_id, aspect_ratio, output_count)
-        if (
+        if force:
+            self._session_configured_agent_image_projects.pop(project_id, None)
+            _PERSISTENT_CONFIGURED_AGENT_IMAGE_PROJECTS.pop(project_id, None)
+        elif (
             self._session_configured_agent_image_projects.get(project_id)
             == settings_signature
             or _PERSISTENT_CONFIGURED_AGENT_IMAGE_PROJECTS.get(project_id)
@@ -1373,7 +1408,12 @@ class GoogleFlowWorker:
             model_id,
         )
 
-    async def ensure_agent_video_settings(self, video_settings: dict | None = None) -> None:
+    async def ensure_agent_video_settings(
+        self,
+        video_settings: dict | None = None,
+        *,
+        force: bool = False,
+    ) -> None:
         """Persist deterministic Agent defaults once for the active Flow project."""
         settings = video_settings if isinstance(video_settings, dict) else {}
         try:
@@ -1393,7 +1433,10 @@ class GoogleFlowWorker:
 
         project_id = self._project_id()
         video_signature = (model_id, output_count)
-        if (
+        if force:
+            self._session_configured_agent_projects.discard(project_id)
+            _PERSISTENT_CONFIGURED_AGENT_VIDEO_PROJECTS.pop(project_id, None)
+        elif (
             project_id in self._session_configured_agent_projects
             or _PERSISTENT_CONFIGURED_AGENT_VIDEO_PROJECTS.get(project_id)
             == video_signature
@@ -2897,6 +2940,11 @@ class GoogleFlowWorker:
                 r'''(expectedPrompts) => {
                     const normalize = (value) => String(value || '')
                         .replace(/\s+/g, ' ').trim().toLowerCase();
+
+                    // Detect active generation pending tiles on canvas
+                    const pendingTiles = Array.from(document.querySelectorAll('flow-pending-tile, [class*="pending-tile"]'));
+                    const hasPendingTile = pendingTiles.length > 0;
+
                     const bubbles = Array.from(document.querySelectorAll('flow-chat-bubble'));
                     let promptIndex = -1;
                     for (let index = bubbles.length - 1; index >= 0; index -= 1) {
@@ -2913,64 +2961,97 @@ class GoogleFlowWorker:
                             break;
                         }
                     }
-                    if (promptIndex < 0) return {promptFound: false, candidates: [], error: ''};
 
                     const found = [];
                     let error = '';
                     const seen = new Set();
-                    for (let index = promptIndex + 1; index < bubbles.length; index += 1) {
-                        const bubble = bubbles[index];
-                        if (bubble.querySelector('.user-bubble')) break;
-                        const agent = bubble.querySelector('.agent-bubble');
-                        if (!agent) continue;
-                        const agentText = normalize(agent.textContent);
-                        if (/(không thành công|vi phạm chính sách|unsuccessful|violates our policy|policy violation|failed to generate|generation failed)/i.test(agentText)) {
-                            error = (agent.textContent || '').trim();
+
+                    const addValidUrlsFromNode = (node, turnRole = 'agent') => {
+                        const urls = [
+                            node.currentSrc || '', node.src || '', node.href || '',
+                            node.getAttribute('data-image-url') || '',
+                            node.getAttribute('data-media-url') || '',
+                            node.getAttribute('data-download-url') || ''
+                        ];
+                        const srcset = node.getAttribute('srcset') || '';
+                        for (const part of srcset.split(',')) {
+                            urls.push(part.trim().split(/\s+/)[0]);
                         }
-                        const nodes = bubble.querySelectorAll(
-                            'img[src], img[srcset], [data-image-url], [data-media-url], ' +
-                            '[data-download-url], a[download][href]'
-                        );
-                        for (const node of nodes) {
-                            const urls = [
-                                node.currentSrc || '', node.src || '', node.href || '',
-                                node.getAttribute('data-image-url') || '',
-                                node.getAttribute('data-media-url') || '',
-                                node.getAttribute('data-download-url') || ''
-                            ];
-                            const srcset = node.getAttribute('srcset') || '';
-                            for (const part of srcset.split(',')) {
-                                urls.push(part.trim().split(/\s+/)[0]);
+                        const validUrls = Array.from(new Set(urls.filter((value) => {
+                            const url = String(value || '').trim();
+                            const lower = url.toLowerCase();
+                            return url && !url.startsWith('data:') &&
+                                (lower.startsWith('blob:') ||
+                                 lower.includes('flow-content.google') ||
+                                 lower.includes('flow.google.com/asb') ||
+                                 lower.includes('googleusercontent.com') ||
+                                 /\.(?:png|jpe?g|webp)(?:\?|$)/i.test(url));
+                        })));
+                        if (!validUrls.length) return;
+                        const card = node.closest('[data-media-id], [data-asset-id], flow-image-tile, flow-canvas-tile, flow-media-tile');
+                        const assetId = card ? (
+                            card.getAttribute('data-media-id') ||
+                            card.getAttribute('data-asset-id') ||
+                            card.getAttribute('data-id') || ''
+                        ) : '';
+                        const key = `${assetId}|${validUrls[0]}`;
+                        if (seen.has(key)) return;
+                        seen.add(key);
+                        found.push({
+                            src: validUrls[0],
+                            urls: validUrls,
+                            assetId,
+                            labelText: '',
+                            turnRole
+                        });
+                    };
+
+                    // 1. Scan bubbles if promptIndex was located
+                    if (promptIndex >= 0) {
+                        for (let index = promptIndex + 1; index < bubbles.length; index += 1) {
+                            const bubble = bubbles[index];
+                            if (bubble.querySelector('.user-bubble')) break;
+                            const agent = bubble.querySelector('.agent-bubble');
+                            if (!agent) continue;
+                            const agentText = normalize(agent.textContent);
+                            if (/(không thành công|vi phạm chính sách|unsuccessful|violates our policy|policy violation|failed to generate|generation failed)/i.test(agentText)) {
+                                error = (agent.textContent || '').trim();
                             }
-                            const validUrls = Array.from(new Set(urls.filter((value) => {
-                                const url = String(value || '').trim();
-                                const lower = url.toLowerCase();
-                                return url && !url.startsWith('data:') &&
-                                    (lower.startsWith('blob:') ||
-                                     lower.includes('flow-content.google') ||
-                                     lower.includes('flow.google.com/asb') ||
-                                     lower.includes('googleusercontent.com') ||
-                                     /\.(?:png|jpe?g|webp)(?:\?|$)/i.test(url));
-                            })));
-                            if (!validUrls.length) continue;
-                            const card = node.closest('[data-media-id], [data-asset-id]');
-                            const assetId = card ? (
-                                card.getAttribute('data-media-id') ||
-                                card.getAttribute('data-asset-id') || ''
-                            ) : '';
-                            const key = `${assetId}|${validUrls[0]}`;
-                            if (seen.has(key)) continue;
-                            seen.add(key);
-                            found.push({
-                                src: validUrls[0],
-                                urls: validUrls,
-                                assetId,
-                                labelText: '',
-                                turnRole: 'agent'
-                            });
+                            const nodes = bubble.querySelectorAll(
+                                'img[src], img[srcset], [data-image-url], [data-media-url], ' +
+                                '[data-download-url], a[download][href]'
+                            );
+                            for (const node of nodes) {
+                                addValidUrlsFromNode(node, 'agent');
+                            }
                         }
                     }
-                    return {promptFound: true, candidates: found, error};
+
+                    // 2. Scan Canvas tiles (flow-image-tile, flow-canvas-tile, flow-media-tile)
+                    const canvasTiles = Array.from(document.querySelectorAll(
+                        'flow-image-tile, flow-canvas-tile, flow-media-tile'
+                    ));
+                    for (const tile of canvasTiles) {
+                        if (tile.tagName.toLowerCase() === 'flow-pending-tile') continue;
+                        const tileText = normalize(tile.textContent);
+                        const isMatch = promptIndex >= 0 || expectedPrompts.some((expected) => {
+                            const match = String(expected || '').match(/ayt-[a-z0-9_-]+/i);
+                            if (match && tileText.includes(match[0].toLowerCase())) return true;
+                            const sceneMatch = expected.match(/scene\s+\d+\/\d+/i);
+                            if (sceneMatch && tileText.includes(sceneMatch[0])) return true;
+                            const sample = expected.slice(0, 60);
+                            return sample && tileText.includes(sample);
+                        });
+                        if (isMatch) {
+                            const nodes = tile.querySelectorAll('img[src], img[srcset], [data-image-url], [data-media-url]');
+                            for (const node of nodes) {
+                                addValidUrlsFromNode(node, 'canvas');
+                            }
+                        }
+                    }
+
+                    const promptFound = promptIndex >= 0 || found.length > 0;
+                    return {promptFound, hasPending: hasPendingTile, candidates: found, error};
                 }''',
                 expected_prompts,
             )
@@ -2984,12 +3065,15 @@ class GoogleFlowWorker:
         self._last_image_prompt_scan_succeeded = True
         if isinstance(candidates, dict):
             self._last_image_prompt_found = bool(candidates.get("promptFound"))
+            self._last_image_pending_detected = bool(candidates.get("hasPending"))
             error_text = str(candidates.get("error") or "").strip()
             if error_text and _is_valid_flow_error_text(error_text):
                 raise FlowGenerationError(
                     f"Google Flow báo lỗi khi tạo image: {error_text}"
                 )
             candidates = candidates.get("candidates") or []
+        else:
+            self._last_image_pending_detected = False
         if not isinstance(candidates, list):
             return ""
         for candidate in reversed(candidates):
@@ -5501,6 +5585,10 @@ class GoogleFlowWorker:
                     submitted_at,
                     detail=explicit_error,
                 )
+                if _is_flow_agent_limit_error(explicit_error):
+                    raise FlowAgentLimitReached(
+                        f"Google Flow đã đạt giới hạn tương tác của Tác nhân (Flow Agent): {explicit_error}"
+                    )
                 if media_type == "video" and _is_flow_video_credit_exhausted_error(explicit_error):
                     raise FlowVideoCreditExhausted(
                         f"Google Flow đã xác nhận hết credit khi tạo video: {explicit_error}"
@@ -5721,6 +5809,19 @@ class GoogleFlowWorker:
             )
         if late_source:
             return late_source
+        if reconcile_only:
+            canvas_candidates = await self._collect_image_candidates()
+            for cand in reversed(canvas_candidates):
+                if not isinstance(cand, dict) or self._candidate_matches_active_reference(cand):
+                    continue
+                source = await self._validate_image_candidate(cand)
+                if source:
+                    self._remember_generated_image_identity(cand, source)
+                    logger.info(
+                        "flow_generation media=image state=canvas_reconcile_reused project=%s",
+                        self._project_id(),
+                    )
+                    return source
         intent_requires_reconciliation = bool(
             submit_if_prompt_missing
             and (
@@ -5731,6 +5832,11 @@ class GoogleFlowWorker:
         if reconcile_only or intent_requires_reconciliation:
             canvas_errors = await self._get_existing_image_error_texts()
             for err in canvas_errors:
+                if _is_flow_agent_limit_error(err):
+                    logger.warning("flow_image agent limit reached during reconciliation: %s", err)
+                    raise FlowAgentLimitReached(
+                        f"Google Flow đã đạt giới hạn tương tác của Tác nhân (Flow Agent): {err}"
+                    )
                 if _is_flow_image_credit_exhausted_error(err):
                     logger.warning("flow_image credit quota exhausted during reconciliation: %s", err)
                     raise FlowImageCreditExhausted(
@@ -5739,6 +5845,7 @@ class GoogleFlowWorker:
             prompt_missing = bool(
                 self._last_image_prompt_scan_succeeded
                 and not self._last_image_prompt_found
+                and not getattr(self, "_last_image_pending_detected", False)
             )
             if prompt_missing:
                 pending_reason = "flow_image_prompt_missing"
@@ -5845,6 +5952,11 @@ class GoogleFlowWorker:
             canvas_errors = await self._get_existing_image_error_texts()
             new_errors = [err for err in canvas_errors if err not in initial_error_texts]
             for err in new_errors:
+                if _is_flow_agent_limit_error(err):
+                    logger.warning("flow_image agent limit reached after submission: %s", err)
+                    raise FlowAgentLimitReached(
+                        f"Google Flow đã đạt giới hạn tương tác của Tác nhân (Flow Agent): {err}"
+                    )
                 if _is_flow_image_credit_exhausted_error(err):
                     logger.warning("flow_image credit quota exhausted after submission: %s", err)
                     raise FlowImageCreditExhausted(

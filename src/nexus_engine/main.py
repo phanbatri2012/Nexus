@@ -8110,6 +8110,7 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
         db.update_video_production_state(video_id, render_status="error")
         return
     from nexus_engine.services.google_flow_worker import (
+        FlowAgentLimitReached,
         FlowAgentSettingsError,
         FlowCreditExhausted,
         FlowImageCreditExhausted,
@@ -8557,14 +8558,15 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
             return
 
     if (
-        isinstance(exc, (FlowImageCreditExhausted, FlowVideoCreditExhausted, FlowCreditExhausted))
+        isinstance(exc, (FlowImageCreditExhausted, FlowVideoCreditExhausted, FlowCreditExhausted, FlowAgentLimitReached))
         and str(job.get("job_type") or "") == "flow_media_generation"
     ):
+        is_agent_limit = isinstance(exc, FlowAgentLimitReached) or "tác nhân" in str(exc).lower() or "agent" in str(exc).lower()
         is_video_quota = isinstance(exc, FlowVideoCreditExhausted) or "video" in str(exc).lower()
-        quota_type = "video" if is_video_quota else "image"
+        quota_type = "agent_limit" if is_agent_limit else ("video" if is_video_quota else "image")
         current_job = db.get_system_job(job["id"]) or job
         result = dict(current_job.get("result") or {})
-        result["attention_required"] = f"flow_{quota_type}_quota_exhausted"
+        result["attention_required"] = f"flow_{quota_type}_quota_exhausted" if quota_type != "agent_limit" else "flow_agent_limit_reached"
         result["quota_exhausted_type"] = quota_type
 
         video_id = int(job.get("video_id") or (job.get("payload") or {}).get("video_id") or 0)
@@ -8575,7 +8577,13 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
             img_completed = sum(1 for k, v in artifacts.items() if k.startswith("scene:") and v.get("status") == "completed")
             vid_completed = sum(1 for k, v in artifacts.items() if k.startswith("scene_video:") and v.get("status") == "completed")
 
-        if is_video_quota:
+        if is_agent_limit:
+            message = (
+                f"Google Flow đã đạt giới hạn tương tác của Tác nhân (Flow Agent) (Đã xong {img_completed} ảnh). "
+                "Đã dừng tại checkpoint; hãy chờ Google đặt lại hạn mức tác nhân rồi nhấn Tiếp tục."
+            )
+            stage = "flow_agent_limit_reached"
+        elif is_video_quota:
             message = (
                 f"Google Flow đã hết Quota Video (Veo) (Đã xong {vid_completed} video, {img_completed} ảnh). "
                 "Đã dừng tại checkpoint; hãy chờ reset quota video rồi nhấn Resume."
@@ -8583,7 +8591,7 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
             stage = "flow_video_quota_exhausted"
         else:
             message = (
-                f"Google Flow đã hết Quota tạo ảnh (Đã xong {img_completed} ảnh). "
+                f"Google Flow đã hết Quota tạo ảnh trên tất cả model (Đã xong {img_completed} ảnh). "
                 "Đã dừng tại checkpoint; hãy chờ Google reset quota rồi nhấn Resume."
             )
             stage = "flow_image_quota_exhausted"

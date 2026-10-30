@@ -137,6 +137,19 @@ GOOGLE_FLOW_VIDEO_MODELS = {
 
 GOOGLE_FLOW_MODELS = {**GOOGLE_FLOW_IMAGE_MODELS, **GOOGLE_FLOW_VIDEO_MODELS}
 
+FLOW_IMAGE_FALLBACK_CHAIN: tuple[str, ...] = (
+    "nano_banana_2_1",
+    "nano_banana_2_lite",
+    "nano_banana_pro",
+)
+
+FLOW_VIDEO_FALLBACK_CHAIN: tuple[str, ...] = (
+    "omni_1_1_flash",
+    "veo_3_1_lite",
+    "veo_3_1_fast",
+    "veo_3_1_quality",
+)
+
 DEFAULT_IMAGE_GENERATION_SETTINGS = {
     "render_mode": "google_flow",
     "stock_video_settings": {
