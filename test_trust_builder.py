@@ -28,6 +28,7 @@ from nexus_engine.services.trust_builder_actions import (
     action_subscribe_channel,
     dismiss_common_popups,
     handle_ad_skipping,
+    is_sponsored_candidate,
 )
 from nexus_engine.services.trust_builder_service import (
     calculate_trust_score,
@@ -133,6 +134,124 @@ def test_action_search_and_pick_video_success():
         assert selected["url"] == "https://www.youtube.com/watch?v=mock123"
         assert selected["channel"] == "@samkechuyen01"
         assert mock_page.wait_for_function.called or mock_page.wait_for_selector.called
+
+    asyncio.run(_run())
+
+
+def test_is_sponsored_candidate_detection():
+    # Vietnamese 'Được tài trợ'
+    assert is_sponsored_candidate({
+        "url": "https://www.youtube.com/watch?v=ad1",
+        "title": "Lenovo Ideapad Slim 3",
+        "channel": "Được tài trợ · CellphoneS",
+    }) is True
+
+    # Vietnamese 'Quảng cáo'
+    assert is_sponsored_candidate({
+        "url": "https://www.youtube.com/watch?v=ad2",
+        "title": "Khoá học lập trình",
+        "channel": "Trung tâm ABC (Quảng cáo)",
+    }) is True
+
+    # English 'Sponsored'
+    assert is_sponsored_candidate({
+        "url": "https://www.youtube.com/watch?v=ad3",
+        "title": "Best VPN 2026",
+        "channel": "Sponsored · Nord Brand",
+    }) is True
+
+    # Title prefix [Ad]
+    assert is_sponsored_candidate({
+        "url": "https://www.youtube.com/watch?v=ad4",
+        "title": "[Ad] Smart watch discount",
+        "channel": "Tech Store",
+    }) is True
+
+    # Ad redirect / tracking URL
+    assert is_sponsored_candidate({
+        "url": "https://www.googleadservices.com/pagead/aclk?sa=L&ai=mock",
+        "title": "Sale off",
+        "channel": "Shop",
+    }) is True
+
+    # Explicit flag
+    assert is_sponsored_candidate({
+        "url": "https://www.youtube.com/watch?v=ad5",
+        "title": "Promo video",
+        "channel": "Brand",
+        "is_ad": True,
+    }) is True
+
+    # Organic video candidate must NOT be flagged
+    assert is_sponsored_candidate({
+        "url": "https://www.youtube.com/watch?v=organic123",
+        "title": "Vợ Mất đột ngột Trước Ngày Chồng Về Phép",
+        "channel": "Trò Chuyện Với Sầm",
+    }) is False
+
+
+def test_action_search_and_pick_video_skips_sponsored_ad_at_top():
+    async def _run():
+        mock_page = AsyncMock()
+        mock_search_elem = AsyncMock()
+        mock_page.wait_for_selector.return_value = mock_search_elem
+        mock_page.wait_for_function = AsyncMock()
+
+        # The first item is a sponsored video at top of page, second is organic
+        mock_page.evaluate.return_value = [
+            {
+                "url": "https://www.youtube.com/watch?v=ad_first",
+                "title": "Lenovo Ideapad Slim 3 | Trợ Giá Đến 4 Triệu",
+                "channel": "Được tài trợ · CellphoneS",
+            },
+            {
+                "url": "https://www.youtube.com/watch?v=organic_win",
+                "title": "Vợ Mất đột ngột Trước Ngày Chồng Về Phép",
+                "channel": "Trò Chuyện Với Sầm",
+            },
+        ]
+
+        selected = await action_search_and_pick_video(
+            mock_page,
+            keyword="truyện tâm sự",
+            target_channel="",
+            timeout_seconds=5.0,
+        )
+
+        # Must skip the sponsored ad and pick the organic video
+        assert selected["url"] == "https://www.youtube.com/watch?v=organic_win"
+        assert selected["channel"] == "Trò Chuyện Với Sầm"
+
+    asyncio.run(_run())
+
+
+def test_action_browse_and_pick_video_skips_sponsored_ad_at_top():
+    async def _run():
+        mock_page = AsyncMock()
+        mock_page.wait_for_selector = AsyncMock()
+
+        # The first item is a sponsored ad card on home page, second is organic
+        mock_page.evaluate.return_value = [
+            {
+                "url": "https://www.youtube.com/watch?v=ad_feed",
+                "title": "Quảng cáo sản phẩm mới",
+                "channel": "Được tài trợ · Brand X",
+            },
+            {
+                "url": "https://www.youtube.com/watch?v=organic_feed",
+                "title": "Trung Tá Đạp Cửa Bếp Cứu Mẹ Ruột 70T",
+                "channel": "Đêm Nay Sầm Kể",
+            },
+        ]
+
+        selected = await action_browse_and_pick_video(
+            mock_page,
+            target_channel="",
+            timeout_seconds=5.0,
+        )
+
+        assert selected["url"] == "https://www.youtube.com/watch?v=organic_feed"
+        assert selected["channel"] == "Đêm Nay Sầm Kể"
 
     asyncio.run(_run())
 

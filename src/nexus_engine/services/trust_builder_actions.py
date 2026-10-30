@@ -94,6 +94,12 @@ async def handle_ad_skipping(page: Any) -> bool:
         ".ytp-ad-skip-button-modern",
         ".ytp-skip-ad-button",
         "button.ytp-ad-skip-button-text",
+        "button.ytp-skip-ad-button",
+        ".ytp-skip-ad-button__text",
+        "button[class*='ytp-ad-skip-button']",
+        "button[class*='ytp-skip-ad-button']",
+        ".videoAdUiSkipButton",
+        ".ytp-ad-overlay-close-button",
     ]
     for sel in skip_selectors:
         try:
@@ -105,6 +111,95 @@ async def handle_ad_skipping(page: Any) -> bool:
         except Exception:
             pass
     return False
+
+
+def is_sponsored_candidate(candidate: dict[str, Any]) -> bool:
+    """Check if a video candidate is an advertisement or sponsored content.
+
+    Detects sponsored video cards, promoted in-feed items, ad tracking URLs,
+    and ad badges across both Vietnamese ('Được tài trợ', 'Quảng cáo') and
+    international ('Sponsored', 'Ad') markers.
+    """
+    if not isinstance(candidate, dict):
+        return False
+    if candidate.get("is_ad"):
+        return True
+
+    url = str(candidate.get("url") or "").strip().lower()
+    if any(ad_domain in url for ad_domain in ("googleadservices.com", "doubleclick.net", "/pagead/", "ad_type=", "adurl=")):
+        return True
+
+    # Check channel metadata for ad/sponsored indicators
+    channel = str(candidate.get("channel") or "").strip().casefold()
+    ad_channel_markers = ("được tài trợ", "duoc tai tro", "sponsored", "quảng cáo", "quang cao")
+    if any(marker in channel for marker in ad_channel_markers):
+        return True
+
+    # Check title metadata for ad prefixes
+    title = str(candidate.get("title") or "").strip().casefold()
+    ad_title_markers = ("được tài trợ", "duoc tai tro", "sponsored", "quảng cáo", "quang cao", "ad")
+    if any(title.startswith(f"[{m}]") or title.startswith(f"({m})") or title.startswith(f"【{m}】") for m in ad_title_markers):
+        return True
+
+    return False
+
+
+_JS_IS_AD_OR_SPONSORED_SNIPPET = r'''
+function isAdOrSponsored(node) {
+    if (!node) return false;
+    try {
+        if (node.closest && node.closest(
+            'ytd-ad-slot-renderer, ytd-in-feed-ad-layout-renderer, ytd-promoted-video-renderer, ' +
+            'ytd-promoted-sparkles-web-renderer, ytd-display-ad-renderer, ytd-statement-banner-renderer, ' +
+            'ytd-brand-video-singleton-renderer, ytd-compact-promoted-item-renderer, ytd-banner-promo-renderer, ' +
+            '[is-ad], [is-promoted], [class*="badge-shape-wiz--ad"]'
+        )) return true;
+        if (node.querySelector && node.querySelector(
+            'ytd-ad-slot-renderer, ytd-in-feed-ad-layout-renderer, ytd-promoted-video-renderer, ' +
+            'ytd-promoted-sparkles-web-renderer, ytd-display-ad-renderer, ytd-statement-banner-renderer, ' +
+            '#ad-badge, .badge-style-type-ad, .badge-shape-wiz--ad, [class*="badge-shape-wiz--ad"], ' +
+            '[class*="ad-badge"], .ytd-ad-inline-playback-meta-renderer'
+        )) return true;
+        if (node.querySelector && node.querySelector(
+            '[aria-label*="Được tài trợ" i], [aria-label*="Sponsored" i], [aria-label="Ad" i], [aria-label*="Quảng cáo" i]'
+        )) return true;
+        const nodeAria = (node.getAttribute && node.getAttribute('aria-label')) || '';
+        if (/(?:được tài trợ|duoc tai tro|sponsored|^ad$|quảng cáo|quang cao)/i.test(nodeAria)) return true;
+        const badgeElems = (node.querySelectorAll && node.querySelectorAll(
+            'badge-shape-wiz, .ytd-badge-supported-renderer, .badge-shape-wiz__text, #ad-badge, ' +
+            '.badge-style-type-ad, ytd-badge-supported-renderer, #channel-name, #byline, #metadata-line, ' +
+            '.ytd-channel-name, #text-container, .ytd-ad-inline-playback-meta-renderer'
+        )) || [];
+        for (const b of badgeElems) {
+            const txt = (b.innerText || b.textContent || '').trim().toLowerCase();
+            if (
+                txt === 'được tài trợ' ||
+                txt === 'duoc tai tro' ||
+                txt === 'sponsored' ||
+                txt === 'ad' ||
+                txt === 'quảng cáo' ||
+                txt.startsWith('được tài trợ') ||
+                txt.startsWith('duoc tai tro') ||
+                txt.startsWith('sponsored') ||
+                txt.includes('được tài trợ') ||
+                txt.includes('duoc tai tro') ||
+                txt.includes('sponsored') ||
+                (txt.includes('quảng cáo') && !txt.includes('bỏ qua'))
+            ) return true;
+        }
+        if (node.querySelector && node.querySelector(
+            'ytd-button-renderer[class*="action-button"], #action-button, .ytd-in-feed-ad-layout-renderer, button[aria-label*="Mua ngay" i], button[aria-label*="Shop now" i]'
+        )) return true;
+        if (node.querySelector && node.querySelector(
+            'a[href*="googleadservices.com"], a[href*="doubleclick.net"], a[href*="/pagead/"], a[href*="adclick"]'
+        )) return true;
+    } catch (e) {
+        // Safe fallback if DOM inspection fails
+    }
+    return false;
+}
+'''
+
 
 
 def _youtube_video_id_from_url(url: str) -> str:
@@ -356,12 +451,16 @@ async def action_search_and_pick_video(
     # 6. Extract candidate video links
     candidates: list[dict[str, str]] = await page.evaluate(
         """() => {
+"""
+        + _JS_IS_AD_OR_SPONSORED_SNIPPET
+        + """
             const results = [];
             const seen = new Set();
             const videoNodes = document.querySelectorAll(
                 'ytd-video-renderer, ytd-rich-item-renderer, ytd-item-section-renderer, ytd-grid-video-renderer, #contents ytd-video-renderer'
             );
             for (const node of videoNodes) {
+                if (isAdOrSponsored(node)) continue;
                 const titleElem = node.querySelector('a#video-title, a#video-title-link, h3 a, #video-title, .ytd-video-renderer h3 a');
                 const thumbElem = node.querySelector('a#thumbnail[href*="/watch?v="], a[href*="/watch?v="]');
                 const channelNode = node.querySelector('ytd-channel-name a, #channel-info a, #byline a, #text.ytd-channel-name, .ytd-channel-name, a[href*="/@"], a[href*="/channel/"]');
@@ -398,6 +497,8 @@ async def action_search_and_pick_video(
             if (results.length === 0) {
                 const allLinks = document.querySelectorAll('a#video-title, a[href*="/watch?v="]');
                 for (const link of allLinks) {
+                    const parentCard = (link.closest && link.closest('ytd-video-renderer, ytd-rich-item-renderer, ytd-item-section-renderer, ytd-grid-video-renderer, ytd-ad-slot-renderer')) || link;
+                    if (isAdOrSponsored(parentCard) || isAdOrSponsored(link)) continue;
                     if (link.href && link.href.includes('/watch?v=') && !seen.has(link.href)) {
                         seen.add(link.href);
                         const title = (link.getAttribute('title') || link.innerText || link.getAttribute('aria-label') || '').trim();
@@ -424,10 +525,15 @@ async def action_search_and_pick_video(
         await natural_scroll(page, min_scrolls=2, max_scrolls=3)
         candidates = await page.evaluate(
             """() => {
+"""
+            + _JS_IS_AD_OR_SPONSORED_SNIPPET
+            + """
                 const list = [];
                 const links = document.querySelectorAll('a#video-title, a[href*="/watch?v="]');
                 const seen = new Set();
                 for (const a of links) {
+                    const parentCard = (a.closest && a.closest('ytd-video-renderer, ytd-rich-item-renderer, ytd-item-section-renderer, ytd-grid-video-renderer, ytd-ad-slot-renderer')) || a;
+                    if (isAdOrSponsored(parentCard) || isAdOrSponsored(a)) continue;
                     if (a.href && !seen.has(a.href)) {
                         seen.add(a.href);
                         const title = (a.getAttribute('title') || a.innerText || a.getAttribute('aria-label') || '').trim();
@@ -442,6 +548,21 @@ async def action_search_and_pick_video(
 
     if not candidates:
         raise RuntimeError(f"Không tìm thấy video kết quả nào cho từ khóa '{keyword}'.")
+
+    # Filter out sponsored / ad videos (Defense-in-depth in Python)
+    organic_candidates = []
+    for cand in candidates:
+        if is_sponsored_candidate(cand):
+            logger.info(
+                "Bỏ qua video quảng cáo / được tài trợ: '%s' (%s)",
+                cand.get("title"),
+                cand.get("channel"),
+            )
+            continue
+        organic_candidates.append(cand)
+    candidates = organic_candidates
+    if not candidates:
+        raise RuntimeError(f"Tất cả video cho từ khóa '{keyword}' là quảng cáo hoặc được tài trợ.")
 
     # Safety Shield Gatekeeper: Filter out subversive/hostile content
     safe_candidates = []
@@ -542,12 +663,16 @@ async def action_search_and_pick_video(
                 await natural_scroll(page, min_scrolls=2, max_scrolls=3)
                 targeted_candidates = await page.evaluate(
                     """() => {
+"""
+                    + _JS_IS_AD_OR_SPONSORED_SNIPPET
+                    + """
                         const list = [];
                         const seen = new Set();
                         const videoNodes = document.querySelectorAll(
                             'ytd-video-renderer, ytd-rich-item-renderer, ytd-item-section-renderer, ytd-grid-video-renderer, #contents ytd-video-renderer'
                         );
                         for (const node of videoNodes) {
+                            if (isAdOrSponsored(node)) continue;
                             const titleElem = node.querySelector('a#video-title, a#video-title-link, h3 a, #video-title, .ytd-video-renderer h3 a');
                             const thumbElem = node.querySelector('a#thumbnail[href*="/watch?v="], a[href*="/watch?v="]');
                             const channelNode = node.querySelector('ytd-channel-name a, #channel-info a, #byline a, #text.ytd-channel-name, .ytd-channel-name, a[href*="/@"], a[href*="/channel/"]');
@@ -583,6 +708,10 @@ async def action_search_and_pick_video(
                         return list;
                     }"""
                 )
+                if targeted_candidates:
+                    targeted_candidates = [
+                        c for c in targeted_candidates if not is_sponsored_candidate(c)
+                    ]
                 if targeted_candidates:
                     # Safety Shield filter on targeted candidates
                     safe_targeted = []
@@ -679,12 +808,16 @@ async def action_browse_and_pick_video(
 
     candidates: list[dict[str, str]] = await page.evaluate(
         """targetChannel => {
+"""
+        + _JS_IS_AD_OR_SPONSORED_SNIPPET
+        + """
             const results = [];
             const seen = new Set();
             const nodes = document.querySelectorAll(
                 'ytd-video-renderer, ytd-rich-item-renderer, ytd-grid-video-renderer, ytd-rich-grid-media'
             );
             for (const node of nodes) {
+                if (isAdOrSponsored(node)) continue;
                 const titleNode = node.querySelector('a#video-title, a#video-title-link, h3 a');
                 const thumbNode = node.querySelector('a#thumbnail[href*="/watch?v="], a[href*="/watch?v="]');
                 const channelNode = node.querySelector(
@@ -708,6 +841,8 @@ async def action_browse_and_pick_video(
             }
             if (results.length === 0) {
                 for (const link of document.querySelectorAll('a#video-title[href*="/watch?v="], a[href*="/watch?v="]')) {
+                    const parentCard = (link.closest && link.closest('ytd-video-renderer, ytd-rich-item-renderer, ytd-grid-video-renderer, ytd-rich-grid-media, ytd-ad-slot-renderer')) || link;
+                    if (isAdOrSponsored(parentCard) || isAdOrSponsored(link)) continue;
                     const url = (link.href || '').trim();
                     const title = (
                         link.getAttribute('title')
@@ -730,6 +865,13 @@ async def action_browse_and_pick_video(
     excluded_ids = excluded_video_ids or set()
     safe_candidates: list[dict[str, str]] = []
     for candidate in candidates:
+        if is_sponsored_candidate(candidate):
+            logger.info(
+                "Bỏ qua video quảng cáo / được tài trợ Watch-only: '%s' (%s)",
+                candidate.get("title", ""),
+                candidate.get("channel", ""),
+            )
+            continue
         match = re.search(r"[?&]v=([a-zA-Z0-9_-]+)", candidate.get("url", ""))
         if match and match.group(1) in excluded_ids:
             continue
@@ -1043,7 +1185,7 @@ async def action_watch_video(
             paused: Boolean(video?.paused),
             ended: Boolean(video?.ended),
             readyState: Number(video?.readyState || 0),
-            adShowing: Boolean(document.querySelector('.ad-showing, .ytp-ad-player-overlay')),
+            adShowing: Boolean(document.querySelector('.ad-showing, .ad-interrupting, .ytp-ad-player-overlay, ytd-action-companion-ad-renderer')),
             videoId: params.get('v') || ''
         };
     }"""
