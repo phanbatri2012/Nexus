@@ -25,6 +25,8 @@ test('wires dynamic Short Video navigation and project screens', async () => {
   assert.match(viewSource, /api\/tts\/voices\?provider_id=omnivoice&status=active/)
   assert.match(viewSource, /api\/tts\/previews/)
   assert.match(viewSource, /<audio[\s\S]*preview\.audio_url/)
+  assert.match(viewSource, /buildVoicePreviewText\(title, poem\)/)
+  assert.match(viewSource, /\.join\(['"]\\n\\n['"]\)/)
   assert.match(viewSource, /character_era: characterEra/)
   assert.match(viewSource, /Thời kỳ hình ảnh/)
   assert.match(viewSource, /character-profile/)

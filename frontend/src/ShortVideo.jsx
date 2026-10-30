@@ -3,6 +3,7 @@ import './ShortVideo.css'
 
 const API_BASE = 'http://127.0.0.1:8080'
 const ACTIVE_PREVIEW_STATUSES = new Set(['queued', 'processing'])
+const VOICE_PREVIEW_MAX_CHARACTERS = 1000
 const PROJECT_TABS = [
   ['create', 'Tạo video'],
   ['jobs', 'Công việc'],
@@ -57,6 +58,33 @@ function previewStatusLabel(preview) {
   if (preview.status === 'completed') return 'Nghe thử đã sẵn sàng'
   if (preview.status === 'canceled') return 'Đã hủy'
   return preview.error || 'Không tạo được bản nghe thử'
+}
+
+function buildVoicePreviewText(title, poem) {
+  const normalizedTitle = String(title || '').trim().replace(/[ \t]+/g, ' ')
+  const titleLine = normalizedTitle && !/[.!?…]$/.test(normalizedTitle)
+    ? `${normalizedTitle}.`
+    : normalizedTitle
+  const normalizedPoem = String(poem || '')
+    .split(/\r?\n/)
+    .map(line => line.trim().replace(/[ \t]+/g, ' '))
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+  const fullSample = [titleLine, normalizedPoem].filter(Boolean).join('\n\n')
+  if (!fullSample) return 'Đây là bản nghe thử giọng đọc cho video thơ.'
+  if (fullSample.length <= VOICE_PREVIEW_MAX_CHARACTERS) return fullSample
+
+  const lines = fullSample.split('\n')
+  const selectedLines = []
+  let selectedLength = 0
+  for (const line of lines) {
+    const addition = line.length + (selectedLines.length ? 1 : 0)
+    if (selectedLength + addition > VOICE_PREVIEW_MAX_CHARACTERS) break
+    selectedLines.push(line)
+    selectedLength += addition
+  }
+  return selectedLines.join('\n').trim() || fullSample.slice(0, VOICE_PREVIEW_MAX_CHARACTERS)
 }
 
 function ItemRow({ item, onOpen }) {
@@ -159,9 +187,7 @@ function CreateView({ project, onCreated }) {
 
   const createVoicePreview = async () => {
     if (!voiceId || previewBusy || (preview && ACTIVE_PREVIEW_STATUSES.has(preview.status))) return
-    const sample = `${title.trim()}${title.trim() && poem.trim() ? '. ' : ''}${poem.trim()}`
-      .replace(/\s+/g, ' ')
-      .slice(0, 200) || 'Đây là bản nghe thử giọng đọc cho video thơ.'
+    const sample = buildVoicePreviewText(title, poem)
     setPreviewBusy(true)
     setVoiceError('')
     try {
