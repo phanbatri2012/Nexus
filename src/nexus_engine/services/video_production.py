@@ -1485,14 +1485,48 @@ async def _generate_scene_image_async(
                 retry_delay_seconds=retry_wait_remaining,
                 pending_image_scene_indices=[int(scene.get("index", 0))],
             )
+    terminal_reason = str(existing_metadata.get("reason_code") or "")
+    if (
+        not force_new_project
+        and existing
+        and existing.get("content_hash") == content_hash
+        and existing.get("status") == "failed"
+        and (
+            existing_metadata.get("terminal") is True
+            or terminal_reason == "flow_max_attempts_exceeded"
+        )
+    ):
+        cached_err = str(existing_metadata.get("error") or "").strip()
+        raise FlowImageNeedsAttention(
+            cached_err or f"Cảnh {scene.get('index', 0) + 1} đã thất bại và đạt giới hạn thử lại."
+        )
+
     generation_attempt = int(existing_metadata.get("generation_attempt") or 0)
     if not is_reconciliation_checkpoint and not is_intent_reconciliation:
         generation_attempt += 1
         if generation_attempt > MAX_FLOW_IMAGE_SUBMISSION_ATTEMPTS:
-            raise FlowGenerationError(
+            error_msg = (
                 f"Cảnh {scene.get('index', 0) + 1} đã vượt quá giới hạn thử tối đa "
                 f"({MAX_FLOW_IMAGE_SUBMISSION_ATTEMPTS} lần). Dừng lại để tránh vòng lặp và bảo vệ quota Google Flow."
             )
+            db.upsert_video_artifact(
+                video_id=video_id,
+                artifact_type=artifact_type,
+                path=str(target),
+                content_hash=content_hash,
+                status="failed",
+                mime_type="image/png",
+                metadata={
+                    **existing_metadata,
+                    **scene,
+                    "error": error_msg,
+                    "failure_stage": "max_attempts_exceeded",
+                    "reason_code": "flow_max_attempts_exceeded",
+                    "generation_attempt": generation_attempt,
+                    "terminal": True,
+                },
+            )
+            raise FlowImageNeedsAttention(error_msg)
     generation_attempt = max(1, generation_attempt)
     request_key = (
         str(
@@ -2740,6 +2774,7 @@ def generate_scene_media(
             FlowCreditExhausted,
             FlowGenerationTimeout,
             FlowImageCreditExhausted,
+            FlowImageNeedsAttention,
             FlowImagePending,
             FlowMediaPending,
             FlowModeError,
@@ -2888,18 +2923,21 @@ def generate_scene_media(
                 if not artifact:
                     return False
                 status = str(artifact.get("status") or "")
-                if status == "queued":
-                    return True
-                if status != "processing":
+                if status not in {"queued", "processing", "retry_wait"}:
                     return False
                 metadata = artifact.get("metadata")
-                return bool(
-                    isinstance(metadata, dict)
-                    and (
-                        metadata.get("flow_receipt")
-                        or metadata.get("flow_submission_intent")
-                    )
-                )
+                if not isinstance(metadata, dict):
+                    return False
+                if metadata.get("terminal") is True:
+                    return False
+                receipt = metadata.get("flow_receipt")
+                intent = metadata.get("flow_submission_intent")
+                if not receipt and not intent:
+                    return False
+                if isinstance(receipt, dict) and receipt.get("deadline_at"):
+                    if _seconds_until(receipt.get("deadline_at")) <= 0:
+                        return False
+                return True
 
             image_pending = sum(
                 waiting(artifact)
@@ -3181,6 +3219,14 @@ def generate_scene_media(
                         exc,
                     )
                     refresh_artifact(artifact_type)
+                except (FlowImageNeedsAttention, FlowCreditExhausted, FlowAgentLimitReached) as exc:
+                    logger.error(
+                        "flow_reconcile media=image scene=%s state=terminal_error detail=%s",
+                        scene_index,
+                        exc,
+                    )
+                    refresh_artifact(artifact_type)
+                    raise
                 except Exception as exc:
                     logger.warning(
                         "flow_reconcile media=image scene=%s state=reconcile_check_error detail=%s",
@@ -3188,7 +3234,11 @@ def generate_scene_media(
                         exc,
                     )
                     refresh_artifact(artifact_type)
-                    append_pending(pending_images, exc, scene_index)
+                    current_art = artifact_snapshot.get(artifact_type) or {}
+                    art_status = str(current_art.get("status") or "")
+                    art_meta = current_art.get("metadata") or {}
+                    if art_status != "failed" and not art_meta.get("terminal"):
+                        append_pending(pending_images, exc, scene_index)
 
             # Phase 1B: Targeted Submission for remaining scenes that still need new prompt dispatch
             for position, scene in enumerate(scenes):
@@ -3237,7 +3287,7 @@ def generate_scene_media(
                     refresh_artifact(artifact_type)
                     append_pending(pending_images, exc, scene_index)
                     continue
-                except FlowCreditExhausted:
+                except (FlowCreditExhausted, FlowAgentLimitReached, FlowImageNeedsAttention):
                     raise
                 except Exception as exc:
                     logger.warning(
@@ -3246,7 +3296,11 @@ def generate_scene_media(
                         exc,
                     )
                     refresh_artifact(artifact_type)
-                    append_pending(pending_images, exc, scene_index)
+                    current_art = artifact_snapshot.get(artifact_type) or {}
+                    art_status = str(current_art.get("status") or "")
+                    art_meta = current_art.get("metadata") or {}
+                    if art_status != "failed" and not art_meta.get("terminal"):
+                        append_pending(pending_images, exc, scene_index)
                     continue
 
                 try:
@@ -3296,6 +3350,11 @@ def generate_scene_media(
                 base_image_paths[position] = None
                 validated_images[position] = None
                 scene_index = int(scenes[position].get("index", position))
+                art_check = artifact_snapshot.get(f"scene:{scene_index}") or {}
+                art_status = str(art_check.get("status") or "")
+                art_meta = art_check.get("metadata") or {}
+                if art_status == "failed" or art_meta.get("terminal") is True:
+                    continue
                 if scene_index not in pending_image_indices:
                     pending_images.append({"scene_index": scene_index})
                     pending_image_indices.add(scene_index)
@@ -3346,6 +3405,23 @@ def generate_scene_media(
                     retry_delay_seconds=min(retry_delays)
                     if retry_delays
                     else FLOW_MEDIA_RECONCILIATION_POLL_SECONDS,
+                )
+
+            missing_image_positions = [
+                pos
+                for pos, path in enumerate(base_image_paths)
+                if path is None
+            ]
+            if missing_image_positions:
+                first_missing_pos = missing_image_positions[0]
+                first_missing_scene = int(scenes[first_missing_pos].get("index", first_missing_pos))
+                art_missing = artifact_snapshot.get(f"scene:{first_missing_scene}") or {}
+                err_text = str(
+                    (art_missing.get("metadata") or {}).get("error")
+                    or "Ảnh cảnh bị lỗi hoặc không thể tạo."
+                )
+                raise FlowImageNeedsAttention(
+                    f"Ảnh cảnh {first_missing_scene + 1} không thể hoàn tất: {err_text}"
                 )
 
             emit_progress(

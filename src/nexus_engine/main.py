@@ -8718,6 +8718,48 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
             current_payload["force_new_flow_project"] = False
             db.update_system_job(job["id"], payload_json=current_payload)
         delay_int = max(1, int(round(retry_delay_seconds)))
+
+        video_id = int(job.get("video_id") or (job.get("payload") or {}).get("video_id") or 0)
+        current_completed = 0
+        if video_id:
+            artifacts = db.list_latest_video_artifacts(video_id, ("scene:", "scene_video:"))
+            current_completed = sum(1 for v in artifacts.values() if v.get("status") == "completed")
+
+        last_completed = recovery_result.get("reconcile_last_completed_count")
+        if last_completed is not None and int(last_completed) == current_completed:
+            stagnant_count = int(recovery_result.get("reconcile_stagnant_count") or 0) + 1
+        else:
+            stagnant_count = 0
+        recovery_result["reconcile_last_completed_count"] = current_completed
+        recovery_result["reconcile_stagnant_count"] = stagnant_count
+
+        MAX_CONSECUTIVE_STAGNANT_RECONCILES = 15
+        if stagnant_count >= MAX_CONSECUTIVE_STAGNANT_RECONCILES:
+            stalled_msg = (
+                f"Google Flow đã thử đối soát {stagnant_count} lần liên tiếp mà không có ảnh/video mới hoàn tất. "
+                "Đã tạm dừng an toàn để bảo vệ quota và tránh vòng lặp vô tận; hãy kiểm tra trạng thái trên Google Flow rồi nhấn Tiếp tục."
+            )
+            recovery_result["attention_required"] = "flow_reconcile_stalled"
+            db.update_system_job(
+                job["id"],
+                status="paused",
+                progress=stalled_msg,
+                error=safe_error,
+                result_json=recovery_result,
+                next_retry_at="",
+                cancel_requested=0,
+                finished_at="",
+            )
+            if video_id:
+                db.update_video_production_state(
+                    video_id,
+                    render_status="paused",
+                    current_stage="flow_reconcile_stalled",
+                    production_progress=stalled_msg,
+                    blocking_reason=safe_error,
+                )
+            return
+
         if is_image_phase:
             progress_msg = (
                 f"Đang chờ Google Flow tạo {len(pending_image_scene_indices)} ảnh còn lại"
